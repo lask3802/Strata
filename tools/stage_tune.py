@@ -27,9 +27,11 @@ What it measures, per configuration (every process restarted): one prompt of goa
 answer, then three short prompts with 256-token answers; and from the logs (STRATA_REMOTE_TIMING=1) each stage's own
 time per prompt chunk and per decode window.  The score is a request's time: prompt_tokens / prefill + answer_tokens /
 decode (the long prompt's decode).  The search: a first split by VRAM; a split that balances the stages' measured
-per-layer prompt cost; then each split point one or two layers either way while that wins; then the larger chunks at
-the best split (a chunk that does not fit is skipped).  Measured on a busy PC the numbers move a few percent between
-runs: the report lists every run.
+per-layer prompt cost; the larger prompt chunks at the better of the two (a larger chunk costs VRAM the decode cache
+would use - when the engine says "add --vram-reserve-mib N" the chunk is tried once more with it); then, at the best
+chunk, each split point two and then one layer either way while that wins (the best split moves with the chunk: a
+larger chunk makes the faster card's share pay).  Measured on a busy PC the numbers move a few percent between runs:
+the report lists every run.
 """
 from __future__ import annotations
 
@@ -207,6 +209,7 @@ RE_WK_WIN = re.compile(r"strata stage worker: windows: own layers ([\d.]+) ms")
 RE_MAIN_WIN = re.compile(r"strata remote: main process between windows ([\d.]+) ms")
 RE_RT = re.compile(r"strata remote: \d+ windows: mean ([\d.]+) ms a round trip = worker ([\d.]+) \+ link ([\d.]+)")
 RE_VRAM = re.compile(r"(\d+) MiB of VRAM free with everything loaded")
+RE_RESERVE = re.compile(r"add --vram-reserve-mib (\d+)")
 
 
 def median_or_none(xs: list[float]) -> float | None:
@@ -275,6 +278,12 @@ class Tuner:
             ok, why = self.main.start(self.main.config(splits, chunk, self.nodes[0], timing=True, extra=extra))
         if not ok:
             run["error"] = why.strip()[-1500:]
+            if self.main.log_path.exists():   # an engine that ran out of VRAM says how much headroom it wants
+                res = [int(m.group(1)) for m in map(RE_RESERVE.search, self.main.log_path.read_text(
+                    encoding="utf-8", errors="replace").splitlines()) if m]
+                if res:
+                    run["suggested_reserve_mib"] = res[-1]
+            self.main.stop()
             say(f"  does not run: {why.strip().splitlines()[-1] if why.strip() else '?'}")
             self.record(run)
             return run
@@ -282,7 +291,7 @@ class Tuner:
         doc = (self.corpus * (1 + n // max(1, len(self.corpus))))[:n]
         long = self.main.chat("Here is a long document. After reading it, write a detailed technical summary of its "
                               "main ideas in about 250 words.\n\n<document>\n" + doc + "\n</document>", LONG_ANSWER)
-        shorts = [self.main.chat(p, SHORT_ANSWER) for p in SHORT_PROMPTS]
+        shorts = [self.main.chat(p, SHORT_ANSWER) for p in SHORT_PROMPTS] if not long.get("error") else []
         run["long"] = long
         run["short_decode"] = median_or_none([s["decode_tps"] for s in shorts if s.get("decode_tps")])
         if long.get("error") or not long.get("prefill_tps"):
@@ -302,6 +311,9 @@ class Tuner:
         for s, (lo, hi) in zip(st, run["stages"]):
             s["layers"] = hi - lo
         run["per_stage"] = st
+        res = [int(m.group(1)) for m in map(RE_RESERVE.search, main_lines) if m]
+        if res:
+            run["suggested_reserve_mib"] = res[-1]
         if run["ok"]:
             say(f"  prefill {run['prefill_tps']:.0f} tok/s, decode {run['decode_tps']:.1f} (short "
                 f"{run['short_decode'] or 0:.1f}), request {run['request_s']:.1f} s; stages: " +
@@ -378,44 +390,48 @@ class Tuner:
             say(f"  {n.name}: {g.get('name')} {g.get('vram_mib')} MiB, PCIe gen {g.get('pcie_gen')} "
                 f"x{g.get('pcie_width')}, RAM {n.info.get('ram', {}).get('total_mib')} MiB, {n.info.get('cpus')} CPUs")
         self.links()
-        splits = self.initial_splits()
-        r = self.measure(splits, c0)
+        r = self.measure(self.initial_splits(), c0)
         if not r["ok"]:
             say("the first split does not run; trying an even one")
             r = self.measure(self.splits_from_weights([1.0] * (len(self.nodes) + 1)), c0)
             if not r["ok"]:
                 return None
-        # balance the prompt stages, then walk each split point while it wins
+        # 1. balance the stages' prompt time
         bal = self.balanced(r)
         if bal and bal != r["splits"] and self.valid(bal):
             self.measure(bal, c0)
+        # 2. the prompt chunk, at the best split so far
+        splits = self.best(c0)["splits"]
+        for c in chunks[1:]:
+            r = self.measure(splits, c)
+            if not r["ok"] and r.get("suggested_reserve_mib"):
+                extra = ["--vram-reserve-mib", str(r["suggested_reserve_mib"] + 100)]
+                say(f"  the engine asks for more VRAM headroom: once more with {' '.join(extra)}")
+                r = self.measure(splits, c, extra)
+            if not r["ok"]:
+                say(f"  chunk {c} does not run at this split; larger ones are not tried")
+                break
+        best = self.best()
+        chunk, extra = best["chunk"], best["extra"]
+        # 3. the split points at that chunk: two, then one layer either way, while that wins
         for step in (2, 1):
             improved = True
             while improved and len(self.runs) < max_runs:
                 improved = False
-                cur = self.best(c0)
+                cur = min((x for x in self.runs if x["ok"] and x["chunk"] == chunk and x["extra"] == extra),
+                          key=lambda x: x["request_s"])
                 for i in range(len(cur["splits"])):
                     for d in (-step, step):
                         cand = list(cur["splits"])
                         cand[i] += d
-                        if not self.valid(cand) or any(x["splits"] == cand and x["chunk"] == c0 for x in self.runs):
+                        if not self.valid(cand) or len(self.runs) >= max_runs:
                             continue
-                        if len(self.runs) >= max_runs:
-                            break
-                        r = self.measure(cand, c0)
+                        r = self.measure(cand, chunk, extra)
                         if r["ok"] and r["request_s"] < cur["request_s"]:
                             improved = True
+                            break
                     if improved:
                         break
-        best = self.best(c0)
-        # larger prompt chunks at the best split (they cost VRAM the decode cache would use)
-        for c in chunks[1:]:
-            if len(self.runs) >= max_runs + len(chunks):
-                break
-            r = self.measure(best["splits"], c)
-            if not r["ok"]:
-                say(f"  chunk {c} does not fit at this split; larger ones are not tried")
-                break
         return self.best()
 
     def links(self) -> None:
