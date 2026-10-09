@@ -213,6 +213,7 @@ bool StageClient::roundtrip_(const StageHeader& h, const void* p1, size_t n1, co
     last_wait_ms_ = std::chrono::duration<double, std::milli>(t2 - t1).count();
     stats_.ms_send += last_send_ms_;
     stats_.ms_wait += last_wait_ms_;
+    last_worker_ms_ = (double) r.a / 1000.0;   // the worker's own time (a reply's `a`, microseconds)
     stats_.bytes_out += sizeof h + n1 + n2;
     if (r.type == (uint32_t) StageMsg::Error) {
         std::string m((size_t) r.bytes, '\0');
@@ -257,14 +258,13 @@ bool StageClient::run(int T, const int32_t* tokens, int64_t pos0, const float* r
     ++stats_.runs;
     const double ms = ms_since(t0);
     stats_.ms_run += ms;
+    win_worker_ms_ += last_worker_ms_;
     if (remote_timing() && (stats_.runs & 63) == 0)
-        std::fprintf(stderr, "strata remote: window T=%d at %lld: %.2f ms (send %.2f, worker %.2f, receive %.2f); "
-                             "%llu windows, mean %.2f ms (send %.2f, worker %.2f, receive %.2f)\n",
-                     T, (long long) pos0, ms, last_send_ms_, last_wait_ms_, last_recv_ms_,
+        std::fprintf(stderr, "strata remote: %llu windows: mean %.2f ms a round trip = worker %.2f + link %.2f "
+                             "(last: T=%d, %.2f = %.2f + %.2f)\n",
                      (unsigned long long) stats_.runs, stats_.ms_run / (double) stats_.runs,
-                     stats_.ms_send / (double) (stats_.runs + stats_.prefills),
-                     stats_.ms_wait / (double) (stats_.runs + stats_.prefills),
-                     stats_.ms_recv / (double) (stats_.runs + stats_.prefills));
+                     win_worker_ms_ / (double) stats_.runs, (stats_.ms_run - win_worker_ms_) / (double) stats_.runs, T, ms,
+                     last_worker_ms_, ms - last_worker_ms_);
     return ok;
 }
 
@@ -305,9 +305,8 @@ bool StageClient::prefill(const int64_t* tokens, int64_t T, int64_t pos0, int64_
     const double ms = ms_since(t0);
     stats_.ms_prefill += ms;
     if (remote_timing())
-        std::fprintf(stderr, "strata remote: chunk T=%lld at %lld: %.0f ms (send %.0f, worker %.0f, receive %.0f; %lld rows back)\n",
-                     (long long) T, (long long) pos0, ms, last_send_ms_, last_wait_ms_, last_recv_ms_,
-                     (long long) (T - skip));
+        std::fprintf(stderr, "strata remote: chunk T=%lld at %lld: %.0f ms = worker %.0f + link %.0f (%lld rows back)\n",
+                     (long long) T, (long long) pos0, ms, last_worker_ms_, ms - last_worker_ms_, (long long) (T - skip));
     return ok;
 }
 
@@ -416,11 +415,13 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
                     break;
                 }
                 std::string e;
+                const auto tw = Clock::now();
                 if (!pending_err.empty()) { e = pending_err; pending_err.clear(); ok = false; }
                 else ok = h.run(T, tok32.data(), m.b, e);
                 if (!ok) { ok = reply_error(e); break; }
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::RunOk;
+                r.a = (int64_t) (ms_since(tw) * 1000.0);   // the worker's own time on the window, microseconds
                 r.bytes = rows * 4;
                 if (!send_msg(fd, r, buf.run_out, rows * 4, nullptr, 0, err)) keep = false;
                 stats.bytes_out += sizeof r + rows * 4;
@@ -449,15 +450,19 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
                 }
                 std::string e;
                 const int64_t skip = std::max<int64_t>(0, std::min<int64_t>(m.c >> 8, T));
+                const auto tw = Clock::now();
                 if (!pending_err.empty()) { e = pending_err; pending_err.clear(); ok = false; }
                 else ok = h.prefill(tok64.data(), T, m.b, m.c & 0xff, e);
                 if (!ok) { ok = reply_error(e); break; }
+                const double work_ms = ms_since(tw);
                 if (remote_timing())
-                    std::fprintf(stderr, "strata stage worker: chunk T=%lld at %lld: received + read in %.0f ms\n",
-                                 (long long) T, (long long) m.b, ms_since(t0));
+                    std::fprintf(stderr, "strata stage worker: chunk T=%lld at %lld: received in %.0f ms, read in %.0f ms\n",
+                                 (long long) T, (long long) m.b, std::chrono::duration<double, std::milli>(tw - t0).count(),
+                                 work_ms);
                 const size_t back = (size_t) (T - skip) * (size_t) buf.pf_row_floats;
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::PrefillOk;
+                r.a = (int64_t) (work_ms * 1000.0);
                 r.bytes = back * 4;
                 if (!send_msg(fd, r, buf.pf_out + (size_t) skip * (size_t) buf.pf_row_floats, back * 4, nullptr, 0, err))
                     keep = false;

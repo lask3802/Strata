@@ -101,7 +101,7 @@ private:
     std::string peer_;
     std::mutex mu_;
     StageStats stats_;
-    double last_send_ms_ = 0, last_wait_ms_ = 0, last_recv_ms_ = 0;
+    double last_send_ms_ = 0, last_wait_ms_ = 0, last_recv_ms_ = 0, last_worker_ms_ = 0, win_worker_ms_ = 0;
 };
 
 /// The worker's end.  Every handler runs on the serving thread; `rows_in`/`rows_out` are the buffers the server
