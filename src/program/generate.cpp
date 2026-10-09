@@ -576,11 +576,11 @@ struct Options {
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
-    /// remote-stage fork: --remote-stage HOST:PORT (with --layer-split K --split-device 0): layers [K, n_layers) run
+    /// remote stage: --remote-stage HOST:PORT (with --layer-split K --split-device 0): layers [K, n_layers) run
     /// in a worker process on another PC (strata --serve --stage-worker PORT --stage-begin K); this process runs
     /// [0, K), the head and the drafter
     std::string remote_stage;
-    /// remote-stage fork, the worker: listen on this port and run layers [stage_begin, n_layers) without the head
+    /// remote stage, the worker: listen on this port and run layers [stage_begin, n_layers) without the head
     int stage_worker = 0;
     int64_t stage_begin = -1;
     /// the worker's listening address (--stage-bind ADDR; empty: every interface).  STRATA_STAGE_TOKEN (both sides)
@@ -2051,7 +2051,7 @@ int main(int argc, char** argv) {
         }
     }
     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
-    // remote-stage fork: which layers this process holds (the expert arena, the expert cache, the dense weights, the
+    // remote stage: which layers this process holds (the expert arena, the expert cache, the dense weights, the
     // session); [own_lo, own_hi), own_hi -1 = to the last layer
     const bool remote_main = !o.remote_stage.empty();
     const bool stage_worker = o.stage_worker > 0;

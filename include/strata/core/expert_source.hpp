@@ -825,7 +825,7 @@ public:
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's GGUF: `native` is the
     /// --native shard, and native_experts.txt names the other shards beside it (per layer, or per role in v4).
     void set_gguf(const std::string& native) { gguf_ = native; }
-    /// REMOTE STAGE (remote-stage fork): hold only layers [lo, hi) (-1: to the last) - a process that runs only
+    /// REMOTE STAGE: hold only layers [lo, hi) (-1: to the last) - a process that runs only
     /// those layers.  The other layers' experts are absent: blob() is null for them.  Set before `open`; a native
     /// pack read from its GGUF only (no experts.bin, no STRATA_ARENA_MMAP, no shared arena).
     void set_layer_range(int64_t lo, int64_t hi) { lo_ = lo; hi_ = hi; }

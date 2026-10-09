@@ -1,4 +1,4 @@
-// include/strata/net/stage_link.hpp - a layer split's later stage on another machine, over TCP (remote-stage fork).
+// include/strata/net/stage_link.hpp - a layer split's later stage on another machine, over TCP.
 //
 // The main process runs layers [0, K) and the head; a worker process (strata --serve --stage-worker PORT
 // --stage-begin K, on another PC) runs layers [K, n_layers) without the head.  They exchange exactly what an

@@ -165,7 +165,7 @@ public:
     /// run `init`.
     bool set_stage_helper(Prefill* helper, std::string& err);
 
-    /// REMOTE STAGE (remote-stage fork), the main side: this stage ends before the last layer and the rest of the
+    /// REMOTE STAGE, the main side: this stage ends before the last layer and the rest of the
     /// model runs in another process.  Instead of a `next` stage, every chunk's rows (T x hc*n_embd floats, pinned
     /// host) go to `remote_send` (on a thread, in order: this stage reads chunk c + 1 meanwhile), and on another
     /// thread, in the same order, `remote_recv` writes the worker's final rows [skip, T) to `rows_out` (pinned

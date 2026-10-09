@@ -139,7 +139,7 @@ public:
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
-    /// REMOTE STAGE (remote-stage fork), the worker's side: run the stage's layers up to the last one but no head -
+    /// REMOTE STAGE, the worker's side: run the stage's layers up to the last one but no head -
     /// the residual after the last layer (its pending write folded in, as the unsplit window folds it before the
     /// head) goes to `handoff_out` like an earlier stage's.  Set before `init`.
     void set_no_head(bool on) { no_head_ = on; }
