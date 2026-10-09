@@ -275,3 +275,12 @@ These are opt-in settings on one rig, not defaults.
 
 With a layer split, `--batch N --batch-groups G --trim-stage-weights` decodes several conversations together and
 pipelines them through the cards: see [BATCHING.md](BATCHING.md).
+
+## Cards in different PCs (remote stage, experimental)
+
+The later layers can also run on a card in **another PC**, over the network (opt-in, Linux, the Qwen3.8-Flash-Next
+family): `--layer-split K --split-device 0 --remote-stage HOST:PORT` here, `strata --serve --stage-worker PORT
+--stage-begin K` there. Each PC loads and caches only its own layers. On an RTX 3080 + an RTX 2080 Ti in two PCs on
+1 GbE (RVN IQ3_S, 128K context), decode ran at 45-55 tok/s against 37-40 on the 3080 alone, and 100K-token prompts
+read at 1,374-1,633 tok/s against 1,120 with 5888-8192-token chunks (slower than one card with 2048-token chunks and
+for 8K prompts). How to run it, the tools and the limits: [REMOTE_STAGE.md](REMOTE_STAGE.md).
