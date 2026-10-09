@@ -1,24 +1,29 @@
 """A remote-stage node agent: starts and stops this PC's Strata stage workers for the layer-split tuner
 (tools/stage_tune.py), and reports the PC's GPU, RAM and CPU and the link speed toward other nodes.  Python's
-standard library only, so it runs wherever the engine runs (Linux, WSL).
+standard library only, so it runs wherever the engine runs (Linux, Windows, WSL).
 
     python tools/stage_node.py node.json
 
 node.json (paths are this PC's):
     {
-      "exe": "/srv/stage/bin/strata",       the engine (a build of the remote-stage fork)
-      "lib_dirs": ["/srv/stage/bin"],       added to LD_LIBRARY_PATH (PATH on Windows)
-      "pack": ".../packs/rvn-iq3_s", "native": "...-00001-of-00008.gguf", "ple_gguf": "...-00002-of-00008.gguf",
-      "expert_profile": ".../expert-profile.bin",
-      "bind": "192.0.2.11",                     the address the agent and the workers listen on
+      "exe": "/srv/stage/bin/strata",              the engine (strata.exe on Windows)
+      "lib_dirs": ["/srv/stage/bin"],              added to LD_LIBRARY_PATH (PATH on Windows)
+      "bind": "192.0.2.11",                          the address the workers (and the agent) listen on
+      "agent_bind": "0.0.0.0",                     optional: the agent's own (default: bind) - "0.0.0.0" also on a
+                                                   second NIC, so the tuner's link test runs over the stage link
       "agent_port": 7840,
       "log_dir": "/srv/stage",
       "args": ["--spec", "4", "--max-context", "131072", "--kv", "int8", "--kv-resident", "32768"],
-      "token_file": "/srv/stage/stage-token",  or STRATA_STAGE_TOKEN in the environment
-      "data_dir": "/srv/stage/shipped",       where tools/stage_ship.py writes (optional)
-      "drop_cache": true,                            default: drop the model files from the page cache
-      "allow_put_bin": false,                        let /put write executables (bin/, mode): the engine shipped
-      "extra_allow": []                              engine flags a /start may add beyond the default list
+      "token_file": "/srv/stage/stage-token",      or STRATA_STAGE_TOKEN in the environment
+      "data_dir": "/srv/stage/shipped",            where tools/stage_ship.py writes (optional)
+      "pack": ".../packs/<pack>", "native": "...-00001-of-0000N.gguf", "ple_gguf": "...-00002-of-0000N.gguf",
+      "expert_profile": ".../expert-profile.bin",  the model a /start that names none runs (optional with data_dir)
+      "drop_cache": true,                          default: drop the model files from the page cache
+      "allow_put_bin": false,                      let /put write executables (bin/, mode): the engine shipped
+      "extra_allow": [],                           engine flags a /start may add beyond the default list
+      "gpu_clocks": {"graphics": [1500, 1905], "memory": [7001, 7001]}
+                                                   optional: lock the GPU's clocks (MHz) while a worker runs - for a
+                                                   Windows worker (see Workers.lock_clocks); needs administrator/root
     }
 
 What the token allows: a holder can start and stop this PC's workers with the engine and model files node.json
@@ -34,10 +39,13 @@ keeps them (a faster restart with the same layers).
 
 Every request carries the shared token in the X-Stage-Token header (the workers get it as STRATA_STAGE_TOKEN), so
 only the tuner and the main process drive this PC.  Endpoints (JSON in and out):
+    GET  /ping                 {"ok": true}: a round trip with no work behind it
     GET  /info                 the GPU (nvidia-smi), RAM, CPU and the workers running here
     POST /start                {"begin": K, "end": K2?, "next": "host:port"?, "port": 7841, "prefill": 5888,
-                                "cache": "auto"|slots, "extra": [...]} - stops the worker on that port, starts this one
-                               and answers when it listens (or with its log's tail when it exits)
+                                "cache": "auto"|slots, "extra": [...], "model"?: {"dir": D, "native": F, "pack": P}}
+                               - stops the worker on that port, starts this one and answers when it listens (or with
+                               its log's tail when it exits).  "model" runs a model shipped under data_dir
+                               (data_dir/models/D/F, data_dir/packs/P), so one agent serves every model shipped to it
     POST /stop                 {"port": 7841} (no port: every worker)
     GET  /log?port=P&lines=N   a worker's log tail
     POST /sink                 reads the body; answers its bytes and the seconds it took (a link test toward here)
@@ -139,6 +147,7 @@ class Workers:
         self.procs: dict[int, subprocess.Popen] = {}
         self.lock = threading.Lock()
         self.start_lock = threading.Lock()   # one /start at a time (two on a port would orphan the first)
+        self.clocks_locked = False
 
     def log_path(self, port: int) -> Path:
         return Path(self.cfg.get("log_dir", ".")) / f"stage-worker-{port}.log"
@@ -158,11 +167,46 @@ class Workers:
                     proc.kill()
                     proc.wait(30)
                 stopped.append(p)
-            return stopped
+        self.reset_clocks()
+        return stopped
 
     def start(self, req: dict) -> dict:
         with self.start_lock:
             return self._start(req)
+
+    def model(self, req: dict) -> dict:
+        """The model files a worker runs: node.json's, or a model shipped under data_dir that /start names -
+        {"model": {"dir": D, "native": F, "pack": P, "profile"?: R, "ple"?: G}} is data_dir/models/D/F,
+        data_dir/packs/P, data_dir/data/R (default: node.json's expert_profile) and data_dir/models/D/G (default: the
+        second shard), tools/stage_ship.py's layout.  Plain names only: nothing outside data_dir."""
+        c = self.cfg
+        m = req.get("model")
+        if m is None:
+            missing = [k for k in ("pack", "native", "expert_profile") if not c.get(k)]
+            if missing:
+                raise ValueError(f"node.json names no {', '.join(missing)}: /start must name a model shipped here")
+            return {k: str(c.get(k) or "") for k in ("pack", "native", "ple_gguf", "expert_profile")}
+        if not c.get("data_dir"):
+            raise ValueError("this node has no data_dir: it runs node.json's model only")
+        if not isinstance(m, dict) or not all(isinstance(m.get(k), str) for k in ("dir", "native", "pack")):
+            raise ValueError('model: {"dir": ..., "native": ..., "pack": ...} expected')
+        for k in ("dir", "native", "pack", "profile", "ple"):
+            v = m.get(k)
+            if v is not None and (not isinstance(v, str) or v in ("", ".", "..") or "/" in v or "\\" in v):
+                raise ValueError(f"model {k}: a plain file or directory name expected, not {v!r}")
+        root = Path(c["data_dir"])
+        mdir = root / "models" / m["dir"]
+        native = mdir / m["native"]
+        shards = sorted(mdir.glob("*.gguf"))
+        ple = mdir / m["ple"] if m.get("ple") else (shards[1] if len(shards) > 1 else None)
+        profile = root / "data" / m["profile"] if m.get("profile") else Path(c.get("expert_profile") or
+                                                                             root / "data" / "expert-profile.bin")
+        out = {"pack": str(root / "packs" / m["pack"]), "native": str(native), "ple_gguf": str(ple or ""),
+               "expert_profile": str(profile)}
+        for k in ("pack", "native", "expert_profile"):
+            if not Path(out[k]).exists():
+                raise ValueError(f"{out[k]} is not here: ship the model first (tools/stage_ship.py)")
+        return out
 
     def _start(self, req: dict) -> dict:
         port = int(req.get("port", 7841))
@@ -173,15 +217,20 @@ class Workers:
             return {"ok": False, "error": f"flags not allowed here: {bad} (node.json extra_allow)"}
         if (req.get("end") is None) != (req.get("next") is None):
             return {"ok": False, "error": "a relay needs both end and next"}
+        try:
+            m = self.model(req)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
         self.stop(port)
         c = self.cfg
         args = [c["exe"], "--serve", "--stage-worker", str(port), "--stage-begin", str(int(req["begin"]))]
         if req.get("end") is not None:
             args += ["--stage-end", str(int(req["end"])), "--stage-next", str(req["next"])]
-        args += ["--pack", c["pack"], "--native", c["native"], "--ple-gguf", c["ple_gguf"],
-                 "--expert-profile", c["expert_profile"], "--expert-cache", str(req.get("cache", "auto")),
+        args += ["--pack", m["pack"], "--native", m["native"]] + (["--ple-gguf", m["ple_gguf"]] if m["ple_gguf"] else [])
+        args += ["--expert-profile", m["expert_profile"], "--expert-cache", str(req.get("cache", "auto")),
                  "--prefill", str(int(req.get("prefill", 2048))), "--stage-bind", c["bind"]]
         args += [str(a) for a in c.get("args", [])] + extra
+        clock_note = self.lock_clocks()
         env = dict(os.environ)
         env["STRATA_STAGE_TOKEN"] = c["_token"]
         env["STRATA_REMOTE_TIMING"] = "1"
@@ -202,16 +251,61 @@ class Workers:
             text = log.read_text(encoding="utf-8", errors="replace")
             if "listening on" in text:
                 if c.get("drop_cache", True):   # its experts are pinned now: the cached file pages are a second copy
-                    for f in model_files(c):
+                    for f in model_files(m):
                         drop_cache(f)
-                return {"ok": True, "port": port, "seconds": round(time.time() - t0, 1), "log": tail(text, 25)}
+                r = {"ok": True, "port": port, "seconds": round(time.time() - t0, 1), "log": tail(text, 25)}
+                if clock_note:
+                    r["clocks"] = clock_note
+                return r
             if proc.poll() is not None:
                 with self.lock:
                     self.procs.pop(port, None)
+                self.reset_clocks()
                 return {"ok": False, "port": port, "exit": proc.returncode, "log": tail(text, 40)}
         self.stop(port)
         return {"ok": False, "port": port, "error": f"not listening after {LISTEN_TIMEOUT_S} s",
                 "log": tail(log.read_text(encoding="utf-8", errors="replace"), 40)}
+
+    def lock_clocks(self) -> str:
+        """node.json "gpu_clocks": {"graphics": [MIN, MAX], "memory": [MIN, MAX]} (MHz) - held with nvidia-smi -lgc/-lmc
+        while a worker runs here, and reset when none does.  Why: a stage worker's GPU idles between decode windows
+        (the other stages run meanwhile), and the Windows driver lowers its clocks then - an RTX 3070 spent 94% of a
+        decode run below P2 (P5: 810 MHz memory) and its windows took 12-22 ms instead of 3.7-4.1 ms locked.  The Linux
+        driver held P2 throughout.  Locking needs an administrator (Windows) or root; otherwise the reply says so and
+        the worker runs unlocked.  Returns a note for the /start reply ("" when nothing was asked)."""
+        gc = self.cfg.get("gpu_clocks")
+        if not gc:
+            return ""
+        smi = shutil.which("nvidia-smi")
+        if smi is None:
+            return "gpu_clocks: no nvidia-smi"
+        notes = []
+        for key, flag in (("graphics", "-lgc"), ("memory", "-lmc")):
+            if key not in gc:
+                continue
+            lo, hi = (gc[key], gc[key]) if isinstance(gc[key], int) else gc[key]
+            try:
+                p = subprocess.run([smi, flag, f"{int(lo)},{int(hi)}"], capture_output=True, text=True, timeout=30)
+                out = (p.stdout + p.stderr).strip().splitlines()
+                notes.append(f"{key} {lo}-{hi} MHz: " + ("locked" if p.returncode == 0 else
+                                                          "NOT locked (" + (out[0] if out else f"exit {p.returncode}") +
+                                                          "; the agent needs administrator / root)"))
+            except (OSError, subprocess.TimeoutExpired) as e:
+                notes.append(f"{key}: NOT locked ({e})")
+        self.clocks_locked = True
+        return "; ".join(notes)
+
+    def reset_clocks(self) -> None:
+        """Undo lock_clocks once no worker runs here."""
+        if not getattr(self, "clocks_locked", False) or self.running():
+            return
+        smi = shutil.which("nvidia-smi")
+        for flag in ("-rgc", "-rmc"):
+            try:
+                subprocess.run([smi, flag], capture_output=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired, TypeError):
+                pass
+        self.clocks_locked = False
 
     def running(self) -> list[int]:
         with self.lock:
@@ -383,10 +477,13 @@ def make_handler(cfg: dict, workers: Workers, store: Store):
                 return
             u = urlparse(self.path)
             q = parse_qs(u.query)
-            if u.path == "/info":
+            if u.path == "/ping":   # a round trip with no work behind it (/info runs nvidia-smi)
+                self.reply(200, {"ok": True})
+            elif u.path == "/info":
                 self.reply(200, {"ok": True, "host": platform.node(), "system": platform.platform(),
                                  "cpus": os.cpu_count(), "gpus": gpu_info(), "ram": ram_info(),
-                                 "workers": workers.running(), "bind": cfg["bind"]})
+                                 "workers": workers.running(), "bind": cfg["bind"],
+                                 "gpu_clocks": cfg.get("gpu_clocks")})
             elif u.path == "/sha256":
                 try:
                     p = store.path(q["path"][0])
@@ -476,8 +573,9 @@ def main() -> None:
         sys.exit(__doc__)
     cfg = load_config(sys.argv[1])
     workers = Workers(cfg)
-    srv = ThreadingHTTPServer((cfg["bind"], int(cfg.get("agent_port", 7840))), make_handler(cfg, workers, Store(cfg)))
-    sys.stderr.write(f"stage_node: listening on {cfg['bind']}:{cfg.get('agent_port', 7840)}\n")
+    addr = cfg.get("agent_bind") or cfg["bind"]
+    srv = ThreadingHTTPServer((addr, int(cfg.get("agent_port", 7840))), make_handler(cfg, workers, Store(cfg)))
+    sys.stderr.write(f"stage_node: listening on {addr}:{cfg.get('agent_port', 7840)}\n")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

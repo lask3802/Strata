@@ -8,19 +8,22 @@ prompt chunk, and writes the configs that run them.
 
 cluster.json:
     {
-      "main": {"config": "/srv/strata/Strata/strata-rvn-iq3_s.json",   the model's server config (args, key, sampling)
-               "exe": "/srv/strata/Strata-fork/build/strata", "cwd": "/srv/strata/Strata-fork",
-               "python": "/srv/strata/Strata/.venv/bin/python", "port": 8080,
-               "api_key_file": "/srv/strata/api-key", "extra": []},
-      "nodes": [{"name": "2080ti", "agent": "http://192.0.2.11:7840", "host": "192.0.2.11", "port": 7841,
-                 "ship": false,                      true: send the node its layers first (tools/stage_ship.py)
-                 "cache": "auto",                    or a slot count: what the card may use (a desktop's card, a
-                                                     VRAM budget: ~2.2 MiB a slot plus ~1 GiB for the rest)
-                 "max_layers": null}],               the most layers it may hold (its RAM: ~1.1 GiB pinned a layer)
-      "ship": {"model_dir": "/srv/strata/models/rvn-iq3s", "pack_dir": "/srv/strata/Strata-data/packs/rvn-iq3_s",
-               "profile": "/srv/strata/Strata/data/expert-profile.bin", "bin_dir": null},
-      "token_file": "/srv/strata/stage-token",
-      "corpus": "/srv/strata/corpus.txt",
+      "main": {"config": "/opt/strata/strata-iq3_s.json",   the model's server config (args, key, sampling)
+               "exe": "/opt/strata/build/strata", "cwd": "/opt/strata",
+               "python": "/opt/strata/.venv/bin/python", "port": 8080,
+               "api_key_file": "/opt/strata/api-key", "extra": []},
+      "nodes": [{"name": "node-b", "agent": "http://192.0.2.11:7840", "host": "192.0.2.11", "port": 7841,
+                 "ship": false,                      true: send the node its layers first (tools/stage_ship.py); its
+                                                     /start then names the shipped model, so node.json need not
+                 "cache": "auto",                    or N: an expert cache of N times the model's largest expert
+                                                     blob (a desktop's card, a VRAM budget: ~2.2 MiB a slot for
+                                                     IQ3_S, ~3 MiB for UD-Q4_K_XL, plus ~1 GiB for the rest)
+                 "max_layers": null}],               the most layers it may hold (its RAM: ~1.1 GiB pinned a layer
+                                                     for IQ3_S, ~1.5 GiB for UD-Q4_K_XL)
+      "ship": {"model_dir": "/data/models/<model>", "pack_dir": "/data/packs/<pack>",
+               "profile": "/opt/strata/data/expert-profile.bin", "bin_dir": null},
+      "token_file": "/opt/strata/stage-token",
+      "corpus": "/opt/strata/corpus.txt",
       "goal": {
         "measure_tokens": 32000,      the prompt every searched configuration reads ("prompt_tokens" works too)
         "answer_tokens": 500,
@@ -63,6 +66,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -136,20 +140,27 @@ class Node:
     def stage_addr(self) -> str:
         return f"{self.host}:{self.port}"
 
-    def call(self, path: str, body: dict | None = None, timeout: float = 900, data: bytes | None = None) -> dict:
+    @property
+    def stage_agent(self) -> str:
+        """The agent at the stage link's address (the same port): reachable there when node.json's agent_bind is."""
+        u = urllib.parse.urlparse(self.agent)
+        return f"{u.scheme}://{self.host}:{u.port or 7840}"
+
+    def call(self, path: str, body: dict | None = None, timeout: float = 900, data: bytes | None = None,
+             base: str | None = None) -> dict:
         headers = {"X-Stage-Token": self.token}
         if data is None and body is not None:
             data = json.dumps(body).encode()
             headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(self.agent + path, data=data, headers=headers,
-                                     method="POST" if data is not None else "GET")
+        url = (base or self.agent) + path
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data is not None else "GET")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.load(r)
         except urllib.error.HTTPError as e:
             return {"ok": False, "error": f"HTTP {e.code}: {e.read().decode(errors='replace')[:300]}"}
         except (urllib.error.URLError, OSError) as e:
-            return {"ok": False, "error": f"{self.agent}: {e}"}
+            return {"ok": False, "error": f"{base or self.agent}: {e}"}
 
     def log(self, lines: int = 4000) -> list[str]:
         return self.call(f"/log?port={self.port}&lines={lines}").get("log", [])
@@ -335,6 +346,31 @@ class Tuner:
             return False, f"shipping layers {lo}-{hi - 1}: {e}"
         return True, ""
 
+    def start_req(self, i: int, lo: int, hi: int, chunk: int) -> dict:
+        """Node i's /start for layers lo..hi-1."""
+        n = self.nodes[i]
+        req = {"begin": lo, "port": n.port, "prefill": chunk, "cache": n.cache, "extra": self.node_extra(n)}
+        if n.ship:   # the model shipped to the node's data_dir: its node.json need not name one
+            c = self.ship_cfg
+            req["model"] = {"dir": Path(c["model_dir"]).name, "pack": Path(c["pack_dir"]).name,
+                            "native": Path(arg_value(self.main.base["args"], "--native")).name,
+                            "profile": Path(c["profile"]).name}
+        if i + 1 < len(self.nodes):
+            req.update(end=hi, next=self.nodes[i + 1].stage_addr)
+        return req
+
+    def node_notes(self) -> list[str]:
+        """What the nodes' /info says the user should change."""
+        notes = []
+        for n in self.nodes:
+            system = str(n.info.get("system", ""))
+            if (system.startswith("Windows") or "microsoft" in system.lower()) and not n.info.get("gpu_clocks"):
+                notes.append(f"{n.name} runs under Windows (WDDM, WSL included): its driver lowers the GPU's clocks "
+                             "between decode windows. Lock them while the worker runs - node.json \"gpu_clocks\" "
+                             "with the agent run as administrator (an RTX 3070: 12-22 ms a window unlocked, 3.7-4.1 "
+                             "ms locked; docs/REMOTE_STAGE.md). Under WSL lock them from Windows (nvidia-smi -lgc/-lmc).")
+        return notes
+
     def start_nodes(self, splits: list[int], chunk: int) -> tuple[bool, str]:
         for n in self.nodes:
             n.call("/stop", {})
@@ -345,10 +381,7 @@ class Tuner:
                 ok, why = self.ship_layers(n, lo, hi)
                 if not ok:
                     return False, f"{n.name}: {why}"
-            req = {"begin": lo, "port": n.port, "prefill": chunk, "cache": n.cache, "extra": self.node_extra(n)}
-            if i + 1 < len(self.nodes):
-                req.update(end=hi, next=self.nodes[i + 1].stage_addr)
-            r = n.call("/start", req)
+            r = n.call("/start", self.start_req(i, lo, hi, chunk))
             if not r.get("ok"):
                 return False, f"{n.name}: " + (r.get("error") or "") + "\n" + "\n".join(r.get("log", [])[-15:])
             say(f"  {n.name}: layers {lo}-{hi - 1} up in {r.get('seconds')} s")
@@ -561,6 +594,8 @@ class Tuner:
             say(f"  {n.name}: {g.get('name')} {g.get('vram_mib')} MiB ({g.get('free_mib')} free), PCIe gen "
                 f"{g.get('pcie_gen')} x{g.get('pcie_width')}, RAM {n.info.get('ram', {}).get('total_mib')} MiB, "
                 f"{n.info.get('cpus')} CPUs")
+        for x in self.node_notes():
+            say("  note: " + x)
         self.links()
         if self.search() is None:
             return None
@@ -596,26 +631,30 @@ class Tuner:
         return None
 
     def links(self) -> None:
-        """main -> node 1 -> node 2 ...: each hop's throughput (64 MiB through the agents) and round trip."""
+        """main -> node 1 -> node 2 ...: each hop's throughput (64 MiB through the agents) and round trip - on the
+        stage link's address when the agent answers there (node.json agent_bind), else on the agent's own."""
         say("links:")
         prev = None
         for n in self.nodes:
+            base = n.stage_agent if n.call("/ping", timeout=5, base=n.stage_agent).get("ok") else n.agent
             t = []
             for _ in range(5):
                 t0 = time.perf_counter()
-                n.call("/info", timeout=30)
+                n.call("/ping", timeout=30, base=base)
                 t.append((time.perf_counter() - t0) * 1000)
             if prev is None:
                 data = b"\0" * (64 << 20)
                 t0 = time.perf_counter()
-                r = n.call("/sink", data=data, timeout=300)
+                r = n.call("/sink", data=data, timeout=300, base=base)
                 mbs = len(data) / (time.perf_counter() - t0) / 1e6 if r.get("ok") else None
                 frm = "main"
             else:
-                r = prev.call("/send", {"url": n.agent, "mib": 64}, timeout=300)
+                r = prev.call("/send", {"url": base, "mib": 64}, timeout=300)
                 mbs = r.get("mb_s")
                 frm = prev.name
-            say(f"  {frm} -> {n.name}: {mbs or 0:.0f} MB/s, agent round trip {min(t):.1f} ms")
+            where = "the stage link" if base == n.stage_agent else (
+                f"the agent's address - the stage link to {n.host} is not measured (node.json agent_bind)")
+            say(f"  {frm} -> {n.name}: {mbs or 0:.0f} MB/s, round trip {min(t):.1f} ms ({where})")
             prev = n
 
     def write(self, best: dict) -> None:
@@ -625,11 +664,7 @@ class Tuner:
         ranges = self.stages(best["splits"])[1:]
         nodes = []
         for i, (n, (lo, hi)) in enumerate(zip(self.nodes, ranges)):
-            req = {"name": n.name, "agent": n.agent, "begin": lo, "port": n.port, "prefill": best["chunk"],
-                   "cache": n.cache, "extra": self.node_extra(n)}
-            if i + 1 < len(self.nodes):
-                req.update(end=hi, next=self.nodes[i + 1].stage_addr)
-            nodes.append(req)
+            nodes.append({"name": n.name, "agent": n.agent, **self.start_req(i, lo, hi, best["chunk"])})
         (self.outdir / "nodes.json").write_text(json.dumps(nodes, indent=1), encoding="utf-8")
         st = lambda r: " ".join(f"{a}-{b - 1}" for a, b in r["stages"])   # noqa: E731
         lines = ["# Layer-split tuning", "",
@@ -665,6 +700,9 @@ class Tuner:
                 lines.append(f"- {st(r)}, chunk {r['chunk']}: " + (
                     f"{c.get('prompt_n')} tokens read at {c.get('prefill_tps'):.0f} tok/s, decode "
                     f"{c.get('decode_tps'):.1f}" if r["ok"] else f"does not run ({(r.get('error') or '')[:120]})"))
+        notes = self.node_notes()
+        if notes:
+            lines += ["", "## Notes", ""] + [f"- {x}" for x in notes]
         lines += ["", f"**Pick**: stages {st(best)}, chunk {best['chunk']} {' '.join(best['extra'])}", "",
                   "Run it: `python3 tools/stage_tune.py apply cluster.json OUTDIR` starts the workers, then serve "
                   "`OUTDIR/main.json` (serve/server.py --config).", ""]
@@ -677,7 +715,7 @@ def apply(cluster: dict, outdir: Path) -> None:
     nodes = json.loads((outdir / "nodes.json").read_text(encoding="utf-8"))
     for spec in reversed(nodes):   # the last first: a relay connects to the next when it starts
         n = Node({"name": spec["name"], "agent": spec["agent"], "host": "-", "port": spec["port"]}, token)
-        req = {k: spec[k] for k in ("begin", "end", "next", "port", "prefill", "cache", "extra") if k in spec}
+        req = {k: spec[k] for k in ("begin", "end", "next", "port", "prefill", "cache", "extra", "model") if k in spec}
         r = n.call("/start", req)
         if not r.get("ok"):
             sys.exit(f"{n.name}: " + (r.get("error") or "") + "\n" + "\n".join(r.get("log", [])[-15:]))

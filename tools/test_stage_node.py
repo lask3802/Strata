@@ -101,6 +101,55 @@ class StartCheckTest(unittest.TestCase):
         self.assertIn("both end and next", w.start({"begin": 24, "end": 40})["error"])
 
 
+class ModelTest(unittest.TestCase):
+    """/start's "model": a model shipped under data_dir, by plain names."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        m = self.d / "models" / "q4"
+        m.mkdir(parents=True)
+        for i in (1, 2, 3):
+            (m / f"M-0000{i}-of-00003.gguf").write_bytes(b"")
+        (self.d / "packs" / "pk").mkdir(parents=True)
+        (self.d / "data").mkdir()
+        (self.d / "data" / "prof.bin").write_bytes(b"")
+        self.w = sn.Workers({"exe": "x", "bind": "x", "data_dir": str(self.d)})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_shipped_model(self):
+        m = self.w.model({"model": {"dir": "q4", "native": "M-00001-of-00003.gguf", "pack": "pk",
+                                    "profile": "prof.bin"}})
+        self.assertEqual(Path(m["native"]), self.d / "models" / "q4" / "M-00001-of-00003.gguf")
+        self.assertEqual(Path(m["ple_gguf"]), self.d / "models" / "q4" / "M-00002-of-00003.gguf")
+        self.assertEqual(Path(m["pack"]), self.d / "packs" / "pk")
+        self.assertEqual(Path(m["expert_profile"]), self.d / "data" / "prof.bin")
+
+    def test_names_only(self):
+        for bad in ("../q4", "q4/x", "..", "", "a\\b"):
+            with self.assertRaises(ValueError):
+                self.w.model({"model": {"dir": bad, "native": "M-00001-of-00003.gguf", "pack": "pk"}})
+
+    def test_not_shipped(self):
+        with self.assertRaisesRegex(ValueError, "ship the model first"):
+            self.w.model({"model": {"dir": "q4", "native": "M-00001-of-00003.gguf", "pack": "other",
+                                    "profile": "prof.bin"}})
+
+    def test_no_model_anywhere(self):
+        with self.assertRaisesRegex(ValueError, "must name a model"):
+            self.w.model({})
+        self.assertIn("must name a model", self.w.start({"begin": 40})["error"])
+
+    def test_node_json_model(self):
+        w = sn.Workers({"exe": "x", "bind": "x", "pack": "p", "native": "n", "expert_profile": "e"})
+        self.assertEqual(w.model({}), {"pack": "p", "native": "n", "ple_gguf": "", "expert_profile": "e"})
+
+    def test_no_clocks_asked(self):
+        self.assertEqual(self.w.lock_clocks(), "")
+
+
 class NodePathsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -119,10 +168,10 @@ class NodePathsTest(unittest.TestCase):
         self.assertEqual(p["ple_gguf"], "/srv/stage/models/rvn/M-00002-of-00002.gguf")
 
     def test_windows_node(self):
-        p = ss.node_paths("R:\\stage", self.m, Path("packs/pk"), Path("data/prof.bin"))
-        self.assertEqual(p["exe"], "R:\\stage\\bin\\strata.exe")
-        self.assertEqual(p["pack"], "R:\\stage\\packs\\pk")
-        self.assertEqual(p["expert_profile"], "R:\\stage\\data\\prof.bin")
+        p = ss.node_paths("D:\\stage", self.m, Path("packs/pk"), Path("data/prof.bin"))
+        self.assertEqual(p["exe"], "D:\\stage\\bin\\strata.exe")
+        self.assertEqual(p["pack"], "D:\\stage\\packs\\pk")
+        self.assertEqual(p["expert_profile"], "D:\\stage\\data\\prof.bin")
 
 
 if __name__ == "__main__":

@@ -8,13 +8,14 @@ loads its own layers, the dense weights come from the pack).  This sends, from t
   - the pack directory, the expert profile and (optional) the engine's directory, whole.
 What the node has already (its /ranges) is not sent again, and every piece's sha256 is compared on arrival.
 
-    python3 tools/stage_ship.py --agent http://192.0.2.12:7840 --token-file /srv/strata/stage-token \\
-        --model-dir /srv/strata/models/rvn-iq3s --pack-dir /srv/strata/Strata-data/packs/rvn-iq3_s \\
-        --profile /srv/strata/Strata/data/expert-profile.bin [--bin-dir /srv/strata/Strata-fork/build/bin] \\
-        --layers 36-47
+    python3 tools/stage_ship.py --agent http://192.0.2.12:7840 --token-file /opt/strata/stage-token \\
+        --model-dir /data/models/<model> --pack-dir /data/packs/<pack> \\
+        --profile /opt/strata/data/expert-profile.bin [--bin-dir /opt/strata/build/bin] \\
+        --layers 36-47 [--data-dir <the node's data_dir>]
 
 On the node the files land under its data_dir: models/<model dir name>/, packs/<pack name>/, data/<profile>,
-bin/ - the paths its node.json then names (printed at the end).
+bin/.  A /start that names the model ({"model": {"dir": ..., "native": ..., "pack": ...}}, as stage_tune.py sends)
+runs it from there; --data-dir prints the paths for a node.json that should run it by default.
 """
 from __future__ import annotations
 
