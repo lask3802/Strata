@@ -15,8 +15,15 @@ node.json (paths are this PC's):
       "log_dir": "/srv/stage",
       "args": ["--spec", "4", "--max-context", "131072", "--kv", "int8", "--kv-resident", "32768"],
       "token_file": "/srv/stage/stage-token",  or STRATA_STAGE_TOKEN in the environment
-      "data_dir": "/srv/stage/shipped"        where tools/stage_ship.py writes (optional)
+      "data_dir": "/srv/stage/shipped",       where tools/stage_ship.py writes (optional)
+      "drop_cache": true                             default: drop the model files from the page cache
     }
+
+The page cache: a worker reads its layers' experts through the file cache and copies them into pinned memory, and
+a shipped file passes through the cache too - left there, a 10-layer worker would take its experts' RAM twice (and
+under WSL the VM keeps the cache from Windows).  So the agent drops the files it wrote and the files a worker read
+from the cache once the worker listens (posix_fadvise DONTNEED: no root; mapped pages stay).  "drop_cache": false
+keeps them (a faster restart with the same layers).
 
 Every request carries the shared token in the X-Stage-Token header (the workers get it as STRATA_STAGE_TOKEN), so
 only the tuner and the main process drive this PC.  Endpoints (JSON in and out):
@@ -155,6 +162,9 @@ class Workers:
             time.sleep(1)
             text = log.read_text(encoding="utf-8", errors="replace")
             if "listening on" in text:
+                if c.get("drop_cache", True):   # its experts are pinned now: the cached file pages are a second copy
+                    for f in model_files(c):
+                        drop_cache(f)
                 return {"ok": True, "port": port, "seconds": round(time.time() - t0, 1), "log": tail(text, 25)}
             if proc.poll() is not None:
                 with self.lock:
@@ -173,6 +183,32 @@ def tail(text: str, n: int) -> list[str]:
     return text.splitlines()[-n:]
 
 
+def drop_cache(path: Path, offset: int = 0, length: int = 0) -> None:
+    """Drop a file's clean pages from the page cache (Linux; elsewhere nothing)."""
+    if not hasattr(os, "posix_fadvise"):
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def model_files(cfg: dict) -> list[Path]:
+    """The files a worker reads: the GGUF shards next to "native", the pack's files."""
+    out: list[Path] = []
+    if cfg.get("native"):
+        out += sorted(Path(cfg["native"]).parent.glob("*.gguf"))
+    if cfg.get("pack") and Path(cfg["pack"]).is_dir():
+        out += [p for p in Path(cfg["pack"]).rglob("*") if p.is_file()]
+    return out
+
+
 def merge_ranges(rs: list[list[int]]) -> list[list[int]]:
     out: list[list[int]] = []
     for off, n in sorted(rs):
@@ -188,6 +224,7 @@ class Store:
 
     def __init__(self, cfg: dict):
         self.root = Path(cfg["data_dir"]).resolve() if cfg.get("data_dir") else None
+        self.drop = bool(cfg.get("drop_cache", True))
         self.lock = threading.Lock()
 
     def path(self, rel: str) -> Path:
@@ -223,6 +260,11 @@ class Store:
                 f.write(chunk)
                 h.update(chunk)
                 left -= len(chunk)
+            if self.drop:   # written through: not left in the page cache
+                f.flush()
+                os.fsync(f.fileno())
+        if self.drop:
+            drop_cache(p, offset, n)
         if left:
             return {"ok": False, "error": f"the body ended {left} bytes short"}
         if mode:
