@@ -6847,9 +6847,33 @@ int main(int argc, char** argv) {
                 ver_same.set_stage(g.n_layers, -1, rx_d, nullptr);
                 const float* out0 = hand_host[0];
                 const int64_t HBF = strata::core::Verifier::handoff_floats(g);
+                // STRATA_REMOTE_TIMING=1: this process's own share of a window - from one window's rows coming back
+                // to the next window's send (the head, sampling, the drafter, then this process's layers)
+                struct MainGap {
+                    bool on = false;
+                    Clock::time_point last{};
+                    double ms = 0;
+                    int64_t n = 0;
+                };
+                static MainGap gap;
+                gap.on = [] { const char* v = std::getenv("STRATA_REMOTE_TIMING"); return v && v[0] == '1'; }();
                 ver_same.set_remote(
                     [&remote_link, out0, rx, HBF](int T, const int32_t* tokens, int64_t pos0, std::string& e) {
-                        return remote_link.run(T, tokens, pos0, out0, (size_t) T * HBF, rx, (size_t) T * HBF, e);
+                        const auto t0 = Clock::now();
+                        if (gap.on && gap.last.time_since_epoch().count() != 0) {
+                            const double d = std::chrono::duration<double, std::milli>(t0 - gap.last).count();
+                            if (d < 1000.0) {   // the same request (a gap of a second is the next prompt)
+                                gap.ms += d;
+                                if (++gap.n % 64 == 0) {
+                                    std::fprintf(stderr, "strata remote: main process between windows %.2f ms each "
+                                                         "(64 windows: head, drafter, layers 0-K)\n", gap.ms / 64);
+                                    gap.ms = 0;
+                                }
+                            }
+                        }
+                        const bool ok = remote_link.run(T, tokens, pos0, out0, (size_t) T * HBF, rx, (size_t) T * HBF, e);
+                        gap.last = Clock::now();
+                        return ok;
                     },
                     [&remote_link](int n_keep, std::string& e) { return remote_link.commit(n_keep, e); });
             }
