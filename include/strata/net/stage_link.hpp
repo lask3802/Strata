@@ -7,7 +7,9 @@
 //     each way, then the accepted count (one way, no reply);
 //   - a prompt chunk: T rows of hc * n_embd floats (the residual streams) each way.
 // The worker keeps its own session (its layers' K/V, GDN state), expert cache and CPU expert pool; the main process
-// sends a reset at every fresh prompt.  Prompt chunks are pipelined: the main process sends chunk c + 1 while the
+// sends a reset at every fresh prompt.  More than two stages: a relay worker (--stage-end K2 --stage-next HOST:PORT)
+// runs [K, K2) and hands its rows to the next worker as the main process hands them to it; the next worker's reply
+// is its reply (main -> A -> B -> A -> main), so the main process sees one worker either way.  Prompt chunks are pipelined: the main process sends chunk c + 1 while the
 // worker reads chunk c (the worker receives on its own thread into two buffers), and takes the replies in order on
 // another thread.  Linux only (POSIX sockets); elsewhere every call fails with a message.
 #pragma once
@@ -17,8 +19,10 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace strata::net {
 
@@ -115,15 +119,41 @@ private:
     StageStats stats_;
 };
 
+/// A relay worker's forwarding of prompt chunks to the next worker: one send in flight, in order.  `rows` must stay
+/// untouched until the next send() or wait() returns (the prompt path's two hand-off buffers alternate, so the one a
+/// chunk writes was sent two chunks ago - and send() waited for that).
+class StageRelay {
+public:
+    explicit StageRelay(StageClient& next) : next_(next) {}
+    ~StageRelay();
+    StageRelay(const StageRelay&) = delete;
+    StageRelay& operator=(const StageRelay&) = delete;
+    /// waits for the previous send, then sends this chunk on a thread
+    bool send(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows, size_t row_floats,
+              int64_t skip, std::string& err);
+    /// the send in flight is out (or failed: its error)
+    bool wait(std::string& err);
+
+private:
+    StageClient& next_;
+    std::future<bool> out_;
+    std::string err_;
+    std::vector<int64_t> tokens_;
+};
+
 /// The worker's end.  Every handler runs on the serving thread, one message at a time in arrival order.
 struct StageHandlers {
     std::function<bool(const StageHello& main_hello, StageHello& mine, std::string& err)> hello;
     /// rows in: StageBuffers::run_in; rows out: run_out
     std::function<bool(int T, const int32_t* tokens, int64_t pos0, std::string& err)> run;
     std::function<bool(int n_keep, std::string& err)> commit;
-    /// rows in: `rows_in` (one of StageBuffers::pf_in[2]); rows out: `rows_out` (one of pf_out[2], all T rows)
-    std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows_in,
+    /// rows in: `rows_in` (one of StageBuffers::pf_in[2]); rows out: `rows_out` (one of pf_out[2], all T rows).
+    /// `skip`: the rows the reply leaves out (the main process does not read them)
+    std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, int64_t skip, const float* rows_in,
                        float* rows_out, std::string& err)> prefill;
+    /// optional (a relay worker): fills a chunk's rows_out [skip, T) just before its reply goes out, on the replying
+    /// thread, in chunk order - the serving thread reads the next chunk meanwhile.  A failure sends an error instead.
+    std::function<bool(float* rows_out, int64_t T, int64_t skip, std::string& err)> prefill_reply;
     std::function<bool(std::string& err)> reset;
     std::function<void()> disconnected;   ///< the main process went away (the session is stale)
 };

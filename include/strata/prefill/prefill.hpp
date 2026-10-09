@@ -173,6 +173,8 @@ public:
     /// wire.  `flags` bit 0: the prompt is one chunk.  Set both before `init`.
     std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows_in,
                        int64_t skip, std::string& err)> remote_send;
+    /// (empty with remote_send set: a relay worker - the next worker's reply goes back to the main process another
+    /// way, and this stage reports no chunk)
     std::function<bool(float* rows_out, int64_t T, int64_t skip, std::string& err)> remote_recv;
     /// REMOTE STAGE: `on_chunk` reads no row before this position (the drafter's window starts later), so the worker
     /// sends back only the rows from it - `skip` rows fewer for the chunks before it.  Per prompt; default all rows.

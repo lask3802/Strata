@@ -398,6 +398,29 @@ struct Inbox {
 }  // namespace
 #endif
 
+StageRelay::~StageRelay() {
+    std::string e;
+    (void) wait(e);
+}
+
+bool StageRelay::wait(std::string& err) {
+    if (!out_.valid()) return true;
+    if (out_.get()) return true;
+    err = err_;
+    return false;
+}
+
+bool StageRelay::send(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows,
+                      size_t row_floats, int64_t skip, std::string& err) {
+    if (!wait(err)) return false;
+    tokens_.assign(tokens, tokens + T);
+    err_.clear();
+    out_ = std::async(std::launch::async, [this, T, pos0, flags, rows, row_floats, skip] {
+        return next_.prefill_send(tokens_.data(), T, pos0, flags, rows, row_floats, skip, err_);
+    });
+    return true;
+}
+
 int serve_stage(const std::string& bind_addr, int port, const std::string& token, const StageHandlers& h,
                 const StageBuffers& buf, StageStats& stats, const bool* stop) {
 #if defined(_WIN32)
@@ -629,7 +652,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 // last chunk's) uses the other
                 float* const out = buf.pf_out[out_buf];
                 if (!pending_err.empty()) { e = pending_err; pending_err.clear(); ok = false; }
-                else ok = h.prefill(in.tok64.data(), T, in.h.b, in.h.c & 0xff, buf.pf_in[in.slot], out, e);
+                else ok = h.prefill(in.tok64.data(), T, in.h.b, in.h.c & 0xff, skip, buf.pf_in[in.slot], out, e);
                 release();   // the chunk is read (its rows were uploaded before `prefill` returned)
                 if (!ok) { keep = reply_error(e); break; }
                 const double work_ms = ms_since(t0);
@@ -644,7 +667,16 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 r.bytes = back * 4;
                 const float* src = out + (size_t) skip * (size_t) buf.pf_row_floats;
                 reply_err.clear();
-                reply_out = std::async(std::launch::async, [fd, r, src, back, &reply_err] {
+                reply_out = std::async(std::launch::async, [fd, r, src, back, out, T, skip, &h, &reply_err] {
+                    if (h.prefill_reply) {   // a relay worker: the next worker's rows (in chunk order)
+                        std::string e;
+                        if (!h.prefill_reply(out, T, skip, e)) {
+                            StageHeader eh;
+                            eh.type = (uint32_t) StageMsg::Error;
+                            eh.bytes = e.size();
+                            return send_msg(fd, eh, e.data(), e.size(), nullptr, 0, reply_err);
+                        }
+                    }
                     return send_msg(fd, r, src, back * 4, nullptr, 0, reply_err);
                 });
                 out_buf ^= 1;

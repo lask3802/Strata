@@ -1007,7 +1007,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     if (stage_le_ < 0) stage_le_ = g.n_layers;
     const bool hands_on = next_ != nullptr || (bool) remote_send;   // remote-stage: the worker takes the place of `next`
     if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != hands_on ||
-        (next_ != nullptr && remote_send) || ((bool) remote_send != (bool) remote_recv)) {
+        (next_ != nullptr && remote_send) || (remote_recv && !remote_send)) {
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
@@ -1018,7 +1018,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             err = "prefill: the layer split's hand-off buffers";
             return false;
         }
-    if (remote_send && m.rx_host == nullptr) {
+    if (remote_recv && m.rx_host == nullptr) {   // (a relay worker sends only: its reply goes back another way)
         void* d = nullptr;
         if (cudaHostAlloc((void**) &m.rx_host, (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess ||
             cudaMalloc(&d, (size_t) chunk * D * 4) != cudaSuccess ||
@@ -3934,6 +3934,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 send_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0, flags, h, skip] {
                     return remote_send(tokens + c0, T, p0, flags, h, skip, send_err_);
                 });
+                if (!remote_recv) {   // a relay worker: the next stage's reply goes back to the main process directly
+                    hand_buf_ ^= 1;
+                    continue;
+                }
                 // its reply on the receiving thread, after the previous chunk's (the replies come in order)
                 auto prev = std::make_shared<std::future<bool>>(std::move(next_run_));
                 const int dev = m.device;

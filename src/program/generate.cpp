@@ -586,6 +586,10 @@ struct Options {
     /// the worker's listening address (--stage-bind ADDR; empty: every interface).  STRATA_STAGE_TOKEN (both sides)
     /// is the shared secret the worker requires in the main process's hello
     std::string stage_bind;
+    /// a relay worker (more than two stages): it runs [stage_begin, stage_end) and hands its rows to the next worker
+    /// (--stage-end K2 --stage-next HOST:PORT); that worker's reply is this one's
+    int64_t stage_end = -1;
+    std::string stage_next;
     /// --split-skip-if-fits (opt-in; the server passes it for a config's "split_skip_if_fits"): with
     /// --layer-split auto, run on CUDA0 alone when it holds every profiled expert pair plus the whole session (KV),
     /// the drafter and the reserve - a split then only adds hand-offs (two RDNA4 cards: 1,384 vs 1,794 tok/s at 4K)
@@ -1823,6 +1827,8 @@ int main(int argc, char** argv) {
         else if (a == "--stage-worker") o.stage_worker = std::atoi(next("--stage-worker"));
         else if (a == "--stage-begin") o.stage_begin = std::atoll(next("--stage-begin"));
         else if (a == "--stage-bind") o.stage_bind = next("--stage-bind");
+        else if (a == "--stage-end") o.stage_end = std::atoll(next("--stage-end"));
+        else if (a == "--stage-next") o.stage_next = next("--stage-next");
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
@@ -2058,6 +2064,12 @@ int main(int argc, char** argv) {
             why = "--remote-stage needs --layer-split K --split-device 0 (layers K.. run in the worker)";
         else if (stage_worker && (!o.layer_split.empty() || o.stage_begin < 2))
             why = "--stage-worker needs --stage-begin K (K >= 2, the main process's --layer-split K) and no --layer-split";
+        else if (!stage_worker && (o.stage_end >= 0 || !o.stage_next.empty()))
+            why = "--stage-end and --stage-next are for a relay --stage-worker";
+        else if (stage_worker && ((o.stage_end >= 0) != !o.stage_next.empty() ||
+                                  (o.stage_end >= 0 && (o.stage_end <= o.stage_begin ||
+                                                        o.stage_end >= strata::core::ModelGeometry{}.n_layers))))
+            why = "a relay worker needs both --stage-end K2 (--stage-begin < K2 < the layer count) and --stage-next HOST:PORT";
         else if (o.batch > 0 || o.pipeline_windows > 0 || o.vision || o.peer_device >= 0)
             why = "it does not support --batch, --pipeline-windows, --vision or --peer-device";
         // a control vector (and the speed projection, which is one) and helper-GPU expert caches act on every layer:
@@ -2076,11 +2088,17 @@ int main(int argc, char** argv) {
         o.prompt_cache_every = 0;
         o.kv_grow = false;   // the elastic K/V gives this process's cache slots up without the other side knowing
         if (remote_main) own_hi = split_at[0];
-        else own_lo = o.stage_begin;
+        else {
+            own_lo = o.stage_begin;
+            own_hi = o.stage_end;   // -1: to the last layer
+        }
         std::fprintf(stderr, "strata generate: remote stage: this process holds layers %lld-%s%s\n", (long long) own_lo,
                      own_hi < 0 ? "last" : std::to_string(own_hi - 1).c_str(),
-                     remote_main ? (", the rest on " + o.remote_stage).c_str() : " (a stage worker, no head)");
+                     remote_main ? (", the rest on " + o.remote_stage).c_str()
+                     : own_hi >= 0 ? (" (a relay stage worker, the rest on " + o.stage_next + ")").c_str()
+                                   : " (a stage worker, no head)");
     }
+    const bool stage_relay = stage_worker && own_hi >= 0;   // remote-stage: a middle worker (hands on to stage_next)
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
@@ -6553,6 +6571,9 @@ int main(int argc, char** argv) {
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
         strata::net::StageClient remote_link;   // remote-stage: the worker that runs layers [K, n_layers)
+        strata::net::StageClient next_link;     // remote-stage relay worker: the next worker
+        strata::net::StageRelay relay(next_link);
+        int64_t relay_skip = 0;                 // the chunk's skip from the main process (the reply leaves those rows out)
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
@@ -6584,7 +6605,15 @@ int main(int argc, char** argv) {
                     return remote_link.prefill_recv(out, row_f, T, skip, e);
                 };
             }
-            if (stage_worker) sp.set_stage(own_lo, -1, nullptr);
+            if (stage_worker) sp.set_stage(own_lo, own_hi, nullptr);
+            if (stage_relay) {   // a relay worker: every chunk's rows go on to the next worker (its reply is ours)
+                const size_t row_f = (size_t) (g.hc * g.n_embd);
+                sp.remote_send = [&relay, &relay_skip, row_f](const int64_t* tk, int64_t T, int64_t p0, int64_t flags,
+                                                              const float* in, int64_t, std::string& e) {
+                    return relay.send(tk, T, p0, flags, in, row_f, relay_skip, e);
+                };
+                sp.remote_recv = nullptr;
+            }
             if (share_pool) sp.set_cpu_pool(&pool);
             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -6903,6 +6932,7 @@ int main(int argc, char** argv) {
             ver_b.set_next(&gs.ver_b, &split_drive_b);   // the setters reach it; the pipeline never chains run/commit
         }
         float *wk_in = nullptr, *wk_out = nullptr;   // remote-stage worker: the window's rows in and out (mapped)
+        float* wk_relay = nullptr;                   // a relay worker: its layers' rows for the next worker (mapped)
         if (stage_worker) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
@@ -6916,8 +6946,16 @@ int main(int argc, char** argv) {
             }
             std::memset(wk_in, 0, hb);
             std::memset(wk_out, 0, hb);
-            ver.set_stage(own_lo, -1, in_d, out_d);
-            ver.set_no_head(true);
+            float* relay_d = nullptr;
+            if (stage_relay && (cudaHostAlloc((void**) &wk_relay, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                                cudaHostGetDevicePointer((void**) &relay_d, wk_relay, 0) != cudaSuccess)) {
+                std::fprintf(stderr, "strata serve: the relay worker's hand-off allocation failed\n");
+                return 1;
+            }
+            // the last worker folds the last layer's pending write and runs no head; a relay worker hands its rows on
+            // as a middle stage of a split does
+            ver.set_stage(own_lo, own_hi, in_d, stage_relay ? relay_d : out_d);
+            ver.set_no_head(!stage_relay);
         }
         ver.set_remote_expert_opt(remote_opt.get());
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
@@ -8447,9 +8485,13 @@ int main(int argc, char** argv) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
+                    // a relay worker: the next worker runs the rest; its rows are this window's reply
+                    if (stage_relay)
+                        return next_link.run(T, tokens, pos0, wk_relay, (size_t) T * HBF, wk_out, (size_t) T * HBF, e);
                     return true;
                 };
                 hs.commit = [&](int n_keep, std::string& e) -> bool {
+                    if (stage_relay && !next_link.commit(n_keep, e)) return false;   // the next worker commits meanwhile
                     if (!ver.commit(n_keep, e) || !ver.wait_commit(e)) return false;
                     // the adaptive tier on this worker's layers, every adapt_every windows (the main process has its own)
                     if (!drive.d.usage.empty() && o.adapt_every > 0 && (++wk_rounds % o.adapt_every) == 0 && !adapt()) {
@@ -8458,9 +8500,10 @@ int main(int argc, char** argv) {
                     }
                     return true;
                 };
-                hs.prefill = [&](const int64_t* tokens, int64_t T, int64_t p0, int64_t flags, const float* rows_in,
-                                 float* rows_out, std::string& e) -> bool {
+                hs.prefill = [&](const int64_t* tokens, int64_t T, int64_t p0, int64_t flags, int64_t skip,
+                                 const float* rows_in, float* rows_out, std::string& e) -> bool {
                     pf_cur_out = rows_out;
+                    relay_skip = skip;   // a relay worker passes the main process's skip on
                     // the prompt path's buffers out of this worker's cache, for the main process's chunk size (a
                     // loan that covers it stays for the rest of the prompt)
                     if (!lend(std::max<int64_t>(T, main_chunk), e)) return false;
@@ -8468,7 +8511,37 @@ int main(int argc, char** argv) {
                     sp.set_single_chunk((flags & 1) != 0);
                     return sp.run(tokens, T, p0, e);
                 };
+                if (stage_relay)   // the next worker's rows of a chunk, in chunk order, on the replying thread
+                    hs.prefill_reply = [&next_link, D](float* rows_out, int64_t T, int64_t skip, std::string& e) {
+                        return next_link.prefill_recv(rows_out, (size_t) D, T, skip, e);
+                    };
+                // a relay worker's link to the next worker (it must be listening; tried for a minute)
+                auto connect_next = [&](std::string& e) -> bool {
+                    strata::net::StageHello mine_next = me, peer_next;
+                    mine_next.layer_begin = (int32_t) own_hi;
+                    mine_next.chunk = pf_chunk;
+                    std::memcpy(mine_next.token, stage_token.data(), stage_token.size());
+                    for (int i = 0;; ++i) {
+                        next_link.close();
+                        if (next_link.connect(o.stage_next, mine_next, peer_next, e)) break;
+                        if (i >= 30 || e.find("differ") != std::string::npos || e.find("worker)") != std::string::npos)
+                            return false;
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                    }
+                    std::fprintf(stderr, "strata serve: relay: layers %d-%d on %s\n", peer_next.layer_begin,
+                                 peer_next.n_layers - 1, o.stage_next.c_str());
+                    return true;
+                };
+                if (stage_relay && !connect_next(err)) {
+                    std::fprintf(stderr, "strata serve: relay: %s\n", err.c_str());
+                    return 1;
+                }
                 hs.reset = [&](std::string& e) -> bool {
+                    if (stage_relay) {   // the next worker zeroes its session too (a broken link is made again)
+                        if (!relay.wait(e) && next_link.connected()) return false;
+                        if (!next_link.connected() && !connect_next(e)) return false;
+                        if (!next_link.reset(e)) return false;
+                    }
                     if (!ver.wait_commit(e) || !refill(e)) return false;
                     apply_pending(true);
                     strata::core::session_zero(ss, g, nullptr, main_cs);
@@ -8477,6 +8550,7 @@ int main(int argc, char** argv) {
                 hs.disconnected = [&] {
                     std::string e;
                     (void) ver.wait_commit(e);
+                    if (stage_relay) (void) relay.wait(e);
                 };
                 strata::net::StageBuffers bufs;
                 bufs.run_in = wk_in;
@@ -8490,8 +8564,10 @@ int main(int argc, char** argv) {
                 bufs.handoff_floats = HBF;
                 bufs.pf_row_floats = D;
                 strata::net::StageStats wst;
-                std::fprintf(stderr, "strata serve: stage worker: layers %lld-%lld, no head, prompt chunk %lld, port %d\n",
-                             (long long) own_lo, (long long) g.n_layers - 1, (long long) pf_chunk, o.stage_worker);
+                std::fprintf(stderr, "strata serve: stage worker: layers %lld-%lld, %s, prompt chunk %lld, port %d\n",
+                             (long long) own_lo, (long long) (stage_relay ? own_hi : g.n_layers) - 1,
+                             stage_relay ? ("relaying to " + o.stage_next).c_str() : "no head", (long long) pf_chunk,
+                             o.stage_worker);
                 std::fflush(stderr);
                 return strata::net::serve_stage(o.stage_bind, o.stage_worker, stage_token, hs, bufs, wst, nullptr);
             }
