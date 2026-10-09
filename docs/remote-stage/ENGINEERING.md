@@ -180,10 +180,10 @@ What went wrong on the way, and why:
   reserve the engine's start-up line asks for.
 - **A third PC made it slower.** With an RTX 3070 as a third stage (under WSL2, then native Windows) decode fell from
   45-54 to 34-41 tok/s. Splitting each worker's window time into GPU wait, pool and staging showed the 3070 waiting
-  12-26 ms for 8 layers where the 2080 Ti waited 4.6-5.9 ms; sampling its P-state showed why (below). Locking its
+  11-26 ms for 8 layers where the 2080 Ti waited 4.6-5.9 ms; sampling its P-state showed why (below). Locking its
   clocks brought it to 3.7-4.1 ms.
 - **The relay's link.** On 1 GbE the middle PC carried every prompt chunk in and out, each way: its link ran at line
-  rate for 26 of 44 s of one prompt (2.6 GB each way). 10 GbE between PCs A and B took most of it away (100K prompt:
+  rate for one long prompt: 2.6 GB each way in the ~38 s it crossed, at up to 123 MB/s ([data/nic-pc-b-1gbe-3pc.txt](../../bench/results/2026-10-10-remote-stage/data/nic-pc-b-1gbe-3pc.txt)). 10 GbE between PCs A and B took most of it away (100K prompt:
   1,248 -> 1,576 tok/s).
 - **Shipping into WSL2 and Windows.** Writing 16.6 GiB into WSL2 left 17.9 GB of page cache in the VM, which Windows
   did not get back; the agent now syncs and drops what it wrote and what a worker read. On Windows the shipped files
@@ -250,6 +250,9 @@ From the timing lines (each stage's own time for a full chunk, divided by its la
 | 5888 | 106 | 18 us | 130-134 | 22-23 us | tuner, K=26 and K=27 |
 | 8192 | 125 | 15 us | 160 | 20 us | tuner, K=28 with the reserve |
 
+The tuner rows divide each stage's chunk time in [the first tuner run's report](../../bench/results/2026-10-10-remote-stage/data/tuner-rvn-2pc-report.md)
+by its layers; the 2048 row is from the sweep's timing lines (not kept).
+
 A layer's experts are 1.11 GiB; streaming that over a ~13 GB/s link takes ~85-92 ms (an estimate from the probe's
 bandwidth), close to the 2048-token time: the prompt path streams most of each layer's experts once per chunk whatever
 its size, which is why the chunk matters more than the split point. The 3070 (PCIe 4.0 x16, 26.3 GB/s) read 8
@@ -258,7 +261,8 @@ layers of a 5888-token chunk in 709-877 ms on Windows (89-110 ms a layer), the 2
 ### Where the decode time goes (RVN IQ3_S)
 
 - Two PCs, K=27, chunk 5888, ~30K (tuner): the round trip 18-21 ms = worker 15.5-17.9 + link 2.8-3.2 (1 GbE); the
-  main process between windows (head, drafter, layers 0-26) 26-46 ms.
+  main process between windows (head, drafter, layers 0-26) 26-46 ms (the main process's timing lines during the
+  first tuner run; not kept, the run's per-stage window times are in its report).
 - Three PCs, 24 / 16 / 8 layers, A-B 10 GbE, C locked, ~91K prompt: the main process between windows 25.3 ms; the
   round trip 23.0 ms = worker 21.9 + link 1.2; the 2080 Ti's own 16 layers 10.7-13.6 ms (GPU wait 9.5-11.5) and the
   next worker 7.2-11.6 ms, of which the 3070's own 8 layers 4.3-6.2 ms (GPU wait 3.9-4.5). The B-C hop on 1 GbE is
@@ -276,7 +280,7 @@ Layers 24 / 16 / 8 on the 3080 / 2080 Ti / 3070, chunk 5888, the 3070 with 2,400
 | A-B on 10 GbE, C native Windows, clocks locked | 51.3 | 658 / 47.8 | 1,110 / 46.5 | 1,451 / 44.1 | 1,640 / 44.7 |
 
 Against the best two-PC rows (K=26 at 5888: 53.5 short, 100K 1,521 / 45.6; at 8192 with the reserve 1,633), the
-locked three-PC chain reads 100K prompts as fast or a little faster and decodes 2-6% slower.
+locked three-PC chain reads 100K prompts as fast or a little faster and decodes 1-8% slower (short 51.3 vs 53.5; 8K 47.8 vs 48.1; 32K 46.5 vs 49.7; 64K 44.1 vs 47.7; 100K 44.7 vs 45.6).
 
 ### The 3070: WSL2, native Windows, clocks (2026-10-09)
 
@@ -334,7 +338,7 @@ largest expert blob, filled with this worker's smaller blobs, and capped by free
 
 ### The tuner on three PCs (UD-Q4_K_XL, 2026-10-10)
 
-`tools/stage_tune.py tune` with the three PCs as two nodes (B a relay, C last), both `"ship": true`; C's agent ran
+`tools/stage_tune.py tune` with the three PCs (two nodes: B a relay, C last), both `"ship": true`; C's agent ran
 as administrator with `gpu_clocks`, so every start of C's worker locked its clocks. Goal: 32,000-token prompts, a
 500-token answer, the profile 30% 8K / 50% 32K / 20% 100K, max context 131072; chunk 5888 only, at most 8 searched
 runs, `init_splits` [24, 40]; C with `--expert-cache 1000` (1,248 slots, ~5.3 GB of VRAM used) and at most 14 layers,
@@ -366,7 +370,7 @@ its start.
 
 ### The tuner's first run (RVN IQ3_S, two PCs, 2026-10-09)
 
-`tools/stage_tune.py tune`, two nodes, goal: a 32,000-token prompt (29,802 tokens as tokenized) and a 500-token
+`tools/stage_tune.py tune`, one node (B), goal: a 32,000-token prompt (29,802 tokens as tokenized) and a 500-token
 answer, chunks 4096 / 5888 / 8192, at most 9 runs:
 
 | stages | chunk | prefill | decode | short decode | request s | per stage: chunk ms / window ms | other CPU % |
@@ -388,7 +392,7 @@ the sweep's choice too (36.1 s there, 36.3 s here).
 
 Without `--remote-stage` or `--stage-worker` nothing of this should run, and the code moved out of the request loop
 (lend and refill) should behave as before. Checked on PC A (2026-10-10): one single-GPU configuration (RVN IQ3_S, the
-3080 alone, `--prefill auto` (5888), the draft layer on, 131072 context, int8 K/V) served by this branch's build twice
+3080 alone, `--prefill auto` (5888), the draft layer on, 131072 context, int8 K/V) served by the feature's build twice
 and by upstream main's build (the merge base, the same build options) once, between them; greedy answers (temperature
 0, top-k 1, at most 200 tokens, reasoning off) to five prompts: code, prose, Chinese, arithmetic, and a 9,364-token
 document (two prompt chunks). The three result files are byte-identical (the same MD5): text, token counts and finish
@@ -407,7 +411,7 @@ reasons. The script and the files: [default_path_check.py](../../bench/results/2
   lock the clocks or say that they should be.
 - **A third PC adds a hop to every window.** Decode runs the stages one after the other, so another stage costs its
   round trip and its fixed per-window work. It paid for long prompts (prompt chunks overlap across stages) and for a
-  model whose experts the first two cards could not cache well (UD-Q4_K_XL); for decode on IQ3_S it was 2-6% behind
+  model whose experts the first two cards could not cache well (UD-Q4_K_XL); for decode on IQ3_S it was 1-8% behind
   two PCs.
 - **The slow stage moves; give the faster card more layers.** With the 3070's clocks locked it was the fastest stage
   per layer, yet held the fewest layers; on UD-Q4_K_XL the 3080's 24 layers were the slow stage of a prompt. Balance by
@@ -438,9 +442,11 @@ reasons. The script and the files: [default_path_check.py](../../bench/results/2
 - **The default path beyond one configuration:** checked byte-identical for one single-GPU configuration ([The
   default path](#the-default-path)); an in-process multi-GPU split, other models and a Windows build against
   upstream's Windows build were not compared.
-- **Builds:** CUDA on Linux and Windows. HIP not built; the SYCL port keeps its own copies of `generate.cpp`,
-  `verify.cpp`, `expert_source.cpp` and `prefill.cpp`, which this branch does not touch, so the Intel engine has no
-  remote stage; the shared header `include/strata/prefill/prefill.hpp` changed under the SYCL copy of `prefill.cpp`.
+- **Running on AMD and Intel:** the branch builds with CUDA 13.0 on Linux (GCC, sm_75 + sm_86) and Windows (MSVC
+  2022, sm_86), with HIP (ROCm 7.0, gfx1100) and the SYCL port (oneAPI 2026.1.1, which also compiles the shared
+  `include/strata/prefill/prefill.hpp` this feature changed); the last two in containers, on 2026-10-10. The remote
+  stage ran on NVIDIA cards only. The SYCL port keeps its own copies of `generate.cpp`, `verify.cpp`,
+  `expert_source.cpp` and `prefill.cpp`, so the Intel engine has no remote stage.
 - **Correctness check** against the in-process split (`--layer-split K --split-device 0`) with the caches fixed: not
   done. So far the start of every benchmark answer (the 100-160 characters the benchmark keeps) was read: coherent and
   on topic in every configuration.

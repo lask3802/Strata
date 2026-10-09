@@ -87,15 +87,21 @@ during the A/B runs (PC C's clock is in local time, PC B's too); `data/clk_stats
 P-states and clocks in a time window. The short-prompt part of each run: 3070 unlocked 23:09:22-23:11:16, 3070 locked
 23:27:16-23:28:40, 2080 Ti 23:15:31-23:16:55.
 
-`data/tuner-q4xl-3pc-report.md`: `tools/stage_tune.py`'s report for UD-Q4_K_XL on A + B + C (8 searched splits, two
-workload-profile runs, the max-context check).
+`data/tuner-q4xl-3pc-report.md` and `-console.txt`: `tools/stage_tune.py`'s report and console output for UD-Q4_K_XL on
+A + B + C (8 searched splits, two workload-profile runs, the max-context check). `data/tuner-rvn-2pc-report.md` and
+`-console.txt`: the first tuner run, RVN IQ3_S on A + B (9 configurations, a 32,000-token goal).
+
+`data/nic-pc-b-1gbe-3pc.txt`: PC B's NIC counters once a second during one long prompt of the all-1 GbE three-PC run;
+`data/nic_busy.py FILE` prints the busy stretch's length, bytes and peak rate. `data/tools-and-engine-lines.txt`: the
+shipper's summary lines, the shipped files' logical and on-disk sizes on PC C, PC A's start-up lines for UD-Q4_K_XL
+alone, and PC C's GPU memory counters at three `--expert-cache` values.
 
 `default_path_check.py URL OUT.json [API_KEY_FILE]` and `data/default-path-{fork1,fork2,base}.json`: greedy answers
-to five prompts from one single-GPU config (RVN IQ3_S on PC A, auto chunk) served by this branch's build twice and by
+to five prompts from one single-GPU config (RVN IQ3_S on PC A, auto chunk) served by the feature's build twice and by
 upstream main's (the merge base) once. The three files are byte-identical.
 
 ## Not tested
 
 Other quantizations of the family; Windows as the main PC; an in-process split on Windows with and without locked
-clocks; more than one run per configuration (decode moved by up to ~12% between two runs of one configuration on
+clocks; more than one run per configuration (decode moved by up to ~14% between two runs of one configuration on
 2026-10-09); AMD and Intel GPUs.

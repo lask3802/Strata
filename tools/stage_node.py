@@ -8,7 +8,7 @@ node.json (paths are this PC's):
     {
       "exe": "/srv/stage/bin/strata",              the engine (strata.exe on Windows)
       "lib_dirs": ["/srv/stage/bin"],              added to LD_LIBRARY_PATH (PATH on Windows)
-      "bind": "192.0.2.11",                          the address the workers (and the agent) listen on
+      "bind": "192.0.2.11",                        the address the workers (and the agent) listen on
       "agent_bind": "0.0.0.0",                     optional: the agent's own (default: bind) - "0.0.0.0" also on a
                                                    second NIC, so the tuner's link test runs over the stage link
       "agent_port": 7840,
@@ -42,7 +42,8 @@ only the tuner and the main process drive this PC.  Endpoints (JSON in and out):
     GET  /ping                 {"ok": true}: a round trip with no work behind it
     GET  /info                 the GPU (nvidia-smi), RAM, CPU and the workers running here
     POST /start                {"begin": K, "end": K2?, "next": "host:port"?, "port": 7841, "prefill": 5888,
-                                "cache": "auto"|slots, "extra": [...], "model"?: {"dir": D, "native": F, "pack": P}}
+                                "cache": "auto"|slots, "extra": [...], "model"?: {"dir": D, "native": F, "pack": P,
+                                "profile"?: R, "ple"?: G}}
                                - stops the worker on that port, starts this one and answers when it listens (or with
                                its log's tail when it exits).  "model" runs a model shipped under data_dir
                                (data_dir/models/D/F, data_dir/packs/P), so one agent serves every model shipped to it
@@ -65,7 +66,9 @@ import hmac
 import json
 import os
 import platform
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -79,6 +82,7 @@ from urllib.parse import parse_qs, urlparse
 EXTRA_ALLOWED = {"--max-context", "--stage-bind", "--vram-reserve-mib", "--vram-reserve-later-mib", "--spec",
                  "--kv", "--kv-resident", "--pcie-frac", "--pool-workers", "--adapt-every", "--adapt-swaps",
                  "--adapt-decay", "--spec-min-p"}
+PLAIN_NAME = re.compile(r"[A-Za-z0-9._-]+")   # a /start's model names: no separator, no drive, no space
 LISTEN_TIMEOUT_S = 600     # loading a worker's experts: up to ~30 GB from disk on a cold cache
 STOP_TIMEOUT_S = 180       # a worker with ~30 GB of pinned experts takes a while to unpin
 
@@ -177,8 +181,10 @@ class Workers:
     def model(self, req: dict) -> dict:
         """The model files a worker runs: node.json's, or a model shipped under data_dir that /start names -
         {"model": {"dir": D, "native": F, "pack": P, "profile"?: R, "ple"?: G}} is data_dir/models/D/F,
-        data_dir/packs/P, data_dir/data/R (default: node.json's expert_profile) and data_dir/models/D/G (default: the
-        second shard), tools/stage_ship.py's layout.  Plain names only: nothing outside data_dir."""
+        data_dir/packs/P, data_dir/data/R (default: node.json's expert_profile, else data/expert-profile.bin) and,
+        only when named, data_dir/models/D/G for --ple-gguf (a worker never runs the PLE layer; the engine finds the
+        shard by tensor name), tools/stage_ship.py's layout.  Names of letters, digits, '.', '_' and '-' only, and
+        every path must resolve inside data_dir (a Windows "C:.." would otherwise replace the root)."""
         c = self.cfg
         m = req.get("model")
         if m is None:
@@ -192,21 +198,23 @@ class Workers:
             raise ValueError('model: {"dir": ..., "native": ..., "pack": ...} expected')
         for k in ("dir", "native", "pack", "profile", "ple"):
             v = m.get(k)
-            if v is not None and (not isinstance(v, str) or v in ("", ".", "..") or "/" in v or "\\" in v):
+            if v is not None and (not isinstance(v, str) or v in (".", "..") or not PLAIN_NAME.fullmatch(v)):
                 raise ValueError(f"model {k}: a plain file or directory name expected, not {v!r}")
-        root = Path(c["data_dir"])
+        root = Path(c["data_dir"]).resolve()
         mdir = root / "models" / m["dir"]
-        native = mdir / m["native"]
-        shards = sorted(mdir.glob("*.gguf"))
-        ple = mdir / m["ple"] if m.get("ple") else (shards[1] if len(shards) > 1 else None)
-        profile = root / "data" / m["profile"] if m.get("profile") else Path(c.get("expert_profile") or
-                                                                             root / "data" / "expert-profile.bin")
-        out = {"pack": str(root / "packs" / m["pack"]), "native": str(native), "ple_gguf": str(ple or ""),
-               "expert_profile": str(profile)}
+        out = {"pack": root / "packs" / m["pack"], "native": mdir / m["native"],
+               "ple_gguf": mdir / m["ple"] if m.get("ple") else None,
+               "expert_profile": root / "data" / m["profile"] if m.get("profile") else
+               Path(c.get("expert_profile") or root / "data" / "expert-profile.bin")}
+        for k, p in out.items():
+            if p is None or (k == "expert_profile" and not m.get("profile")):
+                continue
+            if root not in p.resolve().parents:
+                raise ValueError(f"model {k}: outside data_dir")
         for k in ("pack", "native", "expert_profile"):
-            if not Path(out[k]).exists():
-                raise ValueError(f"{out[k]} is not here: ship the model first (tools/stage_ship.py)")
-        return out
+            if not out[k].exists():
+                raise ValueError(f"model {k} is not shipped here: tools/stage_ship.py first")
+        return {k: str(p or "") for k, p in out.items()}
 
     def _start(self, req: dict) -> dict:
         port = int(req.get("port", 7841))
@@ -230,7 +238,6 @@ class Workers:
         args += ["--expert-profile", m["expert_profile"], "--expert-cache", str(req.get("cache", "auto")),
                  "--prefill", str(int(req.get("prefill", 2048))), "--stage-bind", c["bind"]]
         args += [str(a) for a in c.get("args", [])] + extra
-        clock_note = self.lock_clocks()
         env = dict(os.environ)
         env["STRATA_STAGE_TOKEN"] = c["_token"]
         env["STRATA_REMOTE_TIMING"] = "1"
@@ -239,12 +246,16 @@ class Workers:
             var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
             env[var] = libs + (os.pathsep + env[var] if env.get(var) else "")
         log = self.log_path(port)
-        fh = open(log, "wb")
         kw = {"start_new_session": True} if os.name != "nt" else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT, env=env, **kw)
-        fh.close()
+        try:
+            with open(log, "wb") as fh:
+                proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT, env=env,
+                                        **kw)
+        except OSError as e:   # a wrong exe or log_dir: an answer, not a dropped connection
+            return {"ok": False, "port": port, "error": f"cannot start the worker: {e}"}
         with self.lock:
             self.procs[port] = proc
+        clock_note = self.lock_clocks()   # (the worker reads its experts for seconds before its first window)
         t0 = time.time()
         while time.time() - t0 < LISTEN_TIMEOUT_S:
             time.sleep(1)
@@ -267,45 +278,61 @@ class Workers:
                 "log": tail(log.read_text(encoding="utf-8", errors="replace"), 40)}
 
     def lock_clocks(self) -> str:
-        """node.json "gpu_clocks": {"graphics": [MIN, MAX], "memory": [MIN, MAX]} (MHz) - held with nvidia-smi -lgc/-lmc
-        while a worker runs here, and reset when none does.  Why: a stage worker's GPU idles between decode windows
-        (the other stages run meanwhile), and the Windows driver lowers its clocks then - an RTX 3070 spent 94% of a
-        decode run below P2 (P5: 810 MHz memory) and its windows took 12-22 ms instead of 3.7-4.1 ms locked.  The Linux
-        driver held P2 throughout.  Locking needs an administrator (Windows) or root; otherwise the reply says so and
-        the worker runs unlocked.  Returns a note for the /start reply ("" when nothing was asked)."""
+        """node.json "gpu_clocks": {"graphics": [MIN, MAX], "memory": [MIN, MAX], "gpu"?: INDEX} (MHz) - held with
+        nvidia-smi -lgc/-lmc (on GPU INDEX, else every GPU) while a worker runs here, and reset when none does (a /stop,
+        a worker that exits, the agent stopped by Ctrl+C, SIGTERM or Ctrl+Break; not a killed agent or a closed console
+        window: then `nvidia-smi -rgc` and `-rmc` reset them, as does a reboot).  Why: a stage worker's GPU idles
+        between decode windows (the other stages run meanwhile), and the Windows driver lowers its clocks then - an RTX
+        3070 spent 94% of a decode run below P2 (P5: 810 MHz memory) and its windows took 12-22 ms instead of 3.7-4.1
+        ms locked.  The Linux driver held P2 throughout.  Locking needs an administrator (Windows) or root; otherwise
+        the reply says "NOT locked" and the worker runs unlocked.  Returns a note for the /start reply ("" when nothing
+        was asked)."""
         gc = self.cfg.get("gpu_clocks")
         if not gc:
             return ""
         smi = shutil.which("nvidia-smi")
         if smi is None:
-            return "gpu_clocks: no nvidia-smi"
+            return "gpu_clocks: NOT locked (no nvidia-smi)"
+        dev = ["-i", str(gc["gpu"])] if gc.get("gpu") is not None else []
         notes = []
+        with self.lock:
+            self.clocks_locked = True
         for key, flag in (("graphics", "-lgc"), ("memory", "-lmc")):
             if key not in gc:
                 continue
             lo, hi = (gc[key], gc[key]) if isinstance(gc[key], int) else gc[key]
             try:
-                p = subprocess.run([smi, flag, f"{int(lo)},{int(hi)}"], capture_output=True, text=True, timeout=30)
+                p = subprocess.run([smi, *dev, flag, f"{int(lo)},{int(hi)}"], capture_output=True, text=True,
+                                   timeout=30)
                 out = (p.stdout + p.stderr).strip().splitlines()
                 notes.append(f"{key} {lo}-{hi} MHz: " + ("locked" if p.returncode == 0 else
                                                           "NOT locked (" + (out[0] if out else f"exit {p.returncode}") +
                                                           "; the agent needs administrator / root)"))
             except (OSError, subprocess.TimeoutExpired) as e:
                 notes.append(f"{key}: NOT locked ({e})")
-        self.clocks_locked = True
         return "; ".join(notes)
 
     def reset_clocks(self) -> None:
         """Undo lock_clocks once no worker runs here."""
-        if not getattr(self, "clocks_locked", False) or self.running():
-            return
+        with self.lock:
+            if not self.clocks_locked or any(p.poll() is None for p in self.procs.values()):
+                return
+            self.clocks_locked = False
         smi = shutil.which("nvidia-smi")
+        gc = self.cfg.get("gpu_clocks") or {}
+        dev = ["-i", str(gc["gpu"])] if gc.get("gpu") is not None else []
         for flag in ("-rgc", "-rmc"):
             try:
-                subprocess.run([smi, flag], capture_output=True, timeout=30)
+                subprocess.run([smi, *dev, flag], capture_output=True, timeout=30)
             except (OSError, subprocess.TimeoutExpired, TypeError):
                 pass
-        self.clocks_locked = False
+
+    def reap(self) -> None:
+        """Forget the workers that exited on their own, and reset the clocks if none runs."""
+        with self.lock:
+            for p in [p for p, proc in self.procs.items() if proc.poll() is not None]:
+                self.procs.pop(p)
+        self.reset_clocks()
 
     def running(self) -> list[int]:
         with self.lock:
@@ -480,6 +507,7 @@ def make_handler(cfg: dict, workers: Workers, store: Store):
             if u.path == "/ping":   # a round trip with no work behind it (/info runs nvidia-smi)
                 self.reply(200, {"ok": True})
             elif u.path == "/info":
+                workers.reap()
                 self.reply(200, {"ok": True, "host": platform.node(), "system": platform.platform(),
                                  "cpus": os.cpu_count(), "gpus": gpu_info(), "ram": ram_info(),
                                  "workers": workers.running(), "bind": cfg["bind"],
@@ -576,6 +604,13 @@ def main() -> None:
     addr = cfg.get("agent_bind") or cfg["bind"]
     srv = ThreadingHTTPServer((addr, int(cfg.get("agent_port", 7840))), make_handler(cfg, workers, Store(cfg)))
     sys.stderr.write(f"stage_node: listening on {addr}:{cfg.get('agent_port', 7840)}\n")
+
+    def interrupt(signum, frame):   # a service stop (SIGTERM) or Ctrl+Break: stop the workers, reset the clocks
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), interrupt)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

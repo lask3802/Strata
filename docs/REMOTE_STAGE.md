@@ -22,7 +22,7 @@ window goes through the stages one after the other.
 
 ## When it helps (measured)
 
-Three PCs, 2026-10-09 and 2026-10-10. Every PC built the engine from this branch (CUDA 13.0).
+Three PCs, 2026-10-09 and 2026-10-10. Every PC ran a build of this feature (CUDA 13.0).
 
 | | PC A (main) | PC B | PC C |
 |---|---|---|---|
@@ -56,7 +56,7 @@ K is the number of layers on the 3080; the chunk is `--prefill` on both PCs.
 | K=26, chunk 8192, no reserve | - | out of VRAM at the first long prompt | | | |
 
 - **Decode is 18-44% faster than the 3080 alone** in every row (100K: 45.3-52.0 vs 38.0; short prompts 49.4-54.0 vs
-  39.9): the two caches hold more of the experts (the 3080's decode hit rate 77-87% with the split, 59-60% alone).
+  39.9): the two caches hold more of the experts (the 3080's decode hit rate, from the engines' logs at chunk 2048 during the sweep: 77-87% with the split, 59-60% alone; those logs are not kept with the results).
 - **Long prompts need a large chunk.** At 2048 every split read prompts slower than the 3080 alone (100K: 600-846 vs
   1,120); at 5888-8192 the split is faster from 32K on (1,374-1,633).
 - **Short prompts lose a little** (8K: 589-740 vs 791); the faster decode about makes up for it over a request.
@@ -76,7 +76,7 @@ K is the number of layers on the 3080; the chunk is `--prefill` on both PCs.
   (44.7 vs 45.6 at 100K, 51.3 vs 53.5 short). A third stage adds a hop to every window; on IQ3_S the 3080 and the
   2080 Ti already cache most of what the 3070 would add.
 - On 1 GbE everywhere the middle PC carried every prompt chunk twice (in and out, each way): its link ran at line rate
-  for 26 of 44 s of one prompt (2.6 GB each way). 10 GbE between A and B removed most of that.
+  for one long prompt: 2.6 GB each way in the ~38 s it crossed, at up to 123 MB/s (sampled every second: [data/nic-pc-b-1gbe-3pc.txt](../bench/results/2026-10-10-remote-stage/data/nic-pc-b-1gbe-3pc.txt)). 10 GbE between A and B removed most of that.
 
 ### Huihui UD-Q4_K_XL (a larger model: 71.7 GiB of experts, 1.47-1.90 GiB a layer)
 
@@ -274,7 +274,7 @@ What the measurements say (re-measure on your PCs; `tools/stage_tune.py` does it
 
 ## Tools
 
-Three Python scripts (standard library only) in `tools/`; they run on Linux and Windows. Their docstrings are the
+Three Python scripts (standard library only) in `tools/`. The agent and the shipper run on Linux and Windows; `stage_tune.py tune` runs on a Linux main PC (it starts and stops the server with `pgrep` / `kill`), `stage_tune.py apply` anywhere. Their docstrings are the
 full usage; `python -m unittest tools.test_stage_node` tests the agent's file store and the shipper's paths.
 
 **`tools/stage_node.py`: a node agent** on each worker PC. It starts and stops that PC's stage workers on request
@@ -295,13 +295,19 @@ python3 tools/stage_node.py node.json
 ```
 
 - `POST /start` (`{"begin": K, "end": K2, "next": "host:port", "port": 7841, "prefill": 5888, "cache": "auto",
-  "extra": [...], "model": {"dir": ..., "native": ..., "pack": ...}}`) answers when the worker listens, or with the
-  log's tail when it exits. `"model"` names a model shipped under `data_dir` (plain names only), so **one agent serves
-  every model shipped to it**; without it the worker runs the model node.json names (`pack`, `native`, `ple_gguf`,
-  `expert_profile`, optional with `data_dir`).
-- `"gpu_clocks"` locks the GPU's clocks while a worker runs (Windows; the agent must run as administrator, else the
-  reply says "NOT locked"). `"agent_bind"` lets the agent listen on every interface, so the tuner's link test runs
-  over the stage link when the workers use a second NIC.
+  "extra": [...], "model": {"dir": ..., "native": ..., "pack": ..., "profile": ..., "ple": ...}}`) answers when the
+  worker listens, or with the log's tail when it exits. `"model"` names a model shipped under `data_dir`:
+  `data_dir/models/<dir>/<native>`, `data_dir/packs/<pack>`, optionally `data_dir/data/<profile>` (else node.json's
+  `expert_profile`) and `--ple-gguf data_dir/models/<dir>/<ple>` (a worker never runs the PLE layer; the engine finds
+  the shard by name). Names of letters, digits, `.`, `_` and `-` only, and every path must stay inside `data_dir`.
+  So **one agent serves every model shipped to it**; without `"model"` the worker runs the model node.json names
+  (`pack`, `native`, `ple_gguf`, `expert_profile`, optional with `data_dir`).
+- `"gpu_clocks": {"graphics": [MIN, MAX], "memory": [MIN, MAX], "gpu": INDEX}` locks the GPU's clocks (on GPU INDEX,
+  else every GPU) while a worker runs (Windows; the agent must run as administrator, else the `/start` reply and the
+  tuner say "NOT locked"). They are reset when no worker runs: after a `/stop`, a worker that exits (noticed at the
+  next `/info`), or the agent stopped with Ctrl+C, SIGTERM or Ctrl+Break. A killed agent or a closed console window
+  leaves them locked until `nvidia-smi -rgc -rmc` or a reboot. `"agent_bind"` lets the agent listen on every
+  interface, so the tuner's link test runs over the stage link when the workers use a second NIC.
 - Other endpoints: `GET /ping`, `GET /info` (GPU, RAM, the clock setting), `POST /stop`, `GET /log`, `POST /sink`
   and `POST /send` (a link test), `POST /put`, `GET /ranges`, `GET /sha256` (for `stage_ship.py`). A stop waits up
   to 180 s for the worker to exit (a worker with ~30 GB of pinned experts takes more than 30 s to unpin).
@@ -363,7 +369,7 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
   answer / decode), and the winner reads one prompt near `max_context` (131072, or the model's 262144).
 - With `"ship": true` the tuner sends each node the layers it lacks before starting it and names the model in its
   `/start`. The report adds a note for a Windows (or WSL2) node whose clocks are not locked.
-- On A + B with RVN IQ3_S (two nodes, 9 configurations, 12 minutes) it picked K=26 at chunk 5888, the same as the
+- On A + B with RVN IQ3_S (one node, 9 configurations, 12 minutes; [its report](../bench/results/2026-10-10-remote-stage/data/tuner-rvn-2pc-report.md)) it picked K=26 at chunk 5888, the same as the
   table. On A + B + C with UD-Q4_K_XL (8 searched configurations, two profile runs and the max-context check: 33
   minutes, including shipping 18.5 GiB of layers the nodes lacked) it kept 24 / 16 / 8 at chunk 5888: a weighted
   request of 49.1 s, and a 125,230-token prompt read at 1,410 tok/s with decode at 33.8. Its report:
@@ -407,7 +413,8 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 | Linux, NVIDIA (CUDA 13.0) | measured: Ubuntu 24.04 in an LXC container (main), a Linux host with kernel 6.14 (worker) |
 | Windows 11 native, NVIDIA (MSVC 2022, CUDA 13.0) | measured as a worker (and its node agent); as the main PC not tested |
 | WSL2 (Windows 11, mirrored networking) | measured as a worker |
-| AMD (HIP), Intel (SYCL) | <!-- TODO builds --> not built |
+| AMD (HIP) | builds (ROCm 7.0, gfx1100, in a container); not run: no AMD card was available |
+| Intel (SYCL) | the SYCL port builds (oneAPI 2026.1.1, in a container) but has no remote stage: it keeps its own copies of the engine files this feature changes |
 | Links | measured on 1 GbE and on 10 GbE (limited to ~400 MB/s by its slot) |
 
 ## Troubleshooting
@@ -422,7 +429,7 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 | `cannot connect ...: No route to host` over a second NIC that shows its link up | check that it receives at all (`ip -s link`); a 10 GbE card here received nothing after its host rebooted until the link was taken down and up |
 | a worker restarted right after a stop fails (little VRAM free) | the previous worker is still unpinning (more than 30 s with ~30 GB of experts); wait until its process is gone |
 | `remote stage: the worker refused: wrong token (STRATA_STAGE_TOKEN)` | the same `STRATA_STAGE_TOKEN` on every PC |
-| `remote stage: the two sides differ (protocol ..., first remote layer ..., K/V type ..., model pack ...)` | a build of this branch on every PC, the same pack, the same `--kv`, and `--stage-begin` = the previous stage's K |
+| `remote stage: the two sides differ (protocol ..., first remote layer ..., K/V type ..., model pack ...)` | the same build of the engine on every PC, the same pack, the same `--kv`, and `--stage-begin` = the previous stage's K |
 | `the main process reads prompts in chunks of N tokens, this worker's chunk is M` | the worker's `--prefill` must be at least the main process's chunk |
 | `the main process's context (N) or window (T) is larger than this worker's` | the worker's `--max-context` and `--spec` must be at least the main process's |
 | `ArenaExpertSource: a layer range needs a native pack read from its GGUF` | a pack directory with `experts.bin`: use a copy without it; drop `--shared-expert-arena` |

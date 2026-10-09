@@ -1,5 +1,6 @@
-"""Tests for the remote-stage node agent's file store (tools/stage_node.py) and the shipper's node paths
-(tools/stage_ship.py): no GPU, no network, no engine.
+"""Tests for the remote-stage node agent (tools/stage_node.py: the file store, the model names, the clocks), the
+shipper's node paths (tools/stage_ship.py) and the tuner's /start body and notes (tools/stage_tune.py): no GPU, no
+network, no engine.
 
     python -m unittest tools.test_stage_node
 """
@@ -8,15 +9,18 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import stage_node as sn  # noqa: E402
 import stage_ship as ss  # noqa: E402
+import stage_tune as st  # noqa: E402
 
 
 def on_disk(p: Path) -> int:
@@ -120,20 +124,28 @@ class ModelTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_shipped_model(self):
+        d = self.d.resolve()
         m = self.w.model({"model": {"dir": "q4", "native": "M-00001-of-00003.gguf", "pack": "pk",
                                     "profile": "prof.bin"}})
-        self.assertEqual(Path(m["native"]), self.d / "models" / "q4" / "M-00001-of-00003.gguf")
-        self.assertEqual(Path(m["ple_gguf"]), self.d / "models" / "q4" / "M-00002-of-00003.gguf")
-        self.assertEqual(Path(m["pack"]), self.d / "packs" / "pk")
-        self.assertEqual(Path(m["expert_profile"]), self.d / "data" / "prof.bin")
+        self.assertEqual(Path(m["native"]), d / "models" / "q4" / "M-00001-of-00003.gguf")
+        self.assertEqual(m["ple_gguf"], "")   # not named: no --ple-gguf (a worker never runs the PLE layer)
+        self.assertEqual(Path(m["pack"]), d / "packs" / "pk")
+        self.assertEqual(Path(m["expert_profile"]), d / "data" / "prof.bin")
+        m = self.w.model({"model": {"dir": "q4", "native": "M-00001-of-00003.gguf", "pack": "pk",
+                                    "profile": "prof.bin", "ple": "M-00002-of-00003.gguf"}})
+        self.assertEqual(Path(m["ple_gguf"]), d / "models" / "q4" / "M-00002-of-00003.gguf")
 
     def test_names_only(self):
-        for bad in ("../q4", "q4/x", "..", "", "a\\b"):
-            with self.assertRaises(ValueError):
+        # "C:.." and "C:x": a drive on Windows would replace data_dir as the root
+        for bad in ("../q4", "q4/x", "..", ".", "", "a\\b", "C:..", "C:x", "q4 ", "~", "%TEMP%"):
+            with self.assertRaises(ValueError, msg=bad):
                 self.w.model({"model": {"dir": bad, "native": "M-00001-of-00003.gguf", "pack": "pk"}})
+            with self.assertRaises(ValueError, msg=bad):
+                self.w.model({"model": {"dir": "q4", "native": "M-00001-of-00003.gguf", "pack": "pk",
+                                        "profile": bad}})
 
     def test_not_shipped(self):
-        with self.assertRaisesRegex(ValueError, "ship the model first"):
+        with self.assertRaisesRegex(ValueError, "not shipped here"):
             self.w.model({"model": {"dir": "q4", "native": "M-00001-of-00003.gguf", "pack": "other",
                                     "profile": "prof.bin"}})
 
@@ -148,6 +160,96 @@ class ModelTest(unittest.TestCase):
 
     def test_no_clocks_asked(self):
         self.assertEqual(self.w.lock_clocks(), "")
+
+
+class FakeProc:
+    def __init__(self):
+        self.code = None
+
+    def poll(self):
+        return self.code
+
+
+class ClocksTest(unittest.TestCase):
+    """gpu_clocks: locked while a worker runs, reset when none does (nvidia-smi faked)."""
+
+    def setUp(self):
+        self.calls = []
+        self.rc = 0
+        run = lambda args, **kw: (self.calls.append(args[1:]),   # noqa: E731
+                                  subprocess.CompletedProcess(args, self.rc, "", "Insufficient Permissions"))[1]
+        self.patches = [mock.patch.object(sn.shutil, "which", return_value="nvidia-smi"),
+                        mock.patch.object(sn.subprocess, "run", side_effect=run)]
+        for p in self.patches:
+            p.start()
+        self.w = sn.Workers({"exe": "x", "bind": "x",
+                             "gpu_clocks": {"graphics": [1500, 1905], "memory": [7001, 7001], "gpu": 0}})
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+
+    def test_lock_then_reset_when_none_runs(self):
+        note = self.w.lock_clocks()
+        self.assertEqual(note, "graphics 1500-1905 MHz: locked; memory 7001-7001 MHz: locked")
+        self.assertEqual(self.calls, [["-i", "0", "-lgc", "1500,1905"], ["-i", "0", "-lmc", "7001,7001"]])
+        a, b = FakeProc(), FakeProc()
+        self.w.procs.update({7841: a, 7842: b})
+        self.calls.clear()
+        self.w.reap()                      # both run: nothing reset
+        self.assertEqual(self.calls, [])
+        a.code = 0
+        self.w.reap()                      # one exited on its own, the other runs: still nothing
+        self.assertEqual(self.calls, [])
+        b.code = 0
+        self.w.reap()                      # none runs: reset once
+        self.assertEqual(self.calls, [["-i", "0", "-rgc"], ["-i", "0", "-rmc"]])
+        self.w.reap()
+        self.assertEqual(len(self.calls), 2)
+
+    def test_not_locked_says_so(self):
+        self.rc = 1
+        self.assertIn("NOT locked (Insufficient Permissions; the agent needs administrator / root)",
+                      self.w.lock_clocks())
+
+
+class TunerPiecesTest(unittest.TestCase):
+    """stage_tune's /start body and its notes, on a Tuner built without a cluster."""
+
+    def tuner(self, nodes):
+        t = st.Tuner.__new__(st.Tuner)
+        t.nodes = [st.Node(n, "tok") for n in nodes]
+        t.max_context = 131072
+        t.ship_cfg = {"model_dir": "/data/models/q4", "pack_dir": "/data/packs/pk", "profile": "/opt/prof.bin"}
+        t.main = mock.Mock(base={"args": ["--native", "/data/models/q4/M-00001-of-00003.gguf"]})
+        t.clock_notes = {}
+        return t
+
+    def test_start_req(self):
+        t = self.tuner([{"name": "b", "agent": "http://192.0.2.11:7840", "host": "198.51.100.11", "port": 7841,
+                         "ship": True, "extra": ["--stage-bind", "198.51.100.11"]},
+                        {"name": "c", "agent": "http://192.0.2.12:7840", "host": "192.0.2.12", "cache": 1000}])
+        r = t.start_req(0, 24, 40, 5888)
+        self.assertEqual(r["model"], {"dir": "q4", "pack": "pk", "native": "M-00001-of-00003.gguf",
+                                      "profile": "prof.bin"})
+        self.assertEqual((r["end"], r["next"]), (40, "192.0.2.12:7841"))
+        self.assertEqual(r["extra"], ["--stage-bind", "198.51.100.11", "--max-context", "131072"])
+        r = t.start_req(1, 40, 48, 5888)
+        self.assertNotIn("model", r)       # not shipped: the node's node.json names the model
+        self.assertNotIn("next", r)
+        self.assertEqual(r["cache"], 1000)
+        self.assertEqual(t.nodes[0].stage_agent, "http://198.51.100.11:7840")
+
+    def test_notes(self):
+        t = self.tuner([{"name": "w", "agent": "http://192.0.2.12:7840", "host": "192.0.2.12"},
+                        {"name": "l", "agent": "http://192.0.2.11:7840", "host": "192.0.2.11"}])
+        t.nodes[0].info = {"system": "Windows-11"}
+        t.nodes[1].info = {"system": "Linux-6.14"}
+        self.assertEqual(len(t.node_notes()), 1)
+        t.nodes[0].info["gpu_clocks"] = {"graphics": [1500, 1905]}
+        self.assertEqual(t.node_notes(), [])
+        t.clock_notes["w"] = "graphics 1500-1905 MHz: NOT locked (...)"
+        self.assertIn("not applied", t.node_notes()[0])
 
 
 class NodePathsTest(unittest.TestCase):

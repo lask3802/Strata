@@ -324,6 +324,7 @@ class Tuner:
         self.cpt = CHARS_PER_TOKEN   # chars per token of this corpus, learned from the prompts read
         self.runs: list[dict] = []
         self.runs_path = outdir / "runs.jsonl"
+        self.clock_notes: dict[str, str] = {}   # node -> its agent's "NOT locked" answer (gpu_clocks failed)
 
     def stages(self, splits: list[int]) -> list[tuple[int, int]]:
         b = [0] + list(splits) + [self.n_layers]
@@ -360,8 +361,9 @@ class Tuner:
         return req
 
     def node_notes(self) -> list[str]:
-        """What the nodes' /info says the user should change."""
-        notes = []
+        """What the nodes' /info and their /start answers say the user should change."""
+        notes = [f"{name}: its gpu_clocks were not applied ({why}); the measurements ran with the driver's clocks"
+                 for name, why in self.clock_notes.items()]
         for n in self.nodes:
             system = str(n.info.get("system", ""))
             if (system.startswith("Windows") or "microsoft" in system.lower()) and not n.info.get("gpu_clocks"):
@@ -384,7 +386,10 @@ class Tuner:
             r = n.call("/start", self.start_req(i, lo, hi, chunk))
             if not r.get("ok"):
                 return False, f"{n.name}: " + (r.get("error") or "") + "\n" + "\n".join(r.get("log", [])[-15:])
-            say(f"  {n.name}: layers {lo}-{hi - 1} up in {r.get('seconds')} s")
+            say(f"  {n.name}: layers {lo}-{hi - 1} up in {r.get('seconds')} s"
+                + (f"; clocks: {r['clocks']}" if r.get("clocks") else ""))
+            if "NOT locked" in str(r.get("clocks", "")):
+                self.clock_notes[n.name] = r["clocks"]
         return True, ""
 
     def prompt(self, tokens: int, salt: int) -> str:
@@ -720,7 +725,8 @@ def apply(cluster: dict, outdir: Path) -> None:
         r = n.call("/start", req)
         if not r.get("ok"):
             sys.exit(f"{n.name}: " + (r.get("error") or "") + "\n" + "\n".join(r.get("log", [])[-15:]))
-        say(f"{n.name}: layers {spec['begin']}-{spec.get('end', 'last')} up in {r.get('seconds')} s")
+        say(f"{n.name}: layers {spec['begin']}-{spec.get('end', 'last')} up in {r.get('seconds')} s"
+            + (f"; clocks: {r['clocks']}" if r.get("clocks") else ""))
     say(f"the workers run; serve {outdir / 'main.json'} (serve/server.py --engine strata --config ...)")
 
 
@@ -732,6 +738,8 @@ def main() -> None:
     if sys.argv[1] == "apply":
         apply(cluster, outdir)
         return
+    if os.name == "nt":   # it starts and stops serve/server.py and the engine with pgrep / kill
+        sys.exit("stage_tune: tune runs on a Linux main PC (the nodes may run Windows); apply runs anywhere")
     t = Tuner(cluster, outdir)
     try:
         best = t.tune()
