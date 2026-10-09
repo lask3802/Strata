@@ -39,6 +39,7 @@ only the tuner and the main process drive this PC.  Endpoints (JSON in and out):
                                writes the body at byte N of data_dir/P (a file of T bytes, sparse where nothing
                                was written) and answers the body's sha256; P.ranges.json records what is written
     GET  /ranges?path=P        the byte ranges of data_dir/P written so far ([[offset, length], ...]) and its size
+    GET  /sha256?path=P        the sha256 of data_dir/P (a whole file shipped again only when it changed)
 The shipped model files keep every offset of the originals, so a node that holds only its layers' bytes (and
 every shard's header) loads them as from the whole file - tools/stage_ship.py sends only those.
 """
@@ -308,6 +309,16 @@ def make_handler(cfg: dict, workers: Workers, store: Store):
                 self.reply(200, {"ok": True, "host": platform.node(), "system": platform.platform(),
                                  "cpus": os.cpu_count(), "gpus": gpu_info(), "ram": ram_info(),
                                  "workers": workers.running(), "bind": cfg["bind"]})
+            elif u.path == "/sha256":
+                try:
+                    p = store.path(q["path"][0])
+                    h = hashlib.sha256()
+                    with open(p, "rb") as f:
+                        for b in iter(lambda: f.read(8 << 20), b""):
+                            h.update(b)
+                    self.reply(200, {"ok": True, "sha256": h.hexdigest(), "size": p.stat().st_size})
+                except (KeyError, ValueError, OSError) as e:
+                    self.reply(200, {"ok": False, "error": str(e)})
             elif u.path == "/ranges":
                 try:
                     self.reply(200, store.ranges(q["path"][0]))

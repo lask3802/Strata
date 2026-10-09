@@ -38,12 +38,13 @@ PIECE = 64 << 20
 
 
 class Item:
-    """One file to ship: the byte ranges the node needs of it."""
+    """One file to ship: the byte ranges the node needs of it (None: the whole file, sent again when it changed)."""
 
     def __init__(self, local: Path, rel: str, ranges: list[list[int]] | None = None):
         self.local = local
         self.rel = rel
         self.total = local.stat().st_size
+        self.whole = ranges is None
         self.ranges = merge(ranges if ranges is not None else [[0, self.total]])
         self.mode = "755" if local.stat().st_mode & stat.S_IXUSR else None
 
@@ -116,6 +117,12 @@ class Agent:
         self.url = url.rstrip("/")
         self.token = token
 
+    def sha256(self, rel: str) -> dict:
+        req = urllib.request.Request(f"{self.url}/sha256?path={urllib.parse.quote(rel)}",
+                                     headers={"X-Stage-Token": self.token})
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return json.load(r)
+
     def ranges(self, rel: str) -> dict:
         req = urllib.request.Request(f"{self.url}/ranges?path={urllib.parse.quote(rel)}",
                                      headers={"X-Stage-Token": self.token})
@@ -136,6 +143,14 @@ class Agent:
             return {"ok": False, "error": f"HTTP {e.code}: {e.read().decode(errors='replace')[:300]}"}
 
 
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(8 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
 def ship(agent: Agent, items: list[Item], say=print) -> int:
     """Send what the node lacks; returns the bytes sent."""
     todo = []
@@ -143,6 +158,10 @@ def ship(agent: Agent, items: list[Item], say=print) -> int:
         have = agent.ranges(it.rel)
         got = merge(have.get("ranges") or []) if have.get("size") == it.total else []
         miss = subtract(it.ranges, got)
+        if it.whole and not miss and it.total > 0:   # a whole file the node has: the same bytes?
+            remote = agent.sha256(it.rel)
+            if remote.get("sha256") != file_sha256(it.local):
+                miss = list(it.ranges)
         todo.append((it, miss))
     need = sum(n for _, miss in todo for _, n in miss)
     say(f"ship: {sum(it.nbytes for it in items) / 2**30:.2f} GiB wanted, {need / 2**30:.2f} GiB to send "

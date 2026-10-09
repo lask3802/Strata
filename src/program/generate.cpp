@@ -8503,6 +8503,7 @@ int main(int argc, char** argv) {
                 const bool wk_timing = [] { const char* v = std::getenv("STRATA_REMOTE_TIMING"); return v && v[0] == '1'; }();
                 double wk_own_ms = 0, wk_next_ms = 0;
                 int64_t wk_windows = 0;
+                double wk_wait0 = 0, wk_pool0 = 0, wk_host0 = 0;   // the verifier's counters at the last line
                 hs.run = [&](int T, const int32_t* tokens, int64_t pos0, std::string& e) -> bool {
                     const auto wk_t0 = Clock::now();
                     // a prompt's loan goes back before a window reads the cache (as the request loop does)
@@ -8523,9 +8524,17 @@ int main(int argc, char** argv) {
                         wk_own_ms += std::chrono::duration<double, std::milli>(wk_t1 - wk_t0).count();
                         wk_next_ms += std::chrono::duration<double, std::milli>(Clock::now() - wk_t1).count();
                         if (++wk_windows % 64 == 0) {
-                            std::fprintf(stderr, "strata stage worker: windows: own layers %.2f ms%s each (64 windows)\n",
+                            // ... and where this worker's share went (as STRATA_SPLIT_TIMING splits a local stage's):
+                            // waiting for the GPU to ring a layer, the CPU pool and plan per layer, host staging
+                            std::fprintf(stderr, "strata stage worker: windows: own layers %.2f ms%s each (64 windows; "
+                                                 "wait for the GPU %.2f, pool + plan %.2f, host staging %.2f)\n",
                                          wk_own_ms / 64, stage_relay ? (", next worker " + std::to_string(wk_next_ms / 64) +
-                                                                        " ms").c_str() : "");
+                                                                        " ms").c_str() : "",
+                                         (ver.ms_wait - wk_wait0) / 64, (ver.ms_pool - wk_pool0) / 64,
+                                         (ver.ms_host - wk_host0) / 64);
+                            wk_wait0 = ver.ms_wait;
+                            wk_pool0 = ver.ms_pool;
+                            wk_host0 = ver.ms_host;
                             wk_own_ms = wk_next_ms = 0;
                         }
                     }
