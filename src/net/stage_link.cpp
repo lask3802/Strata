@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <thread>
 #include <vector>
 
@@ -490,7 +491,19 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
         // ---- the serving thread (this one): the messages in order
         std::string err, pending_err;   // pending_err: a failed one-way message, reported on the next reply
         bool greeted = false;
+        // a prompt chunk's reply goes out on its own thread while the next chunk is read; every later send waits
+        // for it (the replies keep their order), and so does the reuse of its output buffer
+        std::future<bool> reply_out;
+        std::string reply_err;
+        int out_buf = 0;
+        auto replies_out = [&]() -> bool {
+            if (!reply_out.valid()) return true;
+            if (reply_out.get()) return true;
+            err = reply_err;
+            return false;
+        };
         auto reply_error = [&](const std::string& m) -> bool {
+            if (!replies_out()) return false;
             StageHeader e;
             e.type = (uint32_t) StageMsg::Error;
             e.bytes = m.size();
@@ -537,7 +550,7 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::HelloOk;
                 r.bytes = sizeof mine;
-                if (!send_msg(fd, r, &mine, sizeof mine, nullptr, 0, err)) keep = false;
+                if (!replies_out() || !send_msg(fd, r, &mine, sizeof mine, nullptr, 0, err)) keep = false;
                 greeted = true;
                 std::fprintf(stderr, "strata stage worker: main process %s: layers %d.. here, context %lld, chunk %lld\n",
                              host, in.hello.layer_begin, (long long) in.hello.max_context, (long long) in.hello.chunk);
@@ -556,7 +569,7 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
                 r.type = (uint32_t) StageMsg::RunOk;
                 r.a = (int64_t) (ms_since(t0) * 1000.0);   // the worker's own time, microseconds
                 r.bytes = in.rows.size() * 4;
-                if (!send_msg(fd, r, buf.run_out, in.rows.size() * 4, nullptr, 0, err)) keep = false;
+                if (!replies_out() || !send_msg(fd, r, buf.run_out, in.rows.size() * 4, nullptr, 0, err)) keep = false;
                 stats.bytes_out += sizeof r + r.bytes;
                 ++stats.runs;
                 stats.ms_run += ms_since(t0);
@@ -573,8 +586,11 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
                 const int64_t skip = std::max<int64_t>(0, std::min<int64_t>(in.h.c >> 8, T));
                 std::string e;
                 bool ok;
+                // this chunk's output buffer: the one whose reply went out two chunks ago - the reply in flight (the
+                // last chunk's) uses the other
+                float* const out = buf.pf_out[out_buf];
                 if (!pending_err.empty()) { e = pending_err; pending_err.clear(); ok = false; }
-                else ok = h.prefill(in.tok64.data(), T, in.h.b, in.h.c & 0xff, buf.pf_in[in.slot], e);
+                else ok = h.prefill(in.tok64.data(), T, in.h.b, in.h.c & 0xff, buf.pf_in[in.slot], out, e);
                 release();   // the chunk is read (its rows were uploaded before `prefill` returned)
                 if (!ok) { keep = reply_error(e); break; }
                 const double work_ms = ms_since(t0);
@@ -582,12 +598,17 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
                     std::fprintf(stderr, "strata stage worker: chunk T=%lld at %lld: read in %.0f ms\n", (long long) T,
                                  (long long) in.h.b, work_ms);
                 const size_t back = (size_t) (T - skip) * (size_t) buf.pf_row_floats;
+                if (!replies_out()) { keep = false; break; }   // the previous reply is out: its buffer is free next time
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::PrefillOk;
                 r.a = (int64_t) (work_ms * 1000.0);
                 r.bytes = back * 4;
-                if (!send_msg(fd, r, buf.pf_out + (size_t) skip * (size_t) buf.pf_row_floats, back * 4, nullptr, 0, err))
-                    keep = false;
+                const float* src = out + (size_t) skip * (size_t) buf.pf_row_floats;
+                reply_err.clear();
+                reply_out = std::async(std::launch::async, [fd, r, src, back, &reply_err] {
+                    return send_msg(fd, r, src, back * 4, nullptr, 0, reply_err);
+                });
+                out_buf ^= 1;
                 stats.bytes_out += sizeof r + back * 4;
                 ++stats.prefills;
                 stats.ms_prefill += work_ms;
@@ -599,7 +620,7 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
                 if (!h.reset(e)) { keep = reply_error(e); break; }
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::ResetOk;
-                if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                if (!replies_out() || !send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
                 ++stats.resets;
                 break;
             }
@@ -610,6 +631,7 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
             release();
             if (!keep) break;
         }
+        (void) replies_out();   // a reply still going out ends first (or fails on the closed socket)
         // end the receiving thread: shutting the socket down wakes a blocked recv
         quit.store(true);
         (void) ::shutdown(fd, SHUT_RDWR);

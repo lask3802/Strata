@@ -115,9 +115,9 @@ struct StageHandlers {
     /// rows in: StageBuffers::run_in; rows out: run_out
     std::function<bool(int T, const int32_t* tokens, int64_t pos0, std::string& err)> run;
     std::function<bool(int n_keep, std::string& err)> commit;
-    /// rows in: `rows_in` (one of StageBuffers::pf_in[2]); rows out: pf_out (all T rows)
+    /// rows in: `rows_in` (one of StageBuffers::pf_in[2]); rows out: `rows_out` (one of pf_out[2], all T rows)
     std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows_in,
-                       std::string& err)> prefill;
+                       float* rows_out, std::string& err)> prefill;
     std::function<bool(std::string& err)> reset;
     std::function<void()> disconnected;   ///< the main process went away (the session is stale)
 };
@@ -127,7 +127,7 @@ struct StageBuffers {
     float* run_out = nullptr;
     size_t run_floats = 0;      ///< capacity of each, floats
     float* pf_in[2] = {};       ///< chunk * D each: the receiving thread fills one while the other is read
-    float* pf_out = nullptr;
+    float* pf_out[2] = {};      ///< chunk * D each: one chunk's rows go back while the next chunk's are written
     size_t pf_floats = 0;
     int64_t handoff_floats = 0; ///< floats per verify row
     int64_t pf_row_floats = 0;  ///< floats per prompt row (D)

@@ -2064,7 +2064,6 @@ int main(int argc, char** argv) {
         o.prompt_cache = 0;
         o.conversation_cache_mib = 0;
         o.prompt_cache_every = 0;
-        o.adapt_every = 0;   // the adaptive tier swaps against this process's cache only; off for now
         if (remote_main) own_hi = split_at[0];
         else own_lo = o.stage_begin;
         if (stage_worker) o.no_prefill_borrow = true;   // the worker's prompt path owns its buffers (no refill step)
@@ -8252,15 +8251,20 @@ int main(int argc, char** argv) {
                 // remote-stage worker: serve the main process instead of stdin.  A prompt starts with a reset; windows,
                 // commits and chunks arrive in order, each whole, and run here one at a time.
                 const int64_t pf_chunk = sp.chunk();
-                float *pf_in[2] = {nullptr, nullptr}, *pf_out = nullptr;   // two in: one on the wire, one being read
-                if (cudaHostAlloc((void**) &pf_in[0], (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostAlloc((void**) &pf_in[1], (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostAlloc((void**) &pf_out, (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) != cudaSuccess) {
+                // two in (one on the wire, one being read) and two out (one being sent back, one being written)
+                float *pf_in[2] = {nullptr, nullptr}, *pf_out[2] = {nullptr, nullptr};
+                float* pf_cur_out = nullptr;
+                bool pf_ok = true;
+                for (int b = 0; b < 2; ++b)
+                    pf_ok = pf_ok &&
+                            cudaHostAlloc((void**) &pf_in[b], (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) == cudaSuccess &&
+                            cudaHostAlloc((void**) &pf_out[b], (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) == cudaSuccess;
+                if (!pf_ok) {
                     std::fprintf(stderr, "strata serve: the stage worker's prompt buffers do not fit in RAM\n");
                     return 1;
                 }
                 sp.on_chunk = [&, D](const float* R_rows, int64_t T, int64_t, std::string& e) -> bool {
-                    if (cudaMemcpy(pf_out, R_rows, (size_t) (T * D) * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    if (cudaMemcpy(pf_cur_out, R_rows, (size_t) (T * D) * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
                         e = std::string("stage worker: the chunk's rows: ") + cudaGetErrorString(cudaGetLastError());
                         return false;
                     }
@@ -8287,22 +8291,36 @@ int main(int argc, char** argv) {
                     mine.chunk = theirs.chunk;   // informational
                     return true;
                 };
+                int64_t wk_rounds = 0;
                 hs.run = [&](int T, const int32_t* tokens, int64_t pos0, std::string& e) -> bool {
+                    // the adaptive tier's swaps of earlier windows land first (as the decode loop does)
+                    if (adapt_nowait()) apply_pending(false);
+                    else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
                     if (!ver.run(T, tokens, pos0, win_pool_fn, win_pool_user, wk_outv.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
                     return true;
                 };
-                hs.commit = [&](int n_keep, std::string& e) -> bool { return ver.commit(n_keep, e) && ver.wait_commit(e); };
+                hs.commit = [&](int n_keep, std::string& e) -> bool {
+                    if (!ver.commit(n_keep, e) || !ver.wait_commit(e)) return false;
+                    // the adaptive tier on this worker's layers, every adapt_every windows (the main process has its own)
+                    if (!drive.d.usage.empty() && o.adapt_every > 0 && (++wk_rounds % o.adapt_every) == 0 && !adapt()) {
+                        e = "stage worker: an adaptive refill failed";
+                        return false;
+                    }
+                    return true;
+                };
                 hs.prefill = [&](const int64_t* tokens, int64_t T, int64_t p0, int64_t flags, const float* rows_in,
-                                 std::string& e) -> bool {
+                                 float* rows_out, std::string& e) -> bool {
+                    pf_cur_out = rows_out;
                     sp.set_hand_in(rows_in);
                     sp.set_single_chunk((flags & 1) != 0);
                     return sp.run(tokens, T, p0, e);
                 };
                 hs.reset = [&](std::string& e) -> bool {
                     if (!ver.wait_commit(e)) return false;
+                    apply_pending(true);
                     strata::core::session_zero(ss, g, nullptr, main_cs);
                     return cudaStreamSynchronize(main_stream) == cudaSuccess;
                 };
@@ -8316,7 +8334,8 @@ int main(int argc, char** argv) {
                 bufs.run_floats = (size_t) strata::kernels::kVerifyMaxT * (size_t) HBF;
                 bufs.pf_in[0] = pf_in[0];
                 bufs.pf_in[1] = pf_in[1];
-                bufs.pf_out = pf_out;
+                bufs.pf_out[0] = pf_out[0];
+                bufs.pf_out[1] = pf_out[1];
                 bufs.pf_floats = (size_t) (pf_chunk * D);
                 bufs.handoff_floats = HBF;
                 bufs.pf_row_floats = D;
