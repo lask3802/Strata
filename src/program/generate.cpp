@@ -8475,7 +8475,12 @@ int main(int argc, char** argv) {
                     return true;
                 };
                 int64_t wk_rounds = 0;
+                // STRATA_REMOTE_TIMING=1: every 64 windows, this worker's own share and the next worker's (a relay)
+                const bool wk_timing = [] { const char* v = std::getenv("STRATA_REMOTE_TIMING"); return v && v[0] == '1'; }();
+                double wk_own_ms = 0, wk_next_ms = 0;
+                int64_t wk_windows = 0;
                 hs.run = [&](int T, const int32_t* tokens, int64_t pos0, std::string& e) -> bool {
+                    const auto wk_t0 = Clock::now();
                     // a prompt's loan goes back before a window reads the cache (as the request loop does)
                     if (!refill(e)) return false;
                     // the adaptive tier's swaps of earlier windows land first (as the decode loop does)
@@ -8485,9 +8490,21 @@ int main(int argc, char** argv) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
+                    const auto wk_t1 = Clock::now();
                     // a relay worker: the next worker runs the rest; its rows are this window's reply
-                    if (stage_relay)
-                        return next_link.run(T, tokens, pos0, wk_relay, (size_t) T * HBF, wk_out, (size_t) T * HBF, e);
+                    if (stage_relay &&
+                        !next_link.run(T, tokens, pos0, wk_relay, (size_t) T * HBF, wk_out, (size_t) T * HBF, e))
+                        return false;
+                    if (wk_timing) {
+                        wk_own_ms += std::chrono::duration<double, std::milli>(wk_t1 - wk_t0).count();
+                        wk_next_ms += std::chrono::duration<double, std::milli>(Clock::now() - wk_t1).count();
+                        if (++wk_windows % 64 == 0) {
+                            std::fprintf(stderr, "strata stage worker: windows: own layers %.2f ms%s each (64 windows)\n",
+                                         wk_own_ms / 64, stage_relay ? (", next worker " + std::to_string(wk_next_ms / 64) +
+                                                                        " ms").c_str() : "");
+                            wk_own_ms = wk_next_ms = 0;
+                        }
+                    }
                     return true;
                 };
                 hs.commit = [&](int n_keep, std::string& e) -> bool {
