@@ -2,10 +2,13 @@
 #include "strata/net/stage_link.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -26,6 +29,12 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+// STRATA_REMOTE_TIMING=1: one line per prompt chunk and every 64th window, the worker's own time and the link's
+bool remote_timing() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_REMOTE_TIMING"); return v && v[0] == '1'; }();
+    return on;
+}
 
 #if !defined(_WIN32)
 
@@ -195,32 +204,21 @@ bool StageClient::connect(const std::string& host_port, const StageHello& mine, 
 #endif
 }
 
-bool StageClient::roundtrip_(const StageHeader& h, const void* p1, size_t n1, const void* p2, size_t n2, StageMsg want,
-                             void* reply, size_t reply_bytes, std::string& err) {
+// the next reply: `want` with exactly reply_bytes of payload, or the worker's error (the connection then stays)
+bool StageClient::read_reply_(StageMsg want, void* reply, size_t reply_bytes, int64_t& worker_us, std::string& err) {
 #if defined(_WIN32)
-    (void) h; (void) p1; (void) n1; (void) p2; (void) n2; (void) want; (void) reply; (void) reply_bytes;
+    (void) want; (void) reply; (void) reply_bytes; (void) worker_us;
     err = "remote stage: not supported on Windows";
     return false;
 #else
-    if (fd_ < 0) { err = "remote stage: not connected"; return false; }
     StageHeader r;
-    const auto t0 = Clock::now();
-    if (!send_msg(fd_, h, p1, n1, p2, n2, err)) { close(); return false; }
-    const auto t1 = Clock::now();
     if (!recv_header(fd_, r, err)) { close(); return false; }
-    const auto t2 = Clock::now();
-    last_send_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    last_wait_ms_ = std::chrono::duration<double, std::milli>(t2 - t1).count();
-    stats_.ms_send += last_send_ms_;
-    stats_.ms_wait += last_wait_ms_;
-    last_worker_ms_ = (double) r.a / 1000.0;   // the worker's own time (a reply's `a`, microseconds)
-    stats_.bytes_out += sizeof h + n1 + n2;
     if (r.type == (uint32_t) StageMsg::Error) {
         std::string m((size_t) r.bytes, '\0');
         std::string e2;
         (void) recv_all(fd_, m.data(), m.size(), e2);
         err = "remote stage (worker): " + m;
-        return false;   // the connection stays: the worker reported and waits for the next message
+        return false;
     }
     if (r.type != (uint32_t) want || r.bytes != reply_bytes) {
         char buf[160];
@@ -231,41 +229,48 @@ bool StageClient::roundtrip_(const StageHeader& h, const void* p1, size_t n1, co
         return false;
     }
     if (reply_bytes > 0 && !recv_all(fd_, reply, reply_bytes, err)) { close(); return false; }
-    last_recv_ms_ = ms_since(t2);
-    stats_.ms_recv += last_recv_ms_;
+    worker_us = r.a;
     stats_.bytes_in += sizeof r + reply_bytes;
     return true;
 #endif
 }
 
-// STRATA_REMOTE_TIMING=1: one line per prompt chunk and every 64th window, with the round trip's three parts
-static bool remote_timing() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_REMOTE_TIMING"); return v && v[0] == '1'; }();
-    return on;
-}
-
 bool StageClient::run(int T, const int32_t* tokens, int64_t pos0, const float* rows_in, size_t in_floats,
                       float* rows_out, size_t out_floats, std::string& err) {
-    std::lock_guard<std::mutex> lk(mu_);
+#if defined(_WIN32)
+    (void) T; (void) tokens; (void) pos0; (void) rows_in; (void) in_floats; (void) rows_out; (void) out_floats;
+    err = "remote stage: not supported on Windows";
+    return false;
+#else
+    std::lock_guard<std::mutex> ls(send_mu_);
+    std::lock_guard<std::mutex> lr(recv_mu_);
+    if (fd_ < 0) { err = "remote stage: not connected"; return false; }
     const auto t0 = Clock::now();
     StageHeader h;
     h.type = (uint32_t) StageMsg::Run;
     h.a = T;
     h.b = pos0;
     h.bytes = (uint64_t) T * sizeof(int32_t) + in_floats * sizeof(float);
-    const bool ok = roundtrip_(h, tokens, (size_t) T * sizeof(int32_t), rows_in, in_floats * sizeof(float),
-                               StageMsg::RunOk, rows_out, out_floats * sizeof(float), err);
-    ++stats_.runs;
+    if (!send_msg(fd_, h, tokens, (size_t) T * sizeof(int32_t), rows_in, in_floats * sizeof(float), err)) {
+        close();
+        return false;
+    }
+    stats_.bytes_out += sizeof h + h.bytes;
+    int64_t wus = 0;
+    const bool ok = read_reply_(StageMsg::RunOk, rows_out, out_floats * sizeof(float), wus, err);
     const double ms = ms_since(t0);
+    ++stats_.runs;
     stats_.ms_run += ms;
-    win_worker_ms_ += last_worker_ms_;
+    stats_.ms_run_worker += (double) wus / 1000.0;
     if (remote_timing() && (stats_.runs & 63) == 0)
         std::fprintf(stderr, "strata remote: %llu windows: mean %.2f ms a round trip = worker %.2f + link %.2f "
-                             "(last: T=%d, %.2f = %.2f + %.2f)\n",
+                             "(last: T=%d at %lld, %.2f = %.2f + %.2f)\n",
                      (unsigned long long) stats_.runs, stats_.ms_run / (double) stats_.runs,
-                     win_worker_ms_ / (double) stats_.runs, (stats_.ms_run - win_worker_ms_) / (double) stats_.runs, T, ms,
-                     last_worker_ms_, ms - last_worker_ms_);
+                     stats_.ms_run_worker / (double) stats_.runs,
+                     (stats_.ms_run - stats_.ms_run_worker) / (double) stats_.runs, T, (long long) pos0, ms,
+                     (double) wus / 1000.0, ms - (double) wus / 1000.0);
     return ok;
+#endif
 }
 
 bool StageClient::commit(int n_keep, std::string& err) {
@@ -274,7 +279,7 @@ bool StageClient::commit(int n_keep, std::string& err) {
     err = "remote stage: not supported on Windows";
     return false;
 #else
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<std::mutex> lk(send_mu_);
     if (fd_ < 0) { err = "remote stage: not connected"; return false; }
     StageHeader h;
     h.type = (uint32_t) StageMsg::Commit;
@@ -286,10 +291,15 @@ bool StageClient::commit(int n_keep, std::string& err) {
 #endif
 }
 
-bool StageClient::prefill(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows_in,
-                          size_t row_floats, float* rows_out, int64_t skip, std::string& err) {
-    std::lock_guard<std::mutex> lk(mu_);
-    const auto t0 = Clock::now();
+bool StageClient::prefill_send(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows_in,
+                               size_t row_floats, int64_t skip, std::string& err) {
+#if defined(_WIN32)
+    (void) tokens; (void) T; (void) pos0; (void) flags; (void) rows_in; (void) row_floats; (void) skip;
+    err = "remote stage: not supported on Windows";
+    return false;
+#else
+    std::lock_guard<std::mutex> lk(send_mu_);
+    if (fd_ < 0) { err = "remote stage: not connected"; return false; }
     skip = std::max<int64_t>(0, std::min<int64_t>(skip, T));
     StageHeader h;
     h.type = (uint32_t) StageMsg::Prefill;
@@ -297,29 +307,79 @@ bool StageClient::prefill(const int64_t* tokens, int64_t T, int64_t pos0, int64_
     h.b = pos0;
     h.c = (flags & 0xff) | (skip << 8);
     const size_t in_bytes = (size_t) T * row_floats * sizeof(float);
-    const size_t out_bytes = (size_t) (T - skip) * row_floats * sizeof(float);
     h.bytes = (uint64_t) T * sizeof(int64_t) + in_bytes;
-    const bool ok = roundtrip_(h, tokens, (size_t) T * sizeof(int64_t), rows_in, in_bytes, StageMsg::PrefillOk,
-                               rows_out + (size_t) skip * row_floats, out_bytes, err);
-    ++stats_.prefills;
+    {
+        std::lock_guard<std::mutex> lq(q_mu_);
+        sent_at_.push_back(Clock::now());
+    }
+    if (!send_msg(fd_, h, tokens, (size_t) T * sizeof(int64_t), rows_in, in_bytes, err)) { close(); return false; }
+    stats_.bytes_out += sizeof h + h.bytes;
+    return true;
+#endif
+}
+
+bool StageClient::prefill_recv(float* rows_out, size_t row_floats, int64_t T, int64_t skip, std::string& err) {
+    std::lock_guard<std::mutex> lk(recv_mu_);
+    if (fd_ < 0) { err = "remote stage: not connected"; return false; }
+    skip = std::max<int64_t>(0, std::min<int64_t>(skip, T));
+    int64_t wus = 0;
+    const bool ok = read_reply_(StageMsg::PrefillOk, rows_out + (size_t) skip * row_floats,
+                                (size_t) (T - skip) * row_floats * sizeof(float), wus, err);
+    Clock::time_point t0 = Clock::now();
+    {
+        std::lock_guard<std::mutex> lq(q_mu_);
+        if (!sent_at_.empty()) {
+            t0 = sent_at_.front();
+            sent_at_.pop_front();
+        }
+    }
     const double ms = ms_since(t0);
+    ++stats_.prefills;
     stats_.ms_prefill += ms;
     if (remote_timing())
-        std::fprintf(stderr, "strata remote: chunk T=%lld at %lld: %.0f ms = worker %.0f + link %.0f (%lld rows back)\n",
-                     (long long) T, (long long) pos0, ms, last_worker_ms_, ms - last_worker_ms_, (long long) (T - skip));
+        std::fprintf(stderr, "strata remote: chunk T=%lld: %.0f ms from its send to its rows = worker %.0f + link and "
+                             "queue %.0f (%lld rows back)\n",
+                     (long long) T, ms, (double) wus / 1000.0, ms - (double) wus / 1000.0, (long long) (T - skip));
     return ok;
 }
 
 bool StageClient::reset(std::string& err) {
-    std::lock_guard<std::mutex> lk(mu_);
+#if defined(_WIN32)
+    err = "remote stage: not supported on Windows";
+    return false;
+#else
+    std::lock_guard<std::mutex> ls(send_mu_);
+    std::lock_guard<std::mutex> lr(recv_mu_);
+    if (fd_ < 0) { err = "remote stage: not connected"; return false; }
     StageHeader h;
     h.type = (uint32_t) StageMsg::Reset;
-    const bool ok = roundtrip_(h, nullptr, 0, nullptr, 0, StageMsg::ResetOk, nullptr, 0, err);
+    if (!send_msg(fd_, h, nullptr, 0, nullptr, 0, err)) { close(); return false; }
+    int64_t wus = 0;
     ++stats_.resets;
-    return ok;
+    return read_reply_(StageMsg::ResetOk, nullptr, 0, wus, err);
+#endif
 }
 
 // ------------------------------------------------------------------------------------------------ serve_stage
+
+#if !defined(_WIN32)
+namespace {
+
+// One message as the receiving thread read it.  A prompt chunk's rows are already in buf.pf_in[slot].
+struct Inbox {
+    StageHeader h;
+    std::vector<int32_t> tok32;
+    std::vector<int64_t> tok64;
+    std::vector<float> rows;    ///< a window's rows (copied to run_in by the serving thread)
+    StageHello hello;
+    int slot = -1;
+    std::string bad;            ///< the message was malformed: reply this error
+    bool closed = false;        ///< the connection ended (err says why)
+    std::string err;
+};
+
+}  // namespace
+#endif
 
 int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, StageStats& stats, const bool* stop) {
 #if defined(_WIN32)
@@ -343,8 +403,6 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
     }
     std::fprintf(stderr, "strata stage worker: listening on port %d\n", port);
     std::fflush(stderr);
-    std::vector<int32_t> tok32;
-    std::vector<int64_t> tok64;
     while (stop == nullptr || !*stop) {
         pollfd pfd{lfd, POLLIN, 0};
         const int pr = ::poll(&pfd, 1, 1000);
@@ -361,6 +419,75 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
         (void) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof tv0);
         std::fprintf(stderr, "strata stage worker: connection from %s\n", host);
         std::fflush(stderr);
+
+        // ---- the receiving thread: whole messages into a queue, a prompt chunk's rows straight into a free pf_in
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<Inbox> q;
+        bool slot_busy[2] = {false, false};
+        std::atomic<bool> quit{false};
+        std::thread reader([&] {
+            for (;;) {
+                Inbox in;
+                if (!recv_header(fd, in.h, in.err)) {
+                    in.closed = true;
+                } else {
+                    const StageMsg type = (StageMsg) in.h.type;
+                    if (type == StageMsg::Hello) {
+                        if (in.h.bytes != sizeof in.hello) {
+                            in.bad = "bad hello";
+                            if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                        } else if (!recv_all(fd, &in.hello, sizeof in.hello, in.err)) {
+                            in.closed = true;
+                        }
+                    } else if (type == StageMsg::Run) {
+                        const int64_t T = in.h.a;
+                        const size_t rows = (size_t) std::max<int64_t>(T, 0) * (size_t) buf.handoff_floats;
+                        if (T < 1 || rows > buf.run_floats || in.h.bytes != (uint64_t) T * 4 + rows * 4) {
+                            in.bad = "bad window size";
+                            if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                        } else {
+                            in.tok32.resize((size_t) T);
+                            in.rows.resize(rows);
+                            if (!recv_all(fd, in.tok32.data(), (size_t) T * 4, in.err) ||
+                                !recv_all(fd, in.rows.data(), rows * 4, in.err))
+                                in.closed = true;
+                        }
+                    } else if (type == StageMsg::Prefill) {
+                        const int64_t T = in.h.a;
+                        const size_t rows = (size_t) std::max<int64_t>(T, 0) * (size_t) buf.pf_row_floats;
+                        if (T < 1 || rows > buf.pf_floats || in.h.bytes != (uint64_t) T * 8 + rows * 4) {
+                            in.bad = "bad prompt chunk size";
+                            if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                        } else {
+                            {   // a free buffer: the serving thread releases one when it has read that chunk
+                                std::unique_lock<std::mutex> lk(mu);
+                                cv.wait(lk, [&] { return !slot_busy[0] || !slot_busy[1] || quit.load(); });
+                                if (quit.load()) break;
+                                in.slot = !slot_busy[0] ? 0 : 1;
+                                slot_busy[in.slot] = true;
+                            }
+                            in.tok64.resize((size_t) T);
+                            if (!recv_all(fd, in.tok64.data(), (size_t) T * 8, in.err) ||
+                                !recv_all(fd, buf.pf_in[in.slot], rows * 4, in.err))
+                                in.closed = true;
+                        }
+                    } else if (type != StageMsg::Commit && type != StageMsg::Reset) {
+                        in.bad = "unknown message type " + std::to_string(in.h.type);
+                        if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                    }
+                }
+                const bool closed = in.closed;
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    q.push_back(std::move(in));
+                }
+                cv.notify_all();
+                if (closed || quit.load()) break;
+            }
+        });
+
+        // ---- the serving thread (this one): the messages in order
         std::string err, pending_err;   // pending_err: a failed one-way message, reported on the next reply
         bool greeted = false;
         auto reply_error = [&](const std::string& m) -> bool {
@@ -371,22 +498,38 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
             return send_msg(fd, e, m.data(), m.size(), nullptr, 0, se);
         };
         for (;;) {
-            StageHeader m;
-            if (!recv_header(fd, m, err)) break;
-            const auto t0 = Clock::now();
-            stats.bytes_in += sizeof m + m.bytes;
-            const StageMsg type = (StageMsg) m.type;
-            if (!greeted && type != StageMsg::Hello) {
-                (void) reply_error("hello first");
-                break;
+            Inbox in;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return !q.empty(); });
+                in = std::move(q.front());
+                q.pop_front();
             }
-            bool ok = true, keep = true;
+            if (in.closed) { err = in.err; break; }
+            auto release = [&] {
+                if (in.slot < 0) return;
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    slot_busy[in.slot] = false;
+                }
+                in.slot = -1;
+                cv.notify_all();
+            };
+            const StageMsg type = (StageMsg) in.h.type;
+            stats.bytes_in += sizeof in.h + in.h.bytes;
+            if (!greeted && type != StageMsg::Hello) { (void) reply_error("hello first"); release(); break; }
+            if (!in.bad.empty()) {
+                release();
+                if (!reply_error(in.bad)) break;
+                continue;
+            }
+            bool keep = true;
+            const auto t0 = Clock::now();
             switch (type) {
             case StageMsg::Hello: {
-                StageHello theirs, mine;
-                if (m.bytes != sizeof theirs || !recv_all(fd, &theirs, sizeof theirs, err)) { keep = false; break; }
+                StageHello mine;
                 std::string he;
-                if (!h.hello(theirs, mine, he) || !hello_matches(theirs, mine, he)) {
+                if (!h.hello(in.hello, mine, he) || !hello_matches(in.hello, mine, he)) {
                     (void) reply_error(he);
                     keep = false;
                     break;
@@ -397,68 +540,47 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
                 if (!send_msg(fd, r, &mine, sizeof mine, nullptr, 0, err)) keep = false;
                 greeted = true;
                 std::fprintf(stderr, "strata stage worker: main process %s: layers %d.. here, context %lld, chunk %lld\n",
-                             host, theirs.layer_begin, (long long) theirs.max_context, (long long) theirs.chunk);
+                             host, in.hello.layer_begin, (long long) in.hello.max_context, (long long) in.hello.chunk);
                 std::fflush(stderr);
                 break;
             }
             case StageMsg::Run: {
-                const int T = (int) m.a;
-                const size_t rows = (size_t) T * (size_t) buf.handoff_floats;
-                if (T < 1 || rows > buf.run_floats || m.bytes != (uint64_t) T * 4 + rows * 4) {
-                    (void) drain(fd, m.bytes, err);
-                    ok = reply_error("bad window size");
-                    break;
-                }
-                tok32.resize((size_t) T);
-                if (!recv_all(fd, tok32.data(), (size_t) T * 4, err) || !recv_all(fd, buf.run_in, rows * 4, err)) {
-                    keep = false;
-                    break;
-                }
+                const int T = (int) in.h.a;
+                std::memcpy(buf.run_in, in.rows.data(), in.rows.size() * 4);
                 std::string e;
-                const auto tw = Clock::now();
+                bool ok;
                 if (!pending_err.empty()) { e = pending_err; pending_err.clear(); ok = false; }
-                else ok = h.run(T, tok32.data(), m.b, e);
-                if (!ok) { ok = reply_error(e); break; }
+                else ok = h.run(T, in.tok32.data(), in.h.b, e);
+                if (!ok) { keep = reply_error(e); break; }
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::RunOk;
-                r.a = (int64_t) (ms_since(tw) * 1000.0);   // the worker's own time on the window, microseconds
-                r.bytes = rows * 4;
-                if (!send_msg(fd, r, buf.run_out, rows * 4, nullptr, 0, err)) keep = false;
-                stats.bytes_out += sizeof r + rows * 4;
+                r.a = (int64_t) (ms_since(t0) * 1000.0);   // the worker's own time, microseconds
+                r.bytes = in.rows.size() * 4;
+                if (!send_msg(fd, r, buf.run_out, in.rows.size() * 4, nullptr, 0, err)) keep = false;
+                stats.bytes_out += sizeof r + r.bytes;
                 ++stats.runs;
                 stats.ms_run += ms_since(t0);
                 break;
             }
             case StageMsg::Commit: {
                 std::string e;
-                if (pending_err.empty() && !h.commit((int) m.a, e)) pending_err = e;
+                if (pending_err.empty() && !h.commit((int) in.h.a, e)) pending_err = e;
                 ++stats.commits;
                 break;
             }
             case StageMsg::Prefill: {
-                const int64_t T = m.a;
-                const size_t rows = (size_t) T * (size_t) buf.pf_row_floats;
-                if (T < 1 || rows > buf.pf_floats || m.bytes != (uint64_t) T * 8 + rows * 4) {
-                    (void) drain(fd, m.bytes, err);
-                    ok = reply_error("bad prompt chunk size");
-                    break;
-                }
-                tok64.resize((size_t) T);
-                if (!recv_all(fd, tok64.data(), (size_t) T * 8, err) || !recv_all(fd, buf.pf_in, rows * 4, err)) {
-                    keep = false;
-                    break;
-                }
+                const int64_t T = in.h.a;
+                const int64_t skip = std::max<int64_t>(0, std::min<int64_t>(in.h.c >> 8, T));
                 std::string e;
-                const int64_t skip = std::max<int64_t>(0, std::min<int64_t>(m.c >> 8, T));
-                const auto tw = Clock::now();
+                bool ok;
                 if (!pending_err.empty()) { e = pending_err; pending_err.clear(); ok = false; }
-                else ok = h.prefill(tok64.data(), T, m.b, m.c & 0xff, e);
-                if (!ok) { ok = reply_error(e); break; }
-                const double work_ms = ms_since(tw);
+                else ok = h.prefill(in.tok64.data(), T, in.h.b, in.h.c & 0xff, buf.pf_in[in.slot], e);
+                release();   // the chunk is read (its rows were uploaded before `prefill` returned)
+                if (!ok) { keep = reply_error(e); break; }
+                const double work_ms = ms_since(t0);
                 if (remote_timing())
-                    std::fprintf(stderr, "strata stage worker: chunk T=%lld at %lld: received in %.0f ms, read in %.0f ms\n",
-                                 (long long) T, (long long) m.b, std::chrono::duration<double, std::milli>(tw - t0).count(),
-                                 work_ms);
+                    std::fprintf(stderr, "strata stage worker: chunk T=%lld at %lld: read in %.0f ms\n", (long long) T,
+                                 (long long) in.h.b, work_ms);
                 const size_t back = (size_t) (T - skip) * (size_t) buf.pf_row_floats;
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::PrefillOk;
@@ -468,13 +590,13 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
                     keep = false;
                 stats.bytes_out += sizeof r + back * 4;
                 ++stats.prefills;
-                stats.ms_prefill += ms_since(t0);
+                stats.ms_prefill += work_ms;
                 break;
             }
             case StageMsg::Reset: {
                 std::string e;
                 pending_err.clear();
-                if (!h.reset(e)) { ok = reply_error(e); break; }
+                if (!h.reset(e)) { keep = reply_error(e); break; }
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::ResetOk;
                 if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
@@ -482,12 +604,17 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
                 break;
             }
             default:
-                (void) drain(fd, m.bytes, err);
-                ok = reply_error("unknown message type " + std::to_string(m.type));
+                keep = reply_error("unknown message type " + std::to_string(in.h.type));
                 break;
             }
-            if (!keep || !ok) break;
+            release();
+            if (!keep) break;
         }
+        // end the receiving thread: shutting the socket down wakes a blocked recv
+        quit.store(true);
+        (void) ::shutdown(fd, SHUT_RDWR);
+        cv.notify_all();
+        reader.join();
         ::close(fd);
         std::fprintf(stderr, "strata stage worker: %s disconnected%s%s\n", host, err.empty() ? "" : ": ", err.c_str());
         std::fflush(stderr);

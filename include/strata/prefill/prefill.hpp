@@ -167,11 +167,13 @@ public:
 
     /// REMOTE STAGE (remote-stage fork), the main side: this stage ends before the last layer and the rest of the
     /// model runs in another process.  Instead of a `next` stage, every chunk's rows (T x hc*n_embd floats, pinned
-    /// host) go to `remote_chunk`, which must write the worker's final rows to `rows_out` (pinned host); they are
-    /// uploaded and passed to `on_chunk` - on a thread, so this stage reads chunk c + 1 meanwhile.  `flags` bit 0:
-    /// the prompt is one chunk.  Set before `init`.
+    /// host) go to `remote_send` (on a thread, in order: this stage reads chunk c + 1 meanwhile), and on another
+    /// thread, in the same order, `remote_recv` writes the worker's final rows [skip, T) to `rows_out` (pinned
+    /// host); they are uploaded and passed to `on_chunk`.  The worker reads chunk c while chunk c + 1 is on the
+    /// wire.  `flags` bit 0: the prompt is one chunk.  Set both before `init`.
     std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows_in,
-                       float* rows_out, int64_t skip, std::string& err)> remote_chunk;
+                       int64_t skip, std::string& err)> remote_send;
+    std::function<bool(float* rows_out, int64_t T, int64_t skip, std::string& err)> remote_recv;
     /// REMOTE STAGE: `on_chunk` reads no row before this position (the drafter's window starts later), so the worker
     /// sends back only the rows from it - `skip` rows fewer for the chunks before it.  Per prompt; default all rows.
     void set_remote_rows_from(int64_t pos) { remote_rows_from_ = pos; }
@@ -204,9 +206,10 @@ private:
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     bool drain_pipeline(std::string& err);
-    // remote-stage: one chunk through the worker, then on_chunk on its rows (runs on the hand-off thread)
-    bool remote_tail(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows, int device,
-                     std::string& err);
+    // remote-stage: one chunk's reply from the worker, then on_chunk on its rows (runs on the receiving thread)
+    bool remote_tail(int64_t T, int64_t pos0, int64_t skip, int device, std::string& err);
+    std::future<bool> send_run_;        ///< remote-stage: the last chunk's send
+    std::string send_err_, recv_err_;
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     int64_t remote_rows_from_ = 0;      ///< set_remote_rows_from

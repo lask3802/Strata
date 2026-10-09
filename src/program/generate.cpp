@@ -6567,9 +6567,12 @@ int main(int argc, char** argv) {
             if (remote_main) {   // remote-stage: every chunk's rows go to the worker; its final rows come back for on_chunk
                 sp.set_stage(0, split_at[0], nullptr);
                 const size_t row_f = (size_t) (g.hc * g.n_embd);
-                sp.remote_chunk = [&remote_link, row_f](const int64_t* tk, int64_t T, int64_t p0, int64_t flags,
-                                                        const float* in, float* out, int64_t skip, std::string& e) {
-                    return remote_link.prefill(tk, T, p0, flags, in, row_f, out, skip, e);
+                sp.remote_send = [&remote_link, row_f](const int64_t* tk, int64_t T, int64_t p0, int64_t flags,
+                                                       const float* in, int64_t skip, std::string& e) {
+                    return remote_link.prefill_send(tk, T, p0, flags, in, row_f, skip, e);
+                };
+                sp.remote_recv = [&remote_link, row_f](float* out, int64_t T, int64_t skip, std::string& e) {
+                    return remote_link.prefill_recv(out, row_f, T, skip, e);
                 };
             }
             if (stage_worker) sp.set_stage(own_lo, -1, nullptr);
@@ -8249,8 +8252,9 @@ int main(int argc, char** argv) {
                 // remote-stage worker: serve the main process instead of stdin.  A prompt starts with a reset; windows,
                 // commits and chunks arrive in order, each whole, and run here one at a time.
                 const int64_t pf_chunk = sp.chunk();
-                float *pf_in = nullptr, *pf_out = nullptr;
-                if (cudaHostAlloc((void**) &pf_in, (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) != cudaSuccess ||
+                float *pf_in[2] = {nullptr, nullptr}, *pf_out = nullptr;   // two in: one on the wire, one being read
+                if (cudaHostAlloc((void**) &pf_in[0], (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostAlloc((void**) &pf_in[1], (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) != cudaSuccess ||
                     cudaHostAlloc((void**) &pf_out, (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: the stage worker's prompt buffers do not fit in RAM\n");
                     return 1;
@@ -8291,8 +8295,9 @@ int main(int argc, char** argv) {
                     return true;
                 };
                 hs.commit = [&](int n_keep, std::string& e) -> bool { return ver.commit(n_keep, e) && ver.wait_commit(e); };
-                hs.prefill = [&](const int64_t* tokens, int64_t T, int64_t p0, int64_t flags, std::string& e) -> bool {
-                    sp.set_hand_in(pf_in);
+                hs.prefill = [&](const int64_t* tokens, int64_t T, int64_t p0, int64_t flags, const float* rows_in,
+                                 std::string& e) -> bool {
+                    sp.set_hand_in(rows_in);
                     sp.set_single_chunk((flags & 1) != 0);
                     return sp.run(tokens, T, p0, e);
                 };
@@ -8309,7 +8314,8 @@ int main(int argc, char** argv) {
                 bufs.run_in = wk_in;
                 bufs.run_out = wk_out;
                 bufs.run_floats = (size_t) strata::kernels::kVerifyMaxT * (size_t) HBF;
-                bufs.pf_in = pf_in;
+                bufs.pf_in[0] = pf_in[0];
+                bufs.pf_in[1] = pf_in[1];
                 bufs.pf_out = pf_out;
                 bufs.pf_floats = (size_t) (pf_chunk * D);
                 bufs.handoff_floats = HBF;
