@@ -23,7 +23,7 @@
 namespace strata::net {
 
 inline constexpr uint32_t kStageMagic = 0x4d525453u;   // "STRM"
-inline constexpr uint32_t kStageProtocol = 2;
+inline constexpr uint32_t kStageProtocol = 3;
 
 enum class StageMsg : uint32_t {
     Hello = 1,
@@ -58,7 +58,9 @@ struct StageHello {
     int64_t max_context = 0;
     int64_t chunk = 0;            ///< the largest prompt chunk the main process sends
     int64_t handoff_floats = 0;   ///< floats per verify-window row
+    uint64_t pack_hash = 0;       ///< the model pack's fingerprint (both sides must load the same model)
     char build[64] = {};          ///< engine build id (informational)
+    char token[64] = {};          ///< the shared secret (STRATA_STAGE_TOKEN); the worker refuses a wrong one
 };
 #pragma pack(pop)
 
@@ -81,7 +83,7 @@ public:
 
     /// "host:port".  Sends `mine`, receives the worker's hello into `peer` and checks it against `mine`.
     bool connect(const std::string& host_port, const StageHello& mine, StageHello& peer, std::string& err);
-    bool connected() const { return fd_ >= 0; }
+    bool connected() const { return fd_ >= 0 && !broken_; }
     void close();
 
     /// One verify window: send T tokens and T rows (in_floats floats), receive T rows (out_floats floats).
@@ -102,7 +104,11 @@ public:
 
 private:
     bool read_reply_(StageMsg want, void* reply, size_t reply_bytes, int64_t& worker_us, std::string& err);
+    /// a failed link: shut down (both directions fail from now on) - the descriptor is closed only by close(), so
+    /// the other thread never reads or writes a number the process may have reused
+    void break_();
     int fd_ = -1;
+    bool broken_ = false;
     std::string peer_;
     std::mutex send_mu_, recv_mu_, q_mu_;
     std::deque<std::chrono::steady_clock::time_point> sent_at_;   ///< outstanding chunks' send start (timing)
@@ -133,8 +139,10 @@ struct StageBuffers {
     int64_t pf_row_floats = 0;  ///< floats per prompt row (D)
 };
 
-/// Listens on `port` (all interfaces) and serves one main process at a time until `stop` is set or listening fails.
-/// Returns 0 when stopped, nonzero on a listen error (with the reason on stderr).
-int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, StageStats& stats, const bool* stop);
+/// Listens on `bind_addr`:`port` (empty: every interface) and serves one main process at a time until `stop` is set
+/// or listening fails.  `token`: the secret a main process's hello must carry (empty: none - any host that reaches
+/// the port can drive the worker).  Returns 0 when stopped, nonzero on a listen error (the reason on stderr).
+int serve_stage(const std::string& bind_addr, int port, const std::string& token, const StageHandlers& h,
+                const StageBuffers& buf, StageStats& stats, const bool* stop);
 
 }  // namespace strata::net

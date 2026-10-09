@@ -3938,7 +3938,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 auto prev = std::make_shared<std::future<bool>>(std::move(next_run_));
                 const int dev = m.device;
                 next_run_ = std::async(std::launch::async, [this, prev, T, p0, skip, dev] {
-                    if (prev->valid() && !prev->get()) return false;
+                    if (prev->valid() && !prev->get()) {
+                        // an earlier chunk failed: still take this chunk's reply off the link, so the next
+                        // request's reset does not read it
+                        std::string ignored;
+                        (void) remote_recv(impl_->rx_host, T, skip, ignored);
+                        return false;
+                    }
                     return remote_tail(T, p0, skip, dev, recv_err_);
                 });
                 hand_buf_ ^= 1;

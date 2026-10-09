@@ -583,6 +583,9 @@ struct Options {
     /// remote-stage fork, the worker: listen on this port and run layers [stage_begin, n_layers) without the head
     int stage_worker = 0;
     int64_t stage_begin = -1;
+    /// the worker's listening address (--stage-bind ADDR; empty: every interface).  STRATA_STAGE_TOKEN (both sides)
+    /// is the shared secret the worker requires in the main process's hello
+    std::string stage_bind;
     /// --split-skip-if-fits (opt-in; the server passes it for a config's "split_skip_if_fits"): with
     /// --layer-split auto, run on CUDA0 alone when it holds every profiled expert pair plus the whole session (KV),
     /// the drafter and the reserve - a split then only adds hand-offs (two RDNA4 cards: 1,384 vs 1,794 tok/s at 4K)
@@ -1819,6 +1822,7 @@ int main(int argc, char** argv) {
         else if (a == "--remote-stage") o.remote_stage = next("--remote-stage");
         else if (a == "--stage-worker") o.stage_worker = std::atoi(next("--stage-worker"));
         else if (a == "--stage-begin") o.stage_begin = std::atoll(next("--stage-begin"));
+        else if (a == "--stage-bind") o.stage_bind = next("--stage-bind");
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
@@ -2056,6 +2060,12 @@ int main(int argc, char** argv) {
             why = "--stage-worker needs --stage-begin K (K >= 2, the main process's --layer-split K) and no --layer-split";
         else if (o.batch > 0 || o.pipeline_windows > 0 || o.vision || o.peer_device >= 0)
             why = "it does not support --batch, --pipeline-windows, --vision or --peer-device";
+        // a control vector (and the speed projection, which is one) and helper-GPU expert caches act on every layer:
+        // the worker would not apply them to its layers
+        else if (!o.cvec_files.empty())
+            why = "it does not carry --control-vector (or a speed projection) to the worker's layers";
+        else if (o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)
+            why = "it does not support --expert-cache-remote";
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: remote stage: %s\n", why);
             return 2;
@@ -2064,6 +2074,7 @@ int main(int argc, char** argv) {
         o.prompt_cache = 0;
         o.conversation_cache_mib = 0;
         o.prompt_cache_every = 0;
+        o.kv_grow = false;   // the elastic K/V gives this process's cache slots up without the other side knowing
         if (remote_main) own_hi = split_at[0];
         else own_lo = o.stage_begin;
         std::fprintf(stderr, "strata generate: remote stage: this process holds layers %lld-%s%s\n", (long long) own_lo,
@@ -3848,7 +3859,7 @@ int main(int argc, char** argv) {
             bool remote = false;
             for (const int r : o.expert_cache_remote) remote = remote || r > 0;
             const bool asked = ev != nullptr && ev[0] != '\0' ? ev[0] != '0' : o.kv_grow;
-            const bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
+            const bool on = asked && !multi_gpu && !remote_main && !stage_worker && o.kv_resident <= 0 &&
                             !o.expert_profile.empty() && !o.resident_cpu_experts && o.expert_cache != 0 && !remote &&
                             strata::core::vmm_available() &&
                             // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range
@@ -8354,6 +8365,22 @@ int main(int argc, char** argv) {
             me.chunk = sp.chunk();
             me.handoff_floats = HBF;
             std::snprintf(me.build, sizeof me.build, "strata remote-stage %s", stage_worker ? "worker" : "main");
+            // the model pack's fingerprint: its tensor index and expert table (the same model on both PCs)
+            for (const char* f : {"/index.txt", "/native_experts.txt"}) {
+                std::FILE* pf = std::fopen((o.pack + f).c_str(), "rb");
+                if (pf == nullptr) continue;
+                std::vector<char> b(1 << 16);
+                me.pack_hash = fnv1a(f, std::strlen(f), me.pack_hash == 0 ? 1469598103934665603ull : me.pack_hash);
+                for (size_t n; (n = std::fread(b.data(), 1, b.size(), pf)) > 0;) me.pack_hash = fnv1a(b.data(), n, me.pack_hash);
+                std::fclose(pf);
+            }
+            const char* tok_env = std::getenv("STRATA_STAGE_TOKEN");
+            const std::string stage_token = tok_env != nullptr ? tok_env : "";
+            if (stage_token.size() >= sizeof me.token) {
+                std::fprintf(stderr, "strata serve: STRATA_STAGE_TOKEN is longer than %zu characters\n", sizeof me.token - 1);
+                return 1;
+            }
+            if (remote_main) std::memcpy(me.token, stage_token.data(), stage_token.size());
             if (remote_main) {
                 strata::net::StageHello peer;
                 if (!remote_link.connect(o.remote_stage, me, peer, err)) {
@@ -8392,7 +8419,7 @@ int main(int argc, char** argv) {
                 strata::net::StageHandlers hs;
                 int64_t main_chunk = pf_chunk;   // the main process's prompt chunk (its hello)
                 hs.hello = [&](const strata::net::StageHello& theirs, strata::net::StageHello& mine, std::string& e) {
-                    mine = me;
+                    mine = me;   // (the worker's own hello carries no token)
                     if (theirs.chunk > pf_chunk) {
                         e = "the main process reads prompts in chunks of " + std::to_string(theirs.chunk) +
                             " tokens, this worker's chunk is " + std::to_string(pf_chunk) + " (start it with --prefill " +
@@ -8466,7 +8493,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: stage worker: layers %lld-%lld, no head, prompt chunk %lld, port %d\n",
                              (long long) own_lo, (long long) g.n_layers - 1, (long long) pf_chunk, o.stage_worker);
                 std::fflush(stderr);
-                return strata::net::serve_stage(o.stage_worker, hs, bufs, wst, nullptr);
+                return strata::net::serve_stage(o.stage_bind, o.stage_worker, stage_token, hs, bufs, wst, nullptr);
             }
         }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
