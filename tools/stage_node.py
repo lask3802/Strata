@@ -14,7 +14,8 @@ node.json (paths are this PC's):
       "agent_port": 7840,
       "log_dir": "/srv/stage",
       "args": ["--spec", "4", "--max-context", "131072", "--kv", "int8", "--kv-resident", "32768"],
-      "token_file": "/srv/stage/stage-token"   or STRATA_STAGE_TOKEN in the environment
+      "token_file": "/srv/stage/stage-token",  or STRATA_STAGE_TOKEN in the environment
+      "data_dir": "/srv/stage/shipped"        where tools/stage_ship.py writes (optional)
     }
 
 Every request carries the shared token in the X-Stage-Token header (the workers get it as STRATA_STAGE_TOKEN), so
@@ -27,9 +28,16 @@ only the tuner and the main process drive this PC.  Endpoints (JSON in and out):
     GET  /log?port=P&lines=N   a worker's log tail
     POST /sink                 reads the body; answers its bytes and the seconds it took (a link test toward here)
     POST /send                 {"url": "http://other:7840", "mib": 64} - sends to another node's /sink
+    POST /put?path=P&offset=N&total=T[&mode=755]
+                               writes the body at byte N of data_dir/P (a file of T bytes, sparse where nothing
+                               was written) and answers the body's sha256; P.ranges.json records what is written
+    GET  /ranges?path=P        the byte ranges of data_dir/P written so far ([[offset, length], ...]) and its size
+The shipped model files keep every offset of the originals, so a node that holds only its layers' bytes (and
+every shard's header) loads them as from the whole file - tools/stage_ship.py sends only those.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -165,7 +173,68 @@ def tail(text: str, n: int) -> list[str]:
     return text.splitlines()[-n:]
 
 
-def make_handler(cfg: dict, workers: Workers):
+def merge_ranges(rs: list[list[int]]) -> list[list[int]]:
+    out: list[list[int]] = []
+    for off, n in sorted(rs):
+        if out and off <= out[-1][0] + out[-1][1]:
+            out[-1][1] = max(out[-1][1], off + n - out[-1][0])
+        else:
+            out.append([off, n])
+    return out
+
+
+class Store:
+    """data_dir: the shipped files and, next to each, the byte ranges written so far (P.ranges.json)."""
+
+    def __init__(self, cfg: dict):
+        self.root = Path(cfg["data_dir"]).resolve() if cfg.get("data_dir") else None
+        self.lock = threading.Lock()
+
+    def path(self, rel: str) -> Path:
+        if self.root is None:
+            raise ValueError("this node has no data_dir")
+        p = (self.root / rel).resolve()
+        if self.root not in p.parents:
+            raise ValueError(f"{rel}: outside data_dir")
+        return p
+
+    def ranges(self, rel: str) -> dict:
+        p = self.path(rel)
+        side = p.with_name(p.name + ".ranges.json")
+        rs = json.loads(side.read_text()) if side.exists() else []
+        return {"ok": True, "path": rel, "size": p.stat().st_size if p.exists() else None, "ranges": rs}
+
+    def put(self, rel: str, offset: int, total: int, body, n: int, mode: str | None) -> dict:
+        p = self.path(rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock:
+            if not p.exists() or p.stat().st_size != total:
+                with open(p, "ab"):
+                    pass
+                os.truncate(p, total)   # sparse: the bytes nobody writes stay holes
+        h = hashlib.sha256()
+        with open(p, "r+b") as f:
+            f.seek(offset)
+            left = n
+            while left > 0:
+                chunk = body.read(min(left, 4 << 20))
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                left -= len(chunk)
+        if left:
+            return {"ok": False, "error": f"the body ended {left} bytes short"}
+        if mode:
+            os.chmod(p, int(mode, 8))
+        with self.lock:
+            side = p.with_name(p.name + ".ranges.json")
+            rs = json.loads(side.read_text()) if side.exists() else []
+            side.write_text(json.dumps(merge_ranges(rs + [[offset, n]])))
+        return {"ok": True, "sha256": h.hexdigest(), "bytes": n}
+
+
+def make_handler(cfg: dict, workers: Workers, store: Store):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):   # one line per request on stderr
             sys.stderr.write("stage_node: %s %s\n" % (self.address_string(), fmt % args))
@@ -197,6 +266,11 @@ def make_handler(cfg: dict, workers: Workers):
                 self.reply(200, {"ok": True, "host": platform.node(), "system": platform.platform(),
                                  "cpus": os.cpu_count(), "gpus": gpu_info(), "ram": ram_info(),
                                  "workers": workers.running(), "bind": cfg["bind"]})
+            elif u.path == "/ranges":
+                try:
+                    self.reply(200, store.ranges(q["path"][0]))
+                except (KeyError, ValueError, OSError) as e:
+                    self.reply(400, {"ok": False, "error": str(e)})
             elif u.path == "/log":
                 port = int(q.get("port", ["7841"])[0])
                 lines = int(q.get("lines", ["200"])[0])
@@ -209,7 +283,17 @@ def make_handler(cfg: dict, workers: Workers):
         def do_POST(self):
             if not self.authorized():
                 return
-            path = urlparse(self.path).path
+            u = urlparse(self.path)
+            path = u.path
+            if path == "/put":   # a shipped file's bytes (tools/stage_ship.py)
+                q = parse_qs(u.query)
+                try:
+                    r = store.put(q["path"][0], int(q["offset"][0]), int(q["total"][0]), self.rfile,
+                                  int(self.headers.get("Content-Length", "0")), q.get("mode", [None])[0])
+                except (KeyError, ValueError, OSError) as e:
+                    r = {"ok": False, "error": str(e)}
+                self.reply(200 if r.get("ok") else 400, r)
+                return
             if path == "/sink":   # a link test: read the body as fast as it comes
                 n = int(self.headers.get("Content-Length", "0"))
                 t0 = time.perf_counter()
@@ -258,7 +342,7 @@ def main() -> None:
         sys.exit(__doc__)
     cfg = load_config(sys.argv[1])
     workers = Workers(cfg)
-    srv = ThreadingHTTPServer((cfg["bind"], int(cfg.get("agent_port", 7840))), make_handler(cfg, workers))
+    srv = ThreadingHTTPServer((cfg["bind"], int(cfg.get("agent_port", 7840))), make_handler(cfg, workers, Store(cfg)))
     sys.stderr.write(f"stage_node: listening on {cfg['bind']}:{cfg.get('agent_port', 7840)}\n")
     try:
         srv.serve_forever()
