@@ -219,6 +219,7 @@ def main() -> None:
     ap.add_argument("--profile", required=True, type=Path)
     ap.add_argument("--bin-dir", type=Path)
     ap.add_argument("--layers", required=True, help="LO-HI, both included (the node's first and last layer)")
+    ap.add_argument("--data-dir", help="the node's data_dir: print the node.json paths for what was shipped")
     a = ap.parse_args()
     token = (Path(a.token_file).read_text().strip() if a.token_file else os.environ.get("STRATA_STAGE_TOKEN", ""))
     lo, hi = (int(x) for x in a.layers.split("-"))
@@ -226,6 +227,8 @@ def main() -> None:
     t0 = time.time()
     sent = ship(Agent(a.agent, token), items)
     print(f"ship: {sent / 2**30:.2f} GiB in {time.time() - t0:.0f} s")
+    if a.data_dir:
+        print("node.json paths:", json.dumps(node_paths(a.data_dir, a.model_dir, a.pack_dir, a.profile), indent=1))
 
 
 if __name__ == "__main__":
