@@ -636,7 +636,8 @@ class Tuner:
         say("links:")
         prev = None
         for n in self.nodes:
-            base = n.stage_agent if n.call("/ping", timeout=5, base=n.stage_agent).get("ok") else n.agent
+            on_stage = n.stage_agent == n.agent or n.call("/ping", timeout=5, base=n.stage_agent).get("ok")
+            base = n.stage_agent if on_stage else n.agent
             t = []
             for _ in range(5):
                 t0 = time.perf_counter()
@@ -652,7 +653,7 @@ class Tuner:
                 r = prev.call("/send", {"url": base, "mib": 64}, timeout=300)
                 mbs = r.get("mb_s")
                 frm = prev.name
-            where = "the stage link" if base == n.stage_agent else (
+            where = "the stage link" if on_stage else (
                 f"the agent's address - the stage link to {n.host} is not measured (node.json agent_bind)")
             say(f"  {frm} -> {n.name}: {mbs or 0:.0f} MB/s, round trip {min(t):.1f} ms ({where})")
             prev = n
