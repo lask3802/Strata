@@ -298,15 +298,17 @@ python3 tools/stage_node.py node.json
   "extra": [...], "model": {"dir": ..., "native": ..., "pack": ..., "profile": ..., "ple": ...}}`) answers when the
   worker listens, or with the log's tail when it exits. `"model"` names a model shipped under `data_dir`:
   `data_dir/models/<dir>/<native>`, `data_dir/packs/<pack>`, optionally `data_dir/data/<profile>` (else node.json's
-  `expert_profile`) and `--ple-gguf data_dir/models/<dir>/<ple>` (a worker never runs the PLE layer; the engine finds
-  the shard by name). Names of letters, digits, `.`, `_` and `-` only, and every path must stay inside `data_dir`.
-  So **one agent serves every model shipped to it**; without `"model"` the worker runs the model node.json names
-  (`pack`, `native`, `ple_gguf`, `expert_profile`, optional with `data_dir`).
+  `expert_profile`, else `data_dir/data/expert-profile.bin`) and `--ple-gguf data_dir/models/<dir>/<ple>` (a worker
+  never runs the PLE layer; the engine finds the shard by name). Names of letters, digits, `.`, `_` and `-` only, not
+  dots alone and not a Windows device name, so every path stays inside `data_dir`. So **one agent serves every model
+  shipped to it**; without `"model"` the worker runs the model node.json names (`pack`, `native`, `ple_gguf`,
+  `expert_profile`, optional with `data_dir`).
 - `"gpu_clocks": {"graphics": [MIN, MAX], "memory": [MIN, MAX], "gpu": INDEX}` locks the GPU's clocks (on GPU INDEX,
-  else every GPU) while a worker runs (Windows; the agent must run as administrator, else the `/start` reply and the
-  tuner say "NOT locked"). They are reset when no worker runs: after a `/stop`, a worker that exits (noticed at the
-  next `/info`), or the agent stopped with Ctrl+C, SIGTERM or Ctrl+Break. A killed agent or a closed console window
-  leaves them locked until `nvidia-smi -rgc -rmc` or a reboot. `"agent_bind"` lets the agent listen on every
+  else every GPU) while a worker runs. It is meant for Windows workers, and works on any OS where the agent runs as
+  administrator (Windows) or root; otherwise the `/start` reply and the tuner say "NOT locked". The clocks are reset
+  when no worker runs: after a `/stop`, a worker that exits (noticed at the next `/info`), or the agent stopped with
+  Ctrl+C or Ctrl+Break (SIGTERM on Linux). A killed agent or a closed console window leaves them locked until
+  `nvidia-smi -rgc -rmc` or a reboot. `"agent_bind"` lets the agent listen on every
   interface, so the tuner's link test runs over the stage link when the workers use a second NIC.
 - Other endpoints: `GET /ping`, `GET /info` (GPU, RAM, the clock setting), `POST /stop`, `GET /log`, `POST /sink`
   and `POST /send` (a link test), `POST /put`, `GET /ranges`, `GET /sha256` (for `stage_ship.py`). A stop waits up

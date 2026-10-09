@@ -390,6 +390,8 @@ class Tuner:
                 + (f"; clocks: {r['clocks']}" if r.get("clocks") else ""))
             if "NOT locked" in str(r.get("clocks", "")):
                 self.clock_notes[n.name] = r["clocks"]
+            elif r.get("clocks"):
+                self.clock_notes.pop(n.name, None)   # locked this time (the agent restarted as administrator)
         return True, ""
 
     def prompt(self, tokens: int, salt: int) -> str:

@@ -124,7 +124,7 @@ class ModelTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_shipped_model(self):
-        d = self.d.resolve()
+        d = self.d
         m = self.w.model({"model": {"dir": "q4", "native": "M-00001-of-00003.gguf", "pack": "pk",
                                     "profile": "prof.bin"}})
         self.assertEqual(Path(m["native"]), d / "models" / "q4" / "M-00001-of-00003.gguf")
@@ -136,13 +136,18 @@ class ModelTest(unittest.TestCase):
         self.assertEqual(Path(m["ple_gguf"]), d / "models" / "q4" / "M-00002-of-00003.gguf")
 
     def test_names_only(self):
-        # "C:.." and "C:x": a drive on Windows would replace data_dir as the root
-        for bad in ("../q4", "q4/x", "..", ".", "", "a\\b", "C:..", "C:x", "q4 ", "~", "%TEMP%"):
-            with self.assertRaises(ValueError, msg=bad):
+        # "C:.." and "C:x": a drive on Windows would replace data_dir as the root; "..." is "." to Windows; NUL and
+        # COM1 are devices in any directory.  The message: refused by name, not because the file is missing.
+        for bad in ("../q4", "q4/x", "..", ".", "...", "", "a\\b", "C:..", "C:x", "q4 ", "~", "%TEMP%", "NUL",
+                    "com1.txt", "a:b"):
+            with self.assertRaisesRegex(ValueError, "plain file or directory name", msg=bad):
                 self.w.model({"model": {"dir": bad, "native": "M-00001-of-00003.gguf", "pack": "pk"}})
-            with self.assertRaises(ValueError, msg=bad):
+            with self.assertRaisesRegex(ValueError, "plain file or directory name", msg=bad):
                 self.w.model({"model": {"dir": "q4", "native": "M-00001-of-00003.gguf", "pack": "pk",
                                         "profile": bad}})
+        for good in ("q4.1", "UD-Q4_K_XL", "nul2", "console"):   # names that only look like the above
+            with self.assertRaisesRegex(ValueError, "not shipped here", msg=good):
+                self.w.model({"model": {"dir": good, "native": "M-00001-of-00003.gguf", "pack": "pk"}})
 
     def test_not_shipped(self):
         with self.assertRaisesRegex(ValueError, "not shipped here"):
@@ -190,11 +195,11 @@ class ClocksTest(unittest.TestCase):
             p.stop()
 
     def test_lock_then_reset_when_none_runs(self):
+        a, b = FakeProc(), FakeProc()
+        self.w.procs.update({7841: a, 7842: b})
         note = self.w.lock_clocks()
         self.assertEqual(note, "graphics 1500-1905 MHz: locked; memory 7001-7001 MHz: locked")
         self.assertEqual(self.calls, [["-i", "0", "-lgc", "1500,1905"], ["-i", "0", "-lmc", "7001,7001"]])
-        a, b = FakeProc(), FakeProc()
-        self.w.procs.update({7841: a, 7842: b})
         self.calls.clear()
         self.w.reap()                      # both run: nothing reset
         self.assertEqual(self.calls, [])
@@ -209,8 +214,31 @@ class ClocksTest(unittest.TestCase):
 
     def test_not_locked_says_so(self):
         self.rc = 1
+        self.w.procs[7841] = FakeProc()
         self.assertIn("NOT locked (Insufficient Permissions; the agent needs administrator / root)",
                       self.w.lock_clocks())
+
+    def test_worker_gone_before_the_lock(self):
+        p = FakeProc()
+        p.code = 1                         # exited while the agent was about to lock: no lock left behind
+        self.w.procs[7841] = p
+        self.assertEqual(self.w.lock_clocks(), "")
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.w.clocks_locked)
+
+    def test_close_stops_a_start_under_way(self):
+        self.w.close()
+        killed = []
+        fake = mock.Mock(**{"kill.side_effect": lambda: killed.append(1), "wait.return_value": 0})
+        with tempfile.TemporaryDirectory() as logs, mock.patch.object(sn.subprocess, "Popen", return_value=fake), \
+                mock.patch.object(sn.Workers, "model", return_value={"pack": "p", "native": "n", "ple_gguf": "",
+                                                                      "expert_profile": "e"}):
+            self.w.cfg.update({"_token": "t", "log_dir": logs})
+            r = self.w.start({"begin": 40, "port": 7899})
+        self.assertEqual(r["error"], "the agent is stopping")
+        self.assertEqual(killed, [1])
+        self.assertEqual(self.w.procs, {})
+        self.assertEqual(self.calls, [])   # no clock lock for it
 
 
 class TunerPiecesTest(unittest.TestCase):

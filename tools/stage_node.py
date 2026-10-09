@@ -83,6 +83,7 @@ EXTRA_ALLOWED = {"--max-context", "--stage-bind", "--vram-reserve-mib", "--vram-
                  "--kv", "--kv-resident", "--pcie-frac", "--pool-workers", "--adapt-every", "--adapt-swaps",
                  "--adapt-decay", "--spec-min-p"}
 PLAIN_NAME = re.compile(r"[A-Za-z0-9._-]+")   # a /start's model names: no separator, no drive, no space
+DEVICE_NAME = re.compile(r"(CON|PRN|AUX|NUL|COM\d|LPT\d)(\..*)?", re.I)   # a Windows device in any directory
 LISTEN_TIMEOUT_S = 600     # loading a worker's experts: up to ~30 GB from disk on a cold cache
 STOP_TIMEOUT_S = 180       # a worker with ~30 GB of pinned experts takes a while to unpin
 
@@ -151,7 +152,9 @@ class Workers:
         self.procs: dict[int, subprocess.Popen] = {}
         self.lock = threading.Lock()
         self.start_lock = threading.Lock()   # one /start at a time (two on a port would orphan the first)
+        self.clock_lock = threading.Lock()   # a clock lock or reset with its nvidia-smi calls, one at a time
         self.clocks_locked = False
+        self.closing = False                 # the agent is stopping: a /start under way stops its own worker
 
     def log_path(self, port: int) -> Path:
         return Path(self.cfg.get("log_dir", ".")) / f"stage-worker-{port}.log"
@@ -159,20 +162,26 @@ class Workers:
     def stop(self, port: int | None) -> list[int]:
         with self.lock:
             ports = [port] if port is not None else list(self.procs)
-            stopped = []
-            for p in ports:
-                proc = self.procs.pop(p, None)
-                if proc is None or proc.poll() is not None:
-                    continue
-                proc.terminate()
-                try:
-                    proc.wait(STOP_TIMEOUT_S)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(30)
-                stopped.append(p)
+            procs = [(p, self.procs.pop(p, None)) for p in ports]
+        stopped = []
+        for p, proc in procs:   # waited for outside the lock: /info answers meanwhile
+            if proc is None or proc.poll() is not None:
+                continue
+            proc.terminate()
+            try:
+                proc.wait(STOP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(30)
+            stopped.append(p)
         self.reset_clocks()
         return stopped
+
+    def close(self) -> None:
+        """The agent is stopping: every worker, and the one a /start under way is starting."""
+        with self.lock:
+            self.closing = True
+        self.stop(None)
 
     def start(self, req: dict) -> dict:
         with self.start_lock:
@@ -183,8 +192,9 @@ class Workers:
         {"model": {"dir": D, "native": F, "pack": P, "profile"?: R, "ple"?: G}} is data_dir/models/D/F,
         data_dir/packs/P, data_dir/data/R (default: node.json's expert_profile, else data/expert-profile.bin) and,
         only when named, data_dir/models/D/G for --ple-gguf (a worker never runs the PLE layer; the engine finds the
-        shard by tensor name), tools/stage_ship.py's layout.  Names of letters, digits, '.', '_' and '-' only, and
-        every path must resolve inside data_dir (a Windows "C:.." would otherwise replace the root)."""
+        shard by tensor name), tools/stage_ship.py's layout.  Names of letters, digits, '.', '_' and '-' only, not
+        dots alone and not a Windows device, so every path stays inside data_dir (a Windows "C:.." would replace the
+        root); a symlink the PC's owner put under data_dir is followed (/put makes none)."""
         c = self.cfg
         m = req.get("model")
         if m is None:
@@ -198,19 +208,15 @@ class Workers:
             raise ValueError('model: {"dir": ..., "native": ..., "pack": ...} expected')
         for k in ("dir", "native", "pack", "profile", "ple"):
             v = m.get(k)
-            if v is not None and (not isinstance(v, str) or v in (".", "..") or not PLAIN_NAME.fullmatch(v)):
+            if v is not None and (not isinstance(v, str) or not PLAIN_NAME.fullmatch(v) or not v.strip(".")
+                                  or DEVICE_NAME.fullmatch(v)):
                 raise ValueError(f"model {k}: a plain file or directory name expected, not {v!r}")
-        root = Path(c["data_dir"]).resolve()
+        root = Path(c["data_dir"])
         mdir = root / "models" / m["dir"]
         out = {"pack": root / "packs" / m["pack"], "native": mdir / m["native"],
                "ple_gguf": mdir / m["ple"] if m.get("ple") else None,
                "expert_profile": root / "data" / m["profile"] if m.get("profile") else
                Path(c.get("expert_profile") or root / "data" / "expert-profile.bin")}
-        for k, p in out.items():
-            if p is None or (k == "expert_profile" and not m.get("profile")):
-                continue
-            if root not in p.resolve().parents:
-                raise ValueError(f"model {k}: outside data_dir")
         for k in ("pack", "native", "expert_profile"):
             if not out[k].exists():
                 raise ValueError(f"model {k} is not shipped here: tools/stage_ship.py first")
@@ -254,7 +260,13 @@ class Workers:
         except OSError as e:   # a wrong exe or log_dir: an answer, not a dropped connection
             return {"ok": False, "port": port, "error": f"cannot start the worker: {e}"}
         with self.lock:
-            self.procs[port] = proc
+            closing = self.closing
+            if not closing:
+                self.procs[port] = proc
+        if closing:   # close() has run or is running: it would not see this worker
+            proc.kill()
+            proc.wait(30)
+            return {"ok": False, "port": port, "error": "the agent is stopping"}
         clock_note = self.lock_clocks()   # (the worker reads its experts for seconds before its first window)
         t0 = time.time()
         while time.time() - t0 < LISTEN_TIMEOUT_S:
@@ -295,37 +307,42 @@ class Workers:
             return "gpu_clocks: NOT locked (no nvidia-smi)"
         dev = ["-i", str(gc["gpu"])] if gc.get("gpu") is not None else []
         notes = []
-        with self.lock:
-            self.clocks_locked = True
-        for key, flag in (("graphics", "-lgc"), ("memory", "-lmc")):
-            if key not in gc:
-                continue
-            lo, hi = (gc[key], gc[key]) if isinstance(gc[key], int) else gc[key]
-            try:
-                p = subprocess.run([smi, *dev, flag, f"{int(lo)},{int(hi)}"], capture_output=True, text=True,
-                                   timeout=30)
-                out = (p.stdout + p.stderr).strip().splitlines()
-                notes.append(f"{key} {lo}-{hi} MHz: " + ("locked" if p.returncode == 0 else
-                                                          "NOT locked (" + (out[0] if out else f"exit {p.returncode}") +
-                                                          "; the agent needs administrator / root)"))
-            except (OSError, subprocess.TimeoutExpired) as e:
-                notes.append(f"{key}: NOT locked ({e})")
+        with self.clock_lock:   # a reset under way finishes first; one that follows sees the flag and the worker
+            if not self.running():
+                return ""        # the worker exited already: nothing to hold the clocks for
+            with self.lock:
+                self.clocks_locked = True
+            for key, flag in (("graphics", "-lgc"), ("memory", "-lmc")):
+                if key not in gc:
+                    continue
+                lo, hi = (gc[key], gc[key]) if isinstance(gc[key], int) else gc[key]
+                try:
+                    p = subprocess.run([smi, *dev, flag, f"{int(lo)},{int(hi)}"], capture_output=True, text=True,
+                                       timeout=30)
+                    out = (p.stdout + p.stderr).strip().splitlines()
+                    notes.append(f"{key} {lo}-{hi} MHz: " + ("locked" if p.returncode == 0 else
+                                                              "NOT locked (" + (out[0] if out else
+                                                                                f"exit {p.returncode}") +
+                                                              "; the agent needs administrator / root)"))
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    notes.append(f"{key}: NOT locked ({e})")
         return "; ".join(notes)
 
     def reset_clocks(self) -> None:
         """Undo lock_clocks once no worker runs here."""
-        with self.lock:
-            if not self.clocks_locked or any(p.poll() is None for p in self.procs.values()):
-                return
-            self.clocks_locked = False
-        smi = shutil.which("nvidia-smi")
-        gc = self.cfg.get("gpu_clocks") or {}
-        dev = ["-i", str(gc["gpu"])] if gc.get("gpu") is not None else []
-        for flag in ("-rgc", "-rmc"):
-            try:
-                subprocess.run([smi, *dev, flag], capture_output=True, timeout=30)
-            except (OSError, subprocess.TimeoutExpired, TypeError):
-                pass
+        with self.clock_lock:
+            with self.lock:
+                if not self.clocks_locked or any(p.poll() is None for p in self.procs.values()):
+                    return
+                self.clocks_locked = False
+            smi = shutil.which("nvidia-smi")
+            gc = self.cfg.get("gpu_clocks") or {}
+            dev = ["-i", str(gc["gpu"])] if gc.get("gpu") is not None else []
+            for flag in ("-rgc", "-rmc"):
+                try:
+                    subprocess.run([smi, *dev, flag], capture_output=True, timeout=30)
+                except (OSError, subprocess.TimeoutExpired, TypeError):
+                    pass
 
     def reap(self) -> None:
         """Forget the workers that exited on their own, and reset the clocks if none runs."""
@@ -616,7 +633,10 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        workers.stop(None)
+        for name in ("SIGINT", "SIGTERM", "SIGBREAK"):   # a second Ctrl+C must not cut the clean-up short
+            if hasattr(signal, name):
+                signal.signal(getattr(signal, name), signal.SIG_IGN)
+        workers.close()
 
 
 if __name__ == "__main__":
