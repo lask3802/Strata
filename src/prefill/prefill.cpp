@@ -3918,12 +3918,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             float* h = m.hand[hand_buf_];
             // remote-stage: the sends go out in order, one at a time - the last chunk's first (so the one two chunks
             // ago, which used this slot, is out too)
+            const auto t_layers = Clock::now();
             if (remote_send && send_run_.valid() && !send_run_.get()) { err = send_err_; return false; }
+            const auto t_sent = Clock::now();
             if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
                 cudaStreamSynchronize(m.cs) != cudaSuccess) {
                 err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
+            // remote-stage, STRATA_REMOTE_TIMING=1: this stage's own time per chunk (the layer-split tuner reads it)
+            static const bool rt = [] { const char* v = std::getenv("STRATA_REMOTE_TIMING"); return v && v[0] == '1'; }();
+            if (remote_send && rt)
+                std::fprintf(stderr, "strata prefill: layers %lld-%lld, chunk T=%lld at %lld: own %.0f ms, waited %.0f ms "
+                                     "for the previous send\n",
+                             (long long) stage_lb_, (long long) stage_le_ - 1, (long long) T, (long long) p0,
+                             std::chrono::duration<double, std::milli>(t_layers - tsetup).count() +
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t_sent).count(),
+                             std::chrono::duration<double, std::milli>(t_sent - t_layers).count());
             // Wait only for the DIRECT successor's previous chunk. That successor
             // may already have forwarded its older chunk to later GPUs.
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
