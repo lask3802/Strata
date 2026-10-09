@@ -13,7 +13,10 @@ cluster.json:
                "python": "/srv/strata/Strata/.venv/bin/python", "port": 8080,
                "api_key_file": "/srv/strata/api-key", "extra": []},
       "nodes": [{"name": "2080ti", "agent": "http://192.0.2.11:7840", "host": "192.0.2.11", "port": 7841,
-                 "ship": false}],                    true: send the node its layers first (tools/stage_ship.py)
+                 "ship": false,                      true: send the node its layers first (tools/stage_ship.py)
+                 "cache": "auto",                    or a slot count: what the card may use (a desktop's card, a
+                                                     VRAM budget: ~2.2 MiB a slot plus ~1 GiB for the rest)
+                 "max_layers": null}],               the most layers it may hold (its RAM: ~1.1 GiB pinned a layer)
       "ship": {"model_dir": "/srv/strata/models/rvn-iq3s", "pack_dir": "/srv/strata/Strata-data/packs/rvn-iq3_s",
                "profile": "/srv/strata/Strata/data/expert-profile.bin", "bin_dir": null},
       "token_file": "/srv/strata/stage-token",
@@ -125,6 +128,7 @@ class Node:
         self.cache = spec.get("cache", "auto")
         self.extra = list(spec.get("extra", []))
         self.ship = bool(spec.get("ship", False))
+        self.max_layers = int(spec["max_layers"]) if spec.get("max_layers") else None
         self.token = token
         self.info: dict = {}
 
@@ -303,6 +307,8 @@ class Tuner:
         self.verify_max = bool(goal.get("verify_max_context", True))
         self.top_n = int(goal.get("top_n", 3))
         self.ship_cfg = cluster.get("ship") or {}
+        ml = cluster["main"].get("max_layers")
+        self.max_layers = [int(ml) if ml else None] + [n.max_layers for n in self.nodes]   # per stage
         self.corpus = Path(cluster["corpus"]).read_text(encoding="utf-8", errors="replace")
         self.runs: list[dict] = []
         self.runs_path = outdir / "runs.jsonl"
@@ -442,11 +448,13 @@ class Tuner:
         best = None
         for sp in itertools.combinations(range(MIN_LAYERS, n - MIN_LAYERS + 1), S - 1):
             b = (0,) + sp + (n,)
-            if any(b[i + 1] - b[i] < MIN_LAYERS for i in range(S)):
+            if not self.valid(list(sp)):
                 continue
             cost = max((self.pre[b[i + 1]] - self.pre[b[i]]) * rate[i] for i in range(S))
             if best is None or cost < best[0]:
                 best = (cost, list(sp))
+        if best is None:
+            sys.exit("stage_tune: no split fits every stage's max_layers")
         return best[1]
 
     def initial_splits(self) -> list[int]:
@@ -479,7 +487,9 @@ class Tuner:
 
     def valid(self, splits: list[int]) -> bool:
         b = [0] + splits + [self.n_layers]
-        return all(b[i + 1] - b[i] >= MIN_LAYERS for i in range(len(b) - 1))
+        caps = getattr(self, "max_layers", None) or [None] * (len(b) - 1)
+        return all(b[i + 1] - b[i] >= MIN_LAYERS and (caps[i] is None or b[i + 1] - b[i] <= caps[i])
+                   for i in range(len(b) - 1))
 
     def best(self, chunk: int | None = None, kind: str = "search") -> dict | None:
         ok = [r for r in self.runs if r["ok"] and r["kind"] == kind and (chunk is None or r["chunk"] == chunk)]
