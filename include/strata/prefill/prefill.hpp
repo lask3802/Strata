@@ -171,7 +171,10 @@ public:
     /// uploaded and passed to `on_chunk` - on a thread, so this stage reads chunk c + 1 meanwhile.  `flags` bit 0:
     /// the prompt is one chunk.  Set before `init`.
     std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows_in,
-                       float* rows_out, std::string& err)> remote_chunk;
+                       float* rows_out, int64_t skip, std::string& err)> remote_chunk;
+    /// REMOTE STAGE: `on_chunk` reads no row before this position (the drafter's window starts later), so the worker
+    /// sends back only the rows from it - `skip` rows fewer for the chunks before it.  Per prompt; default all rows.
+    void set_remote_rows_from(int64_t pos) { remote_rows_from_ = pos; }
     /// REMOTE STAGE, the worker's side: this stage does not start at layer 0 and has no previous stage in this
     /// process - its rows for the next `run` (host, pinned; one chunk) and whether the main prompt is one chunk.
     void set_hand_in(const float* rows) { hand_in_ = rows; }
@@ -206,6 +209,7 @@ private:
                      std::string& err);
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
+    int64_t remote_rows_from_ = 0;      ///< set_remote_rows_from
     Prefill* next_ = nullptr;
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)

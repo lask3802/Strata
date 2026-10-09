@@ -4084,9 +4084,12 @@ bool Prefill::remote_tail(const int64_t* tokens, int64_t T, int64_t pos0, int64_
                           std::string& err) {
     Impl& m = *impl_;
     if (device >= 0) cudaSetDevice(device);
-    if (!remote_chunk(tokens, T, pos0, flags, rows, m.rx_host, err)) return false;
-    if (cudaMemcpyAsync(m.rx_dev, m.rx_host, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.rx_stream) != cudaSuccess ||
-        cudaStreamSynchronize(m.rx_stream) != cudaSuccess) {
+    const int64_t skip = std::max<int64_t>(0, std::min<int64_t>(remote_rows_from_ - pos0, T));   // rows nobody reads
+    if (!remote_chunk(tokens, T, pos0, flags, rows, m.rx_host, skip, err)) return false;
+    if (skip < T &&
+        (cudaMemcpyAsync(m.rx_dev + skip * D, m.rx_host + skip * D, (size_t) (T - skip) * D * 4, cudaMemcpyHostToDevice,
+                         m.rx_stream) != cudaSuccess ||
+         cudaStreamSynchronize(m.rx_stream) != cudaSuccess)) {
         err = std::string("prefill: the remote stage's rows upload: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }

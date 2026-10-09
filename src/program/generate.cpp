@@ -6568,8 +6568,8 @@ int main(int argc, char** argv) {
                 sp.set_stage(0, split_at[0], nullptr);
                 const size_t row_f = (size_t) (g.hc * g.n_embd);
                 sp.remote_chunk = [&remote_link, row_f](const int64_t* tk, int64_t T, int64_t p0, int64_t flags,
-                                                        const float* in, float* out, std::string& e) {
-                    return remote_link.prefill(tk, T, p0, flags, in, (size_t) T * row_f, out, e);
+                                                        const float* in, float* out, int64_t skip, std::string& e) {
+                    return remote_link.prefill(tk, T, p0, flags, in, row_f, out, skip, e);
                 };
             }
             if (stage_worker) sp.set_stage(own_lo, -1, nullptr);
@@ -9581,6 +9581,10 @@ int main(int argc, char** argv) {
             if (use_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
             tr("request", n, geni ? 1 : 0);
             if (use_mtp) mtp.set_prompt_len(n);
+            // remote-stage: the drafter's K/V needs the worker's final rows only within its window of the prompt's end
+            // (MtpDrafter::prefill skips the cells before n - window - 64); 128 more for the groups' alignment
+            if (remote_main)
+                sp.set_remote_rows_from(!use_mtp ? INT64_MAX : o.mtp_window > 0 ? n - o.mtp_window - 128 : 0);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
             conversations.limit_reuse(read_from);
             pp_total = n;

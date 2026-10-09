@@ -27,8 +27,10 @@ enum class StageMsg : uint32_t {
     Run = 3,        // a = T, b = pos0; payload: int32 tokens[T], float rows[T * handoff_floats]
     RunOk = 4,      // payload: float rows[T * handoff_floats]
     Commit = 5,     // a = n_keep; no reply (an error comes back on the next reply)
-    Prefill = 6,    // a = T, b = pos0, c = flags (1: the prompt is one chunk); payload: int64 tokens[T], float rows[T * D]
-    PrefillOk = 7,  // payload: float rows[T * D]
+    Prefill = 6,    // a = T, b = pos0, c = flags (bit 0: the prompt is one chunk) | skip << 8; payload: int64 tokens[T],
+                    // float rows[T * D]
+    PrefillOk = 7,  // payload: float rows[(T - skip) * D], the chunk's rows from row `skip` (the main process needs
+                    // no earlier ones: the drafter's window does not reach them)
     Reset = 8,      // a fresh prompt from position 0
     ResetOk = 9,
     Error = 10,     // payload: the message
@@ -61,6 +63,8 @@ struct StageStats {
     uint64_t runs = 0, commits = 0, prefills = 0, resets = 0;
     uint64_t bytes_out = 0, bytes_in = 0;
     double ms_run = 0, ms_prefill = 0;   ///< wall time of the round trips (main side) / of the work (worker side)
+    /// main side, split of the round trips: sending, waiting for the reply's header (the worker's work), receiving
+    double ms_send = 0, ms_wait = 0, ms_recv = 0;
 };
 
 /// The main process's end: one connection, used by one thread at a time (a mutex guards it).
@@ -81,9 +85,9 @@ public:
              size_t out_floats, std::string& err);
     /// The accepted count of the last window (one way).
     bool commit(int n_keep, std::string& err);
-    /// One prompt chunk: send T tokens and T rows, receive T rows (floats each way).
-    bool prefill(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows_in, size_t floats,
-                 float* rows_out, std::string& err);
+    /// One prompt chunk: send T tokens and T rows of `row_floats`, receive rows [skip, T) into rows_out + skip rows.
+    bool prefill(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows_in, size_t row_floats,
+                 float* rows_out, int64_t skip, std::string& err);
     /// A fresh prompt: the worker zeroes its session.
     bool reset(std::string& err);
 
@@ -97,6 +101,7 @@ private:
     std::string peer_;
     std::mutex mu_;
     StageStats stats_;
+    double last_send_ms_ = 0, last_wait_ms_ = 0, last_recv_ms_ = 0;
 };
 
 /// The worker's end.  Every handler runs on the serving thread; `rows_in`/`rows_out` are the buffers the server
@@ -105,7 +110,7 @@ struct StageHandlers {
     std::function<bool(const StageHello& main_hello, StageHello& mine, std::string& err)> hello;
     std::function<bool(int T, const int32_t* tokens, int64_t pos0, std::string& err)> run;   // in: run_in, out: run_out
     std::function<bool(int n_keep, std::string& err)> commit;
-    std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, std::string& err)> prefill;   // in: pf_in, out: pf_out
+    std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, std::string& err)> prefill;   // in: pf_in, out: pf_out (all T rows)
     std::function<bool(std::string& err)> reset;
     std::function<void()> disconnected;   ///< the main process went away (the session is stale)
 };

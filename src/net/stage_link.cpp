@@ -1,6 +1,7 @@
 // src/net/stage_link.cpp - see include/strata/net/stage_link.hpp.
 #include "strata/net/stage_link.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -203,7 +204,15 @@ bool StageClient::roundtrip_(const StageHeader& h, const void* p1, size_t n1, co
 #else
     if (fd_ < 0) { err = "remote stage: not connected"; return false; }
     StageHeader r;
-    if (!send_msg(fd_, h, p1, n1, p2, n2, err) || !recv_header(fd_, r, err)) { close(); return false; }
+    const auto t0 = Clock::now();
+    if (!send_msg(fd_, h, p1, n1, p2, n2, err)) { close(); return false; }
+    const auto t1 = Clock::now();
+    if (!recv_header(fd_, r, err)) { close(); return false; }
+    const auto t2 = Clock::now();
+    last_send_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    last_wait_ms_ = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    stats_.ms_send += last_send_ms_;
+    stats_.ms_wait += last_wait_ms_;
     stats_.bytes_out += sizeof h + n1 + n2;
     if (r.type == (uint32_t) StageMsg::Error) {
         std::string m((size_t) r.bytes, '\0');
@@ -221,9 +230,17 @@ bool StageClient::roundtrip_(const StageHeader& h, const void* p1, size_t n1, co
         return false;
     }
     if (reply_bytes > 0 && !recv_all(fd_, reply, reply_bytes, err)) { close(); return false; }
+    last_recv_ms_ = ms_since(t2);
+    stats_.ms_recv += last_recv_ms_;
     stats_.bytes_in += sizeof r + reply_bytes;
     return true;
 #endif
+}
+
+// STRATA_REMOTE_TIMING=1: one line per prompt chunk and every 64th window, with the round trip's three parts
+static bool remote_timing() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_REMOTE_TIMING"); return v && v[0] == '1'; }();
+    return on;
 }
 
 bool StageClient::run(int T, const int32_t* tokens, int64_t pos0, const float* rows_in, size_t in_floats,
@@ -238,7 +255,16 @@ bool StageClient::run(int T, const int32_t* tokens, int64_t pos0, const float* r
     const bool ok = roundtrip_(h, tokens, (size_t) T * sizeof(int32_t), rows_in, in_floats * sizeof(float),
                                StageMsg::RunOk, rows_out, out_floats * sizeof(float), err);
     ++stats_.runs;
-    stats_.ms_run += ms_since(t0);
+    const double ms = ms_since(t0);
+    stats_.ms_run += ms;
+    if (remote_timing() && (stats_.runs & 63) == 0)
+        std::fprintf(stderr, "strata remote: window T=%d at %lld: %.2f ms (send %.2f, worker %.2f, receive %.2f); "
+                             "%llu windows, mean %.2f ms (send %.2f, worker %.2f, receive %.2f)\n",
+                     T, (long long) pos0, ms, last_send_ms_, last_wait_ms_, last_recv_ms_,
+                     (unsigned long long) stats_.runs, stats_.ms_run / (double) stats_.runs,
+                     stats_.ms_send / (double) (stats_.runs + stats_.prefills),
+                     stats_.ms_wait / (double) (stats_.runs + stats_.prefills),
+                     stats_.ms_recv / (double) (stats_.runs + stats_.prefills));
     return ok;
 }
 
@@ -261,19 +287,27 @@ bool StageClient::commit(int n_keep, std::string& err) {
 }
 
 bool StageClient::prefill(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows_in,
-                          size_t floats, float* rows_out, std::string& err) {
+                          size_t row_floats, float* rows_out, int64_t skip, std::string& err) {
     std::lock_guard<std::mutex> lk(mu_);
     const auto t0 = Clock::now();
+    skip = std::max<int64_t>(0, std::min<int64_t>(skip, T));
     StageHeader h;
     h.type = (uint32_t) StageMsg::Prefill;
     h.a = T;
     h.b = pos0;
-    h.c = flags;
-    h.bytes = (uint64_t) T * sizeof(int64_t) + floats * sizeof(float);
-    const bool ok = roundtrip_(h, tokens, (size_t) T * sizeof(int64_t), rows_in, floats * sizeof(float),
-                               StageMsg::PrefillOk, rows_out, floats * sizeof(float), err);
+    h.c = (flags & 0xff) | (skip << 8);
+    const size_t in_bytes = (size_t) T * row_floats * sizeof(float);
+    const size_t out_bytes = (size_t) (T - skip) * row_floats * sizeof(float);
+    h.bytes = (uint64_t) T * sizeof(int64_t) + in_bytes;
+    const bool ok = roundtrip_(h, tokens, (size_t) T * sizeof(int64_t), rows_in, in_bytes, StageMsg::PrefillOk,
+                               rows_out + (size_t) skip * row_floats, out_bytes, err);
     ++stats_.prefills;
-    stats_.ms_prefill += ms_since(t0);
+    const double ms = ms_since(t0);
+    stats_.ms_prefill += ms;
+    if (remote_timing())
+        std::fprintf(stderr, "strata remote: chunk T=%lld at %lld: %.0f ms (send %.0f, worker %.0f, receive %.0f; %lld rows back)\n",
+                     (long long) T, (long long) pos0, ms, last_send_ms_, last_wait_ms_, last_recv_ms_,
+                     (long long) (T - skip));
     return ok;
 }
 
@@ -414,14 +448,20 @@ int serve_stage(int port, const StageHandlers& h, const StageBuffers& buf, Stage
                     break;
                 }
                 std::string e;
+                const int64_t skip = std::max<int64_t>(0, std::min<int64_t>(m.c >> 8, T));
                 if (!pending_err.empty()) { e = pending_err; pending_err.clear(); ok = false; }
-                else ok = h.prefill(tok64.data(), T, m.b, m.c, e);
+                else ok = h.prefill(tok64.data(), T, m.b, m.c & 0xff, e);
                 if (!ok) { ok = reply_error(e); break; }
+                if (remote_timing())
+                    std::fprintf(stderr, "strata stage worker: chunk T=%lld at %lld: received + read in %.0f ms\n",
+                                 (long long) T, (long long) m.b, ms_since(t0));
+                const size_t back = (size_t) (T - skip) * (size_t) buf.pf_row_floats;
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::PrefillOk;
-                r.bytes = rows * 4;
-                if (!send_msg(fd, r, buf.pf_out, rows * 4, nullptr, 0, err)) keep = false;
-                stats.bytes_out += sizeof r + rows * 4;
+                r.bytes = back * 4;
+                if (!send_msg(fd, r, buf.pf_out + (size_t) skip * (size_t) buf.pf_row_floats, back * 4, nullptr, 0, err))
+                    keep = false;
+                stats.bytes_out += sizeof r + back * 4;
                 ++stats.prefills;
                 stats.ms_prefill += ms_since(t0);
                 break;
