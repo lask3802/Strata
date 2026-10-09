@@ -688,10 +688,13 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
             case StageMsg::Reset: {
                 std::string e;
                 pending_err.clear();
+                // a chunk's reply still going out finishes first (a relay's reply thread reads the next worker's
+                // link, which the reset may make again)
+                if (!replies_out()) { keep = false; break; }
                 if (!h.reset(e)) { keep = reply_error(e); break; }
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::ResetOk;
-                if (!replies_out() || !send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
                 ++stats.resets;
                 break;
             }

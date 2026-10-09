@@ -46,6 +46,7 @@ class Item:
         self.total = local.stat().st_size
         self.whole = ranges is None
         self.ranges = merge(ranges if ranges is not None else [[0, self.total]])
+        self.fp: str | None = None   # a sparse file's source: what its byte ranges on the node belong to
         self.mode = "755" if local.stat().st_mode & stat.S_IXUSR else None
 
     @property
@@ -101,7 +102,10 @@ def gguf_items(model_dir: Path, lo: int, hi: int) -> list[Item]:
                 if n is None:
                     raise SystemExit(f"{path.name}: {t.name}: unknown size ({t.type_name})")
                 rs.append([g.data_start + t.offset, n])
-        items.append(Item(path, f"models/{model_dir.name}/{path.name}", rs))
+        it = Item(path, f"models/{model_dir.name}/{path.name}", rs)
+        with open(path, "rb") as f:   # the header names every tensor's offset: same header, same layout
+            it.fp = hashlib.sha256(f.read(g.data_start)).hexdigest()[:32] + f"-{it.total}"
+        items.append(it)
     return items
 
 
@@ -131,6 +135,8 @@ class Agent:
 
     def put(self, item: Item, off: int, data: bytes) -> dict:
         q = f"path={urllib.parse.quote(item.rel)}&offset={off}&total={item.total}"
+        if item.fp:
+            q += f"&fp={urllib.parse.quote(item.fp)}"
         if item.mode:
             q += f"&mode={item.mode}"
         req = urllib.request.Request(f"{self.url}/put?{q}", data=data, method="POST",
@@ -156,7 +162,8 @@ def ship(agent: Agent, items: list[Item], say=print) -> int:
     todo = []
     for it in items:
         have = agent.ranges(it.rel)
-        got = merge(have.get("ranges") or []) if have.get("size") == it.total else []
+        same = have.get("size") == it.total and (it.fp is None or have.get("fp") in (None, it.fp))
+        got = merge(have.get("ranges") or []) if same else []   # another source: everything again
         miss = subtract(it.ranges, got)
         if it.whole and not miss and it.total > 0:   # a whole file the node has: the same bytes?
             remote = agent.sha256(it.rel)
@@ -178,6 +185,8 @@ def ship(agent: Agent, items: list[Item], say=print) -> int:
                 while pos < end or n == 0:
                     f.seek(pos)
                     data = f.read(min(PIECE, end - pos))
+                    if not data and n != 0:
+                        raise SystemExit(f"ship: {it.local} ended at {pos} (it changed while shipping)")
                     r = agent.put(it, pos, data)
                     if not r.get("ok") or r.get("sha256") != hashlib.sha256(data).hexdigest():
                         raise SystemExit(f"ship: {it.rel} at {pos}: {r.get('error') or 'sha256 differs'}")

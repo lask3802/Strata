@@ -310,6 +310,7 @@ class Tuner:
         ml = cluster["main"].get("max_layers")
         self.max_layers = [int(ml) if ml else None] + [n.max_layers for n in self.nodes]   # per stage
         self.corpus = Path(cluster["corpus"]).read_text(encoding="utf-8", errors="replace")
+        self.cpt = CHARS_PER_TOKEN   # chars per token of this corpus, learned from the prompts read
         self.runs: list[dict] = []
         self.runs_path = outdir / "runs.jsonl"
 
@@ -354,7 +355,7 @@ class Tuner:
         return True, ""
 
     def prompt(self, tokens: int, salt: int) -> str:
-        n = int(tokens * CHARS_PER_TOKEN)
+        n = int(tokens * self.cpt)
         text = self.corpus * (1 + (n + salt) // max(1, len(self.corpus)))
         start = salt % max(1, len(self.corpus))   # a different slice per length
         return ("Here is a long document. After reading it, write a detailed technical summary of its main ideas in "
@@ -396,11 +397,14 @@ class Tuner:
             return run
         failed = None
         for i, n in enumerate(contexts):
-            r = self.main.chat(self.prompt(n, 7919 * (i + 1)), LONG_ANSWER)
+            text = self.prompt(n, 7919 * (i + 1))
+            r = self.main.chat(text, LONG_ANSWER)
             run["by_ctx"][str(n)] = r
-            if r.get("error") or not r.get("prefill_tps"):
-                failed = r.get("error", "no timings")
+            if r.get("error") or not r.get("prefill_tps") or not r.get("decode_tps"):
+                failed = r.get("error", "no prefill or decode timing")
                 break
+            if r.get("prompt_n"):   # the corpus's real chars per token (code or CJK read denser than prose)
+                self.cpt = len(text) / r["prompt_n"]
         if failed is None and kind != "max":
             shorts = [self.main.chat(p, SHORT_ANSWER) for p in SHORT_PROMPTS]
             run["short_decode"] = median_or_none([s["decode_tps"] for s in shorts if s.get("decode_tps")])

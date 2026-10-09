@@ -16,8 +16,15 @@ node.json (paths are this PC's):
       "args": ["--spec", "4", "--max-context", "131072", "--kv", "int8", "--kv-resident", "32768"],
       "token_file": "/srv/stage/stage-token",  or STRATA_STAGE_TOKEN in the environment
       "data_dir": "/srv/stage/shipped",       where tools/stage_ship.py writes (optional)
-      "drop_cache": true                             default: drop the model files from the page cache
+      "drop_cache": true,                            default: drop the model files from the page cache
+      "allow_put_bin": false,                        let /put write executables (bin/, mode): the engine shipped
+      "extra_allow": []                              engine flags a /start may add beyond the default list
     }
+
+What the token allows: a holder can start and stop this PC's workers with the engine and model files node.json
+names, and the flags in EXTRA_ALLOWED (or "extra_allow"); with "data_dir", write files under it; with
+"allow_put_bin", also the engine there (that is running code of their choice - for a node you ship the engine to).
+The token and the traffic are plain text: a LAN you trust, or a VPN tunnel.
 
 The page cache: a worker reads its layers' experts through the file cache and copies them into pinned memory, and
 a shipped file passes through the cache too - left there, a 10-layer worker would take its experts' RAM twice (and
@@ -46,6 +53,7 @@ every shard's header) loads them as from the whole file - tools/stage_ship.py se
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import platform
@@ -59,6 +67,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+# engine flags a /start may add (the tuner's): no flag that names a file to write or read
+EXTRA_ALLOWED = {"--max-context", "--stage-bind", "--vram-reserve-mib", "--vram-reserve-later-mib", "--spec",
+                 "--kv", "--kv-resident", "--pcie-frac", "--pool-workers", "--adapt-every", "--adapt-swaps",
+                 "--adapt-decay", "--spec-min-p"}
 LISTEN_TIMEOUT_S = 600     # loading a worker's experts: up to ~30 GB from disk on a cold cache
 STOP_TIMEOUT_S = 180       # a worker with ~30 GB of pinned experts takes a while to unpin
 
@@ -112,6 +124,7 @@ class Workers:
         self.cfg = cfg
         self.procs: dict[int, subprocess.Popen] = {}
         self.lock = threading.Lock()
+        self.start_lock = threading.Lock()   # one /start at a time (two on a port would orphan the first)
 
     def log_path(self, port: int) -> Path:
         return Path(self.cfg.get("log_dir", ".")) / f"stage-worker-{port}.log"
@@ -134,7 +147,18 @@ class Workers:
             return stopped
 
     def start(self, req: dict) -> dict:
+        with self.start_lock:
+            return self._start(req)
+
+    def _start(self, req: dict) -> dict:
         port = int(req.get("port", 7841))
+        allowed = EXTRA_ALLOWED | set(self.cfg.get("extra_allow", []))
+        extra = [str(a) for a in req.get("extra", [])]
+        bad = [a for a in extra if a.startswith("-") and a not in allowed]
+        if bad:
+            return {"ok": False, "error": f"flags not allowed here: {bad} (node.json extra_allow)"}
+        if (req.get("end") is None) != (req.get("next") is None):
+            return {"ok": False, "error": "a relay needs both end and next"}
         self.stop(port)
         c = self.cfg
         args = [c["exe"], "--serve", "--stage-worker", str(port), "--stage-begin", str(int(req["begin"]))]
@@ -143,7 +167,7 @@ class Workers:
         args += ["--pack", c["pack"], "--native", c["native"], "--ple-gguf", c["ple_gguf"],
                  "--expert-profile", c["expert_profile"], "--expert-cache", str(req.get("cache", "auto")),
                  "--prefill", str(int(req.get("prefill", 2048))), "--stage-bind", c["bind"]]
-        args += [str(a) for a in c.get("args", [])] + [str(a) for a in req.get("extra", [])]
+        args += [str(a) for a in c.get("args", [])] + extra
         env = dict(os.environ)
         env["STRATA_STAGE_TOKEN"] = c["_token"]
         env["STRATA_REMOTE_TIMING"] = "1"
@@ -226,6 +250,7 @@ class Store:
     def __init__(self, cfg: dict):
         self.root = Path(cfg["data_dir"]).resolve() if cfg.get("data_dir") else None
         self.drop = bool(cfg.get("drop_cache", True))
+        self.allow_bin = bool(cfg.get("allow_put_bin", False))
         self.lock = threading.Lock()
 
     def path(self, rel: str) -> Path:
@@ -236,20 +261,39 @@ class Store:
             raise ValueError(f"{rel}: outside data_dir")
         return p
 
+    @staticmethod
+    def side(p: Path) -> Path:
+        return p.with_name(p.name + ".ranges.json")
+
+    def read_side(self, p: Path) -> dict:
+        """{"fp": the source's fingerprint, "ranges": [[offset, length], ...]} (an old list: no fingerprint)."""
+        s = self.side(p)
+        if not s.exists():
+            return {"fp": None, "ranges": []}
+        d = json.loads(s.read_text())
+        return d if isinstance(d, dict) else {"fp": None, "ranges": d}
+
     def ranges(self, rel: str) -> dict:
         p = self.path(rel)
-        side = p.with_name(p.name + ".ranges.json")
-        rs = json.loads(side.read_text()) if side.exists() else []
-        return {"ok": True, "path": rel, "size": p.stat().st_size if p.exists() else None, "ranges": rs}
+        d = self.read_side(p)
+        return {"ok": True, "path": rel, "size": p.stat().st_size if p.exists() else None, "ranges": d["ranges"],
+                "fp": d["fp"]}
 
-    def put(self, rel: str, offset: int, total: int, body, n: int, mode: str | None) -> dict:
+    def put(self, rel: str, offset: int, total: int, body, n: int, mode: str | None, fp: str | None) -> dict:
         p = self.path(rel)
+        if not self.allow_bin and (mode or rel.split("/", 1)[0] == "bin"):
+            return {"ok": False, "error": "this node does not take executables (node.json allow_put_bin)"}
         p.parent.mkdir(parents=True, exist_ok=True)
         with self.lock:
-            if not p.exists() or p.stat().st_size != total:
+            d = self.read_side(p) if p.exists() else {"fp": None, "ranges": []}
+            # (a sidecar without a fingerprint, from before they existed: kept, and it takes this one)
+            if not p.exists() or p.stat().st_size != total or (fp and d["fp"] is not None and d["fp"] != fp):
+                # a new file, or a different source (size or fingerprint): what was written of it is void
                 with open(p, "ab"):
                     pass
+                os.truncate(p, 0)
                 os.truncate(p, total)   # sparse: the bytes nobody writes stay holes
+                self.side(p).write_text(json.dumps({"fp": fp, "ranges": []}))
         h = hashlib.sha256()
         with open(p, "r+b") as f:
             f.seek(offset)
@@ -271,9 +315,8 @@ class Store:
         if mode:
             os.chmod(p, int(mode, 8))
         with self.lock:
-            side = p.with_name(p.name + ".ranges.json")
-            rs = json.loads(side.read_text()) if side.exists() else []
-            side.write_text(json.dumps(merge_ranges(rs + [[offset, n]])))
+            d = self.read_side(p)
+            self.side(p).write_text(json.dumps({"fp": d["fp"] or fp, "ranges": merge_ranges(d["ranges"] + [[offset, n]])}))
         return {"ok": True, "sha256": h.hexdigest(), "bytes": n}
 
 
@@ -291,7 +334,7 @@ def make_handler(cfg: dict, workers: Workers, store: Store):
             self.wfile.write(body)
 
         def authorized(self) -> bool:
-            if self.headers.get("X-Stage-Token", "") == cfg["_token"]:
+            if hmac.compare_digest(self.headers.get("X-Stage-Token", "").encode(), cfg["_token"].encode()):
                 return True
             self.reply(403, {"ok": False, "error": "wrong or missing X-Stage-Token"})
             return False
@@ -342,7 +385,8 @@ def make_handler(cfg: dict, workers: Workers, store: Store):
                 q = parse_qs(u.query)
                 try:
                     r = store.put(q["path"][0], int(q["offset"][0]), int(q["total"][0]), self.rfile,
-                                  int(self.headers.get("Content-Length", "0")), q.get("mode", [None])[0])
+                                  int(self.headers.get("Content-Length", "0")), q.get("mode", [None])[0],
+                                  q.get("fp", [None])[0])
                 except (KeyError, ValueError, OSError) as e:
                     r = {"ok": False, "error": str(e)}
                 self.reply(200 if r.get("ok") else 400, r)
@@ -360,6 +404,8 @@ def make_handler(cfg: dict, workers: Workers, store: Store):
                 return
             try:
                 req = self.body_json()
+                if not isinstance(req, dict):
+                    raise ValueError("a JSON object expected")
             except (ValueError, json.JSONDecodeError) as e:
                 self.reply(400, {"ok": False, "error": f"bad JSON: {e}"})
                 return

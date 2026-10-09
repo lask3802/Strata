@@ -8569,12 +8569,13 @@ int main(int argc, char** argv) {
                 auto connect_next = [&](std::string& e) -> bool {
                     strata::net::StageHello mine_next = me, peer_next;
                     mine_next.layer_begin = (int32_t) own_hi;
-                    mine_next.chunk = pf_chunk;
+                    mine_next.chunk = main_chunk;   // the main process's (this worker's own until its hello)
                     std::memcpy(mine_next.token, stage_token.data(), stage_token.size());
                     for (int i = 0;; ++i) {
                         next_link.close();
                         if (next_link.connect(o.stage_next, mine_next, peer_next, e)) break;
-                        if (i >= 30 || e.find("differ") != std::string::npos || e.find("worker)") != std::string::npos)
+                        // a refusal (token, context, chunk) or a different model does not change by waiting
+                        if (i >= 30 || e.find("differ") != std::string::npos || e.find("refused") != std::string::npos)
                             return false;
                         std::this_thread::sleep_for(std::chrono::seconds(2));
                     }
@@ -8600,7 +8601,12 @@ int main(int argc, char** argv) {
                 hs.disconnected = [&] {
                     std::string e;
                     (void) ver.wait_commit(e);
-                    if (stage_relay) (void) relay.wait(e);
+                    // a relay: replies the next worker still owes (chunks the main process will not read) must not
+                    // meet the next main process's reset - the link is made again at that reset
+                    if (stage_relay) {
+                        (void) relay.wait(e);
+                        next_link.close();
+                    }
                 };
                 strata::net::StageBuffers bufs;
                 bufs.run_in = wk_in;
