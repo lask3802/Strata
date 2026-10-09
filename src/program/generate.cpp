@@ -55,6 +55,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/net/stage_link.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
@@ -575,6 +576,13 @@ struct Options {
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
+    /// remote-stage fork: --remote-stage HOST:PORT (with --layer-split K --split-device 0): layers [K, n_layers) run
+    /// in a worker process on another PC (strata --serve --stage-worker PORT --stage-begin K); this process runs
+    /// [0, K), the head and the drafter
+    std::string remote_stage;
+    /// remote-stage fork, the worker: listen on this port and run layers [stage_begin, n_layers) without the head
+    int stage_worker = 0;
+    int64_t stage_begin = -1;
     /// --split-skip-if-fits (opt-in; the server passes it for a config's "split_skip_if_fits"): with
     /// --layer-split auto, run on CUDA0 alone when it holds every profiled expert pair plus the whole session (KV),
     /// the drafter and the reserve - a split then only adds hand-offs (two RDNA4 cards: 1,384 vs 1,794 tok/s at 4K)
@@ -1808,6 +1816,9 @@ int main(int argc, char** argv) {
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
         else if (a == "--split-device") o.split_device = next("--split-device");
+        else if (a == "--remote-stage") o.remote_stage = next("--remote-stage");
+        else if (a == "--stage-worker") o.stage_worker = std::atoi(next("--stage-worker"));
+        else if (a == "--stage-begin") o.stage_begin = std::atoll(next("--stage-begin"));
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
@@ -2030,6 +2041,37 @@ int main(int argc, char** argv) {
         }
     }
     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
+    // remote-stage fork: which layers this process holds (the expert arena, the expert cache, the dense weights, the
+    // session); [own_lo, own_hi), own_hi -1 = to the last layer
+    const bool remote_main = !o.remote_stage.empty();
+    const bool stage_worker = o.stage_worker > 0;
+    int64_t own_lo = 0, own_hi = -1;
+    if (remote_main || stage_worker) {
+        const char* why = nullptr;
+        if (remote_main && stage_worker) why = "--remote-stage and --stage-worker exclude each other";
+        else if (!o.serve) why = "it needs --serve";
+        else if (remote_main && (!split_same || split_at.size() != 1))
+            why = "--remote-stage needs --layer-split K --split-device 0 (layers K.. run in the worker)";
+        else if (stage_worker && (!o.layer_split.empty() || o.stage_begin < 2))
+            why = "--stage-worker needs --stage-begin K (K >= 2, the main process's --layer-split K) and no --layer-split";
+        else if (o.batch > 0 || o.pipeline_windows > 0 || o.vision || o.peer_device >= 0)
+            why = "it does not support --batch, --pipeline-windows, --vision or --peer-device";
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: remote stage: %s\n", why);
+            return 2;
+        }
+        // conversation checkpoints hold only this process's layers: every prompt is read from token 0
+        o.prompt_cache = 0;
+        o.conversation_cache_mib = 0;
+        o.prompt_cache_every = 0;
+        o.adapt_every = 0;   // the adaptive tier swaps against this process's cache only; off for now
+        if (remote_main) own_hi = split_at[0];
+        else own_lo = o.stage_begin;
+        if (stage_worker) o.no_prefill_borrow = true;   // the worker's prompt path owns its buffers (no refill step)
+        std::fprintf(stderr, "strata generate: remote stage: this process holds layers %lld-%s%s\n", (long long) own_lo,
+                     own_hi < 0 ? "last" : std::to_string(own_hi - 1).c_str(),
+                     remote_main ? (", the rest on " + o.remote_stage).c_str() : " (a stage worker, no head)");
+    }
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
@@ -2661,7 +2703,12 @@ int main(int argc, char** argv) {
         }
         std::fclose(f);
     };
-    if (stage_trim) {
+    if (remote_main || stage_worker) {   // remote-stage: this process's layers' dense weights only
+        add_foreign(own_lo, own_hi < 0 ? (int64_t) 1 << 30 : own_hi, skip, o.mmap_experts);
+        strata::core::NativeDense::set_layer_range((int) own_lo, own_hi < 0 ? (1 << 30) : (int) own_hi);
+        std::fprintf(stderr, "strata generate: remote stage: the dense weights of layers %lld-%s only\n",
+                     (long long) own_lo, own_hi < 0 ? "last" : std::to_string(own_hi - 1).c_str());
+    } else if (stage_trim) {
         add_foreign(0, split_at[0], skip, o.mmap_experts);
         strata::core::NativeDense::set_layer_range(0, (int) split_at[0]);
         std::fprintf(stderr, "strata generate: layer split: CUDA0 loads the dense weights of layers 0-%lld only\n",
@@ -2840,7 +2887,7 @@ int main(int argc, char** argv) {
     std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
     float* ple_emb_dev = nullptr;
     float* ple_scratch = nullptr;
-    if (!o.ple_gguf.empty()) {
+    if (!o.ple_gguf.empty() && !stage_worker) {   // remote-stage: a worker never holds layer 1, where the PLE block runs
         strata::kernels::PleIoOptions pio;
         pio.mode = o.ple_io == "mmap" || o.ple_io == "ram" ? strata::kernels::PleIo::Mmap : strata::kernels::PleIo::Direct;
         pio.lock = o.ple_io == "ram";
@@ -3171,6 +3218,14 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: profile %s: %zu ranked pairs, built for %lld slots\n",
                      o.expert_profile.c_str(), profile.size(), (long long) pslots);
+        if (remote_main || stage_worker) {   // remote-stage: the cache holds only this process's layers
+            std::vector<std::pair<int32_t, int32_t>> mine;
+            for (const auto& pr : profile)
+                if (pr.first >= own_lo && (own_hi < 0 || pr.first < own_hi)) mine.push_back(pr);
+            std::fprintf(stderr, "strata generate: remote stage: %zu of the %zu pairs are this process's layers\n",
+                         mine.size(), profile.size());
+            profile.swap(mine);
+        }
     }
     // #477: the whole ranking as loaded, the prior of --expert-profile-save's order (a layer split keeps only
     // CUDA0's pairs in `profile` below).  Empty without --expert-profile-save.
@@ -3784,7 +3839,8 @@ int main(int argc, char** argv) {
     // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
     {
         const strata::core::OnDevice on0(0);
-        const int64_t hi0 = multi_gpu ? split_at[0] : -1;
+        const int64_t hi0 = multi_gpu ? split_at[0] : own_hi;   // remote-stage: own_hi (-1 without it)
+        const int64_t lo0 = own_lo;                              // remote-stage: a worker's first layer (else 0)
         // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
         // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
         {
@@ -3804,11 +3860,11 @@ int main(int argc, char** argv) {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
-        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
+        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, lo0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
-        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, lo0, hi0) == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
@@ -4012,7 +4068,7 @@ int main(int argc, char** argv) {
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
-    if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
+    if (!o.native_head_gguf.empty() && !multi_gpu && !stage_worker) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
         if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
@@ -4223,6 +4279,7 @@ int main(int argc, char** argv) {
         else if (pin_wddm_cap)
             std::fprintf(stderr, "strata generate: multi-GPU under WDDM: at most 8 GiB of the expert arena is pinned "
                                  "(STRATA_ARENA_PIN_GIB changes it)\n");
+        if (remote_main || stage_worker) arena_src.set_layer_range(own_lo, own_hi);   // remote-stage
         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -6504,6 +6561,15 @@ int main(int argc, char** argv) {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+            if (remote_main) {   // remote-stage: every chunk's rows go to the worker; its final rows come back for on_chunk
+                sp.set_stage(0, split_at[0], nullptr);
+                const size_t row_f = (size_t) (g.hc * g.n_embd);
+                sp.remote_chunk = [&remote_link, row_f](const int64_t* tk, int64_t T, int64_t p0, int64_t flags,
+                                                        const float* in, float* out, std::string& e) {
+                    return remote_link.prefill(tk, T, p0, flags, in, (size_t) T * row_f, out, e);
+                };
+            }
+            if (stage_worker) sp.set_stage(own_lo, -1, nullptr);
             if (share_pool) sp.set_cpu_pool(&pool);
             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -6658,6 +6724,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
+        strata::net::StageClient remote_link;   // remote-stage: the worker that runs layers [K, n_layers)
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
@@ -6702,8 +6769,9 @@ int main(int argc, char** argv) {
         if (n_stages > 1) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
-            std::vector<float*> hand((size_t) n_stages - 1, nullptr);
-            for (float*& h : hand) {
+            std::vector<float*> hand((size_t) n_stages - 1, nullptr), hand_host((size_t) n_stages - 1, nullptr);
+            for (size_t hi = 0; hi < hand.size(); ++hi) {
+                float*& h = hand[hi];
                 float* hh = nullptr;
                 if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
                     cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
@@ -6711,6 +6779,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 std::memset(hh, 0, hb);
+                hand_host[hi] = hh;
             }
             split_drive.base = &drive;
             split_drive.n = n_stages;
@@ -6721,6 +6790,25 @@ int main(int argc, char** argv) {
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
                 split_drive.pcie_num[st] = pcie_num_of(o.pcie_frac);
+            }
+            if (remote_main) {
+                // remote-stage: layers [K, n_layers) run in the worker; `ver_same` runs only the head, on the rows the
+                // worker sends back (the worker folded the last layer's pending write, as the unsplit window does)
+                float *rx = nullptr, *rx_d = nullptr;
+                if (cudaHostAlloc((void**) &rx, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &rx_d, rx, 0) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: the remote stage's hand-off allocation failed\n");
+                    return 1;
+                }
+                std::memset(rx, 0, hb);
+                ver_same.set_stage(g.n_layers, -1, rx_d, nullptr);
+                const float* out0 = hand_host[0];
+                const int64_t HBF = strata::core::Verifier::handoff_floats(g);
+                ver_same.set_remote(
+                    [&remote_link, out0, rx, HBF](int T, const int32_t* tokens, int64_t pos0, std::string& e) {
+                        return remote_link.run(T, tokens, pos0, out0, (size_t) T * HBF, rx, (size_t) T * HBF, e);
+                    },
+                    [&remote_link](int n_keep, std::string& e) { return remote_link.commit(n_keep, e); });
             }
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
@@ -6752,6 +6840,8 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st)
                 plan_s += ", " + std::to_string(split_at[(size_t) st - 1]) + "-" + std::to_string(split_drive.end[st] - 1) +
                           " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
+            if (remote_main) plan_s = "0-" + std::to_string(split_at[0] - 1) + " (CUDA0), " + std::to_string(split_at[0]) + "-" +
+                                      std::to_string(g.n_layers - 1) + " (" + o.remote_stage + "), the head (CUDA0)";
             std::fprintf(stderr, "strata serve: layer split: layers %s, one hand-off per window\n", plan_s.c_str());
         }
         // --pipeline-windows: the odd windows' verifiers and their hand-off (initialized before `ver`, which stays the
@@ -6797,6 +6887,23 @@ int main(int argc, char** argv) {
                 return 1;
             }
             ver_b.set_next(&gs.ver_b, &split_drive_b);   // the setters reach it; the pipeline never chains run/commit
+        }
+        float *wk_in = nullptr, *wk_out = nullptr;   // remote-stage worker: the window's rows in and out (mapped)
+        if (stage_worker) {
+            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            float *in_d = nullptr, *out_d = nullptr;
+            if (cudaHostAlloc((void**) &wk_in, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostGetDevicePointer((void**) &in_d, wk_in, 0) != cudaSuccess ||
+                cudaHostAlloc((void**) &wk_out, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostGetDevicePointer((void**) &out_d, wk_out, 0) != cudaSuccess) {
+                std::fprintf(stderr, "strata serve: the stage worker's hand-off allocation failed\n");
+                return 1;
+            }
+            std::memset(wk_in, 0, hb);
+            std::memset(wk_out, 0, hb);
+            ver.set_stage(own_lo, -1, in_d, out_d);
+            ver.set_no_head(true);
         }
         ver.set_remote_expert_opt(remote_opt.get());
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
@@ -7293,7 +7400,7 @@ int main(int argc, char** argv) {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
-            const bool batched = use_mtp && !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
+            const bool batched = use_mtp && !multi_gpu && !remote_main && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
             if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
             if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
@@ -8111,6 +8218,106 @@ int main(int argc, char** argv) {
                         std::abort();
                     }
                 }).detach();
+        }
+        if (stage_worker || remote_main) {
+            const int64_t HBF = strata::core::Verifier::handoff_floats(g);
+            const int64_t D = g.hc * g.n_embd;
+            strata::net::StageHello me;
+            me.n_embd = (int32_t) g.n_embd;
+            me.hc = (int32_t) g.hc;
+            me.n_layers = (int32_t) g.n_layers;
+            me.n_expert = (int32_t) g.n_expert;
+            me.layer_begin = (int32_t) (stage_worker ? own_lo : split_at[0]);
+            me.max_t = (int32_t) std::max(o.spec, 1);
+            me.kv_type = g.n_qsa_layers() > 0 ? (int32_t) ss.qsa_states[ss.qsa_primary()].kv_mode : -1;
+            me.max_context = o.max_context;
+            me.chunk = sp.chunk();
+            me.handoff_floats = HBF;
+            std::snprintf(me.build, sizeof me.build, "strata remote-stage %s", stage_worker ? "worker" : "main");
+            if (remote_main) {
+                strata::net::StageHello peer;
+                if (!remote_link.connect(o.remote_stage, me, peer, err)) {
+                    std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                    return 1;
+                }
+                std::fprintf(stderr, "strata serve: remote stage %s: layers %d-%d there (prompt chunk %lld, context %lld)\n",
+                             o.remote_stage.c_str(), peer.layer_begin, peer.n_layers - 1, (long long) peer.chunk,
+                             (long long) peer.max_context);
+            } else {
+                // remote-stage worker: serve the main process instead of stdin.  A prompt starts with a reset; windows,
+                // commits and chunks arrive in order, each whole, and run here one at a time.
+                const int64_t pf_chunk = sp.chunk();
+                float *pf_in = nullptr, *pf_out = nullptr;
+                if (cudaHostAlloc((void**) &pf_in, (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostAlloc((void**) &pf_out, (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: the stage worker's prompt buffers do not fit in RAM\n");
+                    return 1;
+                }
+                sp.on_chunk = [&, D](const float* R_rows, int64_t T, int64_t, std::string& e) -> bool {
+                    if (cudaMemcpy(pf_out, R_rows, (size_t) (T * D) * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        e = std::string("stage worker: the chunk's rows: ") + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                    return true;
+                };
+                sp.on_stage_chunk = nullptr;
+                sp.should_stop = nullptr;
+                std::vector<int32_t> wk_outv((size_t) strata::kernels::kVerifyMaxT, 0);
+                strata::net::StageHandlers hs;
+                hs.hello = [&](const strata::net::StageHello& theirs, strata::net::StageHello& mine, std::string& e) {
+                    mine = me;
+                    if (theirs.chunk > pf_chunk) {
+                        e = "the main process reads prompts in chunks of " + std::to_string(theirs.chunk) +
+                            " tokens, this worker's chunk is " + std::to_string(pf_chunk) + " (start it with --prefill " +
+                            std::to_string(theirs.chunk) + ")";
+                        return false;
+                    }
+                    if (theirs.max_context > o.max_context || theirs.max_t > me.max_t) {
+                        e = "the main process's context (" + std::to_string(theirs.max_context) + ") or window (" +
+                            std::to_string(theirs.max_t) + ") is larger than this worker's (" +
+                            std::to_string(o.max_context) + ", " + std::to_string(me.max_t) + ")";
+                        return false;
+                    }
+                    mine.chunk = theirs.chunk;   // informational
+                    return true;
+                };
+                hs.run = [&](int T, const int32_t* tokens, int64_t pos0, std::string& e) -> bool {
+                    if (!ver.run(T, tokens, pos0, win_pool_fn, win_pool_user, wk_outv.data(), e) || drive.d.failed) {
+                        if (drive.d.failed && drive.d.fail) e = drive.d.fail;
+                        return false;
+                    }
+                    return true;
+                };
+                hs.commit = [&](int n_keep, std::string& e) -> bool { return ver.commit(n_keep, e) && ver.wait_commit(e); };
+                hs.prefill = [&](const int64_t* tokens, int64_t T, int64_t p0, int64_t flags, std::string& e) -> bool {
+                    sp.set_hand_in(pf_in);
+                    sp.set_single_chunk((flags & 1) != 0);
+                    return sp.run(tokens, T, p0, e);
+                };
+                hs.reset = [&](std::string& e) -> bool {
+                    if (!ver.wait_commit(e)) return false;
+                    strata::core::session_zero(ss, g, nullptr, main_cs);
+                    return cudaStreamSynchronize(main_stream) == cudaSuccess;
+                };
+                hs.disconnected = [&] {
+                    std::string e;
+                    (void) ver.wait_commit(e);
+                };
+                strata::net::StageBuffers bufs;
+                bufs.run_in = wk_in;
+                bufs.run_out = wk_out;
+                bufs.run_floats = (size_t) strata::kernels::kVerifyMaxT * (size_t) HBF;
+                bufs.pf_in = pf_in;
+                bufs.pf_out = pf_out;
+                bufs.pf_floats = (size_t) (pf_chunk * D);
+                bufs.handoff_floats = HBF;
+                bufs.pf_row_floats = D;
+                strata::net::StageStats wst;
+                std::fprintf(stderr, "strata serve: stage worker: layers %lld-%lld, no head, prompt chunk %lld, port %d\n",
+                             (long long) own_lo, (long long) g.n_layers - 1, (long long) pf_chunk, o.stage_worker);
+                std::fflush(stderr);
+                return strata::net::serve_stage(o.stage_worker, hs, bufs, wst, nullptr);
+            }
         }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
@@ -9324,6 +9531,10 @@ int main(int argc, char** argv) {
             if (resume == 0) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
+                if (remote_main && !remote_link.reset(err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 for (auto& st : stages) {
                     const strata::core::OnDevice on(st->dev);
                     strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);

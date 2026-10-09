@@ -165,6 +165,18 @@ public:
     /// run `init`.
     bool set_stage_helper(Prefill* helper, std::string& err);
 
+    /// REMOTE STAGE (remote-stage fork), the main side: this stage ends before the last layer and the rest of the
+    /// model runs in another process.  Instead of a `next` stage, every chunk's rows (T x hc*n_embd floats, pinned
+    /// host) go to `remote_chunk`, which must write the worker's final rows to `rows_out` (pinned host); they are
+    /// uploaded and passed to `on_chunk` - on a thread, so this stage reads chunk c + 1 meanwhile.  `flags` bit 0:
+    /// the prompt is one chunk.  Set before `init`.
+    std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows_in,
+                       float* rows_out, std::string& err)> remote_chunk;
+    /// REMOTE STAGE, the worker's side: this stage does not start at layer 0 and has no previous stage in this
+    /// process - its rows for the next `run` (host, pinned; one chunk) and whether the main prompt is one chunk.
+    void set_hand_in(const float* rows) { hand_in_ = rows; }
+    void set_single_chunk(bool on) { single_chunk_ = on; }
+
     /// The CPU expert pool (decode's, idle while a prompt is read). With STRATA_PREFILL_CPU_SHARE set, a chunk below
     /// stream_all_min() tokens - an agent's tool output - hands it the non-resident experts routed by at most MAXT of
     /// its tokens, fewest first, up to a share of the experts it would stream (`auto`: measured, where both sides end
@@ -189,6 +201,9 @@ private:
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     bool drain_pipeline(std::string& err);
+    // remote-stage: one chunk through the worker, then on_chunk on its rows (runs on the hand-off thread)
+    bool remote_tail(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows, int device,
+                     std::string& err);
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
