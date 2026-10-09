@@ -12,7 +12,16 @@
 #include <thread>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -37,7 +46,73 @@ bool remote_timing() {
     return on;
 }
 
-#if !defined(_WIN32)
+// ---- the sockets of both systems behind one small set of calls
+#if defined(_WIN32)
+using sock_t = SOCKET;
+const sock_t kNoSock = INVALID_SOCKET;
+using sock_len = int;
+using poll_fd = WSAPOLLFD;
+constexpr int kSendFlags = 0;
+int sock_close(sock_t s) { return ::closesocket(s); }
+int sock_shutdown(sock_t s) { return ::shutdown(s, SD_BOTH); }
+int sock_errno() { return WSAGetLastError(); }
+bool sock_eintr(int e) { return e == WSAEINTR; }
+bool sock_timedout(int e) { return e == WSAETIMEDOUT || e == WSAEWOULDBLOCK; }
+int sock_poll(poll_fd* p, int n, int ms) { return ::WSAPoll(p, (ULONG) n, ms); }
+std::string sock_errstr(int e) {
+    char buf[256] = {};
+    const DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, (DWORD) e, 0,
+                                   buf, sizeof buf, nullptr);
+    std::string m(buf, n);
+    while (!m.empty() && (m.back() == '\n' || m.back() == '\r' || m.back() == '.')) m.pop_back();
+    return m + " (" + std::to_string(e) + ")";
+}
+/// a read's or a write's timeout (0: none) - Winsock takes milliseconds
+void set_timeout(sock_t s, int opt, int seconds) {
+    const DWORD ms = (DWORD) seconds * 1000;
+    (void) setsockopt(s, SOL_SOCKET, opt, (const char*) &ms, sizeof ms);
+}
+/// Winsock needs WSAStartup once per process
+bool net_init() {
+    static const bool ok = [] {
+        WSADATA d;
+        return WSAStartup(MAKEWORD(2, 2), &d) == 0;
+    }();
+    return ok;
+}
+#else
+using sock_t = int;
+const sock_t kNoSock = -1;
+using sock_len = socklen_t;
+using poll_fd = pollfd;
+constexpr int kSendFlags = MSG_NOSIGNAL;   // a closed peer is an error, not SIGPIPE
+int sock_close(sock_t s) { return ::close(s); }
+int sock_shutdown(sock_t s) { return ::shutdown(s, SHUT_RDWR); }
+int sock_errno() { return errno; }
+bool sock_eintr(int e) { return e == EINTR; }
+bool sock_timedout(int e) { return e == EAGAIN || e == EWOULDBLOCK; }
+int sock_poll(poll_fd* p, int n, int ms) { return ::poll(p, (nfds_t) n, ms); }
+std::string sock_errstr(int e) { return std::strerror(e); }
+void set_timeout(sock_t s, int opt, int seconds) {
+    timeval tv{};
+    tv.tv_sec = seconds;
+    (void) setsockopt(s, SOL_SOCKET, opt, &tv, sizeof tv);
+}
+bool net_init() { return true; }
+#endif
+
+template <class T>
+void set_opt(sock_t s, int level, int name, T v) {
+    (void) setsockopt(s, level, name, (const char*) &v, (sock_len) sizeof v);
+}
+
+sock_t S(std::intptr_t fd) { return (sock_t) fd; }
+
+#if defined(_WIN32)
+const char* gai_err(int rc) { return gai_strerrorA(rc); }   // the narrow one whatever UNICODE says
+#else
+const char* gai_err(int rc) { return gai_strerror(rc); }
+#endif
 
 // Seconds a read or write may block before the link counts as dead (STRATA_REMOTE_TIMEOUT_S; a prompt chunk on a
 // slow worker can take several seconds, a first window after a long prompt a few more).
@@ -50,31 +125,35 @@ int io_timeout_s() {
     return s;
 }
 
-void tune_socket(int fd) {
-    int one = 1;
-    (void) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    (void) setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+void tune_socket(sock_t fd) {
+    set_opt<int>(fd, IPPROTO_TCP, TCP_NODELAY, 1);
+    set_opt<int>(fd, SOL_SOCKET, SO_KEEPALIVE, 1);
     // a peer that vanished without a FIN (power, cable) is noticed in about a minute, not the default two hours
-    int idle = 30, intvl = 10, cnt = 3;
-    (void) setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
-    (void) setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
-    (void) setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
-    int buf = 8 << 20;
-    (void) setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof buf);
-    (void) setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof buf);
-    timeval tv{};
-    tv.tv_sec = io_timeout_s();
-    (void) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    (void) setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    // (seconds on both systems; Windows 10 1709 and later)
+#if defined(TCP_KEEPIDLE)
+    set_opt<int>(fd, IPPROTO_TCP, TCP_KEEPIDLE, 30);
+#endif
+#if defined(TCP_KEEPINTVL)
+    set_opt<int>(fd, IPPROTO_TCP, TCP_KEEPINTVL, 10);
+#endif
+#if defined(TCP_KEEPCNT)
+    set_opt<int>(fd, IPPROTO_TCP, TCP_KEEPCNT, 3);
+#endif
+    set_opt<int>(fd, SOL_SOCKET, SO_SNDBUF, 8 << 20);
+    set_opt<int>(fd, SOL_SOCKET, SO_RCVBUF, 8 << 20);
+    set_timeout(fd, SO_RCVTIMEO, io_timeout_s());
+    set_timeout(fd, SO_SNDTIMEO, io_timeout_s());
 }
 
-bool send_all(int fd, const void* p, size_t n, std::string& err) {
+bool send_all(sock_t fd, const void* p, size_t n, std::string& err) {
     const char* c = (const char*) p;
     while (n > 0) {
-        const ssize_t w = ::send(fd, c, n, MSG_NOSIGNAL);
+        const int k = (int) std::min<size_t>(n, (size_t) 1 << 30);   // Winsock counts in int
+        const long long w = ::send(fd, c, k, kSendFlags);
         if (w < 0) {
-            if (errno == EINTR) continue;
-            err = std::string("remote stage: send failed: ") + std::strerror(errno);
+            const int e = sock_errno();
+            if (sock_eintr(e)) continue;
+            err = std::string("remote stage: send failed: ") + sock_errstr(e);
             return false;
         }
         c += w;
@@ -83,15 +162,16 @@ bool send_all(int fd, const void* p, size_t n, std::string& err) {
     return true;
 }
 
-bool recv_all(int fd, void* p, size_t n, std::string& err) {
+bool recv_all(sock_t fd, void* p, size_t n, std::string& err) {
     char* c = (char*) p;
     while (n > 0) {
-        const ssize_t r = ::recv(fd, c, n, 0);
+        const int k = (int) std::min<size_t>(n, (size_t) 1 << 30);
+        const long long r = ::recv(fd, c, k, 0);
         if (r == 0) { err = "remote stage: the peer closed the connection"; return false; }
         if (r < 0) {
-            if (errno == EINTR) continue;
-            err = std::string("remote stage: receive failed: ") +
-                  (errno == EAGAIN || errno == EWOULDBLOCK ? std::string("timed out") : std::string(std::strerror(errno)));
+            const int e = sock_errno();
+            if (sock_eintr(e)) continue;
+            err = std::string("remote stage: receive failed: ") + (sock_timedout(e) ? std::string("timed out") : sock_errstr(e));
             return false;
         }
         c += r;
@@ -101,18 +181,18 @@ bool recv_all(int fd, void* p, size_t n, std::string& err) {
 }
 
 // header + up to two payload parts, as one logical message
-bool send_msg(int fd, const StageHeader& h, const void* p1, size_t n1, const void* p2, size_t n2, std::string& err) {
+bool send_msg(sock_t fd, const StageHeader& h, const void* p1, size_t n1, const void* p2, size_t n2, std::string& err) {
     return send_all(fd, &h, sizeof h, err) && (n1 == 0 || send_all(fd, p1, n1, err)) &&
            (n2 == 0 || send_all(fd, p2, n2, err));
 }
 
-bool recv_header(int fd, StageHeader& h, std::string& err) {
+bool recv_header(sock_t fd, StageHeader& h, std::string& err) {
     if (!recv_all(fd, &h, sizeof h, err)) return false;
     if (h.magic != kStageMagic) { err = "remote stage: bad message magic (not a Strata stage peer?)"; return false; }
     return true;
 }
 
-bool drain(int fd, uint64_t n, std::string& err) {
+bool drain(sock_t fd, uint64_t n, std::string& err) {
     char tmp[65536];
     while (n > 0) {
         const size_t k = (size_t) std::min<uint64_t>(n, sizeof tmp);
@@ -141,8 +221,6 @@ bool hello_matches(const StageHello& a, const StageHello& b, std::string& err) {
     return true;
 }
 
-#endif
-
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------ StageClient
@@ -150,26 +228,18 @@ bool hello_matches(const StageHello& a, const StageHello& b, std::string& err) {
 StageClient::~StageClient() { close(); }
 
 void StageClient::close() {
-#if !defined(_WIN32)
-    if (fd_ >= 0) ::close(fd_);
-#endif
+    if (fd_ >= 0) (void) sock_close(S(fd_));
     fd_ = -1;
     broken_ = false;
 }
 
 void StageClient::break_() {
-#if !defined(_WIN32)
-    if (fd_ >= 0) (void) ::shutdown(fd_, SHUT_RDWR);
-#endif
+    if (fd_ >= 0) (void) sock_shutdown(S(fd_));
     broken_ = true;
 }
 
 bool StageClient::connect(const std::string& host_port, const StageHello& mine, StageHello& peer, std::string& err) {
-#if defined(_WIN32)
-    (void) host_port; (void) mine; (void) peer;
-    err = "remote stage: not supported on Windows";
-    return false;
-#else
+    if (!net_init()) { err = "remote stage: the sockets did not start (WSAStartup)"; return false; }
     const size_t colon = host_port.rfind(':');
     if (colon == std::string::npos || colon == 0 || colon + 1 >= host_port.size()) {
         err = "remote stage: expected HOST:PORT, got \"" + host_port + "\"";
@@ -180,60 +250,56 @@ bool StageClient::connect(const std::string& host_port, const StageHello& mine, 
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     if (const int rc = getaddrinfo(host.c_str(), port.c_str(), &hints, &res); rc != 0) {
-        err = "remote stage: cannot resolve " + host_port + ": " + gai_strerror(rc);
+        err = "remote stage: cannot resolve " + host_port + ": " + gai_err(rc);
         return false;
     }
-    int fd = -1;
-    for (addrinfo* ai = res; ai != nullptr && fd < 0; ai = ai->ai_next) {
+    sock_t fd = kNoSock;
+    int last = 0;
+    for (addrinfo* ai = res; ai != nullptr && fd == kNoSock; ai = ai->ai_next) {
         fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
-        if (::connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
-            ::close(fd);
-            fd = -1;
+        if (fd == kNoSock) { last = sock_errno(); continue; }
+        if (::connect(fd, ai->ai_addr, (sock_len) ai->ai_addrlen) != 0) {
+            last = sock_errno();
+            (void) sock_close(fd);
+            fd = kNoSock;
         }
     }
     freeaddrinfo(res);
-    if (fd < 0) { err = "remote stage: cannot connect to " + host_port + ": " + std::strerror(errno); return false; }
+    if (fd == kNoSock) { err = "remote stage: cannot connect to " + host_port + ": " + sock_errstr(last); return false; }
     tune_socket(fd);
-    fd_ = fd;
+    fd_ = (std::intptr_t) fd;
     peer_ = host_port;
     StageHeader h;
     h.type = (uint32_t) StageMsg::Hello;
     h.bytes = sizeof mine;
     StageHeader r;
-    if (!send_msg(fd_, h, &mine, sizeof mine, nullptr, 0, err) || !recv_header(fd_, r, err)) { close(); return false; }
+    if (!send_msg(S(fd_), h, &mine, sizeof mine, nullptr, 0, err) || !recv_header(S(fd_), r, err)) { close(); return false; }
     if (r.type == (uint32_t) StageMsg::Error) {
         std::string m((size_t) r.bytes, '\0');
         std::string e2;
-        (void) recv_all(fd_, m.data(), m.size(), e2);
+        (void) recv_all(S(fd_), m.data(), m.size(), e2);
         err = "remote stage: the worker refused: " + m;
         close();
         return false;
     }
-    if (r.type != (uint32_t) StageMsg::HelloOk || r.bytes != sizeof peer || !recv_all(fd_, &peer, sizeof peer, err)) {
+    if (r.type != (uint32_t) StageMsg::HelloOk || r.bytes != sizeof peer || !recv_all(S(fd_), &peer, sizeof peer, err)) {
         if (err.empty()) err = "remote stage: unexpected reply to hello";
         close();
         return false;
     }
     if (!hello_matches(mine, peer, err)) { close(); return false; }
     return true;
-#endif
 }
 
 // the next reply: `want` with exactly reply_bytes of payload, or the worker's error (the connection then stays)
 bool StageClient::read_reply_(StageMsg want, void* reply, size_t reply_bytes, int64_t& worker_us, std::string& err) {
-#if defined(_WIN32)
-    (void) want; (void) reply; (void) reply_bytes; (void) worker_us;
-    err = "remote stage: not supported on Windows";
-    return false;
-#else
     StageHeader r;
     if (broken_) { err = "remote stage: the link failed earlier"; return false; }
-    if (!recv_header(fd_, r, err)) { break_(); return false; }
+    if (!recv_header(S(fd_), r, err)) { break_(); return false; }
     if (r.type == (uint32_t) StageMsg::Error) {
         std::string m((size_t) r.bytes, '\0');
         std::string e2;
-        (void) recv_all(fd_, m.data(), m.size(), e2);
+        (void) recv_all(S(fd_), m.data(), m.size(), e2);
         err = "remote stage (worker): " + m;
         return false;
     }
@@ -245,20 +311,14 @@ bool StageClient::read_reply_(StageMsg want, void* reply, size_t reply_bytes, in
         break_();
         return false;
     }
-    if (reply_bytes > 0 && !recv_all(fd_, reply, reply_bytes, err)) { break_(); return false; }
+    if (reply_bytes > 0 && !recv_all(S(fd_), reply, reply_bytes, err)) { break_(); return false; }
     worker_us = r.a;
     stats_.bytes_in += sizeof r + reply_bytes;
     return true;
-#endif
 }
 
 bool StageClient::run(int T, const int32_t* tokens, int64_t pos0, const float* rows_in, size_t in_floats,
                       float* rows_out, size_t out_floats, std::string& err) {
-#if defined(_WIN32)
-    (void) T; (void) tokens; (void) pos0; (void) rows_in; (void) in_floats; (void) rows_out; (void) out_floats;
-    err = "remote stage: not supported on Windows";
-    return false;
-#else
     std::lock_guard<std::mutex> ls(send_mu_);
     std::lock_guard<std::mutex> lr(recv_mu_);
     if (!connected()) { err = "remote stage: not connected"; return false; }
@@ -268,7 +328,7 @@ bool StageClient::run(int T, const int32_t* tokens, int64_t pos0, const float* r
     h.a = T;
     h.b = pos0;
     h.bytes = (uint64_t) T * sizeof(int32_t) + in_floats * sizeof(float);
-    if (!send_msg(fd_, h, tokens, (size_t) T * sizeof(int32_t), rows_in, in_floats * sizeof(float), err)) {
+    if (!send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int32_t), rows_in, in_floats * sizeof(float), err)) {
         break_();
         return false;
     }
@@ -287,34 +347,22 @@ bool StageClient::run(int T, const int32_t* tokens, int64_t pos0, const float* r
                      (stats_.ms_run - stats_.ms_run_worker) / (double) stats_.runs, T, (long long) pos0, ms,
                      (double) wus / 1000.0, ms - (double) wus / 1000.0);
     return ok;
-#endif
 }
 
 bool StageClient::commit(int n_keep, std::string& err) {
-#if defined(_WIN32)
-    (void) n_keep;
-    err = "remote stage: not supported on Windows";
-    return false;
-#else
     std::lock_guard<std::mutex> lk(send_mu_);
     if (!connected()) { err = "remote stage: not connected"; return false; }
     StageHeader h;
     h.type = (uint32_t) StageMsg::Commit;
     h.a = n_keep;
-    if (!send_msg(fd_, h, nullptr, 0, nullptr, 0, err)) { break_(); return false; }
+    if (!send_msg(S(fd_), h, nullptr, 0, nullptr, 0, err)) { break_(); return false; }
     stats_.bytes_out += sizeof h;
     ++stats_.commits;
     return true;
-#endif
 }
 
 bool StageClient::prefill_send(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows_in,
                                size_t row_floats, int64_t skip, std::string& err) {
-#if defined(_WIN32)
-    (void) tokens; (void) T; (void) pos0; (void) flags; (void) rows_in; (void) row_floats; (void) skip;
-    err = "remote stage: not supported on Windows";
-    return false;
-#else
     std::lock_guard<std::mutex> lk(send_mu_);
     if (!connected()) { err = "remote stage: not connected"; return false; }
     skip = std::max<int64_t>(0, std::min<int64_t>(skip, T));
@@ -329,10 +377,9 @@ bool StageClient::prefill_send(const int64_t* tokens, int64_t T, int64_t pos0, i
         std::lock_guard<std::mutex> lq(q_mu_);
         sent_at_.push_back(Clock::now());
     }
-    if (!send_msg(fd_, h, tokens, (size_t) T * sizeof(int64_t), rows_in, in_bytes, err)) { break_(); return false; }
+    if (!send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int64_t), rows_in, in_bytes, err)) { break_(); return false; }
     stats_.bytes_out += sizeof h + h.bytes;
     return true;
-#endif
 }
 
 bool StageClient::prefill_recv(float* rows_out, size_t row_floats, int64_t T, int64_t skip, std::string& err) {
@@ -361,25 +408,19 @@ bool StageClient::prefill_recv(float* rows_out, size_t row_floats, int64_t T, in
 }
 
 bool StageClient::reset(std::string& err) {
-#if defined(_WIN32)
-    err = "remote stage: not supported on Windows";
-    return false;
-#else
     std::lock_guard<std::mutex> ls(send_mu_);
     std::lock_guard<std::mutex> lr(recv_mu_);
     if (!connected()) { err = "remote stage: not connected"; return false; }
     StageHeader h;
     h.type = (uint32_t) StageMsg::Reset;
-    if (!send_msg(fd_, h, nullptr, 0, nullptr, 0, err)) { break_(); return false; }
+    if (!send_msg(S(fd_), h, nullptr, 0, nullptr, 0, err)) { break_(); return false; }
     int64_t wus = 0;
     ++stats_.resets;
     return read_reply_(StageMsg::ResetOk, nullptr, 0, wus, err);
-#endif
 }
 
 // ------------------------------------------------------------------------------------------------ serve_stage
 
-#if !defined(_WIN32)
 namespace {
 
 // One message as the receiving thread read it.  A prompt chunk's rows are already in buf.pf_in[slot].
@@ -396,7 +437,6 @@ struct Inbox {
 };
 
 }  // namespace
-#endif
 
 StageRelay::~StageRelay() {
     std::string e;
@@ -423,29 +463,31 @@ bool StageRelay::send(const int64_t* tokens, int64_t T, int64_t pos0, int64_t fl
 
 int serve_stage(const std::string& bind_addr, int port, const std::string& token, const StageHandlers& h,
                 const StageBuffers& buf, StageStats& stats, const bool* stop) {
-#if defined(_WIN32)
-    (void) bind_addr; (void) port; (void) token; (void) h; (void) buf; (void) stats; (void) stop;
-    std::fprintf(stderr, "strata stage worker: not supported on Windows\n");
-    return 1;
-#else
+    if (!net_init()) {
+        std::fprintf(stderr, "strata stage worker: the sockets did not start (WSAStartup)\n");
+        return 1;
+    }
     addrinfo hints{}, *res = nullptr;
     hints.ai_family = bind_addr.empty() ? AF_INET6 : AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
     const std::string port_s = std::to_string(port);
     if (const int rc = getaddrinfo(bind_addr.empty() ? nullptr : bind_addr.c_str(), port_s.c_str(), &hints, &res); rc != 0) {
-        std::fprintf(stderr, "strata stage worker: cannot resolve %s: %s\n", bind_addr.c_str(), gai_strerror(rc));
+        std::fprintf(stderr, "strata stage worker: cannot resolve %s: %s\n", bind_addr.c_str(), gai_err(rc));
         return 1;
     }
-    const int lfd = ::socket(res->ai_family, SOCK_STREAM, 0);
-    if (lfd < 0) { std::fprintf(stderr, "strata stage worker: socket: %s\n", std::strerror(errno)); freeaddrinfo(res); return 1; }
-    int one = 1, zero = 0;
-    (void) setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    if (res->ai_family == AF_INET6) (void) setsockopt(lfd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
-    if (::bind(lfd, res->ai_addr, res->ai_addrlen) != 0 || ::listen(lfd, 1) != 0) {
+    const sock_t lfd = ::socket(res->ai_family, SOCK_STREAM, 0);
+    if (lfd == kNoSock) {
+        std::fprintf(stderr, "strata stage worker: socket: %s\n", sock_errstr(sock_errno()).c_str());
+        freeaddrinfo(res);
+        return 1;
+    }
+    set_opt<int>(lfd, SOL_SOCKET, SO_REUSEADDR, 1);
+    if (res->ai_family == AF_INET6) set_opt<int>(lfd, IPPROTO_IPV6, IPV6_V6ONLY, 0);
+    if (::bind(lfd, res->ai_addr, (sock_len) res->ai_addrlen) != 0 || ::listen(lfd, 1) != 0) {
         std::fprintf(stderr, "strata stage worker: cannot listen on %s:%d: %s\n", bind_addr.empty() ? "*" : bind_addr.c_str(),
-                     port, std::strerror(errno));
-        ::close(lfd);
+                     port, sock_errstr(sock_errno()).c_str());
+        (void) sock_close(lfd);
         freeaddrinfo(res);
         return 1;
     }
@@ -455,21 +497,21 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                                : " (a token is required)");
     std::fflush(stderr);
     while (stop == nullptr || !*stop) {
-        pollfd pfd{lfd, POLLIN, 0};
-        const int pr = ::poll(&pfd, 1, 1000);
+        poll_fd pfd{};
+        pfd.fd = lfd;
+        pfd.events = POLLIN;
+        const int pr = sock_poll(&pfd, 1, 1000);
         if (pr <= 0) continue;
         sockaddr_storage peer{};
-        socklen_t plen = sizeof peer;
-        const int fd = ::accept(lfd, (sockaddr*) &peer, &plen);
-        if (fd < 0) continue;
+        sock_len plen = sizeof peer;
+        const sock_t fd = ::accept(lfd, (sockaddr*) &peer, &plen);
+        if (fd == kNoSock) continue;
         char host[128] = "?";
         (void) getnameinfo((sockaddr*) &peer, plen, host, sizeof host, nullptr, 0, NI_NUMERICHOST);
         tune_socket(fd);
         // the hello within 10 s (a silent peer does not hold the only connection); after it no read timeout - the
         // main process may wait for its next prompt for hours (the receiving thread lifts it once the hello is in)
-        timeval tv10{};
-        tv10.tv_sec = 10;
-        (void) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv10, sizeof tv10);
+        set_timeout(fd, SO_RCVTIMEO, 10);
         std::fprintf(stderr, "strata stage worker: connection from %s\n", host);
         std::fflush(stderr);
 
@@ -493,8 +535,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                         } else if (!recv_all(fd, &in.hello, sizeof in.hello, in.err)) {
                             in.closed = true;
                         } else {
-                            timeval tv0{};
-                            (void) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof tv0);
+                            set_timeout(fd, SO_RCVTIMEO, 0);
                         }
                     } else if (type == StageMsg::Run) {
                         const int64_t T = in.h.a;
@@ -708,17 +749,16 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         (void) replies_out();   // a reply still going out ends first (or fails on the closed socket)
         // end the receiving thread: shutting the socket down wakes a blocked recv
         quit.store(true);
-        (void) ::shutdown(fd, SHUT_RDWR);
+        (void) sock_shutdown(fd);
         cv.notify_all();
         reader.join();
-        ::close(fd);
+        (void) sock_close(fd);
         std::fprintf(stderr, "strata stage worker: %s disconnected%s%s\n", host, err.empty() ? "" : ": ", err.c_str());
         std::fflush(stderr);
         if (h.disconnected) h.disconnected();
     }
-    ::close(lfd);
+    (void) sock_close(lfd);
     return 0;
-#endif
 }
 
 }  // namespace strata::net

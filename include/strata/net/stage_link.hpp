@@ -11,7 +11,7 @@
 // runs [K, K2) and hands its rows to the next worker as the main process hands them to it; the next worker's reply
 // is its reply (main -> A -> B -> A -> main), so the main process sees one worker either way.  Prompt chunks are pipelined: the main process sends chunk c + 1 while the
 // worker reads chunk c (the worker receives on its own thread into two buffers), and takes the replies in order on
-// another thread.  Linux only (POSIX sockets); elsewhere every call fails with a message.
+// another thread.  POSIX sockets on Linux, Winsock on Windows.
 #pragma once
 
 #include <chrono>
@@ -111,7 +111,7 @@ private:
     /// a failed link: shut down (both directions fail from now on) - the descriptor is closed only by close(), so
     /// the other thread never reads or writes a number the process may have reused
     void break_();
-    int fd_ = -1;
+    std::intptr_t fd_ = -1;   ///< the socket (a Winsock SOCKET fits; -1: none)
     bool broken_ = false;
     std::string peer_;
     std::mutex send_mu_, recv_mu_, q_mu_;
