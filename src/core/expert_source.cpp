@@ -3777,7 +3777,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
             st.error = err.empty() ? "unreadable shard while reading the experts from the GGUF" : err;
             return st;
         }
-        st.bytes = lay.total;
+        st.bytes = (l_end >= lay.n_layers ? lay.total : lay.layer_offset(l_end)) - lay.layer_offset(layer_lo);
         st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         return st;
     }

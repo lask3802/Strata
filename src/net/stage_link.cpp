@@ -53,6 +53,9 @@ const sock_t kNoSock = INVALID_SOCKET;
 using sock_len = int;
 using poll_fd = WSAPOLLFD;
 constexpr int kSendFlags = 0;
+// Winsock's SO_REUSEADDR binds over a port another process is listening on (two workers on one port, either one
+// taking the connection); SO_EXCLUSIVEADDRUSE refuses that, as Linux does
+constexpr int kListenOpt = SO_EXCLUSIVEADDRUSE;
 int sock_close(sock_t s) { return ::closesocket(s); }
 int sock_shutdown(sock_t s) { return ::shutdown(s, SD_BOTH); }
 int sock_errno() { return WSAGetLastError(); }
@@ -61,8 +64,12 @@ bool sock_timedout(int e) { return e == WSAETIMEDOUT || e == WSAEWOULDBLOCK; }
 int sock_poll(poll_fd* p, int n, int ms) { return ::WSAPoll(p, (ULONG) n, ms); }
 std::string sock_errstr(int e) {
     char buf[256] = {};
-    const DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, (DWORD) e, 0,
-                                   buf, sizeof buf, nullptr);
+    // English where the system has it: the log is read back as UTF-8 (stage_node), a localized ANSI text is not
+    DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, (DWORD) e,
+                             MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), buf, sizeof buf, nullptr);
+    if (n == 0)
+        n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, (DWORD) e, 0, buf,
+                           sizeof buf, nullptr);
     std::string m(buf, n);
     while (!m.empty() && (m.back() == '\n' || m.back() == '\r' || m.back() == '.')) m.pop_back();
     return m + " (" + std::to_string(e) + ")";
@@ -86,6 +93,7 @@ const sock_t kNoSock = -1;
 using sock_len = socklen_t;
 using poll_fd = pollfd;
 constexpr int kSendFlags = MSG_NOSIGNAL;   // a closed peer is an error, not SIGPIPE
+constexpr int kListenOpt = SO_REUSEADDR;   // a restart binds over its own TIME_WAIT, never over a live listener
 int sock_close(sock_t s) { return ::close(s); }
 int sock_shutdown(sock_t s) { return ::shutdown(s, SHUT_RDWR); }
 int sock_errno() { return errno; }
@@ -482,7 +490,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         freeaddrinfo(res);
         return 1;
     }
-    set_opt<int>(lfd, SOL_SOCKET, SO_REUSEADDR, 1);
+    set_opt<int>(lfd, SOL_SOCKET, kListenOpt, 1);
     if (res->ai_family == AF_INET6) set_opt<int>(lfd, IPPROTO_IPV6, IPV6_V6ONLY, 0);
     if (::bind(lfd, res->ai_addr, (sock_len) res->ai_addrlen) != 0 || ::listen(lfd, 1) != 0) {
         std::fprintf(stderr, "strata stage worker: cannot listen on %s:%d: %s\n", bind_addr.empty() ? "*" : bind_addr.c_str(),
@@ -501,6 +509,10 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         pfd.fd = lfd;
         pfd.events = POLLIN;
         const int pr = sock_poll(&pfd, 1, 1000);
+        if (pr < 0 && !sock_eintr(sock_errno())) {   // (a network that went down: no spinning on the error)
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
         if (pr <= 0) continue;
         sockaddr_storage peer{};
         sock_len plen = sizeof peer;

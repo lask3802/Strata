@@ -107,6 +107,20 @@ def gpu_info() -> list[dict]:
 
 
 def ram_info() -> dict:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                        ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                        ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                        ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                        ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+        m = MEMORYSTATUSEX(dwLength=ctypes.sizeof(MEMORYSTATUSEX))
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            return {}
+        return {"total_mib": m.ullTotalPhys >> 20, "available_mib": m.ullAvailPhys >> 20}
     try:
         mem = {}
         for line in Path("/proc/meminfo").read_text().splitlines():
@@ -224,6 +238,30 @@ def drop_cache(path: Path, offset: int = 0, length: int = 0) -> None:
         os.close(fd)
 
 
+def new_sparse(p: Path, total: int) -> None:
+    """p emptied and grown to total bytes, all of them a hole: the bytes nobody writes take no disk."""
+    with open(p, "wb", buffering=0) as f:
+        if os.name != "nt":
+            f.truncate(total)
+            return
+        # Windows: a file is not sparse unless marked (NTFS and ReFS write a gap as zeros), and the CRT's
+        # truncate grows a file by writing zeros itself; SetEndOfFile grows it as a hole
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = wintypes.HANDLE(msvcrt.get_osfhandle(f.fileno()))
+        done = wintypes.DWORD()
+        FSCTL_SET_SPARSE = 0x900C4
+        # no dense fallback: the first write near a shard's end would then write every byte before it (tens of GB)
+        if not k32.DeviceIoControl(h, FSCTL_SET_SPARSE, None, 0, None, 0, ctypes.byref(done), None):
+            raise ctypes.WinError(ctypes.get_last_error(),
+                                  f"{p}: cannot mark it sparse - put data_dir on NTFS or ReFS (not FAT32/exFAT)")
+        f.seek(total)
+        if not k32.SetEndOfFile(h):
+            raise ctypes.WinError(ctypes.get_last_error(), f"{p}: cannot grow it to {total} bytes")
+
+
 def model_files(cfg: dict) -> list[Path]:
     """The files a worker reads: the GGUF shards next to "native", the pack's files."""
     out: list[Path] = []
@@ -289,10 +327,7 @@ class Store:
             # (a sidecar without a fingerprint, from before they existed: kept, and it takes this one)
             if not p.exists() or p.stat().st_size != total or (fp and d["fp"] is not None and d["fp"] != fp):
                 # a new file, or a different source (size or fingerprint): what was written of it is void
-                with open(p, "ab"):
-                    pass
-                os.truncate(p, 0)
-                os.truncate(p, total)   # sparse: the bytes nobody writes stay holes
+                new_sparse(p, total)
                 self.side(p).write_text(json.dumps({"fp": fp, "ranges": []}))
         h = hashlib.sha256()
         with open(p, "r+b") as f:

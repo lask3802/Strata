@@ -212,11 +212,14 @@ def plan(model_dir: Path, pack_dir: Path, profile: Path, bin_dir: Path | None, l
 def node_paths(data_dir: str, model_dir: Path, pack_dir: Path, profile: Path) -> dict:
     """node.json's paths for what plan() ships."""
     shards = sorted(p.name for p in model_dir.glob("*.gguf"))
-    d = data_dir.rstrip("/")
-    return {"exe": f"{d}/bin/strata", "lib_dirs": [f"{d}/bin"], "pack": f"{d}/packs/{pack_dir.name}",
-            "native": f"{d}/models/{model_dir.name}/{shards[0]}",
-            "ple_gguf": f"{d}/models/{model_dir.name}/{shards[1]}" if len(shards) > 1 else "",
-            "expert_profile": f"{d}/data/{profile.name}"}
+    win = bool(re.match(r"[A-Za-z]:", data_dir)) or "\\" in data_dir   # a Windows node: its own separator, .exe
+    sep = "\\" if win else "/"
+    d = data_dir.rstrip("/\\")
+    j = lambda *parts: sep.join([d, *parts])   # noqa: E731
+    return {"exe": j("bin", "strata.exe" if win else "strata"), "lib_dirs": [j("bin")],
+            "pack": j("packs", pack_dir.name), "native": j("models", model_dir.name, shards[0]),
+            "ple_gguf": j("models", model_dir.name, shards[1]) if len(shards) > 1 else "",
+            "expert_profile": j("data", profile.name)}
 
 
 def main() -> None:
