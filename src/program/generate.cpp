@@ -6638,8 +6638,8 @@ int main(int argc, char** argv) {
     //
     // `nonfinite` (#879): a window's head logits held a NaN or an infinity (Verifier::nonfinite_row).  None of that
     // window's tokens was written; every state that may carry the poison (the live session, the checkpoints, the
-    // parked conversations, the idle batch slots) is dropped at the next request's start, which reads its prompt from
-    // token 0.  A batch slot ends the same way: `BDONE <slot> <n> nonfinite`.
+    // parked conversations, the idle batch slots; a remote worker's checkpoint parts) is dropped at the next request's
+    // start, which reads its prompt from token 0.  A batch slot ends the same way: `BDONE <slot> <n> nonfinite`.
     //
     // Before that, `RESUME <n>` (n prompt tokens are not read again), `PP <position> <prompt_tokens> <ms> <tok/s>`
     // after every prompt chunk, and `REUSED <n>` once the prompt is read.  (`ERR <message>` instead when a request
@@ -11800,7 +11800,8 @@ int main(int argc, char** argv) {
             nf_hit = false;
             // #879: an earlier window met non-finite logits.  The poison sits in a conversation's K/V and recurrent
             // state, so nothing that may hold it is continued: the live session, every checkpoint, every parked
-            // conversation and every idle batch slot go, and this prompt is read from token 0 (resume == 0 below)
+            // conversation and every idle batch slot go, and this prompt is read from token 0 (resume == 0 below:
+            // with a remote stage, a Reset that keeps none of the worker's checkpoint parts, `checks` being empty)
             if (nan_flush) {
                 nan_flush = false;
                 const size_t n_checks = checks.size();
@@ -11820,10 +11821,11 @@ int main(int argc, char** argv) {
                         ++n_slots;
                     }
                 std::fprintf(stderr, "strata serve: after non-finite logits (#879): dropped the live session, %zu "
-                                     "checkpoint%s, %zu parked conversation%s and %zu idle slot%s (%zu running slot%s "
+                                     "checkpoint%s%s, %zu parked conversation%s and %zu idle slot%s (%zu running slot%s "
                                      "not kept after their reply); reading this prompt from token 0\n", n_checks,
-                             n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
-                             n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
+                             n_checks == 1 ? "" : "s", remote_main ? " (the remote worker's parts too)" : "", n_parked,
+                             n_parked == 1 ? "" : "s", n_slots, n_slots == 1 ? "" : "s", n_running,
+                             n_running == 1 ? "" : "s");
             }
             int64_t resume = 0;
             bool from_live = false;

@@ -140,6 +140,8 @@ Main side:
   `limit_reuse`, the cuts) is computed later from `resume`, so the request then reads from 0. Any other error: fatal.
 - STRATA_CKPT_REREAD in remote mode zeroes and Resets the worker too (keep = the chain), so the comparison holds.
 - `resume == 0`: Reset with keep = the surviving checkpoints' ids (normally empty).
+- After non-finite logits (#879, docs/DETAILS.md) the next request drops every checkpoint first, so its Reset
+  keeps none of the worker's parts (keep = {}) and both sides read the prompt from token 0.
 
 Cost (estimated, not measured on its own): one round trip per checkpoint saved and per request resumed, plus the
 worker's copy (~55 MB for ~17 GDN layers). The prompt is read in parts at the cut points as on one GPU.
