@@ -7,7 +7,8 @@ is still open. Using it: [../REMOTE_STAGE.md](../REMOTE_STAGE.md). Raw numbers:
 `remote_main` / `stage_worker` / `stage_relay` parts of `src/program/generate.cpp`, `Verifier::set_remote` /
 `set_no_head` (`src/core/verify.cpp`), `Prefill::remote_send` / `remote_recv` (`src/prefill/prefill.cpp`),
 `ArenaExpertSource::set_layer_range` (`src/core/expert_source.cpp`), and `tools/stage_node.py`,
-`tools/stage_tune.py`, `tools/stage_ship.py` (tests: `tools/test_stage_node.py`).
+`tools/stage_tune.py`, `tools/stage_ship.py` (tests: `tools/test_stage_node.py`, and `src/net/stage_link_test.cpp`
+for the link over loopback).
 
 ## Design
 
@@ -29,7 +30,8 @@ the head and the drafter on the worker would have saved that return trip and mov
 ### The protocol
 
 One TCP connection per main process. Every message is a 40-byte header (`magic` "STRM", `type`, three int64 fields
-`a b c`, payload `bytes`) and a payload. Protocol version 4 (3 before the hello carried the tail-skip rank).
+`a b c`, payload `bytes`) and a payload. Protocol version 5 (4 before images: the Positions message and the hello's
+`vision`; 3 before the hello carried the tail-skip rank).
 
 | message | header fields | payload | reply |
 |---|---|---|---|
@@ -38,6 +40,7 @@ One TCP connection per main process. Every message is a 40-byte header (`magic` 
 | Commit | a = accepted count | none | none (an error comes back on the next reply) |
 | Prefill (a prompt chunk) | a = T, b = first position, c = flags (bit 0: the prompt is one chunk) and `skip` << 8 | int64 tokens[T], fp32 rows[T x 10,240] | PrefillOk: a = the worker's time (us), rows[(T - skip) x 10,240] |
 | Reset (a fresh prompt) | | none | ResetOk |
+| Positions (`--vision`: the next request's) | a = cells; b = 1: plain positions (no table) | int32 (t, h, w)[cells] | none (an error comes back on the next reply, a Reset's included) |
 | Error | | the message | |
 
 **The hello** carries what both sides must agree on, and each side checks the other's: the protocol, `n_embd`, `hc`,
@@ -45,7 +48,9 @@ One TCP connection per main process. Every message is a 40-byte header (`magic` 
 fingerprint of the pack (FNV-1a over the pack's `index.txt` and `native_experts.txt`). The worker also refuses a main
 process whose prompt chunk, context or window is larger than its own, and a wrong `STRATA_STAGE_TOKEN` (the token is
 the hello's last field; the worker's own hello carries none). The main process's `STRATA_ROUTE_TAIL_SKIP` rank rides
-along and the worker takes it (a relay passes it on), so every layer skips as in one process. The hello is 192 bytes in
+along and the worker takes it (a relay passes it on), so every layer skips as in one process. So does whether the
+main process reads images (`vision`): a worker started without `--vision` refuses such a main process, and the main
+process checks the worker's hello for it too. The hello is 192 bytes in
 every protocol, so an older peer is refused for its protocol number. A peer that sends no hello within 10 s is dropped; after
 the hello the worker waits for messages without a time limit (the next prompt may be hours away), while sends and the
 main process's receives time out after `STRATA_REMOTE_TIMEOUT_S` (300 s). Sockets: `TCP_NODELAY`, 8 MiB buffers,
@@ -62,6 +67,8 @@ keepalive after 30 s idle, 3 probes 10 s apart.
   token prompt that is 3.72 GB out and 1.35 GB back; for a prompt shorter than the window, every row comes back.
   Without a drafter no prompt rows come back.
 - a commit is the header alone.
+- a position table is 12 B a cell, for the cells a request can reach (its prompt, its answer and 64 more): about 0.36 MB
+  for a 30,000-token request, sent once before it, and only when the request has a picture (or follows one).
 
 ### Pipelining the prompt
 
@@ -100,6 +107,33 @@ worker. A relay connects to the next worker when it starts (30 tries, 2 s apart;
 a context mismatch - is not retried) and again at the first reset after each main process's hello (so the next worker
 hears that main process's values, such as its tail-skip rank) or after that link broke; when its main process goes
 away it drops the link to the next worker, so replies still owed on it cannot reach the next main process.
+
+### Images
+
+With `--vision`, a picture becomes image tokens whose input rows the encoder's embeddings replace at layer 0, on the
+main PC; nothing about that crosses the link (the hand-off is the residual, whatever the input was). What every layer
+needs is the position table: each rope kernel reads a cell's (t, h, w) from a device table
+(`strata/kernels/mrope.hpp`). Text is the identity; a picture's cells sit on a grid at one t, and every cell after
+the picture moves on by the picture's extent (the larger of its patch rows and columns), not by its token count. A
+worker that kept the identity would rotate its layers' queries and keys differently from the main process's layers
+for every cell from the picture on. The main process therefore sends its table before each request that has a
+picture (`StageMsg::Positions`: the cells the request can reach, its prompt and answer plus 64), and "plain positions"
+(no table) before the first text request after one; text after text sends nothing.
+
+The worker keeps the table in the same device buffer for the whole process, because the rope kernels in its captured
+CUDA graphs hold that pointer: it waits for the last request's commit and the device, then writes the buffer in place
+(`stage_positions_fill`: the cells past the table sent continue from its last one, as the main process's own table
+does past its prompt). The table outlives a connection while the next main process starts from the identity and
+sends nothing for text, so a worker puts a picture's table back to the identity when its main process goes away. A
+relay forwards the table to the next worker first, making its link to the next worker if a new main process's hello
+dropped it, and a relay started with `--vision` checks at its start that the next worker has it too. Positions is one
+way, like a commit, and its failure (or a malformed table) comes back as the next reply's error. A Reset drops a
+pending commit error (it belongs to the request before), but not a Positions error, because the positions belong to
+the request the Reset begins, which must not run on the old table. A later table replaces an earlier one's failure:
+the main process sent no Reset for a request it then refused (a prompt longer than the context, say).
+`STRATA_STAGE_POSITIONS=0` on the main process (a test switch) sends no table, to show what the positions change.
+`src/net/stage_link_test.cpp` checks the table's fill, the hello, the table arriving whole, and the errors' order
+over loopback.
 
 ### Windows
 

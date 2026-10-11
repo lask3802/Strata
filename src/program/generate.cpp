@@ -2445,8 +2445,8 @@ int main(int argc, char** argv) {
                                   (o.stage_end >= 0 && (o.stage_end <= o.stage_begin ||
                                                         o.stage_end >= strata::core::ModelGeometry{}.n_layers))))
             why = "a relay worker needs both --stage-end K2 (--stage-begin < K2 < the layer count) and --stage-next HOST:PORT";
-        else if (o.batch > 0 || o.pipeline_windows > 0 || o.vision || o.peer_device >= 0)
-            why = "it does not support --batch, --pipeline-windows, --vision or --peer-device";
+        else if (o.batch > 0 || o.pipeline_windows > 0 || o.peer_device >= 0)
+            why = "it does not support --batch, --pipeline-windows or --peer-device";
         // (0.1.44: the head-alias loan is laid out for a single-GPU whole model; the worker has no head)
         else if (o.prefill_head_alias)
             why = "it does not support --prefill-head-alias";
@@ -2960,7 +2960,9 @@ int main(int argc, char** argv) {
             o.pcie_frac = pcie_frac_for_gbps(bw, base);
             std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
                                  "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
-            o.pcie_frac_auto = (o.layer_split.empty() || pcie_auto_split_ok()) && decode_defaults_arch_ok() && !pf_old;
+            // (a remote stage's main process has no local later stage for STRATA_PCIE_AUTO_SPLIT to refine)
+            o.pcie_frac_auto = (o.layer_split.empty() || (pcie_auto_split_ok() && o.remote_stage.empty())) &&
+                               decode_defaults_arch_ok() && !pf_old;
             o.pcie_probe_gbps = bw;
         } else {
             o.pcie_frac = base;
@@ -8813,8 +8815,19 @@ int main(int argc, char** argv) {
             const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
             // #1884: with nearly every expert in the GPU cache (V100 32 GB, Coder IQ1_M: 94.8% of the experts, 99.9% decode hits) the few
             // misses are cheap and the skip costs more draft acceptance (70.1% -> 68.2%) than it saves: -1..2% decode.  No default then.
-            size_t cached_experts = 0;
-            for (int32_t r : host_res) cached_experts += r >= 0 ? 1 : 0;
+            // A remote stage's process holds only its own layers' experts (the other PC caches the rest): the share is
+            // of those, the nearest it can see to the whole split's (an in-process split counts every stage's).
+            size_t cached_experts = 0, counted_experts = 0;
+            {
+                const int64_t own_end = own_hi >= 0 ? own_hi : g.n_layers;
+                const bool own_only = remote_main || stage_worker;
+                for (size_t i = 0; i < host_res.size(); ++i) {
+                    const int64_t l = (int64_t) i / g.n_expert;
+                    if (own_only && (l < own_lo || l >= own_end)) continue;
+                    ++counted_experts;
+                    cached_experts += host_res[i] >= 0 ? 1 : 0;
+                }
+            }
             // (STRATA_TAIL_SKIP_MAX_CACHED=<percent>, default 90, moves the line; 101 = never).  0.1.43: 60 on a HIP layer split, where
             // 2x R9700 (5 pairs, skip on vs off): Q2_0 story -6.2% at 70% cached, -1.8% at 60%; IQ3_S +6..15% at 44-52%, about 0 at 60%.
 #if defined(STRATA_USE_HIP)
@@ -8824,8 +8837,8 @@ int main(int argc, char** argv) {
 #endif
             const char* mcs = std::getenv("STRATA_TAIL_SKIP_MAX_CACHED");
             const double max_cached = mcs != nullptr && mcs[0] != 0 ? std::atof(mcs) / 100.0 : max_cached_default;
-            const bool nearly_all_cached = !host_res.empty() && !all_experts_resident &&
-                                           (double) cached_experts >= max_cached * (double) host_res.size();
+            const bool nearly_all_cached = counted_experts > 0 && !all_experts_resident &&
+                                           (double) cached_experts >= max_cached * (double) counted_experts;
             // NVFP4 experts (any layer): no default (sergqwer/strata-nvfp4 c83625c3).  On the fork's qwen-nvfp4-gptq pack the
             // skip moved the answers by teacher-forced KL 0.035 against it off - as much as the GPTQ quantization's own error
             // against an all-Q8_0 reference (0.038) - for +11.5% decode (RTX 5090).  STRATA_ROUTE_TAIL_SKIP=7 opts in.
@@ -8844,7 +8857,7 @@ int main(int argc, char** argv) {
             if (tse == nullptr && nearly_all_cached && o.batch == 0 && o.peer_device < 0 && decode_defaults_arch_ok())
                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in the GPU cache, so "
                                      "few are missed and skipping them costs more draft acceptance than it saves; "
-                                     "STRATA_ROUTE_TAIL_SKIP=7 turns it on\n", 100.0 * (double) cached_experts / (double) host_res.size());
+                                     "STRATA_ROUTE_TAIL_SKIP=7 turns it on\n", 100.0 * (double) cached_experts / (double) counted_experts);
             if (tail_default_ok) strata::core::set_tail_skip_rank(7);
             if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a verify window routes at rank %d or "
@@ -10018,6 +10031,7 @@ int main(int argc, char** argv) {
             me.chunk = sp.chunk();
             me.handoff_floats = HBF;
             me.tail_skip = (int32_t) strata::core::tail_skip_rank();   // a worker's: informational
+            me.vision = o.vision ? 1 : 0;   // images: the worker's layers need the position table (StageMsg::Positions)
             std::snprintf(me.build, sizeof me.build, "strata remote-stage %s", stage_worker ? "worker" : "main");
             // the model pack's fingerprint: its tensor index and expert table (the same model on both PCs)
             for (const char* f : {"/index.txt", "/native_experts.txt"}) {
@@ -10072,6 +10086,9 @@ int main(int argc, char** argv) {
                 std::vector<int32_t> wk_outv((size_t) strata::kernels::kVerifyMaxT, 0);
                 strata::net::StageHandlers hs;
                 int64_t main_chunk = pf_chunk;   // the main process's prompt chunk (its hello)
+                // ... and whether it reads images (a relay's next worker must too); until a hello this worker's own,
+                // so a relay started with --vision checks at its start that the next worker has it
+                int32_t main_vision = o.vision ? 1 : 0;
                 hs.hello = [&](const strata::net::StageHello& theirs, strata::net::StageHello& mine, std::string& e) {
                     mine = me;   // (the worker's own hello carries no token)
                     // another protocol: the link refuses it for its number (its fields may sit elsewhere)
@@ -10087,6 +10104,11 @@ int main(int argc, char** argv) {
                             std::to_string(theirs.chunk) + ")";
                         return false;
                     }
+                    if (theirs.vision != 0 && !o.vision) {
+                        e = "the main process reads images (--vision): start this worker with --vision too (its "
+                            "layers rotate by the images' positions)";
+                        return false;
+                    }
                     if (theirs.max_context > o.max_context || theirs.max_t > me.max_t) {
                         e = "the main process's context (" + std::to_string(theirs.max_context) + ") or window (" +
                             std::to_string(theirs.max_t) + ") is larger than this worker's (" +
@@ -10095,6 +10117,7 @@ int main(int argc, char** argv) {
                     }
                     mine.chunk = theirs.chunk;   // informational
                     main_chunk = theirs.chunk;
+                    main_vision = theirs.vision;
                     // STRATA_ROUTE_TAIL_SKIP changes answers, so this worker's layers skip as the main process's do (the
                     // stages of an in-process split share one rank); its default differs by build (CUDA 7, HIP off)
                     if (theirs.tail_skip != strata::core::tail_skip_rank()) {
@@ -10118,13 +10141,27 @@ int main(int argc, char** argv) {
                     const auto wk_t0 = Clock::now();
                     // a prompt's loan goes back before a window reads the cache (as the request loop does)
                     if (!refill(e)) return false;
-                    // the adaptive tier's swaps of earlier windows land first (as the decode loop does)
+                    // the adaptive tier's swaps of earlier windows land first (as the decode loop does; with 0.1.43's
+                    // STRATA_ADAPT_OVERLAP the tables take them now and each layer waits for its own copies inside
+                    // the window, as there)
                     if (adapt_nowait()) apply_pending(false);
+                    else if (aov && !pending.empty() && !aflipped) {
+                        if (src.complement_ready() && !src.soft_commit_exchanges()) {
+                            apply_pending(true);
+                        } else {
+                            for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+                            res_upload();
+                            aflipped = true;
+                            ++aov_flips;
+                            agate.active.store(true, std::memory_order_release);
+                        }
+                    }
                     else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
                     if (!ver.run(T, tokens, pos0, win_pool_fn, win_pool_user, wk_outv.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
+                    if (aflipped) apply_pending(true);   // every layer's copies were waited for in the window
                     const auto wk_t1 = Clock::now();
                     // a relay worker: the next worker runs the rest; its rows are this window's reply
                     if (stage_relay &&
@@ -10142,6 +10179,10 @@ int main(int argc, char** argv) {
                                                                         " ms").c_str() : "",
                                          (ver.ms_wait - wk_wait0) / 64, (ver.ms_pool - wk_pool0) / 64,
                                          (ver.ms_host - wk_host0) / 64);
+                            if (aov)   // as the main process's decode line
+                                std::fprintf(stderr, "strata stage worker: adapt overlap: %lld windows took swaps still "
+                                                     "landing, a layer waited %.2f ms in all so far\n",
+                                             (long long) aov_flips, ver.ms_gate);
                             wk_wait0 = ver.ms_wait;
                             wk_pool0 = ver.ms_pool;
                             wk_host0 = ver.ms_host;
@@ -10181,6 +10222,7 @@ int main(int argc, char** argv) {
                     mine_next.layer_begin = (int32_t) own_hi;
                     mine_next.chunk = main_chunk;   // the main process's (this worker's own until its hello)
                     mine_next.tail_skip = (int32_t) strata::core::tail_skip_rank();   // the main process's, as above
+                    mine_next.vision = main_vision;   // the main process's (a worker started with --vision has it)
                     std::memcpy(mine_next.token, stage_token.data(), stage_token.size());
                     for (int i = 0;; ++i) {
                         next_link.close();
@@ -10209,9 +10251,54 @@ int main(int argc, char** argv) {
                     strata::core::session_zero(ss, g, nullptr, main_cs);
                     return cudaStreamSynchronize(main_stream) == cudaSuccess;
                 };
+                // --vision: the main process's position table for its next request.  A picture's cells rotate by
+                // their (t, h, w) and every cell after it by the picture's extent, not its token count, so this
+                // worker's rope kernels need the same table the main process built (they read their own copy).
+                // Cells past the table sent continue from its last one, as the main process's do past its prompt.
+                // The table outlives a connection: the next main process starts from the identity and sends nothing
+                // for text, so a picture's table goes back to the identity when its main process goes away.
+                bool wk_mrope_identity = true;
+                auto wk_positions_set = [&](const int32_t* table, int64_t cells_in, std::string& e) -> bool {
+                    // no kernel of an earlier request may still read the table
+                    if (!ver.wait_commit(e)) return false;
+                    if (cudaDeviceSynchronize() != cudaSuccess) {
+                        e = std::string("stage worker: ") + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                    wk_mrope_identity = false;   // (until the upload has landed)
+                    strata::net::stage_positions_fill(mrope_host.data(), (int64_t) mrope_host.size() / 3, table,
+                                                      cells_in);
+                    if (cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
+                                   cudaMemcpyHostToDevice) != cudaSuccess) {
+                        e = "stage worker: the image position upload failed";
+                        return false;
+                    }
+                    wk_mrope_identity = table == nullptr;
+                    return true;
+                };
+                if (o.vision)
+                    hs.positions = [&](const int32_t* table, int64_t cells_in, std::string& e) -> bool {
+                        const int64_t cells = (int64_t) mrope_host.size() / 3;
+                        if (table != nullptr && cells_in > cells) {
+                            e = "the main process's position table (" + std::to_string(cells_in) +
+                                " cells) is longer than this worker's context";
+                            return false;
+                        }
+                        if (stage_relay) {   // the next worker's layers too (its link is made again after a hello)
+                            if (!relay.wait(e) && next_link.connected()) return false;
+                            if (!next_link.connected() && !connect_next(e)) return false;
+                            if (!next_link.positions(table, cells_in, e)) return false;
+                        }
+                        return wk_positions_set(table, cells_in, e);
+                    };
                 hs.disconnected = [&] {
                     std::string e;
                     (void) ver.wait_commit(e);
+                    // a picture's positions do not reach the next main process's text (a relay's next worker resets
+                    // its own when this relay closes the link below)
+                    if (o.vision && !wk_mrope_identity && !wk_positions_set(nullptr, 0, e))
+                        std::fprintf(stderr, "strata stage worker: the image positions did not go back to the "
+                                             "identity: %s\n", e.c_str());
                     // a relay: replies the next worker still owes (chunks the main process will not read) must not
                     // meet the next main process's reset - the link is made again at that reset
                     if (stage_relay) {
@@ -11385,11 +11472,32 @@ int main(int argc, char** argv) {
                     return ok;
                 };
                 if (ve.empty() && !upload_mrope()) ve = "the image position upload failed";
+                // a remote stage's layers rotate by the same positions: the worker's table follows this one (the
+                // cells this request can reach, the rest continuing from the last; a text request after a picture
+                // sends the identity).  STRATA_STAGE_POSITIONS=0 (a test switch) leaves the worker's table alone, to
+                // show what the positions change.
+                static const bool send_positions = [] {
+                    const char* v = std::getenv("STRATA_STAGE_POSITIONS");
+                    return v == nullptr || std::atoi(v) != 0;
+                }();
+                if (ve.empty() && remote_main && send_positions &&
+                    !remote_link.positions(geni ? mrope_host.data() : nullptr,
+                                           geni ? std::min<int64_t>(cells, n + max_new + 64) : 0, err)) {
+                    std::printf("ERR %s\n", err.c_str());   // the link is gone (as a failed reset)
+                    std::fflush(stdout);
+                    return 1;
+                }
                 if (!ve.empty()) {
-                    // leave the table as the identity so the next text request is untouched
+                    // leave the table as the identity so the next text request is untouched (the worker's as well:
+                    // it may still hold an earlier picture's, and a text request sends nothing)
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
                     upload_mrope();
                     mrope_identity = true;
+                    if (remote_main && send_positions && !remote_link.positions(nullptr, 0, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        std::fflush(stdout);
+                        return 1;
+                    }
                     std::printf("ERR %s\n", ve.c_str());
                     std::fflush(stdout);
                     continue;
