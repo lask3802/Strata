@@ -8360,6 +8360,13 @@ int main(int argc, char** argv) {
         auto pl_drain = [&]() {
             std::string e2;
             pl_drain_err.clear();
+            // remote-stage: a drain that stops at an error first waits for a window still waiting on the worker
+            // (Verifier::remote_settle), so the next request's Reset or CkptRestore is the only user of the link
+            auto stop_at = [&](const std::string& why) {
+                pl_drain_err = why.empty() ? std::string("a pipelined window failed") : why;
+                for (int st = 0; st < n_stages && pipe; ++st)
+                    for (int par = 0; par < 2; ++par) stage_ver_p(st, par).remote_settle();
+            };
             for (int round = 0; round < 10000000; ++round) {
                 bool any = false, remote_wait = false;
                 for (int st = 0; st < n_stages && pipe; ++st)
@@ -8367,12 +8374,9 @@ int main(int argc, char** argv) {
                         strata::core::Verifier& v = stage_ver_p(st, par);
                         if (!v.in_flight()) continue;
                         any = true;
-                        if (v.service(&drive_pool_split, PSD[par], e2) < 0) {
-                            pl_drain_err = e2.empty() ? std::string("a pipelined window failed") : e2;
-                            return;
-                        }
+                        if (v.service(&drive_pool_split, PSD[par], e2) < 0) return stop_at(e2);
                         if (v.done(e2)) v.pl_finish(nullptr, e2);
-                        else if (!e2.empty()) { pl_drain_err = e2; return; }
+                        else if (!e2.empty()) return stop_at(e2);
                         remote_wait = remote_wait || v.remote_waiting();
                     }
                 if (!any) break;

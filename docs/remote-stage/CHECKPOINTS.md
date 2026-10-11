@@ -130,8 +130,10 @@ Main side:
   time: each Run waits for the worker's reply, and the window's one-way Commit goes out before the next message, so
   the worker has run that Commit when it reads the CkptSave, and a Commit that failed comes back as the CkptSave's
   error. With `--pipeline-windows` a Run waits on a job thread, so every link message from the request's own thread
-  (CkptSave, CkptRestore, Reset) comes after a `pl_drain`, which ends with nothing in flight; an error that drain
-  saw is set aside (`pl_drain_err`): no CkptSave over it, and no live continuation after a decode it ended.
+  (CkptSave, CkptRestore, Reset) comes after a `pl_drain`, which ends with no Run in flight (one that stops at an
+  error first waits for a window still waiting on the worker, and gives it up without its Commit); that error is set
+  aside (`pl_drain_err`): no CkptSave over it, and no live continuation after a decode it ended, so the worker's
+  session is next replaced by a Reset or a CkptRestore.
 - Request start, checkpoint path: after the main's restore, `CkptRestore(c.remote_id, resume, keep)`. On the
   missing-id Error: one shared helper zeroes the main's session, sends Reset (keep = {}), and sets `resume = 0`,
   `from_live = false`, `reread_to = -1`, `checks.clear()`; everything after (MTP `kv_restore`, `read_from`,
