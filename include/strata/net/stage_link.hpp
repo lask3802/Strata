@@ -112,6 +112,9 @@ public:
     bool connect(const std::string& host_port, const StageHello& mine, StageHello& peer, std::string& err);
     bool connected() const { return fd_ >= 0 && !broken_; }
     void close();
+    /// From another thread: the socket shut down, so a run() waiting for its reply fails (and then breaks the link).
+    /// Linux wakes a blocked read at once; on Windows (not tested) the read may wait for the link's own timeout.
+    void abort();
 
     /// One verify window: send T tokens and T rows (in_floats floats), receive T rows (out_floats floats).
     bool run(int T, const int32_t* tokens, int64_t pos0, const float* rows_in, size_t in_floats, float* rows_out,

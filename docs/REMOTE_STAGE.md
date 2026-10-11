@@ -282,6 +282,20 @@ strata stage worker: windows: own layers 11.08 ms, next worker 8.59 ms each (64 
 own window time splits into waiting for its GPU, the CPU expert pool and the plan, and host staging: a GPU wait far
 above another card's for the same layers points at clocks (Windows, above).
 
+## Overlapping the decode windows (`--pipeline-windows 2`)
+
+`--pipeline-windows 2` works on the main process: the decode loop of [MULTI_GPU.md](MULTI_GPU.md) runs with two
+stages, layers 0 to K-1 as the front stage and the worker followed by this PC's head as the last one. While the
+worker and the head verify window N, layers 0 to K-1 already run window N+1 on the guess that N is accepted whole;
+a wrong guess is undone on this PC (its layers' recurrent state comes back from a snapshot). The worker only ever
+gets verified windows, in the serial loop's order, so it needs no new flag. `1` overlaps only the prompt's short
+reads. Both stages share this PC's GPU: the second verify window of each and two copies of layers 0 to K-1's
+recurrent state are kept out of the expert cache (444 MiB at K=26). Measured on an earlier base: +12% decode on
+`spec_prompts.py`. To compare greedy answers byte for byte with the serial loop, run the worker with
+`STRATA_IQ_MT_MIN=1 STRATA_PREFILL_CPU_SHARE=0` (and `--pcie-frac 0 --adapt-every 0` on both PCs), and set
+`STRATA_ROUTE_TAIL_SKIP=0` on the main process: the skip depends on which rows share a window, and the overlapped
+loop may group them otherwise.
+
 ## Picking K and the chunk
 
 What the measurements say (re-measure on your PCs; `tools/stage_tune.py` does it):
@@ -424,8 +438,9 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 
 ## What is turned off or refused
 
-- **Refused at start** with a remote stage: `--batch`, `--pipeline-windows`, `--peer-device`,
-  `--control-vector` (and the speed projection, which is one), `--expert-cache-remote`.
+- **Refused at start** with a remote stage: `--batch`, `--peer-device`, `--control-vector` (and the speed
+  projection, which is one), `--expert-cache-remote`, and `--pipeline-windows` on a worker (the main process
+  takes it, see [Overlapping the decode windows](#overlapping-the-decode-windows---pipeline-windows-2)).
 - **Turned off without an error:** the prompt cache, the conversation cache and mid-prompt checkpoints (each PC
   holds only its layers' state, so every prompt is read from token 0), and `--kv-grow`. With `--prompt-cache N`
   given on the main process, conversation checkpoints at the prompt's turn boundaries come back: the worker keeps its

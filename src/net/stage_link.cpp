@@ -246,6 +246,10 @@ void StageClient::break_() {
     broken_ = true;
 }
 
+void StageClient::abort() {
+    if (fd_ >= 0) (void) sock_shutdown(S(fd_));   // the waiting read fails and breaks the link itself
+}
+
 bool StageClient::connect(const std::string& host_port, const StageHello& mine, StageHello& peer, std::string& err) {
     if (!net_init()) { err = "remote stage: the sockets did not start (WSAStartup)"; return false; }
     const size_t colon = host_port.rfind(':');
