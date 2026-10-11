@@ -827,6 +827,19 @@ print(r.choices[0].message.content)
   `"recover"` needs the exact xhigh sentence in the first system message and skips requests with images; re-reading
   the changed prefix costs prompt time. Either mode can mistake repeated useful code or checks for a loop, so keep
   the recorded answer quality alongside the completion rate when testing it.
+- **Earlier turns' reasoning left out of the prompt (opt-in).** Agents such as opencode send every earlier turn's
+  reasoning back (`reasoning_content`), and the template renders it, so a long tool-calling session carries dozens of
+  the model's own thinking passages. The quantized and abliterated builds copy them: the same opening sentence, then
+  the same tool calls, turn after turn - a loop across requests, which the guard above (inside one reply) does not see.
+  `"history_reasoning": "drop"` in `strata-<model>.json` renders every assistant turn of the request with an empty
+  thinking block (the default `"keep"` renders it as sent); reasoning written inline in a message's text is not
+  touched, and `/props` then reports `supports_preserve_reasoning: false`. Measured on one captured opencode request
+  (68 messages from a session that had looped for 25 turns; sampling 0.6 / 0.95 / top-k 20), 6 replies per model with
+  the earlier reasoning removed against as sent, replies that repeat an earlier tool call: UD-Q4_K_XL on an RTX 3080 +
+  RTX 2080 Ti remote stage 6 -> 0, SC117 IQ3_S on an RTX 3080 5 -> 0, the official IQ3_S 2 -> 0, RVN IQ3_S 5 -> 3
+  (remote stage) and 5 -> 1 (RTX 3080). Raising presence penalty to 1.5 or temperature to 1.0 instead changed nothing
+  (6 of 6). Through this setting, RVN IQ3_S on the remote stage repeated in 4 of 12. The previous turn stays reusable
+  (the checkpoint in front of the reply): three consecutive turns of ~50K tokens read only 717 and 176 new tokens.
 - **Changing the effort without re-reading the prompt (opt-in, 0.1.39, #458).** The effort's instruction is the
   first thing in the prompt, so a request that only changes the effort (an agent's "think harder" switch, `none` for
   a quick tool step) reads the whole conversation again. `"effort_position": "end"` in `strata-<model>.json` renders

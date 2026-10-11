@@ -177,6 +177,68 @@ class UnreadContentParts(unittest.TestCase):
                       self.template.render(msgs[0], tools=msgs[1], **msgs[2]))
 
 
+class HistoryReasoning(unittest.TestCase):
+    """The run config's opt-in "history_reasoning": "drop": earlier turns' reasoning is not rendered."""
+
+    CALL = [{"id": "c1", "type": "function", "function": {"name": "ls", "arguments": {}}}]   # arguments parsed, as the
+                                                                                             # template takes them
+    CHAT = [{"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": "", "reasoning_content": "I need to investigate this further.",
+             "tool_calls": CALL},
+            {"role": "tool", "tool_call_id": "c1", "content": "a.txt"},
+            {"role": "assistant", "content": "", "reasoning_content": "I need to investigate this further.",
+             "tool_calls": CALL},
+            {"role": "tool", "tool_call_id": "c1", "content": "a.txt"}]
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.service = Service(MockEngine(self.tok, "ok"), self.tok,
+                               ChatTemplate(Path(__file__).with_name("chat_template.jinja")))
+
+    def prompt(self, messages):
+        return self.tok.decode(self.service.encode_prompt(messages, None, {}), errors="replace")
+
+    @staticmethod
+    def bare(messages):
+        return [{k: v for k, v in m.items() if k != "reasoning_content"} for m in messages]
+
+    def test_keep_is_the_default(self):
+        self.assertEqual(self.service.history_reasoning, "keep")
+        self.assertEqual(self.prompt(self.CHAT).count("I need to investigate"), 2)
+
+    def test_drop_renders_the_turns_without_their_reasoning(self):
+        self.service.history_reasoning = "drop"
+        before = copy.deepcopy(self.CHAT)
+        self.assertNotIn("I need to investigate", self.prompt(self.CHAT))
+        self.assertEqual(self.prompt(self.CHAT), self.prompt(self.bare(self.CHAT)))
+        self.assertEqual(self.CHAT, before)                           # the request's messages are not changed
+
+    def test_drop_covers_a_last_assistant_message(self):
+        # the template closes it and opens a new reply after it: it is history like the others
+        self.service.history_reasoning = "drop"
+        chat = self.CHAT + [{"role": "user", "content": "go on"},
+                            {"role": "assistant", "content": "Part", "reasoning_content": "Still thinking."}]
+        p = self.prompt(chat)
+        self.assertNotIn("Still thinking.", p)
+        self.assertNotIn("I need to investigate", p)
+        self.assertEqual(p, self.prompt(self.bare(chat)))
+
+    def test_shared_prefix_uses_the_same_messages(self):
+        # the prefix boundary is found on the rendered messages: with the earlier reasoning left in there it would not
+        # line up with the prompt and the pinned prefix would come out shorter.  K=3 ends on a tool message, K=4 on an
+        # assistant turn with reasoning (a slice-then-drop implementation would keep that one)
+        keep = Service(MockEngine(self.tok, "ok"), self.tok, ChatTemplate(Path(__file__).with_name("chat_template.jinja")))
+        self.service.history_reasoning = "drop"
+        for k in (3, 4):
+            with self.subTest(messages=k):
+                want = {"strata_prefix": {"messages": k}}
+                keep.prepare(self.bare(self.CHAT), None, {}, 16, req=want)
+                got = {"strata_prefix": {"messages": k}}
+                self.service.prepare(self.CHAT, None, {}, 16, req=got)
+                self.assertTrue(want["strata_prefix"].get("tokens"))
+                self.assertEqual(got["strata_prefix"], want["strata_prefix"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

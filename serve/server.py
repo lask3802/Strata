@@ -165,6 +165,28 @@ LOOP_TAIL_CHARS = 2048           # chars at the end of the reasoning also checke
 LOOP_TAIL_PERIOD = 64            # a period at most this long in that tail reads as a fully repeated window
 
 
+def drop_history_reasoning(messages):
+    """The run config's opt-in "history_reasoning": "drop": the messages without the reasoning of every assistant
+    turn, so the template renders those turns with an empty thinking block.  Every turn: the template closes an
+    assistant message and opens a new reply after it, so a last assistant message is history too.  The input is not
+    changed.  Reasoning a client writes inline in the content (a leading <think> block) is not touched.
+
+    Why: clients such as opencode send every earlier turn's reasoning back (reasoning_content) and the template keeps
+    it.  In long tool-calling sessions the quantized and abliterated Qwen3.8-Flash-Next builds then copy their own
+    earlier reasoning and repeat earlier tool calls.  Measured on one captured opencode request (68 messages, a session
+    that had looped for 25 turns; config sampling 0.6 / 0.95 / 20), 6 replies per model, the earlier reasoning removed
+    on the client side: the replies that repeat an earlier call went from 6 to 0 (UD-Q4_K_XL, RTX 3080 + 2080 Ti
+    split), 5 to 0 (SC117 IQ3_S, RTX 3080), 2 to 0 (the official IQ3_S, RTX 3080) and 5 to 3 / 5 to 1 (RVN IQ3_S, split
+    / RTX 3080).  Through this setting, RVN IQ3_S on the split: 4 of 12.  The turn before stays reusable: three
+    consecutive turns reused all but 717 and 176 tokens of their ~50K-token prompts."""
+    out = []
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "assistant" and "reasoning_content" in m:
+            m = {k: v for k, v in m.items() if k != "reasoning_content"}
+        out.append(m)
+    return out
+
+
 def reasoning_repeat_coverage(text):
     """Coverage of recent words by 12-word passages seen at least three times.
 
@@ -3096,6 +3118,7 @@ class Service:
         self.vision_held = False                         # an elastic encoder holds VRAM the expert cache gave it
         self.last_image_at = 0.0                         # when an image turn last ended (the elastic encoder's idle)
         self.reasoning_loop_recovery = False
+        self.history_reasoning = "keep"                  # opt-in "drop": earlier turns' reasoning not rendered
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
@@ -3792,6 +3815,8 @@ class Service:
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens."""
+        if self.history_reasoning == "drop":
+            messages = drop_history_reasoning(messages)
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
@@ -3952,6 +3977,8 @@ class Service:
         {"tokens": N} (what the engine's `pin=N` takes: always a prefix of the prompt's ids, the tokenizer's merge across
         the boundary included), or {} when the prefix cannot be marked (said in the log: the request is never refused for
         it).  A malformed field is a 400."""
+        if self.history_reasoning == "drop":           # the same messages encode_prompt renders
+            messages = drop_history_reasoning(messages)
         keys = ("messages", "message", "chars", "tokens")
         if (not isinstance(spec, dict) or not spec or any(k not in keys for k in spec) or
                 set(spec) not in ({"messages"}, {"tokens"}, {"message", "chars"})):
@@ -5621,7 +5648,9 @@ def make_handler(svc: Service):
             props = {"default_generation_settings": {"n_ctx": svc.reported_ctx(), "params": params},
                      "total_slots": max(1, int(getattr(svc.engine, "batch", 0) or 0)),   # #1004: the batch slots
                      "model_alias": svc.model, "chat_template": svc.template.source,
-                     "chat_template_caps": svc.template.caps,
+                     # "history_reasoning": "drop" does not render the reasoning a client sends back
+                     "chat_template_caps": ({**svc.template.caps, "supports_preserve_reasoning": False}
+                                            if svc.history_reasoning == "drop" else svc.template.caps),
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded()}
             if getattr(svc.engine, "model_path", None):
@@ -6891,6 +6920,12 @@ def main() -> int:
         raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
+    history_reasoning = cfg.get("history_reasoning", "keep")   # opt-in "drop" (drop_history_reasoning)
+    if history_reasoning not in ("keep", "drop"):
+        raise SystemExit(f"[strata] config \"history_reasoning\" must be \"keep\" or \"drop\", not {history_reasoning!r}")
+    svc.history_reasoning = history_reasoning
+    if history_reasoning == "drop":
+        print("[strata] history_reasoning: drop - earlier turns' reasoning is not rendered into the prompt", flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     if a.engine == "strata" and groups:                 # replicas: every card of every group

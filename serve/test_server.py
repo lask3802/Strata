@@ -3055,8 +3055,14 @@ class WebApp(unittest.TestCase):
             props = json.loads(self.get("/props")[2])
             self.assertEqual(props["default_generation_settings"]["params"]["n_predict"], -1)
             self.assertEqual(self.get("/props?model=not-loaded&autoload=true")[0], 404)
+            svc.history_reasoning = "drop"            # the reasoning a client sends back is not rendered then
+            caps = json.loads(self.get("/props")[2])["chat_template_caps"]
+            self.assertIs(caps["supports_preserve_reasoning"], False)
+            self.assertIs(caps["supports_tool_calls"], True)
+            self.assertIs(svc.template.caps["supports_preserve_reasoning"], True)   # the template's own caps unchanged
         finally:
             svc.engine.max_context, svc.vision, svc.sampling_defaults, svc.shared = previous
+            svc.history_reasoning = "keep"
 
     def test_props_caps_follow_the_active_template(self):
         source = self.svc.template.source
