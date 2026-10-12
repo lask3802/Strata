@@ -192,11 +192,12 @@ process at a time; when the main process goes away it waits for the next one. Th
 ```
 
 Then start the server as usual. `--layer-split K --split-device 0` keeps the head on this card and sends layers K
-onward to the worker. Keep the split in `"args"` (the config's `"layer_split"` key is for cards in one PC), and drop
-`--conversation-cache-mib`: the remote stage turns the conversation cache off anyway. The main process connects once,
-at start, and stops if the worker is not listening. The log then says:
+onward to the worker. Keep the split in `"args"` (the config's `"layer_split"` key is for cards in one PC);
+`--conversation-cache-mib` may stay: a remote main process turns conversation parking off and says so in one line.
+The main process connects once, at start, and stops if the worker is not listening. The log then says:
 
 ```
+strata generate: remote stage: conversation checkpoints are off, every prompt is read from token 0
 strata generate: remote stage: this process holds layers 0-25, the rest on 192.0.2.11:7841
 strata serve: layer split: layers 0-25 (CUDA0), 26-47 (192.0.2.11:7841), the head (CUDA0), one hand-off per window
 strata serve: remote stage 192.0.2.11:7841: layers 26-47 there (prompt chunk 5888, context 131072)
@@ -263,8 +264,11 @@ main process without it.
 | `STRATA_REMOTE_TIMEOUT_S` | any | seconds a send or receive may block before the link counts as dead (default 300). After the hello, a worker waits for the next message without a limit |
 
 Fixed: a peer that connects but sends no hello within 10 s is dropped; TCP keepalive notices a peer that vanished
-without closing (power, cable) in about a minute. On Windows a worker's port is bound exclusively
-(`SO_EXCLUSIVEADDRUSE`), so a second worker on the same port fails as it does on Linux.
+without closing (power, cable) in about a minute. A worker stuck in a message it serves (a window, a prompt chunk, a
+commit, a reset, a position table) for `STRATA_WATCHDOG_S` (60 s) ends with a stall report, as a main process does;
+its agent does not start it again. A relay's waits for its next worker do not count: they end by the link's timeouts,
+and the next worker has its own watchdog. On Windows a worker's port is bound exclusively (`SO_EXCLUSIVEADDRUSE`), so
+a second worker on the same port fails as it does on Linux.
 
 **Timing lines** (`STRATA_REMOTE_TIMING=1`), what the tuner reads:
 
@@ -441,12 +445,13 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 - **Refused at start** with a remote stage: `--batch`, `--peer-device`, `--control-vector` (and the speed
   projection, which is one), `--expert-cache-remote`, and `--pipeline-windows` on a worker (the main process
   takes it, see [Overlapping the decode windows](#overlapping-the-decode-windows---pipeline-windows-2)).
-- **Turned off without an error:** the prompt cache, the conversation cache and mid-prompt checkpoints (each PC
-  holds only its layers' state, so every prompt is read from token 0), and `--kv-grow`. With `--prompt-cache N`
-  given on the main process, conversation checkpoints at the prompt's turn boundaries come back: the worker keeps its
-  layers' part of each ([remote-stage/CHECKPOINTS.md](remote-stage/CHECKPOINTS.md): later turns of a 16K-token chat
-  get their first token in 0.33-0.49 s instead of 14-15 s on an RTX 3080 + RTX 2080 Ti). Mid-prompt checkpoints and
-  parking stay off, and session files are refused.
+- **Turned off without an error** (the main process's log says so): the prompt cache, conversation
+  parking (`--conversation-cache-mib`) and mid-prompt checkpoints (each PC holds only its layers' state, so every
+  prompt is read from token 0), and `--kv-grow`. With `--prompt-cache N` given on the main process, conversation
+  checkpoints at the prompt's turn boundaries come back: the worker keeps its layers' part of each
+  ([remote-stage/CHECKPOINTS.md](remote-stage/CHECKPOINTS.md): later turns of a 16K-token chat get their first token
+  in 0.33-0.49 s instead of 14-15 s on an RTX 3080 + RTX 2080 Ti). Mid-prompt checkpoints and parking stay off, and
+  session files are refused.
 - **Not checked** with a remote stage: `STRATA_PREFILL_HELP`, `--adapt-async 1`, `--resident-experts`,
   `--mmap-experts` / `--resident-budget-gib` (the mapped expert source gets no layer range; it maps the whole pack),
   `STRATA_PF_FUSED=1`.
@@ -499,6 +504,7 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 | `the main process's context (N) or window (T) is larger than this worker's` | the worker's `--max-context` and `--spec` must be at least the main process's |
 | `ArenaExpertSource: a layer range needs a native pack read from its GGUF` | a pack directory with `experts.bin`: use a copy without it; drop `--shared-expert-arena` |
 | `strata generate: remote stage: it does not support ...` | remove that flag (see above) |
-| a request fails with a link error | the next request's prompt stops the main engine ("the link failed earlier") and the server starts it again, which connects anew; the worker waits for the new connection. Read from the code, not tested |
+| a request fails with a link error | the main engine ends with that error at once; the next request starts it again (the server tries three times, 15 s apart) and it connects anew, while the worker waits for the new connection. If the worker itself ended (its log ends with a stall report, or it exited), start it again first: its agent does not |
+| the main process waits at its start, then `receive failed: timed out` | the worker is serving another main process, or is stuck; a stuck worker ends by itself after `STRATA_WATCHDOG_S` (60 s) |
 | decode slower than expected on Linux | look at `decode expert cache hit rate` on every PC; keep the adaptive tier on everywhere (do not set `--adapt-every 0`) |
 | numbers that move between runs | record the other load on every PC and repeat runs: the same configuration decoded a ~30K prompt's answer at 50.2 and 44.0 tok/s twenty minutes apart |
