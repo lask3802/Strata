@@ -4,7 +4,9 @@
 """
 from __future__ import annotations
 
+import base64
 import contextlib
+import queue
 import io
 import json
 import os
@@ -5335,6 +5337,295 @@ class LazyVision(unittest.TestCase):
                 v.restart()
         self.assertTrue(started[-1].killed)
         self.assertFalse(v.alive())
+
+
+class OnDemandVision(unittest.TestCase):
+    """vision "on_demand": the encoder runs only while a request's new pictures are encoded: the expert cache lends
+    its VRAM before the start (lend(True)) and gets it back after the stop (lend(False)), also when the start fails."""
+
+    PNG = b"\x89PNG\r\n\x1a\n"
+
+    def make(self, ready=True, gpu=True):
+        import serve.server as server
+        events = []
+
+        class Proc:
+            def __init__(self, cwd):
+                self.lines = queue.Queue()
+                self.lines.put("READY 1" + chr(10) if ready else "oops" + chr(10))
+                self.stdin, self.stdout, self.ended, self.cwd = self, self, False, cwd
+
+            def write(self, text):
+                if text.startswith("ENC "):
+                    events.append("encode")
+                    Path(self.cwd, text.split()[2]).write_bytes(b"rows")
+                    self.lines.put("OK 3" + chr(10))
+                elif text.startswith("QUIT"):
+                    events.append("stop")
+                    self.ended = True
+
+            def flush(self):
+                pass
+
+            def readline(self):
+                return self.lines.get(timeout=5)
+
+            def poll(self):
+                return 0 if self.ended else None
+
+            def kill(self):
+                self.ended = True
+
+            def wait(self, timeout=None):
+                return 0
+
+        def popen(what, args, **kw):
+            events.append("start")
+            return Proc(kw.get("cwd"))
+
+        p1, p2 = mock.patch.object(server, "popen", popen), mock.patch.object(server, "contain")
+        p1.start(), p2.start()
+        self.addCleanup(p1.stop), self.addCleanup(p2.stop)
+        cfg = {"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf", "on_demand": True, "gpu": gpu}
+        with contextlib.redirect_stdout(io.StringIO()):
+            v = server.Vision(cfg)
+        self.addCleanup(lambda: shutil.rmtree(v.dir, ignore_errors=True))
+        v.lend = lambda on: events.append("lend" if on else "give back")
+        return v, events
+
+    def quiet(self, f, *a):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return f(*a)
+
+    def test_nothing_runs_until_a_picture_and_after_it(self):
+        v, events = self.make()
+        self.assertEqual(events, [])
+        self.assertEqual(v.vram_mib, 1600)
+        path, n = self.quiet(v.encode, self.PNG + b"a")
+        self.assertEqual(n, 3)
+        self.assertEqual(events, ["lend", "start", "encode", "stop", "give back"])
+        self.assertFalse(v.alive())
+
+    def test_one_start_for_a_request_and_none_for_cached_pictures(self):
+        v, events = self.make()
+        self.quiet(v.encode, self.PNG + b"a")
+        events.clear()
+        self.quiet(v.encode_all, [self.PNG + b"a", self.PNG + b"b", self.PNG + b"c"])
+        self.assertEqual(events, ["lend", "start", "encode", "encode", "stop", "give back"])
+        events.clear()
+        self.quiet(v.encode_all, [self.PNG + b"b", self.PNG + b"a"])
+        self.assertEqual(events, [])
+
+    def test_a_failed_start_gives_the_vram_back(self):
+        import serve.server as server
+        v, events = self.make(ready=False)
+        with self.assertRaises(server.GpuBusy):         # a 503 as a resident encoder's failed start, not the picture's 400
+            self.quiet(v.encode, self.PNG + b"a")
+        self.assertEqual(events[0:2], ["lend", "start"])
+        self.assertEqual(events[-1], "give back")
+        self.assertFalse(v.alive())
+
+    def test_a_refused_lend_still_starts_and_gives_nothing_back(self):
+        v, events = self.make()
+
+        def lend(on):
+            events.append("lend" if on else "give back")
+            raise ValueError("VRAM needs an engine started with --vram-elastic")
+        v.lend = lend
+        self.quiet(v.encode, self.PNG + b"a")
+        self.assertEqual(events, ["lend", "start", "encode", "stop"])
+
+    def test_a_cpu_encoder_lends_nothing(self):
+        v, events = self.make(gpu=False)
+        self.assertEqual(v.vram_mib, 0)
+        self.quiet(v.encode, self.PNG + b"a")
+        self.assertEqual(events, ["start", "encode", "stop"])
+
+    @staticmethod
+    def reply(slots, free, mib=None):
+        """The engine's VRAM answer: 1952 slots in 4300 MiB when whole; `mib` the mapped segments' MiB."""
+        return {"expert_slots": slots, "expert_slots_full": 1952, "expert_cache_full_mib": 4300, "vram_free_mib": free,
+                "expert_cache_mib": 4300 if mib is None and slots == 1952 else mib}
+
+    def service(self, replies, nvml=(), batch=0, slots=1952):
+        """A Service around an engine whose VRAM command answers `replies` in turn; free_vram_mib() reads `nvml` in
+        turn (None once it runs out: no NVML)."""
+        import serve.server as server
+        sent = []
+
+        class Engine:
+            info = {"expert_slots": slots, "vram_free_mib": 727}
+
+            def vram(self, reserve):
+                sent.append(reserve)
+                out = replies.pop(0)
+                self.info["expert_slots"] = out["expert_slots"]
+                return out
+        Engine.batch = batch
+        svc = server.Service.__new__(server.Service)
+        svc.engine, svc.vram_reserve, svc.lend_return_s = Engine(), None, 0.3
+        svc.vision_held = False                         # (0.1.44: the elastic encoder's flag, read by vram())
+        svc.vision = SimpleNamespace(vram_mib=1600, on_demand=True, alive=lambda: False)
+        svc.loaded = lambda: True
+        frees = list(nvml)
+        svc.free_vram_mib = lambda: frees.pop(0) if frees else None
+        svc.frees = frees
+        return svc, sent
+
+    def test_the_lend_is_the_free_vram_plus_the_encoder_and_the_give_back_relative_to_it(self):
+        # 600 MiB free (less than the start's 1100 reserve: the buffers made after the cache), 3 segments lent
+        svc, sent = self.service([self.reply(1254, 2136, 2764), self.reply(1952, 600)], nvml=[600, 500, 2100])
+        self.assertFalse(svc._vision_down())
+        self.quiet(svc._lend_vision_vram, True)
+        self.assertEqual(sent, [2200])
+        self.assertEqual(svc._vision_goal, {"proc": None, "mapped": 4300, "free": 600})   # no VRAM command before: whole
+        self.quiet(svc._lend_vision_vram, False)
+        # no command while the stopped encoder's VRAM was not back (NVML 500); then keeping the 600 free before, less 64
+        self.assertEqual(sent, [2200, 536])
+        self.assertEqual(svc.frees, [])                 # NVML read again until it was back
+        self.assertFalse(svc._vision_lent)
+
+    def test_a_partial_grow_is_tried_again(self):
+        svc, sent = self.service([self.reply(1254, 2136, 2764), self.reply(1500, 1100, 3276), self.reply(1952, 600)])
+        svc.lend_return_s = 2.0
+        self.quiet(svc._lend_vision_vram, True)
+        self.quiet(svc._lend_vision_vram, False)        # no NVML: the engine's last free figure, each try
+        # the lend: the engine's last free figure (727) + 1600; then 600 kept free (less 64) both times
+        self.assertEqual(sent, [2327, 536, 536])
+
+    def test_vram_that_does_not_come_back_is_made_up_at_the_next_picture(self):
+        svc, sent = self.service([self.reply(1254, 2136, 2764), self.reply(1000, 2648, 2252), self.reply(1952, 600)],
+                                 nvml=[600] + [300] * 100)
+        svc.lend_return_s = 3.0
+        t0 = time.time()
+        self.quiet(svc._lend_vision_vram, True)
+        self.quiet(svc._lend_vision_vram, False)        # another program holds it: no command, given up after ~1 s
+        self.assertLess(time.time() - t0, 2.0)
+        self.assertEqual(sent, [2200])
+        svc.frees[:] = [2136, 2648]                     # it came back meanwhile
+        self.quiet(svc._lend_vision_vram, True)
+        self.assertEqual(sent[-1], 2136 + 1600)
+        self.assertEqual(svc._vision_goal, {"proc": None, "mapped": 4300, "free": 600})   # still the first lend's
+        self.quiet(svc._lend_vision_vram, False)
+        self.assertEqual(sent, [2200, 3736, 2648 - 2048 - 64])
+        self.assertEqual(svc.engine.info["expert_slots"], 1952)
+
+    def test_a_post_vram_reserve_is_the_new_goal_and_the_give_back_keeps_it_free(self):
+        import threading as th
+        svc, sent = self.service([self.reply(1254, 2136, 2764), self.reply(1952, 600), self.reply(1500, 1700, 3276),
+                                  self.reply(800, 3236, 1740), self.reply(1500, 1700, 3276)], nvml=[600, 2100, 1700, 5236])
+        svc.fifo = th.Lock()
+        self.quiet(svc._lend_vision_vram, True)
+        self.quiet(svc._lend_vision_vram, False)
+        self.quiet(svc.vram, 1700)                      # the user keeps 1700 MiB free for a game
+        self.assertIsNone(svc._vision_goal)
+        self.assertEqual(svc._cache_seen, (None, 3276, 1700))
+        self.quiet(svc._lend_vision_vram, True)
+        self.assertEqual(svc._vision_goal, {"proc": None, "mapped": 3276, "free": 1700})   # what that reserve left
+        # the game let go of 2000 MiB meanwhile (NVML 5236): the give-back still grows by what was lent, no more
+        self.quiet(svc._lend_vision_vram, False)
+        self.assertEqual(sent[-1], 5236 - 1536 - 64)
+
+    def test_a_shortfall_is_not_made_up_from_what_another_program_holds(self):
+        # the cache 512 MiB short of its goal (4300, 600 free then); a game holds 590 MiB: 522 free before the lend
+        svc, sent = self.service([self.reply(1000, 2058, 2252), self.reply(1700, 522, 3788)], nvml=[522, 2058])
+        svc._cache_seen = (None, 3788, 522)
+        svc._vision_goal = {"proc": None, "mapped": 4300, "free": 600}
+        self.quiet(svc._lend_vision_vram, True)
+        self.quiet(svc._lend_vision_vram, False)
+        # 2058 - 2048 short - 64 would leave the card nearly nothing: it keeps the 522 it had, less 64
+        self.assertEqual(sent, [522 + 1600, 458])
+
+    def test_a_card_with_almost_nothing_free_gets_its_segments_back(self):
+        # 30 MiB free before the lend: the VRAM is back at the lend's own figure (1566), not at short + 64 (1600)
+        svc, sent = self.service([self.reply(1254, 1566, 2764), self.reply(1952, 30)], nvml=[30, 1566])
+        self.quiet(svc._lend_vision_vram, True)
+        self.quiet(svc._lend_vision_vram, False)
+        self.assertEqual(sent, [1630, 0])
+        self.assertEqual(svc.engine.info["expert_slots"], 1952)
+
+    def test_without_nvml_a_post_reserve_is_what_the_give_back_asks_for(self):
+        svc, sent = self.service([self.reply(800, 3236, 1740), self.reply(1500, 1700, 3276)])
+        svc.vram_reserve, svc._cache_seen = 1700, (None, 3276, 1700)   # a POST /v1/vram 1700 before
+        self.quiet(svc._lend_vision_vram, True)
+        self.assertEqual(svc._vision_goal, {"proc": None, "mapped": 3276, "free": 1700})
+        self.quiet(svc._lend_vision_vram, False)
+        # not the lend's stale free less what is short (it could grow past the goal if VRAM came free meanwhile)
+        self.assertEqual(sent, [727 + 1600, 1700])
+
+    def test_nothing_is_lent_without_the_engine_figures_or_with_batch_slots(self):
+        svc, sent = self.service([], batch=2)
+        self.quiet(svc._lend_vision_vram, True)
+        self.quiet(svc._lend_vision_vram, False)
+        self.assertEqual(sent, [])
+        svc, sent = self.service([{"expert_slots": 1952}])   # an answer without the cache's size
+        self.quiet(svc._lend_vision_vram, True)
+        self.quiet(svc._lend_vision_vram, False)
+        self.assertEqual(sent, [2200 - 600 + 727])       # the lend went; nothing to give back to
+        self.assertFalse(svc._vision_lent)
+        svc, sent = self.service([])
+        svc.loaded = lambda: False
+        self.quiet(svc._lend_vision_vram, True)
+        self.assertEqual(sent, [])
+
+    def test_the_service_wires_an_on_demand_encoder_and_leaves_a_resident_one(self):
+        tok = ByteTokenizer()
+        on = SimpleNamespace(on_demand=True, lend=None)
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                      vision=on)
+        self.assertEqual(on.lend, svc._lend_vision_vram)
+        resident = SimpleNamespace(lend=None)
+        Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                vision=resident)
+        self.assertIsNone(resident.lend)
+
+    def test_start_vision_makes_the_encoder_and_says_when_the_cache_cannot_lend(self):
+        import serve.server as server
+        started = []
+
+        def popen(what, args, **kw):
+            started.append(args)
+            return SimpleNamespace(stdin=io.StringIO(), stdout=io.StringIO("READY 1" + chr(10)), poll=lambda: None)
+        base = {"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf", "gpu": True}
+        with mock.patch.object(server, "popen", popen), mock.patch.object(server, "contain"):
+            for cfg, note in (({"vision": {**base, "on_demand": True}}, True),
+                              ({"vision": {**base, "on_demand": True}, "vram_elastic": True}, False),
+                              ({"vision": {**base, "on_demand": True}, "args": ["--vram-elastic"]}, False),
+                              ({"vision": {**base, "on_demand": True}, "vram_elastic": True, "parallel": 2}, True),
+                              ({"vision": {**base, "on_demand": True}, "vram_elastic": True, "args": ["--batch", "4"]}, True)):
+                with self.subTest(cfg=cfg):
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        v = server.start_vision(cfg, {}, lazy=False)
+                    self.addCleanup(lambda d=v.dir: shutil.rmtree(d, ignore_errors=True))
+                    self.assertTrue(v.on_demand)
+                    self.assertEqual(v.vram_mib, 1600)
+                    self.assertEqual("cannot make room" in out.getvalue(), note)
+            self.assertEqual(started, [])               # on demand: nothing runs before a picture
+            with contextlib.redirect_stdout(io.StringIO()):
+                v = server.start_vision({"vision": base}, {}, lazy=False)
+            self.addCleanup(lambda: shutil.rmtree(v.dir, ignore_errors=True))
+            self.assertFalse(v.on_demand)
+            self.assertEqual(len(started), 1)           # resident: started now, as before
+
+    def test_a_request_s_new_tool_pictures_start_the_encoder_once(self):
+        from serve.frontend import anthropic_to_messages
+        v, events = self.make()
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                      vision=v)
+        v.lend = lambda on: events.append("lend" if on else "give back")
+
+        def pic(b):
+            return {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                "data": base64.b64encode(self.PNG + b).decode()}}
+        call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}
+        msgs = [{"role": "user", "content": "look"}, call,
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [pic(b"a"), pic(b"b")]}]}]
+        m, _, _ = anthropic_to_messages({"messages": msgs})
+        ids, _, _ = self.quiet(svc.prepare, m, None, {})
+        self.assertEqual(events, ["lend", "start", "encode", "encode", "stop", "give back"])
+        svc.drop_embeddings()
 
 
 class VisionShutdown(unittest.TestCase):

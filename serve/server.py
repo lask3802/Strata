@@ -2265,13 +2265,22 @@ class Vision:
         self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
+        # opt-in "on_demand": true - the encoder runs only while a request's new pictures are encoded, and stops
+        # after them.  A GPU encoder (its mmproj weights, ~0.9 GiB for the BF16 one, and its work buffers) otherwise
+        # holds VRAM the expert cache could use for every token decoded.  `lend` (set by the Service) takes "vram_mib"
+        # from the engine's expert cache before the start (VRAM <reserve + vram_mib>, --vram-elastic) and gives it
+        # back after the stop; the encoded pictures stay cached on disk, so a picture sent again starts nothing.
+        self.on_demand = cfg.get("on_demand") is True
+        self.vram_mib = int(cfg.get("vram_mib", 1600)) if self.on_demand and cfg.get("gpu") else 0
+        self.lend = None
+        self._held, self._lent = 0, False
         # opt-in (the vision section's "elastic": true, with the config's "vram_elastic"): the encoder starts with the
         # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
-        # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
-        self.elastic = cfg.get("elastic") is True
+        # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down).  "on_demand" above wins over it.
+        self.elastic = cfg.get("elastic") is True and not self.on_demand
         self.elastic_mib = int(cfg.get("elastic_mib") or 2048)
         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
-        if not lazy and not self.elastic:
+        if not lazy and not self.elastic and not self.on_demand:
             self._start()
 
     def _start(self):
@@ -2422,15 +2431,55 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
+    @contextlib.contextmanager
+    def held(self):
+        """on_demand: an encoder started inside this block (by the first picture not in the cache) runs until the
+        outermost block ends, then stops and its VRAM goes back.  Nothing for a resident encoder."""
+        if not getattr(self, "on_demand", False):
+            yield
+            return
+        self._held += 1
+        try:
+            yield
+        finally:
+            self._held -= 1
+            if self._held == 0 and self.on_demand and (self.proc is not None or self._lent):
+                self._stop_on_demand()
+
+    def _start_on_demand(self):
+        t0 = time.perf_counter()
+        if self.lend is not None and self.vram_mib > 0:
+            try:
+                self.lend(True)
+                self._lent = True                       # given back in held(), also when the start below fails
+            except Exception as e:  # noqa: BLE001 - the encoder may still fit; its start says when it does not
+                print(f"[strata] the expert cache did not make room for the vision encoder: {e}", flush=True)
+        try:
+            self.restart()
+        except RuntimeError as e:   # not the picture's fault (no VRAM, a broken exe): a 503, as a resident one's start
+            raise GpuBusy(str(e)) from None
+        print(f"[strata] vision encoder started for this request's pictures in {time.perf_counter() - t0:.1f} s",
+              flush=True)
+
+    def _stop_on_demand(self):
+        self.unload()
+        if self._lent:
+            self._lent = False
+            try:
+                self.lend(False)
+            except Exception as e:  # noqa: BLE001 - an engine that died gets its whole cache back at its restart
+                print(f"[strata] the expert cache did not take the vision encoder's VRAM back: {e}", flush=True)
+
     def encode_all(self, sources: list, cancel=None) -> list[tuple[Path, int]]:
         """encode() for every image of one request: the files of this request's earlier images are never evicted to
         make room for a later one (#1072: with more than 64 unique images the first was deleted before the request
         had read it).  `cancel` (#1999): a request whose client left does not encode its next pictures."""
         out: list[tuple[Path, int]] = []
-        for src in sources:
-            if cancel is not None and cancel.is_set():
-                raise ClientGone()
-            out.append(self.encode(src, keep=[p for p, _ in out]))
+        with self.held():                               # on_demand: one encoder start for all of them
+            for src in sources:
+                if cancel is not None and cancel.is_set():
+                    raise ClientGone()
+                out.append(self.encode(src, keep=[p for p, _ in out]))
         return out
 
     def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
@@ -2438,10 +2487,12 @@ class Vision:
         `keep`: files the caller still needs (never evicted by this call)."""
         data = self.normalize(source if isinstance(source, bytes) else self.load(source))
         key = hashlib.sha256(data).hexdigest()[:32]
-        with self.lock:
+        with self.held(), self.lock:
             if key in self.cache:
                 self.cache[key] = self.cache.pop(key)                  # most recently used last
                 return self.cache[key]
+            if getattr(self, "on_demand", False) and not self.alive():
+                self._start_on_demand()
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
@@ -2884,6 +2935,39 @@ def vision_env(cfg: dict, env: dict) -> dict:
     return env
 
 
+def start_vision(cfg: dict, env: dict, lazy: bool) -> Vision:
+    """The config's "vision" section's encoder (relative paths are the config's cwd's, as for the engine): started now,
+    or with the model (lazy), with the first picture until it idles ("elastic"), or for each request's new pictures
+    ("on_demand", which wins over "elastic")."""
+    on_demand = cfg["vision"].get("on_demand") is True
+    elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True and not on_demand
+    if on_demand and cfg["vision"].get("elastic") is True:
+        print('[strata] the vision section has both "on_demand" and "elastic": on_demand is used', flush=True)
+    if on_demand:
+        print("[strata] the vision encoder starts for each request's new pictures and stops after them (on_demand)",
+              flush=True)
+        args = cfg.get("args", [])
+        elastic = cfg.get("vram_elastic") is True or "--vram-elastic" in args
+        batched = "--batch" in args or "--slots" in args or (isinstance(cfg.get("parallel"), int) and
+                                                              not isinstance(cfg.get("parallel"), bool) and cfg["parallel"] > 1)
+        if cfg["vision"].get("gpu") and (not elastic or batched):
+            print('[strata] note: the expert cache cannot make room for the on-demand GPU encoder (it needs '
+                  '"vram_elastic": true and no batch slots): the encoder starts in whatever VRAM is free', flush=True)
+    else:
+        print("the vision encoder starts with the first picture (elastic) ..." if elastic else
+              "loading the vision encoder ..." if not lazy else
+              "vision encoder unloaded; it starts with the model ...", flush=True)
+    vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
+            for k, v in cfg["vision"].items()}
+    if not on_demand and vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
+        print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
+              "encoder its VRAM): the encoder starts with the model instead", flush=True)
+        vcfg["elastic"] = False
+    return Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                  env=vision_env(cfg, env), lazy=lazy)
+
+
 class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
@@ -3117,6 +3201,8 @@ class Service:
         self.vram_reserve_asked = False                  # a POST /v1/vram was made (vram_reserve None is then asked)
         self.vision_held = False                         # an elastic encoder holds VRAM the expert cache gave it
         self.last_image_at = 0.0                         # when an image turn last ended (the elastic encoder's idle)
+        if vision is not None and getattr(vision, "on_demand", False):
+            vision.lend = self._lend_vision_vram          # the encoder's VRAM, from the expert cache while it runs
         self.reasoning_loop_recovery = False
         self.history_reasoning = "keep"                  # opt-in "drop": earlier turns' reasoning not rendered
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
@@ -3246,7 +3332,8 @@ class Service:
         """The encoder should run and does not (the engine's load starts it again).  An elastic encoder is down
         between pictures by design: it starts in the image turn (_vision_up), not with the engine."""
         return (self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
-                and not getattr(self.vision, "elastic", False))
+                and not getattr(self.vision, "elastic", False)
+                and not getattr(self.vision, "on_demand", False))   # (on_demand: down between pictures, too)
 
     def _engine_reserve(self) -> int | None:
         """The VRAM the engine keeps free for other programs outside an elastic encoder's turn: the last POST /v1/vram
@@ -3417,11 +3504,119 @@ class Service:
             images_api.restore_session(self)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
-                self.engine.vram(self.vram_reserve)
+                self._engine_vram(self.vram_reserve)
             except (ValueError, EngineDied) as e:
                 print(f"[strata] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
 
     vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
+    lend_return_s = 3.0                                  # how long the expert cache waits for a stopped encoder's VRAM
+
+    def _engine_vram(self, reserve_mib: int | None) -> dict:
+        """engine.vram(), keeping what it answers - the expert cache's mapped MiB and the free VRAM - with the engine
+        process that answered: the on-demand encoder's lend counts from that.  A process with no VRAM command since its
+        start has its whole cache (nothing else resizes it)."""
+        out = self.engine.vram(reserve_mib)
+        self._cache_seen = (getattr(self.engine, "proc", None), out.get("expert_cache_mib"), out.get("vram_free_mib"))
+        return out
+
+    def _lend_vision_vram(self, lend: bool) -> None:
+        """vision "on_demand", the caller holding the FIFO (pictures are encoded between requests).  Lend: `VRAM <free
+        now + vram_mib>`, so the expert cache gives up whole segments (512 MiB by default) until about vram_mib more is
+        free (one segment less at worst: what it keeps is rounded up to whole segments).  Give back: the cache grows to
+        the goal - the most it held (mapped MiB) before a lend of this engine process - and no further.  Both are
+        relative to the cache, not to the engine's start reserve: what is free at run time is less than that reserve
+        (the buffers made after the cache come out of it) and a grow maps only whole segments that fit, so a give-back
+        "to the reserve" left the cache a segment short after every picture.  The goal carries over, so a give-back
+        that fell short (the encoder's VRAM came back late) is made up at the next picture; a POST /v1/vram resets it
+        (the cache that reserve leaves is the new goal).  Needs --vram-elastic (the config's "vram_elastic": true);
+        without it the engine refuses (ValueError) and the encoder starts in what is free."""
+        if not lend:
+            self._return_vision_vram()
+            return
+        self._vision_lent = False
+        if not hasattr(self.engine, "vram") or not self.loaded() or getattr(self.engine, "batch", 0):
+            return
+        info = getattr(self.engine, "info", None) or {}
+        proc = getattr(self.engine, "proc", None)
+        seen = getattr(self, "_cache_seen", None)
+        mapped0 = seen[1] if seen is not None and seen[0] is proc else None
+        goal = getattr(self, "_vision_goal", None)
+        if goal is not None and goal["proc"] is not proc:   # another engine process: its cache started whole
+            goal = None
+        free = self.free_vram_mib()
+        out = self._engine_vram((free if free is not None else info.get("vram_free_mib") or 0) + self.vision.vram_mib)
+        if out.get("expert_cache_mib") is None:
+            print("[strata] the engine did not say its expert-cache size: the vision encoder starts in what is free",
+                  flush=True)
+            return
+        if mapped0 is None:
+            mapped0 = out.get("expert_cache_full_mib", 0)
+        lent_free = out.get("vram_free_mib") or 0               # free and mapped after the lend, the encoder not up
+        free0 = lent_free - (mapped0 - out["expert_cache_mib"])  # free before the lend
+        if goal is None or mapped0 > goal["mapped"]:
+            goal = {"proc": proc, "mapped": mapped0, "free": free0}   # and what was free while the cache held that
+        self._vision_goal = goal
+        self._vision_lent_at = (lent_free, out["expert_cache_mib"], free0)
+        self._vision_lent = True
+        print(f"[strata] vision encoder starting: the expert cache lent {max(0, mapped0 - out['expert_cache_mib'])} MiB "
+              f"({out.get('expert_slots')} slots left), {out.get('vram_free_mib')} MiB of VRAM free", flush=True)
+
+    def _return_vision_vram(self) -> None:
+        """The lent segments back, up to the goal and no further: `VRAM <free - what the cache is short - 64>` lets it
+        grow by what it is short (the margin is below a segment), so the VRAM a POST /v1/vram reserve keeps free stays
+        free.  "free" is NVML's, read once the stopped encoder's VRAM is back: once it is what the lend left free (its
+        answer's figure, measured before the encoder started) less what the cache has grown since, within 64 MiB - a
+        figure relative to the lend, so a card with almost nothing free before it (a small one) gets its segments back
+        too.  Before that a command would grow the cache by less than it is short of.  When the VRAM does not come back
+        within a second (another program took it) or lend_return_s, the cache stays short until the next picture.
+        Every command keeps at least the less of what was free before this lend and what was free when the cache held
+        its goal, so a shortfall is made up from VRAM that came back late and never from what another program took.
+        Without NVML each try goes after a pause, asking for the POST /v1/vram reserve when there is one (the cache that
+        reserve left is the goal), else for the engine's last free figure less what is short; a try sent before the
+        encoder's VRAM is back can shrink the cache a segment, which a later try grows back.  Assumes NVML's free figure
+        is the engine's cudaMemGetInfo one, as on Linux."""
+        lent, self._vision_lent = getattr(self, "_vision_lent", False), False
+        goal = getattr(self, "_vision_goal", None)
+        if not lent or goal is None or not hasattr(self.engine, "vram") or not self.loaded():
+            return
+        proc = getattr(self.engine, "proc", None)
+        lent_free, lent_mapped, free0 = getattr(self, "_vision_lent_at", (0, 0, 0))
+        # never less free than before the lend, or than while the cache held its goal, whichever is less: a shortfall
+        # is made up from VRAM that came back late, not from what another program took meanwhile
+        floor = min(free0, goal["free"]) - 64
+        t0, first, sent = time.time(), None, 0
+        while True:
+            seen = getattr(self, "_cache_seen", None)
+            if seen is None or seen[0] is not proc or seen[1] is None:
+                break
+            short = goal["mapped"] - seen[1]
+            waited = time.time() - t0
+            if short <= 0 or waited > self.lend_return_s:
+                break
+            free = self.free_vram_mib()
+            nvml = free is not None
+            if not nvml:
+                time.sleep(0.25)
+                want = self.vram_reserve if self.vram_reserve is not None else max(0, (seen[2] or 0) - short - 64, floor)
+            elif free + 64 < lent_free - (seen[1] - lent_mapped):   # the encoder's VRAM is not back (yet)
+                first = free if first is None else first
+                if waited > 1.0 and free <= first:      # and nothing came back for a second: in use elsewhere
+                    break
+                time.sleep(0.1)
+                continue
+            else:
+                want = max(0, free - short - 64, floor)
+            before = seen[1]
+            self._engine_vram(want)
+            sent += 1
+            if nvml and (want == floor > free - short - 64 or
+                         self._cache_seen[1] is not None and self._cache_seen[1] <= before):
+                break      # the floor held it back (the rest is another program's), or it did not grow though NVML saw room
+        seen = getattr(self, "_cache_seen", None) or (None, None, None)
+        left = goal["mapped"] - (seen[1] or 0)
+        print(f"[strata] vision encoder stopped: the expert cache "
+              f"{'whole again' if left <= 0 else f'{left} MiB short until the next picture'} after {sent} VRAM "
+              f"command(s) in {time.time() - t0:.1f} s, {seen[2]} MiB of VRAM free", flush=True)
 
     def vram(self, reserve_mib: int | None) -> dict:
         """#533, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
@@ -3444,8 +3639,9 @@ class Service:
                 return {"status": "not loaded", "reserve_mib": reserve_mib,
                         "note": "applied when the model loads"}
             # an elastic encoder that runs keeps its VRAM on top of the asked reserve
-            out = self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
+            out = self._engine_vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
             self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
+            self._vision_goal = None                     # the cache's size the on-demand encoder gives back to: this one
             print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
                   f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
             return {"status": "ok", **out}
@@ -3846,6 +4042,7 @@ class Service:
         the conversation; a picture the user sends keeps the 400.  A picture that encodes stays in the cache, so the
         prompt's own encode below finds it."""
         fetched = {}                     # a URL's bytes, so prepare() does not download the same picture again
+        found, why = [], {}              # (content, n, source) of every tool picture; why one is left out
         for m in messages:
             content = m.get("content")
             if m.get("role") != "tool" or not isinstance(content, list):
@@ -3853,21 +4050,33 @@ class Service:
             for n, item in enumerate(content):
                 if not isinstance(item, dict) or item.get("type") != "image":
                     continue
-                why = "this server has no image encoder" if self.vision is None else None
-                if why is None:
-                    src = item["source"]
+                src = item["source"]
+                if self.vision is None:
+                    why[(id(content), n)] = "this server has no image encoder"
+                elif src.startswith(("http://", "https://")):
+                    if cancel is not None and cancel.is_set():
+                        raise ClientGone()
                     try:
-                        if cancel is not None and cancel.is_set():
-                            raise ClientGone()
-                        if src.startswith(("http://", "https://")):
-                            src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
-                        with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
-                            self.vision.encode(src)
+                        src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                     except (ValueError, OSError) as e:
-                        why = str(e)
-                if why is not None:
-                    print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
-                    content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
+                        why[(id(content), n)] = str(e)
+                found.append((content, n, src))
+        todo = [(c, n, src) for c, n, src in found if (id(c), n) not in why]
+        if todo:
+            # the encoder takes its turn with the requests (see prepare()); all of them in one turn, so an on-demand
+            # encoder starts once for them
+            with self._turn(cancel), (self.vision.held() if hasattr(self.vision, "held") else contextlib.nullcontext()):
+                for c, n, src in todo:
+                    if cancel is not None and cancel.is_set():
+                        raise ClientGone()
+                    try:
+                        self.vision.encode(src)
+                    except (ValueError, OSError) as e:
+                        why[(id(c), n)] = str(e)
+        for c, n, _ in found:
+            if (id(c), n) in why:
+                print(f"[strata] a picture a tool returned was left out of the prompt: {why[(id(c), n)]}", flush=True)
+                c[n] = {"type": "text", "text": f"[image omitted: {why[(id(c), n)]}]"}
         return fetched
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
@@ -6734,20 +6943,7 @@ def main() -> int:
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
         if cfg.get("vision"):
-            elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
-            print("the vision encoder starts with the first picture (elastic) ..." if elastic else
-                  "loading the vision encoder ..." if not lazy else
-                  "vision encoder unloaded; it starts with the model ...", flush=True)
-            # relative paths are the config's cwd's, as for the engine below
-            vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                        if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
-                    for k, v in cfg["vision"].items()}
-            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
-                print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
-                      "encoder its VRAM): the encoder starts with the model instead", flush=True)
-                vcfg["elastic"] = False
-            vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env), lazy=lazy)
+            vision = start_vision(cfg, env, lazy)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
