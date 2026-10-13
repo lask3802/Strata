@@ -33,7 +33,7 @@
 namespace strata::net {
 
 inline constexpr uint32_t kStageMagic = 0x4d525453u;   // "STRM"
-inline constexpr uint32_t kStageProtocol = 6;
+inline constexpr uint32_t kStageProtocol = 7;
 /// Conversation checkpoints (docs/remote-stage/CHECKPOINTS.md): the most parts a worker keeps; a main process whose
 /// hello asks for more is refused
 inline constexpr int32_t kStageCkptMax = 64;
@@ -41,15 +41,16 @@ inline constexpr int32_t kStageCkptMax = 64;
 /// recovers from (it reads the prompt from token 0); every other error means the worker's session is lost
 inline constexpr char kStageCkptMissing[] = "checkpoint not held: ";
 
+// (rows[n * w]: n rows of w floats in the link's row format, StageRows)
 enum class StageMsg : uint32_t {
     Hello = 1,
     HelloOk = 2,
-    Run = 3,        // a = T, b = pos0; payload: int32 tokens[T], float rows[T * handoff_floats]
-    RunOk = 4,      // a = the worker's time (us); payload: float rows[T * handoff_floats]
+    Run = 3,        // a = T, b = pos0; payload: int32 tokens[T], rows[T * handoff_floats]
+    RunOk = 4,      // a = the worker's time (us); payload: rows[T * handoff_floats]
     Commit = 5,     // a = n_keep; no reply (an error comes back on the next reply)
     Prefill = 6,    // a = T, b = pos0, c = flags (bit 0: the prompt is one chunk) | skip << 8; payload: int64 tokens[T],
-                    // float rows[T * D]
-    PrefillOk = 7,  // a = the worker's time (us); payload: float rows[(T - skip) * D], the chunk's rows from row `skip`
+                    // rows[T * D]
+    PrefillOk = 7,  // a = the worker's time (us); payload: rows[(T - skip) * D], the chunk's rows from row `skip`
                     // (the main process needs no earlier ones: the drafter's window does not reach them)
     Reset = 8,      // a fresh prompt from position 0; payload: int64 keep[] (the checkpoint ids the worker keeps)
     ResetOk = 9,
@@ -84,12 +85,32 @@ struct StageHello {
     int32_t tail_skip = 0;        ///< the main process's STRATA_ROUTE_TAIL_SKIP rank (0: off); a worker uses it
     int32_t vision = 0;           ///< started with --vision (a main process with it needs a worker with it)
     int32_t ckpt_max = 0;         ///< the main process: the checkpoint parts it may have the worker keep (0: none)
-    char build[52] = {};          ///< engine build id (informational)
+    /// the row formats this side sends and reads (bit 1 << StageRows); the link uses the narrowest both list.  A main
+    /// process lists fp32 and the one it asks for (STRATA_REMOTE_ROWS), a worker every one it has
+    uint32_t row_formats = 1u << 0;
+    char build[48] = {};          ///< engine build id (informational)
     char token[64] = {};          ///< the shared secret (STRATA_STAGE_TOKEN); the worker refuses a wrong one
 };
 #pragma pack(pop)
 // one size across protocols: an older peer's hello is read whole and refused for its protocol, not as malformed
 static_assert(sizeof(StageHello) == 192, "the hello's size");
+
+/// How a message's rows (a window's, a prompt chunk's, both ways) travel.  fp32 is the engine's own and the default;
+/// bf16 halves the bytes and rounds each value to 8 significant bits (round to nearest even, as the GPU kernels do).
+/// The engine's buffers stay fp32 on both sides: the link converts as it sends and reads.  A format that loses
+/// precision is the main process's choice (STRATA_REMOTE_ROWS); a worker lists every one it has.
+enum class StageRows : uint32_t { F32 = 0, BF16 = 1 };
+inline constexpr uint32_t kStageRowsAll = (1u << (uint32_t) StageRows::F32) | (1u << (uint32_t) StageRows::BF16);
+/// The format of a link whose two hellos list `a` and `b`: the narrowest in both (fp32 when no other is).
+StageRows stage_rows_agreed(uint32_t a, uint32_t b);
+const char* stage_rows_name(StageRows f);
+/// "fp32" / "bf16" (as STRATA_REMOTE_ROWS names them); false for another name
+bool stage_rows_parse(const std::string& name, StageRows& f);
+/// Bytes of `rows` rows of `width` floats each in format `f`.
+size_t stage_rows_bytes(StageRows f, size_t rows, size_t width);
+/// `rows` x `width` floats to format `f` (stage_rows_bytes of them at dst), and back.
+void stage_rows_encode(StageRows f, const float* src, size_t rows, size_t width, void* dst);
+void stage_rows_decode(StageRows f, const void* src, size_t rows, size_t width, float* dst);
 
 /// Seconds a send or receive on a link may block before the link counts as dead (STRATA_REMOTE_TIMEOUT_S, default 300).
 int io_timeout_s();
@@ -110,6 +131,7 @@ struct StageStats {
     uint64_t bytes_out = 0, bytes_in = 0;
     double ms_run = 0, ms_prefill = 0;   ///< wall time of the round trips (main side) / of the work (worker side)
     double ms_run_worker = 0;            ///< main side: the worker's own share of ms_run
+    double ms_encode = 0, ms_decode = 0; ///< the rows' conversion to and from the link's format (not fp32: none)
 };
 
 /// The main process's end: one connection.  Windows, commits and resets are whole round trips (one thread at a
@@ -164,6 +186,8 @@ public:
 
     const StageStats& stats() const { return stats_; }
     std::string peer_name() const { return peer_; }
+    /// the row format the connection agreed on (connect)
+    StageRows rows() const { return rows_; }
 
 private:
     bool read_reply_(StageMsg want, void* reply, size_t reply_bytes, int64_t& worker_us, std::string& err);
@@ -176,8 +200,14 @@ private:
     std::intptr_t fd_ = -1;   ///< the socket (a Winsock SOCKET fits; -1: none)
     std::atomic<bool> broken_{false};   ///< (the sending side sets it, the receiving side reads it)
     std::string peer_;
+    StageRows rows_ = StageRows::F32;
     std::mutex send_mu_, recv_mu_, q_mu_;
-    std::deque<std::chrono::steady_clock::time_point> sent_at_;   ///< outstanding chunks' send start (timing)
+    struct Sent {
+        std::chrono::steady_clock::time_point at;   ///< the send's start (its rows' conversion first)
+        double encode_ms = 0;
+    };
+    std::deque<Sent> sent_at_;   ///< outstanding chunks (timing)
+    std::vector<unsigned char> tx_, rx_;   ///< the rows in the link's format (not fp32): send_mu_'s, recv_mu_'s
     StageStats stats_;
 };
 

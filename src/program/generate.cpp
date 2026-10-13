@@ -10298,14 +10298,25 @@ int main(int argc, char** argv) {
             }
             if (remote_main) std::memcpy(me.token, stage_token.data(), stage_token.size());
             if (remote_main) {
+                // STRATA_REMOTE_ROWS=bf16: the rows cross the link as bf16 (half the bytes, each value rounded to 8
+                // significant bits) when the worker has it; unset or fp32: fp32, as before
+                if (const char* v = std::getenv("STRATA_REMOTE_ROWS"); v != nullptr && *v != '\0') {
+                    strata::net::StageRows f = strata::net::StageRows::F32;
+                    if (!strata::net::stage_rows_parse(v, f)) {
+                        std::fprintf(stderr, "strata serve: STRATA_REMOTE_ROWS=%s: expected fp32 or bf16\n", v);
+                        return 1;
+                    }
+                    me.row_formats |= 1u << (uint32_t) f;
+                }
                 remote_hello = me;
                 if (!remote_connect(err, false)) {
                     std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                     return 1;
                 }
-                std::fprintf(stderr, "strata serve: remote stage %s: layers %d-%d there (prompt chunk %lld, context %lld)\n",
-                             o.remote_stage.c_str(), remote_peer.layer_begin, remote_peer.n_layers - 1,
-                             (long long) remote_peer.chunk, (long long) remote_peer.max_context);
+                std::fprintf(stderr, "strata serve: remote stage %s: layers %d-%d there (prompt chunk %lld, context %lld, "
+                             "rows %s)\n", o.remote_stage.c_str(), remote_peer.layer_begin, remote_peer.n_layers - 1,
+                             (long long) remote_peer.chunk, (long long) remote_peer.max_context,
+                             strata::net::stage_rows_name(remote_link.rows()));
             } else {
                 // remote-stage worker: serve the main process instead of stdin.  A prompt starts with a reset; windows,
                 // commits and chunks arrive in order, each whole, and run here one at a time.
@@ -10360,6 +10371,7 @@ int main(int argc, char** argv) {
                     return want >= tokens;
                 };
                 int32_t main_ckpt_max = 0;       // the checkpoint parts the main process may have this worker keep
+                uint32_t main_rows = 1u << 0;    // the row formats it lists (a relay's next link asks for the same)
                 hs.hello = [&](const strata::net::StageHello& theirs, strata::net::StageHello& mine, std::string& e) {
                     mine = me;   // (the worker's own hello carries no token)
                     // another protocol: the link refuses it for its number (its fields may sit elsewhere)
@@ -10426,6 +10438,7 @@ int main(int argc, char** argv) {
                         next_link.close();
                     }
                     main_ckpt_max = theirs.ckpt_max;
+                    main_rows = theirs.row_formats;
                     return true;
                 };
                 int64_t wk_rounds = 0;
@@ -10582,6 +10595,7 @@ int main(int argc, char** argv) {
                     mine_next.tail_skip = (int32_t) strata::core::tail_skip_rank();   // the main process's, as above
                     mine_next.vision = main_vision;   // the main process's (a worker started with --vision has it)
                     mine_next.ckpt_max = main_ckpt_max;
+                    mine_next.row_formats = main_rows;   // (the main process's: until its hello, fp32)
                     std::memcpy(mine_next.token, stage_token.data(), stage_token.size());
                     for (int i = 0;; ++i) {
                         // each try can block (a connect's SYN tries, the hello's reply): its own allowance (as in
@@ -10594,8 +10608,9 @@ int main(int argc, char** argv) {
                             return false;
                         std::this_thread::sleep_for(std::chrono::seconds(2));
                     }
-                    std::fprintf(stderr, "strata serve: relay: layers %d-%d on %s\n", peer_next.layer_begin,
-                                 peer_next.n_layers - 1, o.stage_next.c_str());
+                    std::fprintf(stderr, "strata serve: relay: layers %d-%d on %s (rows %s)\n", peer_next.layer_begin,
+                                 peer_next.n_layers - 1, o.stage_next.c_str(),
+                                 strata::net::stage_rows_name(next_link.rows()));
                     return true;
                 };
                 if (stage_relay && !connect_next(err)) {

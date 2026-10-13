@@ -45,8 +45,13 @@
 //      after one;
 //  14. a hello's reply is read whole within connect()'s deadline (a worker that sends part of it is given up at it,
 //      or at a stop flag), and an error reply of 2^62 bytes is not read: at the hello an unexpected reply, later a
-//      link out of step.
+//      link out of step;
+//  15. row formats: bf16 rounds as kernels::bf16_from_f32 does (ties to even, a NaN kept) and comes back exactly; a
+//      link uses the narrowest format both hellos list (fp32 when no other); a main process listing bf16 gets a
+//      window's and a chunk's rows back rounded once, in half the bytes, one listing fp32 only gets them exact; the
+//      worker's sizes follow the agreed format (an fp32-sized window on a bf16 link is malformed).
 // The handlers run on the worker's serving thread: what they share with the test is behind a mutex or atomic.
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/net/stage_ckpt_store.hpp"
 #include "strata/net/stage_link.hpp"
 
@@ -517,7 +522,7 @@ int main() {
     // 1. the hello
     StageHello old_side = hello_of();
     old_side.protocol = 4;
-    check(!greet(old_side) && contains(err, "the worker refused:") && contains(err, "protocol 4/6"),
+    check(!greet(old_side) && contains(err, "the worker refused:") && contains(err, "protocol 4/7"),
           "a protocol 4 main process is refused for its protocol");
     StageHello greedy = hello_of();
     greedy.ckpt_max = kStageCkptMax + 1;
@@ -1205,6 +1210,119 @@ int main() {
               "... as a later reply: not read, the link out of step (lost)");
         a.close();
         liar2.stop();
+    }
+
+    // 15. row formats
+    {
+        using strata::kernels::bf16_from_f32;
+        using strata::kernels::f32_from_bf16;
+        // zeros, 1.0, ties to even both ways, the largest finite (to inf), infinities, NaNs, a denormal; then random bits
+        std::vector<uint32_t> bits = {0u,          0x80000000u, 0x3f800000u, 0x3f808000u, 0x3f818000u,
+                                      0x3f80ffffu, 0x7f7fffffu, 0x7f800000u, 0xff800000u, 0x7fc00000u,
+                                      0x7f800001u, 0xffffffffu, 0x00000001u};
+        std::mt19937 rng(7);
+        for (int i = 0; i < 100000; ++i) bits.push_back((uint32_t) rng());
+        const size_t n = bits.size();
+        std::vector<float> f(n), fb(n);
+        std::memcpy(f.data(), bits.data(), n * 4);
+        std::vector<unsigned char> wire(stage_rows_bytes(StageRows::BF16, n, 1));
+        stage_rows_encode(StageRows::BF16, f.data(), n, 1, wire.data());
+        stage_rows_decode(StageRows::BF16, wire.data(), n, 1, fb.data());
+        bool same = wire.size() == n * 2, exact = true;
+        for (size_t i = 0; i < n && same && exact; ++i) {
+            uint16_t hb;
+            uint32_t u;
+            std::memcpy(&hb, wire.data() + 2 * i, 2);
+            std::memcpy(&u, &fb[i], 4);
+            same = hb == bf16_from_f32(f[i]);
+            exact = u == (uint32_t) hb << 16;
+        }
+        check(same, "bf16: kernels::bf16_from_f32's rounding (ties to even, a NaN kept), 2 bytes a value");
+        check(exact, "... and back exactly (the top half of an fp32)");
+        const uint32_t f32 = 1u << (uint32_t) StageRows::F32, b16 = 1u << (uint32_t) StageRows::BF16;
+        check(stage_rows_agreed(f32, kStageRowsAll) == StageRows::F32 &&
+                  stage_rows_agreed(f32 | b16, kStageRowsAll) == StageRows::BF16 &&
+                  stage_rows_agreed(f32 | b16, f32) == StageRows::F32 && stage_rows_agreed(0, 0) == StageRows::F32 &&
+                  stage_rows_agreed(f32 | b16 | (1u << 9), kStageRowsAll | (1u << 9)) == StageRows::BF16,
+              "the narrowest format both list, fp32 when no other (a format this build lacks: not chosen)");
+        StageRows parsed = StageRows::F32;
+        check(stage_rows_parse("bf16", parsed) && parsed == StageRows::BF16 && stage_rows_parse("fp32", parsed) &&
+                  parsed == StageRows::F32 && !stage_rows_parse("fp8", parsed),
+              "STRATA_REMOTE_ROWS names: fp32, bf16");
+
+        worker_vision = 1;
+        Worker wk15;
+        if (!wk15.start(h, buf)) {
+            check(false, "a worker for the row formats");
+        } else {
+            StageClient cl;
+            StageHello mine_b = hello_of();
+            mine_b.row_formats = f32 | b16;
+            check(cl.connect(wk15.where, mine_b, peer, err) && cl.rows() == StageRows::BF16 &&
+                      peer.row_formats == kStageRowsAll,
+                  "a main process listing bf16: the link agrees on it (the worker lists every format)");
+            // values bf16 rounds; the worker's handlers copy rows in to out, so each comes back rounded once
+            std::vector<float> win15((size_t) (2 * kHbf)), wout15(win15.size()), want(win15.size());
+            for (size_t i = 0; i < win15.size(); ++i) {
+                win15[i] = 1.0f + (float) i / 3.0f + 1e-3f;
+                want[i] = f32_from_bf16(bf16_from_f32(win15[i]));
+            }
+            std::vector<int32_t> t2(2, 1);
+            const uint64_t out0 = cl.stats().bytes_out, in0 = cl.stats().bytes_in;
+            check(cl.reset({}, err) &&
+                      cl.run(2, t2.data(), 0, win15.data(), win15.size(), wout15.data(), wout15.size(), err) &&
+                      wout15 == want && want != win15 &&
+                      cl.stats().bytes_out - out0 == sizeof(StageHeader) + 2 * 4 + 2 * kHbf * 2 &&
+                      cl.stats().bytes_in - in0 == 2 * sizeof(StageHeader) + 2 * kHbf * 2,
+                  "a window's rows cross as bf16 both ways (2 bytes a value), each value rounded once");
+            const int64_t skip = 3;
+            std::vector<int64_t> ptok15((size_t) kChunk, 1);
+            std::vector<float> pin15((size_t) (kChunk * kD)), pout15(pin15.size(), -1.0f), pwant15(pin15.size(), -1.0f);
+            for (size_t i = 0; i < pin15.size(); ++i) {
+                pin15[i] = -2.0f - (float) i / 7.0f;
+                if (i >= (size_t) (skip * kD)) pwant15[i] = f32_from_bf16(bf16_from_f32(pin15[i]));
+            }
+            check(cl.prefill_send(ptok15.data(), kChunk, 0, 0, pin15.data(), (size_t) kD, skip, err) &&
+                      cl.prefill_recv(pout15.data(), (size_t) kD, kChunk, skip, err) && pout15 == pwant15,
+                  "a prompt chunk's rows too, from row `skip` (the rows before it untouched)");
+            cl.close();
+            check(cl.connect(wk15.where, hello_of(), peer, err) && cl.rows() == StageRows::F32 &&
+                      cl.run(2, t2.data(), 0, win15.data(), win15.size(), wout15.data(), wout15.size(), err) &&
+                      wout15 == win15,
+                  "a main process listing fp32 only: fp32, the rows exact");
+            cl.close();
+            {
+                Raw r;
+                StageHello rh = hello_of();
+                rh.row_formats = f32 | b16;
+                StageHeader rep;
+                std::string pl;
+                const int32_t t1 = 1;
+                std::vector<unsigned char> row16((size_t) kHbf * 2);
+                stage_rows_encode(StageRows::BF16, win15.data(), 1, (size_t) kHbf, row16.data());
+                bool ok = r.open(wk15.where);
+                if (ok) {
+                    r.header(StageMsg::Hello, 0, sizeof rh);
+                    r.send(&rh, sizeof rh);
+                    ok = r.reply(rep, pl) && rep.type == (uint32_t) StageMsg::HelloOk;
+                }
+                bool f32_sized = false, b16_sized = false;
+                if (ok) {
+                    r.header(StageMsg::Run, 1, 4 + (uint64_t) kHbf * 4);
+                    r.send(&t1, 4);
+                    r.send(win15.data(), (size_t) kHbf * 4);
+                    f32_sized = r.reply(rep, pl) && rep.type == (uint32_t) StageMsg::Error && contains(pl, "bad window size");
+                    r.header(StageMsg::Run, 1, 4 + (uint64_t) kHbf * 2);
+                    r.send(&t1, 4);
+                    r.send(row16.data(), row16.size());
+                    b16_sized = r.reply(rep, pl) && rep.type == (uint32_t) StageMsg::RunOk && rep.bytes == (uint64_t) kHbf * 2 &&
+                                std::memcmp(pl.data(), row16.data(), row16.size()) == 0;
+                }
+                check(ok && f32_sized && b16_sized,
+                      "the worker's sizes follow the agreed format: an fp32-sized window on a bf16 link is malformed");
+            }
+            wk15.stop();
+        }
     }
 
     if (g_fail == 0) std::printf("stage_link_test: all passed\n");
