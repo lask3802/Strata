@@ -261,6 +261,43 @@ bool send_msg(sock_t fd, const StageHeader& h, const void* p1, size_t n1, const 
            (n2 == 0 || send_all(fd, p2, n2, err));
 }
 
+// A message's rows in format f (rows x width floats at the engine's side), sent or read a slice at a time: no buffer
+// of a whole chunk's rows (a 5888-token chunk's bf16 rows are 120 MB), and each slice's conversion overlaps the socket
+// moving the last one.  fp32 goes as it is, in one call, as before row formats.  conv_ms: the conversions' time.
+constexpr size_t kSliceFloats = (size_t) 1 << 18;   // 256K values a slice (512 KiB of bf16)
+
+size_t slice_rows(size_t width) { return std::max<size_t>(1, kSliceFloats / std::max<size_t>(width, 1)); }
+
+bool send_rows(sock_t fd, StageRows f, const float* src, size_t rows, size_t width, std::vector<unsigned char>& buf,
+               double& conv_ms, std::string& err) {
+    if (f == StageRows::F32) return rows * width == 0 || send_all(fd, src, rows * width * sizeof(float), err);
+    const size_t step = slice_rows(width);
+    buf.resize(stage_rows_bytes(f, std::min(rows, step), width));
+    for (size_t r = 0; r < rows; r += step) {
+        const size_t k = std::min(step, rows - r);
+        const Clock::time_point t = Clock::now();
+        stage_rows_encode(f, src + r * width, k, width, buf.data());
+        conv_ms += ms_since(t);
+        if (!send_all(fd, buf.data(), stage_rows_bytes(f, k, width), err)) return false;
+    }
+    return true;
+}
+
+bool recv_rows(sock_t fd, StageRows f, float* dst, size_t rows, size_t width, std::vector<unsigned char>& buf,
+               double& conv_ms, std::string& err) {
+    if (f == StageRows::F32) return rows * width == 0 || recv_all(fd, dst, rows * width * sizeof(float), err);
+    const size_t step = slice_rows(width);
+    buf.resize(stage_rows_bytes(f, std::min(rows, step), width));
+    for (size_t r = 0; r < rows; r += step) {
+        const size_t k = std::min(step, rows - r);
+        if (!recv_all(fd, buf.data(), stage_rows_bytes(f, k, width), err)) return false;
+        const Clock::time_point t = Clock::now();
+        stage_rows_decode(f, buf.data(), k, width, dst + r * width);
+        conv_ms += ms_since(t);
+    }
+    return true;
+}
+
 bool recv_header(sock_t fd, StageHeader& h, std::string& err) {
     if (!recv_all(fd, &h, sizeof h, err)) return false;
     if (h.magic != kStageMagic) { err = "remote stage: bad message magic (not a Strata stage peer?)"; return false; }
@@ -584,7 +621,8 @@ bool StageClient::alive(std::string& err) {
 }
 
 // the next reply: `want` with exactly reply_bytes of payload, or the worker's error (the connection then stays)
-bool StageClient::read_reply_(StageMsg want, void* reply, size_t reply_bytes, int64_t& worker_us, std::string& err) {
+bool StageClient::read_reply_(StageMsg want, void* reply, size_t reply_bytes, int64_t& worker_us, std::string& err,
+                              size_t rows, size_t width, double* conv_ms) {
     StageHeader r;
     if (broken_) { err = "remote stage: the link failed earlier"; return false; }
     if (!recv_header(S(fd_), r, err)) { break_(); return false; }
@@ -609,7 +647,13 @@ bool StageClient::read_reply_(StageMsg want, void* reply, size_t reply_bytes, in
         break_();
         return false;
     }
-    if (reply_bytes > 0 && !recv_all(S(fd_), reply, reply_bytes, err)) { break_(); return false; }
+    double conv = 0;
+    if (rows > 0 ? !recv_rows(S(fd_), rows_, (float*) reply, rows, width, rx_, conv, err)
+                 : reply_bytes > 0 && !recv_all(S(fd_), reply, reply_bytes, err)) {
+        break_();
+        return false;
+    }
+    if (conv_ms != nullptr) *conv_ms += conv;
     worker_us = r.a;
     stats_.bytes_in += sizeof r + reply_bytes;
     return true;
@@ -621,43 +665,30 @@ bool StageClient::run(int T, const int32_t* tokens, int64_t pos0, const float* r
     std::lock_guard<std::mutex> lr(recv_mu_);
     if (!connected()) { err = "remote stage: not connected"; return false; }
     const auto t0 = Clock::now();
-    // the rows in the link's format (a window's few rows, converted here); fp32 goes as it is
-    const void* body = rows_in;
-    size_t in_bytes = in_floats * sizeof(float);
-    void* reply = rows_out;
-    size_t reply_bytes = out_floats * sizeof(float);
+    // the rows in the link's format (send_rows / read_reply_ convert them); fp32 goes as it is
+    const bool f32 = rows_ == StageRows::F32;
     const size_t w_in = T > 0 ? in_floats / (size_t) T : 0, w_out = T > 0 ? out_floats / (size_t) T : 0;
-    if (rows_ != StageRows::F32) {
-        if (T < 1 || w_in * (size_t) T != in_floats || w_out * (size_t) T != out_floats) {
-            err = "remote stage: a window's rows are not T whole rows";
-            return false;
-        }
-        in_bytes = stage_rows_bytes(rows_, (size_t) T, w_in);
-        tx_.resize(in_bytes);
-        stage_rows_encode(rows_, rows_in, (size_t) T, w_in, tx_.data());
-        body = tx_.data();
-        reply_bytes = stage_rows_bytes(rows_, (size_t) T, w_out);
-        rx_.resize(reply_bytes);
-        reply = rx_.data();
-        stats_.ms_encode += ms_since(t0);
+    if (!f32 && (T < 1 || w_in * (size_t) T != in_floats || w_out * (size_t) T != out_floats)) {
+        err = "remote stage: a window's rows are not T whole rows";
+        return false;
     }
+    const size_t in_bytes = f32 ? in_floats * sizeof(float) : stage_rows_bytes(rows_, (size_t) T, w_in);
+    const size_t reply_bytes = f32 ? out_floats * sizeof(float) : stage_rows_bytes(rows_, (size_t) T, w_out);
     StageHeader h;
     h.type = (uint32_t) StageMsg::Run;
     h.a = T;
     h.b = pos0;
     h.bytes = (uint64_t) T * sizeof(int32_t) + in_bytes;
-    if (!send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int32_t), body, in_bytes, err)) {
+    if (f32 ? !send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int32_t), rows_in, in_bytes, err)
+            : !send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int32_t), nullptr, 0, err) ||
+                  !send_rows(S(fd_), rows_, rows_in, (size_t) T, w_in, tx_, stats_.ms_encode, err)) {
         break_();
         return false;
     }
     stats_.bytes_out += sizeof h + h.bytes;
     int64_t wus = 0;
-    const bool ok = read_reply_(StageMsg::RunOk, reply, reply_bytes, wus, err);
-    if (ok && rows_ != StageRows::F32) {
-        const auto td = Clock::now();
-        stage_rows_decode(rows_, rx_.data(), (size_t) T, w_out, rows_out);
-        stats_.ms_decode += ms_since(td);
-    }
+    const bool ok = read_reply_(StageMsg::RunOk, rows_out, reply_bytes, wus, err, f32 ? 0 : (size_t) T, w_out,
+                                &stats_.ms_decode);
     const double ms = ms_since(t0);
     ++stats_.runs;
     stats_.ms_run += ms;
@@ -694,27 +725,30 @@ bool StageClient::prefill_send(const int64_t* tokens, int64_t T, int64_t pos0, i
     h.a = T;
     h.b = pos0;
     h.c = (flags & 0xff) | (skip << 8);
-    const auto t0 = Clock::now();
-    // the rows in the link's format, converted on this thread (the prompt path sends on one of its own); fp32 goes
-    // as it is
-    const void* body = rows_in;
-    size_t in_bytes = (size_t) T * row_floats * sizeof(float);
-    double encode_ms = 0;
-    if (rows_ != StageRows::F32) {
-        in_bytes = stage_rows_bytes(rows_, (size_t) T, row_floats);
-        tx_.resize(in_bytes);
-        stage_rows_encode(rows_, rows_in, (size_t) T, row_floats, tx_.data());
-        body = tx_.data();
-        encode_ms = ms_since(t0);
-        stats_.ms_encode += encode_ms;
-    }
+    // the rows in the link's format, converted as they go out on this thread (the prompt path sends on one of its
+    // own); fp32 goes as it is
+    const bool f32 = rows_ == StageRows::F32;
+    const size_t in_bytes = f32 ? (size_t) T * row_floats * sizeof(float) : stage_rows_bytes(rows_, (size_t) T, row_floats);
     h.bytes = (uint64_t) T * sizeof(int64_t) + in_bytes;
+    const uint64_t seq = ++sent_seq_;
     {
         std::lock_guard<std::mutex> lq(q_mu_);
-        sent_at_.push_back(Sent{t0, encode_ms});
+        sent_at_.push_back(Sent{Clock::now(), seq, 0});
     }
-    if (!send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int64_t), body, in_bytes, err)) { break_(); return false; }
+    double encode_ms = 0;
+    if (f32 ? !send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int64_t), rows_in, in_bytes, err)
+            : !send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int64_t), nullptr, 0, err) ||
+                  !send_rows(S(fd_), rows_, rows_in, (size_t) T, row_floats, tx_, encode_ms, err)) {
+        break_();
+        return false;
+    }
     stats_.bytes_out += sizeof h + h.bytes;
+    if (!f32) {
+        stats_.ms_encode += encode_ms;
+        std::lock_guard<std::mutex> lq(q_mu_);   // (its reply may be read already: then it is gone)
+        for (Sent& s : sent_at_)
+            if (s.seq == seq) s.encode_ms = encode_ms;
+    }
     return true;
 }
 
@@ -723,24 +757,15 @@ bool StageClient::prefill_recv(float* rows_out, size_t row_floats, int64_t T, in
     if (!connected()) { err = "remote stage: not connected"; return false; }
     skip = std::max<int64_t>(0, std::min<int64_t>(skip, T));
     const size_t back = (size_t) (T - skip);
-    float* const dst = rows_out + (size_t) skip * row_floats;
-    void* reply = dst;
-    size_t reply_bytes = back * row_floats * sizeof(float);
-    if (rows_ != StageRows::F32) {   // (the link's format, converted below)
-        reply_bytes = stage_rows_bytes(rows_, back, row_floats);
-        rx_.resize(reply_bytes);
-        reply = rx_.data();
-    }
+    const bool f32 = rows_ == StageRows::F32;
+    // (the link's format: read_reply_ converts the rows as they come)
+    const size_t reply_bytes = f32 ? back * row_floats * sizeof(float) : stage_rows_bytes(rows_, back, row_floats);
     int64_t wus = 0;
-    const bool ok = read_reply_(StageMsg::PrefillOk, reply, reply_bytes, wus, err);
     double decode_ms = 0;
-    if (ok && rows_ != StageRows::F32) {
-        const auto td = Clock::now();
-        stage_rows_decode(rows_, rx_.data(), back, row_floats, dst);
-        decode_ms = ms_since(td);
-        stats_.ms_decode += decode_ms;
-    }
-    Sent sent{Clock::now(), 0};
+    const bool ok = read_reply_(StageMsg::PrefillOk, rows_out + (size_t) skip * row_floats, reply_bytes, wus, err,
+                                f32 ? 0 : back, row_floats, &decode_ms);
+    stats_.ms_decode += decode_ms;
+    Sent sent{Clock::now(), 0, 0};
     {
         std::lock_guard<std::mutex> lq(q_mu_);
         if (!sent_at_.empty()) {
@@ -1035,7 +1060,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
             // ends it, for the same reason.
             bool hello_in = have_first;
             StageRows fmt = StageRows::F32;   // the admitted hello's rows format
-            std::vector<unsigned char> wire;  // rows in another format than fp32, before their conversion
+            std::vector<unsigned char> wire;  // a slice of rows in another format than fp32, before its conversion
             for (;;) {
                 Inbox in;
                 bool last = false;   // a first message that is not a whole hello: nothing after it is read
@@ -1091,17 +1116,10 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                         } else {
                             in.tok32.resize((size_t) T);
                             in.rows.resize(rows);
-                            const bool f32 = fmt == StageRows::F32;
-                            if (!f32) wire.resize(rows_bytes);
                             if (!recv_all(fd, in.tok32.data(), (size_t) T * 4, in.err) ||
-                                !recv_all(fd, f32 ? (void*) in.rows.data() : (void*) wire.data(), rows_bytes, in.err)) {
+                                !recv_rows(fd, fmt, in.rows.data(), (size_t) T, (size_t) buf.handoff_floats, wire,
+                                           in.decode_ms, in.err))
                                 in.closed = true;
-                            } else if (!f32) {
-                                const auto td = Clock::now();
-                                stage_rows_decode(fmt, wire.data(), (size_t) T, (size_t) buf.handoff_floats,
-                                                  in.rows.data());
-                                in.decode_ms = ms_since(td);
-                            }
                         }
                     } else if (type == StageMsg::Prefill) {
                         const int64_t T = in.h.a;   // (bounded first, as a window's)
@@ -1121,20 +1139,12 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                                 in.slot = !slot_busy[0] ? 0 : 1;
                                 slot_busy[in.slot] = true;
                             }
-                            // fp32 straight into the free buffer; another format through `wire`, converted into it
+                            // (fp32 straight into the free buffer; another format a slice at a time, converted into it)
                             in.tok64.resize((size_t) T);
-                            const bool f32 = fmt == StageRows::F32;
-                            if (!f32) wire.resize(rows_bytes);
                             if (!recv_all(fd, in.tok64.data(), (size_t) T * 8, in.err) ||
-                                !recv_all(fd, f32 ? (void*) buf.pf_in[in.slot] : (void*) wire.data(), rows_bytes,
-                                          in.err)) {
+                                !recv_rows(fd, fmt, buf.pf_in[in.slot], (size_t) T, (size_t) buf.pf_row_floats, wire,
+                                           in.decode_ms, in.err))
                                 in.closed = true;
-                            } else if (!f32) {
-                                const auto td = Clock::now();
-                                stage_rows_decode(fmt, wire.data(), (size_t) T, (size_t) buf.pf_row_floats,
-                                                  buf.pf_in[in.slot]);
-                                in.decode_ms = ms_since(td);
-                            }
                         }
                     } else if (type == StageMsg::Positions) {
                         // (t, h, w) per cell; at most 4M cells (the handler checks it against the context)
@@ -1192,9 +1202,10 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         // the position the session holds (a checkpoint is saved only there): a chunk's end, a window's first
         // position plus its accepted count, 0 after a reset, L after a checkpoint restore
         int64_t pos = 0, run_pos0 = 0;
-        // the replies' rows in another format than fp32: a window's (this thread's), a prompt chunk's (its reply
-        // thread's: one is out at a time)
+        // a slice of the replies' rows in another format than fp32: a window's (this thread's), a prompt chunk's (its
+        // reply thread's: one is out at a time), and that one's conversion time (stats has it once the reply is out)
         std::vector<unsigned char> run_tx, pf_tx;
+        double reply_encode_ms = 0;
         // a prompt chunk's reply goes out on its own thread while the next chunk is read; every later send waits
         // for it (the replies keep their order), and so does the reuse of its output buffer
         std::future<bool> reply_out;
@@ -1202,7 +1213,10 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         int out_buf = 0;
         auto replies_out = [&]() -> bool {
             if (!reply_out.valid()) return true;
-            if (reply_out.get()) return true;
+            const bool ok = reply_out.get();
+            stats.ms_encode += reply_encode_ms;
+            reply_encode_ms = 0;
+            if (ok) return true;
             err = reply_err;
             return false;
         };
@@ -1424,16 +1438,15 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 r.type = (uint32_t) StageMsg::RunOk;
                 r.a = (int64_t) (ms_since(t0) * 1000.0);   // the worker's own time, microseconds
                 r.bytes = in.rows.size() * 4;
-                const void* body = buf.run_out;
-                if (rows_fmt != StageRows::F32) {   // (the link's format: a window's few rows, converted here)
-                    const auto te = Clock::now();
+                if (rows_fmt == StageRows::F32) {
+                    if (!replies_out() || !send_msg(fd, r, buf.run_out, (size_t) r.bytes, nullptr, 0, err)) keep = false;
+                } else {   // (the link's format, converted as it goes out)
                     r.bytes = stage_rows_bytes(rows_fmt, (size_t) T, (size_t) buf.handoff_floats);
-                    run_tx.resize((size_t) r.bytes);
-                    stage_rows_encode(rows_fmt, buf.run_out, (size_t) T, (size_t) buf.handoff_floats, run_tx.data());
-                    body = run_tx.data();
-                    stats.ms_encode += ms_since(te);
+                    if (!replies_out() || !send_msg(fd, r, nullptr, 0, nullptr, 0, err) ||
+                        !send_rows(fd, rows_fmt, buf.run_out, (size_t) T, (size_t) buf.handoff_floats, run_tx,
+                                   stats.ms_encode, err))
+                        keep = false;
                 }
-                if (!replies_out() || !send_msg(fd, r, body, (size_t) r.bytes, nullptr, 0, err)) keep = false;
                 stats.bytes_out += sizeof r + r.bytes;
                 ++stats.runs;
                 stats.ms_run += ms_since(t0);
@@ -1479,7 +1492,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 reply_err.clear();
                 // (the rows in the link's format on the reply thread too, after a relay's next worker has filled them)
                 reply_out = std::async(std::launch::async, [fd, r, src, back_rows, D, out, T, skip, fmt = rows_fmt,
-                                                            &pf_tx, &h, &reply_err] {
+                                                            &pf_tx, &reply_encode_ms, &h, &reply_err] {
                     if (h.prefill_reply) {   // a relay worker: the next worker's rows (in chunk order)
                         std::string e;
                         if (!h.prefill_reply(out, T, skip, e)) {
@@ -1490,13 +1503,12 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                         }
                     }
                     if (fmt == StageRows::F32) return send_msg(fd, r, src, (size_t) r.bytes, nullptr, 0, reply_err);
-                    const auto te = Clock::now();
-                    pf_tx.resize((size_t) r.bytes);
-                    stage_rows_encode(fmt, src, back_rows, D, pf_tx.data());
-                    if (remote_timing())
+                    const bool sent = send_msg(fd, r, nullptr, 0, nullptr, 0, reply_err) &&
+                                      send_rows(fd, fmt, src, back_rows, D, pf_tx, reply_encode_ms, reply_err);
+                    if (sent && remote_timing())
                         std::fprintf(stderr, "strata stage worker: chunk T=%lld: its rows to %s in %.0f ms\n",
-                                     (long long) T, stage_rows_name(fmt), ms_since(te));
-                    return send_msg(fd, r, pf_tx.data(), (size_t) r.bytes, nullptr, 0, reply_err);
+                                     (long long) T, stage_rows_name(fmt), reply_encode_ms);
+                    return sent;
                 });
                 out_buf ^= 1;
                 stats.bytes_out += sizeof r + r.bytes;

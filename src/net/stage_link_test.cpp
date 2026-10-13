@@ -48,8 +48,9 @@
 //      link out of step;
 //  15. row formats: bf16 rounds as kernels::bf16_from_f32 does (ties to even, a NaN kept) and comes back exactly; a
 //      link uses the narrowest format both hellos list (fp32 when no other); a main process listing bf16 gets a
-//      window's and a chunk's rows back rounded once, in half the bytes, one listing fp32 only gets them exact; the
-//      worker's sizes follow the agreed format (an fp32-sized window on a bf16 link is malformed).
+//      window's and a chunk's rows back rounded to bf16, in half the bytes, one listing fp32 only gets them exact; the
+//      worker's sizes follow the agreed format (an fp32-sized window or chunk on a bf16 link is malformed), and a
+//      second hello on a connection agrees again; a chunk larger than one conversion slice comes back whole.
 // The handlers run on the worker's serving thread: what they share with the test is behind a mutex or atomic.
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/net/stage_ckpt_store.hpp"
@@ -1274,7 +1275,7 @@ int main() {
                       wout15 == want && want != win15 &&
                       cl.stats().bytes_out - out0 == sizeof(StageHeader) + 2 * 4 + 2 * kHbf * 2 &&
                       cl.stats().bytes_in - in0 == 2 * sizeof(StageHeader) + 2 * kHbf * 2,
-                  "a window's rows cross as bf16 both ways (2 bytes a value), each value rounded once");
+                  "a window's rows cross as bf16 both ways (2 bytes a value), come back rounded to bf16");
             const int64_t skip = 3;
             std::vector<int64_t> ptok15((size_t) kChunk, 1);
             std::vector<float> pin15((size_t) (kChunk * kD)), pout15(pin15.size(), -1.0f), pwant15(pin15.size(), -1.0f);
@@ -1306,22 +1307,86 @@ int main() {
                     r.send(&rh, sizeof rh);
                     ok = r.reply(rep, pl) && rep.type == (uint32_t) StageMsg::HelloOk;
                 }
-                bool f32_sized = false, b16_sized = false;
+                // a window of one row, fp32- or bf16-sized: its reply's type and payload size
+                auto window = [&](bool as_f32) {
+                    r.header(StageMsg::Run, 1, 4 + (uint64_t) kHbf * (as_f32 ? 4 : 2));
+                    r.send(&t1, 4);
+                    if (as_f32) r.send(win15.data(), (size_t) kHbf * 4);
+                    else r.send(row16.data(), row16.size());
+                    return r.reply(rep, pl);
+                };
+                const bool ok_reply = ok;
+                const bool f32_bad = ok && window(true) && rep.type == (uint32_t) StageMsg::Error &&
+                                     contains(pl, "bad window size");
+                const bool b16_runs = ok && window(false) && rep.type == (uint32_t) StageMsg::RunOk &&
+                                      rep.bytes == (uint64_t) kHbf * 2 &&
+                                      std::memcmp(pl.data(), row16.data(), row16.size()) == 0;
+                // a prompt chunk of 2 rows, fp32-sized
+                bool chunk_bad = false;
                 if (ok) {
-                    r.header(StageMsg::Run, 1, 4 + (uint64_t) kHbf * 4);
-                    r.send(&t1, 4);
-                    r.send(win15.data(), (size_t) kHbf * 4);
-                    f32_sized = r.reply(rep, pl) && rep.type == (uint32_t) StageMsg::Error && contains(pl, "bad window size");
-                    r.header(StageMsg::Run, 1, 4 + (uint64_t) kHbf * 2);
-                    r.send(&t1, 4);
-                    r.send(row16.data(), row16.size());
-                    b16_sized = r.reply(rep, pl) && rep.type == (uint32_t) StageMsg::RunOk && rep.bytes == (uint64_t) kHbf * 2 &&
-                                std::memcmp(pl.data(), row16.data(), row16.size()) == 0;
+                    const int64_t tk[2] = {1, 2};
+                    r.header(StageMsg::Prefill, 2, 2 * 8 + (uint64_t) (2 * kD) * 4);
+                    r.send(tk, sizeof tk);
+                    r.send(pin15.data(), (size_t) (2 * kD) * 4);
+                    chunk_bad = r.reply(rep, pl) && rep.type == (uint32_t) StageMsg::Error &&
+                                contains(pl, "bad prompt chunk size");
                 }
-                check(ok && f32_sized && b16_sized,
-                      "the worker's sizes follow the agreed format: an fp32-sized window on a bf16 link is malformed");
+                check(ok_reply && f32_bad && b16_runs && chunk_bad,
+                      "the worker's sizes follow the agreed format: an fp32-sized window or chunk on a bf16 link is "
+                      "malformed, a bf16 one runs");
+                // the same connection, a second hello listing fp32 only: from it on, fp32
+                StageHello rh32 = hello_of();
+                bool again = false;
+                if (ok) {
+                    r.header(StageMsg::Hello, 0, sizeof rh32);
+                    r.send(&rh32, sizeof rh32);
+                    again = r.reply(rep, pl) && rep.type == (uint32_t) StageMsg::HelloOk;
+                }
+                const bool f32_runs = again && window(true) && rep.type == (uint32_t) StageMsg::RunOk &&
+                                      rep.bytes == (uint64_t) kHbf * 4 &&
+                                      std::memcmp(pl.data(), win15.data(), (size_t) kHbf * 4) == 0;
+                const bool b16_bad = again && window(false) && rep.type == (uint32_t) StageMsg::Error &&
+                                     contains(pl, "bad window size");
+                check(again && f32_runs && b16_bad,
+                      "a second hello on the connection agrees again: fp32 from it on (exact), bf16-sized is malformed");
             }
             wk15.stop();
+        }
+        // a chunk larger than a conversion slice (256K values): 50 rows of 8192 floats go 32 rows, then 18
+        constexpr int64_t kBigD = 8192, kBigT = 50;
+        std::vector<float> bin0((size_t) (kBigT * kBigD)), bin1(bin0.size()), bout0(bin0.size()), bout1(bin0.size());
+        StageBuffers bb = buf;
+        bb.pf_in[0] = bin0.data();
+        bb.pf_in[1] = bin1.data();
+        bb.pf_out[0] = bout0.data();
+        bb.pf_out[1] = bout1.data();
+        bb.pf_floats = bin0.size();
+        bb.pf_row_floats = kBigD;
+        StageHandlers hb = h;
+        hb.prefill = [&](const int64_t*, int64_t T, int64_t, int64_t, int64_t, const float* in, float* out, std::string&) {
+            std::memcpy(out, in, (size_t) (T * kBigD) * 4);
+            return true;
+        };
+        Worker wkb;
+        if (!wkb.start(hb, bb)) {
+            check(false, "a worker for the large chunk");
+        } else {
+            StageClient cl;
+            StageHello mine_b = hello_of();
+            mine_b.row_formats = f32 | b16;
+            const int64_t skip = 3;
+            std::vector<int64_t> btok((size_t) kBigT, 1);
+            std::vector<float> bin((size_t) (kBigT * kBigD)), bout(bin.size(), -1.0f), bwant(bin.size(), -1.0f);
+            for (size_t i = 0; i < bin.size(); ++i) {
+                bin[i] = (float) (i % 1009) * 1.0009f - 500.0f;
+                if (i >= (size_t) (skip * kBigD)) bwant[i] = f32_from_bf16(bf16_from_f32(bin[i]));
+            }
+            check(cl.connect(wkb.where, mine_b, peer, err) && cl.rows() == StageRows::BF16 &&
+                      cl.prefill_send(btok.data(), kBigT, 0, 0, bin.data(), (size_t) kBigD, skip, err) &&
+                      cl.prefill_recv(bout.data(), (size_t) kBigD, kBigT, skip, err) && bout == bwant,
+                  "a chunk of more than one conversion slice (a part slice last) comes back whole, rounded to bf16");
+            cl.close();
+            wkb.stop();
         }
     }
 

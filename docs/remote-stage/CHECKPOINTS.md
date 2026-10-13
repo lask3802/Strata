@@ -36,8 +36,9 @@ draft acceptance, not correctness (every draft is verified), and is the same on 
 A remote stage keeps its behaviour (no checkpoints, every prompt from 0) unless `--prompt-cache N` is given
 EXPLICITLY on the main's command line (an `o.prompt_cache_explicit` flag set by the parser; a config that passes
 `--prompt-cache 6`, the one-GPU default, turns it on too). Without it the messages stay the same (a Reset is the
-header alone, as before) and the cut loop does not split the prompt. The hello says protocol 6, so the main and every
-worker must run this version, with or without checkpoints (they always had to run the same protocol).
+header alone, as before) and the cut loop does not split the prompt. The checkpoints made it protocol 6 (the row
+formats, 7: ENGINEERING.md), so the main and every worker must run this version, with or without checkpoints (they
+always had to run the same protocol).
 
 ## Scope
 

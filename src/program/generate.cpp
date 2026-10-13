@@ -10297,6 +10297,9 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (remote_main) std::memcpy(me.token, stage_token.data(), stage_token.size());
+            if (stage_worker && std::getenv("STRATA_REMOTE_ROWS") != nullptr)
+                std::fprintf(stderr, "strata serve: STRATA_REMOTE_ROWS is the main process's choice; a worker takes "
+                                     "the row format its main process asks for (it ignores its own)\n");
             if (remote_main) {
                 // STRATA_REMOTE_ROWS=bf16: the rows cross the link as bf16 (half the bytes, each value rounded to 8
                 // significant bits) when the worker has it; unset or fp32: fp32, as before

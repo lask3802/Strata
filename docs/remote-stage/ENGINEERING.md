@@ -30,16 +30,17 @@ the head and the drafter on the worker would have saved that return trip and mov
 ### The protocol
 
 One TCP connection per main process. Every message is a 40-byte header (`magic` "STRM", `type`, three int64 fields
-`a b c`, payload `bytes`) and a payload. Protocol version 6 (3 before the hello carried the tail-skip rank, 4 before
+`a b c`, payload `bytes`) and a payload. Protocol version 7 (3 before the hello carried the tail-skip rank, 4 before
 images, which added the Positions message and the hello's `vision`, 5 before the conversation checkpoints, which
-added `CkptSave` / `CkptRestore`, a keep list on `Reset` and the hello's `ckpt_max`: [CHECKPOINTS.md](CHECKPOINTS.md)).
+added `CkptSave` / `CkptRestore`, a keep list on `Reset` and the hello's `ckpt_max`: [CHECKPOINTS.md](CHECKPOINTS.md);
+6 before the row formats, below).
 
 | message | header fields | payload | reply |
 |---|---|---|---|
 | Hello | | `StageHello` (below) | HelloOk with the worker's hello, or Error |
-| Run (a verify window) | a = T, b = first position | int32 tokens[T], fp32 rows[T x 12,804] | RunOk: a = the worker's time (us), rows[T x 12,804] |
+| Run (a verify window) | a = T, b = first position | int32 tokens[T], rows[T x 12,804] | RunOk: a = the worker's time (us), rows[T x 12,804] |
 | Commit | a = accepted count | none | none (an error comes back on the next reply) |
-| Prefill (a prompt chunk) | a = T, b = first position, c = flags (bit 0: the prompt is one chunk) and `skip` << 8 | int64 tokens[T], fp32 rows[T x 10,240] | PrefillOk: a = the worker's time (us), rows[(T - skip) x 10,240] |
+| Prefill (a prompt chunk) | a = T, b = first position, c = flags (bit 0: the prompt is one chunk) and `skip` << 8 | int64 tokens[T], rows[T x 10,240] | PrefillOk: a = the worker's time (us), rows[(T - skip) x 10,240] |
 | Reset (a fresh prompt) | | int64 keep[] (empty: none) | ResetOk |
 | Positions (`--vision`: the next request's) | a = cells; b = 1: plain positions (no table) | int32 (t, h, w)[cells] | none (an error comes back on the next reply, a Reset's and a CkptRestore's included) |
 | CkptSave | a = id, b = position | int64 keep[] | CkptSaveOk: a = 1 stored, 0 not |
@@ -58,6 +59,18 @@ every protocol, so an older peer is refused for its protocol number. A peer that
 the hello the worker waits for messages without a time limit (the next prompt may be hours away), while sends and the
 main process's receives time out after `STRATA_REMOTE_TIMEOUT_S` (300 s). Sockets: `TCP_NODELAY`, 8 MiB buffers,
 keepalive after 30 s idle, 3 probes 10 s apart.
+
+**Row formats.** The rows (both ways, windows and prompt chunks) are fp32 unless the main process asks for another
+format: `STRATA_REMOTE_ROWS=bf16` halves their bytes and rounds each value to 8 significant bits (to nearest even, as
+the GPU kernels round to bf16). It is opt-in because it changes answers a little (measured below); the default stays
+fp32, and every message after the hello is byte for byte what protocol 6 sent. Each hello lists the formats its side sends and reads
+(`row_formats`, a bit per format): a main process lists fp32 and the one it asks for, a worker every one it has, and
+the link uses the narrowest both list (fp32 when no other). A relay asks its next worker for what its main process
+listed. A format added later is a new bit, not a new protocol: a side that lacks it does not list it. The engine's
+buffers stay fp32 on both PCs; the link converts as it sends and reads, on the threads that already move the rows (a
+prompt chunk's: the main process's sending thread and its receiving one, the worker's receiving thread and its reply
+thread; a window's few rows: the calling thread). With `STRATA_REMOTE_TIMING=1` each chunk's line adds the main
+process's conversion times, and the worker logs its own.
 
 **Recovery.** The worker serves one connection at a time. A new one stays in the listen backlog, unread, until the
 served one has had no message read, being read, or a reply going out for `STRATA_REMOTE_TAKEOVER_S` (30 s; 0:

@@ -131,7 +131,8 @@ struct StageStats {
     uint64_t bytes_out = 0, bytes_in = 0;
     double ms_run = 0, ms_prefill = 0;   ///< wall time of the round trips (main side) / of the work (worker side)
     double ms_run_worker = 0;            ///< main side: the worker's own share of ms_run
-    double ms_encode = 0, ms_decode = 0; ///< the rows' conversion to and from the link's format (not fp32: none)
+    double ms_encode = 0, ms_decode = 0; ///< the rows' conversion to and from the link's format (fp32: none); a
+                                         ///< worker's chunk replies are added as each one is out
 };
 
 /// The main process's end: one connection.  Windows, commits and resets are whole round trips (one thread at a
@@ -190,7 +191,10 @@ public:
     StageRows rows() const { return rows_; }
 
 private:
-    bool read_reply_(StageMsg want, void* reply, size_t reply_bytes, int64_t& worker_us, std::string& err);
+    /// `rows` > 0: the payload is that many rows of `width` floats in the link's format, read into `reply` (floats),
+    /// their conversion's time added to *conv_ms
+    bool read_reply_(StageMsg want, void* reply, size_t reply_bytes, int64_t& worker_us, std::string& err,
+                     size_t rows = 0, size_t width = 0, double* conv_ms = nullptr);
     /// a synchronous message with a keep[] payload (Reset, CkptSave, CkptRestore); `reply_a`: the reply's `a`
     bool keep_call_(StageMsg type, StageMsg want, int64_t a, int64_t b, const std::vector<int64_t>& keep,
                     int64_t& reply_a, std::string& err);
@@ -203,11 +207,13 @@ private:
     StageRows rows_ = StageRows::F32;
     std::mutex send_mu_, recv_mu_, q_mu_;
     struct Sent {
-        std::chrono::steady_clock::time_point at;   ///< the send's start (its rows' conversion first)
-        double encode_ms = 0;
+        std::chrono::steady_clock::time_point at;   ///< the send's start
+        uint64_t seq = 0;
+        double encode_ms = 0;                        ///< its rows' conversion (known when the send is out)
     };
     std::deque<Sent> sent_at_;   ///< outstanding chunks (timing)
-    std::vector<unsigned char> tx_, rx_;   ///< the rows in the link's format (not fp32): send_mu_'s, recv_mu_'s
+    uint64_t sent_seq_ = 0;
+    std::vector<unsigned char> tx_, rx_;   ///< a slice of rows in the link's format (not fp32): send_mu_'s, recv_mu_'s
     StageStats stats_;
 };
 
