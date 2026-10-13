@@ -109,8 +109,17 @@ bool stage_rows_parse(const std::string& name, StageRows& f);
 /// Bytes of `rows` rows of `width` floats each in format `f`.
 size_t stage_rows_bytes(StageRows f, size_t rows, size_t width);
 /// `rows` x `width` floats to format `f` (stage_rows_bytes of them at dst), and back.
+/// bf16 runs on SSE2 (every x86-64 CPU) or AVX2 (when the CPU has it), elsewhere value by value.
 void stage_rows_encode(StageRows f, const float* src, size_t rows, size_t width, void* dst);
 void stage_rows_decode(StageRows f, const void* src, size_t rows, size_t width, float* dst);
+namespace detail {
+/// (tests, benchmarks) the bf16 conversion of n values with one instruction set: 0 value by value, 1 SSE2, 2 AVX2;
+/// false (nothing written) when this build or CPU lacks it
+bool stage_bf16_encode_isa(int isa, const float* src, size_t n, void* dst);
+bool stage_bf16_decode_isa(int isa, const void* src, size_t n, float* dst);
+/// the one stage_rows_encode / _decode use
+int stage_rows_isa();
+}  // namespace detail
 
 /// Seconds a send or receive on a link may block before the link counts as dead (STRATA_REMOTE_TIMEOUT_S, default 300).
 int io_timeout_s();

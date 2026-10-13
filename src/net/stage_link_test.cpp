@@ -1240,6 +1240,31 @@ int main() {
         }
         check(same, "bf16: kernels::bf16_from_f32's rounding (ties to even, a NaN kept), 2 bytes a value");
         check(exact, "... and back exactly (the top half of an fp32)");
+        // each instruction set this CPU has, the same bits: the whole set (a 13-value tail past the vectors) and every
+        // length from 0 to 40 (tails alone, one vector and a tail)
+        std::vector<unsigned char> wi(wire.size());
+        std::vector<float> fi(n);
+        int isas = 0;
+        bool isa_same = true;
+        for (int isa = 0; isa <= 2; ++isa) {
+            std::fill(wi.begin(), wi.end(), (unsigned char) 0xA5);
+            if (!detail::stage_bf16_encode_isa(isa, f.data(), n, wi.data())) continue;
+            ++isas;
+            isa_same = isa_same && wi == wire;
+            isa_same = isa_same && detail::stage_bf16_decode_isa(isa, wire.data(), n, fi.data()) &&
+                       std::memcmp(fi.data(), fb.data(), n * 4) == 0;
+            for (size_t len = 0; len <= 40 && isa_same; ++len) {
+                std::vector<unsigned char> w2(2 * len + 2, 0xA5);
+                std::vector<float> f2(len + 1, -9.0f);
+                isa_same = detail::stage_bf16_encode_isa(isa, f.data() + 3, len, w2.data()) &&
+                           std::memcmp(w2.data(), wire.data() + 6, 2 * len) == 0 && w2[2 * len] == 0xA5 &&
+                           detail::stage_bf16_decode_isa(isa, wire.data() + 6, len, f2.data()) &&
+                           std::memcmp(f2.data(), fb.data() + 3, 4 * len) == 0 && f2[len] == -9.0f;
+            }
+        }
+        std::printf("  (bf16 conversion: %d instruction sets here, the rows' own: %d)\n", isas, detail::stage_rows_isa());
+        check(isa_same && isas >= 1 && detail::stage_rows_isa() < isas,
+              "... the same bits on every instruction set this CPU has (SSE2, AVX2), tails included, nothing past them");
         const uint32_t f32 = 1u << (uint32_t) StageRows::F32, b16 = 1u << (uint32_t) StageRows::BF16;
         check(stage_rows_agreed(f32, kStageRowsAll) == StageRows::F32 &&
                   stage_rows_agreed(f32 | b16, kStageRowsAll) == StageRows::BF16 &&

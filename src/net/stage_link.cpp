@@ -12,6 +12,22 @@
 #include <thread>
 #include <vector>
 
+// the rows' conversion: SSE2 (every x86-64 CPU) or AVX2 (when the CPU has it), with no build flag
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(_M_ARM64EC)
+#define STRATA_ROWS_X86 1
+#include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
+#if defined(__GNUC__) || defined(__clang__)
+#define STRATA_ROWS_AVX2 __attribute__((target("avx2")))
+#else
+#define STRATA_ROWS_AVX2
+#endif
+#endif
+
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -67,11 +83,11 @@ size_t stage_rows_bytes(StageRows f, size_t rows, size_t width) {
     return rows * width * (f == StageRows::BF16 ? 2 : 4);
 }
 
-void stage_rows_encode(StageRows f, const float* src, size_t rows, size_t width, void* dst) {
-    const size_t n = rows * width;
-    if (f == StageRows::F32) { std::memcpy(dst, src, n * 4); return; }
-    // kernels::bf16_from_f32 (to nearest even; a NaN stays one, quieted), without its branch: the loop vectorizes
-    unsigned char* d = (unsigned char*) dst;
+// ---- bf16 rows: kernels::bf16_from_f32 (to nearest even; a NaN stays one, quieted) and f32_from_bf16 (exact), on n
+// values, one instruction set each
+namespace {
+
+void bf16_encode_scalar(const float* src, size_t n, unsigned char* d) {
     for (size_t i = 0; i < n; ++i) {
         uint32_t u;
         std::memcpy(&u, src + i, 4);
@@ -82,16 +98,154 @@ void stage_rows_encode(StageRows f, const float* src, size_t rows, size_t width,
     }
 }
 
-void stage_rows_decode(StageRows f, const void* src, size_t rows, size_t width, float* dst) {
-    const size_t n = rows * width;
-    if (f == StageRows::F32) { std::memcpy(dst, src, n * 4); return; }
-    const unsigned char* s = (const unsigned char*) src;
-    for (size_t i = 0; i < n; ++i) {   // (kernels::f32_from_bf16: exact)
+void bf16_decode_scalar(const unsigned char* s, size_t n, float* dst) {
+    for (size_t i = 0; i < n; ++i) {
         uint16_t b;
         std::memcpy(&b, s + 2 * i, 2);
         const uint32_t u = (uint32_t) b << 16;
         std::memcpy(dst + i, &u, 4);
     }
+}
+
+#if defined(STRATA_ROWS_X86)
+// Four values: the rounded top half, or the quieted NaN, each SIGN-EXTENDED from its 16 bits (an arithmetic shift),
+// so the signed saturating pack after it keeps the 16 bits as they are.  The 32-bit add wraps as the scalar one does
+// (only a NaN's sum carries out, and a NaN takes the other value).
+inline __m128i bf16_round4(__m128i u) {
+    const __m128i lsb = _mm_and_si128(_mm_srli_epi32(u, 16), _mm_set1_epi32(1));
+    const __m128i r = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(u, _mm_set1_epi32(0x7fff)), lsb), 16);
+    const __m128i q = _mm_or_si128(_mm_srai_epi32(u, 16), _mm_set1_epi32(64));
+    const __m128i nan = _mm_cmpgt_epi32(_mm_and_si128(u, _mm_set1_epi32(0x7fffffff)), _mm_set1_epi32(0x7f800000));
+    return _mm_or_si128(_mm_and_si128(nan, q), _mm_andnot_si128(nan, r));
+}
+
+void bf16_encode_sse2(const float* src, size_t n, unsigned char* d) {
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m128i a = bf16_round4(_mm_loadu_si128((const __m128i*) (src + i)));
+        const __m128i b = bf16_round4(_mm_loadu_si128((const __m128i*) (src + i + 4)));
+        _mm_storeu_si128((__m128i*) (d + 2 * i), _mm_packs_epi32(a, b));
+    }
+    bf16_encode_scalar(src + i, n - i, d + 2 * i);
+}
+
+void bf16_decode_sse2(const unsigned char* s, size_t n, float* dst) {
+    const __m128i zero = _mm_setzero_si128();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m128i v = _mm_loadu_si128((const __m128i*) (s + 2 * i));
+        _mm_storeu_si128((__m128i*) (dst + i), _mm_unpacklo_epi16(zero, v));   // (each 16 bits as a top half)
+        _mm_storeu_si128((__m128i*) (dst + i + 4), _mm_unpackhi_epi16(zero, v));
+    }
+    bf16_decode_scalar(s + 2 * i, n - i, dst + i);
+}
+
+STRATA_ROWS_AVX2 inline __m256i bf16_round8(__m256i u) {   // (bf16_round4's, eight at a time)
+    const __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(u, 16), _mm256_set1_epi32(1));
+    const __m256i r = _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(u, _mm256_set1_epi32(0x7fff)), lsb), 16);
+    const __m256i q = _mm256_or_si256(_mm256_srai_epi32(u, 16), _mm256_set1_epi32(64));
+    const __m256i nan =
+        _mm256_cmpgt_epi32(_mm256_and_si256(u, _mm256_set1_epi32(0x7fffffff)), _mm256_set1_epi32(0x7f800000));
+    return _mm256_blendv_epi8(r, q, nan);
+}
+
+STRATA_ROWS_AVX2 void bf16_encode_avx2(const float* src, size_t n, unsigned char* d) {
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m256i a = bf16_round8(_mm256_loadu_si256((const __m256i*) (src + i)));
+        const __m256i b = bf16_round8(_mm256_loadu_si256((const __m256i*) (src + i + 8)));
+        // the pack works within each 128-bit half (a0-3 b0-3 | a4-7 b4-7): the quarters back in order
+        const __m256i p = _mm256_permute4x64_epi64(_mm256_packs_epi32(a, b), 0xD8);
+        _mm256_storeu_si256((__m256i*) (d + 2 * i), p);
+    }
+    bf16_encode_sse2(src + i, n - i, d + 2 * i);
+}
+
+STRATA_ROWS_AVX2 void bf16_decode_avx2(const unsigned char* s, size_t n, float* dst) {
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256i v = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) (s + 2 * i)));
+        _mm256_storeu_si256((__m256i*) (dst + i), _mm256_slli_epi32(v, 16));
+    }
+    bf16_decode_scalar(s + 2 * i, n - i, dst + i);
+}
+
+// AVX2 and the OS saving its registers (as kernels/cpu/expert_layout.cpp's cpu_avx2_ok looks)
+bool rows_avx2() {
+    static const bool ok = [] {
+        unsigned r[4] = {0, 0, 0, 0};
+        auto cpuid = [&](unsigned leaf, unsigned sub) {
+#if defined(_MSC_VER)
+            int x[4];
+            __cpuidex(x, (int) leaf, (int) sub);
+            for (int k = 0; k < 4; ++k) r[k] = (unsigned) x[k];
+#else
+            __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
+#endif
+        };
+        cpuid(0, 0);
+        if (r[0] < 7) return false;
+        cpuid(1, 0);
+        if (!((r[2] >> 27) & 1u) || !((r[2] >> 28) & 1u)) return false;   // OSXSAVE, AVX
+#if defined(_MSC_VER)
+        const unsigned long long xcr0 = _xgetbv(0);
+#else
+        unsigned lo = 0, hi = 0;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
+#endif
+        if ((xcr0 & 6) != 6) return false;   // the OS saves the SSE and AVX state
+        cpuid(7, 0);
+        return ((r[1] >> 5) & 1u) != 0;
+    }();
+    return ok;
+}
+#endif
+
+}  // namespace
+
+namespace detail {
+
+bool stage_bf16_encode_isa(int isa, const float* src, size_t n, void* dst) {
+    unsigned char* d = (unsigned char*) dst;
+    if (isa == 0) { bf16_encode_scalar(src, n, d); return true; }
+#if defined(STRATA_ROWS_X86)
+    if (isa == 1) { bf16_encode_sse2(src, n, d); return true; }
+    if (isa == 2 && rows_avx2()) { bf16_encode_avx2(src, n, d); return true; }
+#endif
+    return false;
+}
+
+bool stage_bf16_decode_isa(int isa, const void* src, size_t n, float* dst) {
+    const unsigned char* s = (const unsigned char*) src;
+    if (isa == 0) { bf16_decode_scalar(s, n, dst); return true; }
+#if defined(STRATA_ROWS_X86)
+    if (isa == 1) { bf16_decode_sse2(s, n, dst); return true; }
+    if (isa == 2 && rows_avx2()) { bf16_decode_avx2(s, n, dst); return true; }
+#endif
+    return false;
+}
+
+int stage_rows_isa() {
+#if defined(STRATA_ROWS_X86)
+    return rows_avx2() ? 2 : 1;
+#else
+    return 0;
+#endif
+}
+
+}  // namespace detail
+
+void stage_rows_encode(StageRows f, const float* src, size_t rows, size_t width, void* dst) {
+    const size_t n = rows * width;
+    if (f == StageRows::F32) { std::memcpy(dst, src, n * 4); return; }
+    (void) detail::stage_bf16_encode_isa(detail::stage_rows_isa(), src, n, dst);
+}
+
+void stage_rows_decode(StageRows f, const void* src, size_t rows, size_t width, float* dst) {
+    const size_t n = rows * width;
+    if (f == StageRows::F32) { std::memcpy(dst, src, n * 4); return; }
+    (void) detail::stage_bf16_decode_isa(detail::stage_rows_isa(), src, n, dst);
 }
 
 namespace {
