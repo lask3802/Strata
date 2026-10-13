@@ -746,6 +746,26 @@ Against that build's 10 GbE speed and this build's fp32 rows on 1 GbE, bf16 wins
 the 32K one. On this 10 GbE pair (390-400 MB/s) it gains nothing: the 4K prompts read at the same speed, the 32K ones
 4% slower on average, less than the 9% between its own two 32K runs.
 
+Three PCs, `--pipeline-windows 2` on the main process, this build on all three: PC A (layers 0-25, head, drafter),
+PC B a relay (26-39) over 10 GbE, PC C (40-47, under WSL2, 1,700 cache slots, its desktop in use) over 1 GbE. The relay
+passes the main process's format on (its log and PC C's say `rows bf16`). One session, fp32, bf16, bf16, fp32 for
+each workload; the prompts as above, and `spec_prompts.py` (40 prompts of 200 tokens):
+
+| rows | 4K prefill, tok/s | 32K prefill, tok/s | decode at 4K / 32K, tok/s | decode, 40 prompts, tok/s | a window's round trip (PC B's wait for PC C) |
+|---|---|---|---|---|---|
+| fp32 | 362, 466; 418, 460 | 983, 1,042; 1,108, 1,082 | 46.4, 43.5 / 39.4, 43.3; 43.4, 42.1 / 41.8, 38.1 | 54.4, 56.6 | 28.9-30.0 ms (17.4-18.1 ms) |
+| bf16 | 519, 562; 517, 569 | 1,493, 1,484; 1,446, 1,474 | 51.7, 48.3 / 46.5, 44.3; 51.7, 50.0 / 44.6, 46.8 | 60.1, 59.4 | 21.1-26.1 ms (10.4-14.1 ms) |
+
+On average bf16 read the 4K prompts 27% faster and the 32K ones 40% faster, and decoded 14% (at 4K / 32K) and 8% (the
+40 prompts) faster. PC C's own 8 layers also took less time per window with bf16 rows (8.5-8.6 against 14.2-14.5 ms in
+the long-prompt runs, 11.2-11.7 against 12.9-13.0 in the 40-prompt ones), which the link does not explain; its clocks
+drop between windows (see the lessons below).
+
+Two PCs over 1 GbE with `--pipeline-windows 2`, the same session: 4K prompts 452, 465 (fp32) and 537, 545 (bf16)
+tok/s, 32K ones 1,264, 1,190 and 1,403, 1,395; decode at 4K / 32K 52-56 and 54-58 tok/s; a window's link time 2.72
+and 1.66 ms. The 40-prompt decode runs of that pair are left out: the main process's time between windows doubled
+in two of the four (48-50 ms against 23-28), one of each format.
+
 Conversion, one chunk of 5,888 rows (60 million values): the main process 8-19 ms to bf16 and 7-17 ms back (a few
 chunks up to 38 and 76 ms), the worker 13-21 ms and 15-18 ms, against 3-9 s per chunk from its send to its rows. A
 standalone loop over one such chunk, a slice of 256K values at a time as the link converts (g++ -O3, best of 5): PC A
@@ -821,7 +841,6 @@ link that is the bottleneck.
   ([CHECKPOINTS.md](CHECKPOINTS.md): built, opt-in with `--prompt-cache N`, checked on two GPUs; a relay is not
   run).
 - **A ring topology** for three or more PCs.
-- **A bf16 hand-off** (half the traffic); its effect on the answers would need measuring.
 - **Windows as the main PC** (only workers were run on Windows), and the clock behaviour of an in-process split on
   Windows.
 - **Other quantizations** (official IQ3_S, IQ3_XXS, IQ2_XS, UD-IQ4_XS): not tested.
