@@ -728,8 +728,8 @@ it; the wait for the token only on Windows, where the recv it prevents is not wo
 
 ### Row formats: bf16 (2026-10-13)
 
-PC A main (layers 0-25, head, drafter) and PC B worker (26-47), RVN IQ3_S, chunk 5888, the settings above,
-`--pipeline-windows` off, `STRATA_REMOTE_TIMING=1`; the worker ran the same build as the main process. Each prompt
+PC A main (layers 0-25, head, drafter) and PC B worker (26-47), RVN IQ3_S, chunk 5888, the models and settings
+of [the rig](#the-rig), `--pipeline-windows` off, `STRATA_REMOTE_TIMING=1`; the worker ran the same build as the main process. Each prompt
 read from 0, two 4K prompts (3,843 and 3,600 tokens) and two 32K ones (30,167 and 30,122), one session (both
 directions of a row are converted when bf16 is on):
 
@@ -737,26 +737,28 @@ directions of a row are converted when bf16 is on):
 |---|---|---|---|---|
 | 1 GbE, fp32 | 460, 450 | 1,220, 1,189 | 56.1, 54.0 / 52.7, 51.9 | 2.78 ms |
 | 1 GbE, bf16 | 524, 523 | 1,313, 1,300 | 59.7, 57.5 / 57.4, 54.8 | 1.62 ms |
-| 10 GbE, bf16 | 628, 643 | 1,277, 1,395 | 57.6, 61.4 / 57.3, 55.9 | |
+| 10 GbE, bf16 | 628, 643 | 1,277, 1,395 | 57.6, 61.4 / 57.3, 55.9 | 0.32 ms |
 
 The same day, a build without this change read the same prompts on 10 GbE (fp32 rows) at 641 / 626 (4K) and
-1,404 / 1,373 (32K), and on 1 GbE at 442 / 443 and 1,220 / 1,173: fp32 rows on 1 GbE cost 31% of the 4K prefill and
-14% of the 32K one (the first 4K chunk's rows took 2.7 s on the link and in the queue against 0.27 s). bf16 wins back
-about 40% of the 4K loss and about half of the 32K one, and on this 10 GbE pair (390-400 MB/s) it gains nothing.
+1,404 / 1,373 (32K), and on 1 GbE at 442 / 443 and 1,220 / 1,173: fp32 rows on 1 GbE cost 30% of the 4K prefill and
+14% of the 32K one (the first 4K chunk's rows took 2.7 s on the link and in the queue on 1 GbE, 0.27 s on 10 GbE).
+Against that build's 10 GbE speed and this build's fp32 rows on 1 GbE, bf16 wins back 38% of the 4K loss and 55% of
+the 32K one. On this 10 GbE pair (390-400 MB/s) it gains nothing: the 4K prompts read at the same speed, the 32K ones
+4% slower on average, less than the 9% between its own two 32K runs.
 
 Conversion, one chunk of 5,888 rows (60 million values): the main process 8-19 ms to bf16 and 7-17 ms back (a few
 chunks up to 38 and 76 ms), the worker 13-21 ms and 15-18 ms, against 3-9 s per chunk from its send to its rows. A
-standalone loop over the same buffer (g++ -O3, best of 5): PC A 16.5 ms value by value, 12.7 ms SSE2, 10.2 ms AVX2 to
-bf16 and 16.0-16.4 ms back on all three; PC B 16.7 / 14.1 / 12.2 ms and 19.1-19.4 ms back. Back from bf16 is bound by
-memory, not by the instructions.
+standalone loop over one such chunk, a slice of 256K values at a time as the link converts (g++ -O3, best of 5): PC A
+16.5 ms value by value, 12.7 ms SSE2, 10.2 ms AVX2 to bf16 and 16.0-16.4 ms back on all three; PC B 16.7 / 14.1 /
+12.2 ms, and 19.1-19.4 ms back on all three.
 
 What it changes in the answers, greedy, 40 prompts of 200 tokens, `--pcie-frac 0 --adapt-every 0 --adapt-swaps 0`
 both sides, `--mtp-max-t 1 --suffix-draft 0`, `STRATA_IQ_MT_MIN=1 STRATA_PREFILL_CPU_SHARE=0` (an earlier version of
 the change that converted whole buffers value by value; the instruction sets give the same bits, `stage_link_test`
 15): against an fp32 run, a second fp32 run's first-window logits differ by KL 4.0e-4 on average (median 0), bf16's
 by 1.1e-3 (median 6.0e-4, largest 5.4e-3); the top token is the same for 40 of 40 in both, the top 10 keep 9.93 and
-9.62 of their tokens; the whole answer is the same for 35 of 40 (fp32 again) and 24 of 40 (bf16). Where bf16's answers
-part they mostly say the same thing in other words. So it stays opt-in, for a link that is the bottleneck.
+9.62 of their tokens; the whole answer is the same for 35 of 40 (fp32 again) and 24 of 40 (bf16). So it stays opt-in, for a
+link that is the bottleneck.
 
 ## Lessons
 

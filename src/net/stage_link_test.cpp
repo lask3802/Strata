@@ -1217,10 +1217,12 @@ int main() {
     {
         using strata::kernels::bf16_from_f32;
         using strata::kernels::f32_from_bf16;
-        // zeros, 1.0, ties to even both ways, the largest finite (to inf), infinities, NaNs, a denormal; then random bits
+        // zeros, 1.0, ties to even both ways (and negative), the largest finite (to inf, both signs), infinities, NaNs,
+        // a denormal; then random bits
         std::vector<uint32_t> bits = {0u,          0x80000000u, 0x3f800000u, 0x3f808000u, 0x3f818000u,
                                       0x3f80ffffu, 0x7f7fffffu, 0x7f800000u, 0xff800000u, 0x7fc00000u,
-                                      0x7f800001u, 0xffffffffu, 0x00000001u};
+                                      0x7f800001u, 0xffffffffu, 0x00000001u, 0xbf808000u, 0xbf818000u,
+                                      0xff7fffffu};
         std::mt19937 rng(7);
         for (int i = 0; i < 100000; ++i) bits.push_back((uint32_t) rng());
         const size_t n = bits.size();
@@ -1263,7 +1265,12 @@ int main() {
             }
         }
         std::printf("  (bf16 conversion: %d instruction sets here, the rows' own: %d)\n", isas, detail::stage_rows_isa());
-        check(isa_same && isas >= 1 && detail::stage_rows_isa() < isas,
+        // the rows take the best set here; where the compiler can ask the CPU on its own, AVX2 is found when it is there
+        bool best = isas >= 1 && detail::stage_rows_isa() == isas - 1;
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+        best = best && (isas == 3) == (__builtin_cpu_supports("avx2") != 0);
+#endif
+        check(isa_same && best,
               "... the same bits on every instruction set this CPU has (SSE2, AVX2), tails included, nothing past them");
         const uint32_t f32 = 1u << (uint32_t) StageRows::F32, b16 = 1u << (uint32_t) StageRows::BF16;
         check(stage_rows_agreed(f32, kStageRowsAll) == StageRows::F32 &&
