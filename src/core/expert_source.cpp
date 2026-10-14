@@ -3746,6 +3746,8 @@ void defer_weight_stats(const float* w, const int32_t* kind, const int32_t* ids,
 //   lag1   token t-1's S inside the window (not available to the mixer: an upper bound for a one-token lag; at t = 0
 //          the previous window's last token, so in one-token windows lag1 is prev)
 //   cache  each CPU entry's expert's last output row in an earlier window, weighted by this token's weight
+// and what STRATA_VERIFY_DEFER_HEAVY=<th> still leaves to the late add, sum |S_{w < th}|^2 / sum |S|^2 (the rows post(l)
+// does not wait for: to first order the deviation's KL scales with it).
 // Plain statics as above; the expert cache is host memory, up to n_layers * n_expert rows (a measurement switch).
 // The verifier sets ps->stats only on the layers it defers, in windows it defers (not --spec-split's groups).
 void defer_proxy_stats(const float* out, const float* w, const int32_t* kind, const int32_t* ids, int64_t n_tok,
@@ -3753,6 +3755,9 @@ void defer_proxy_stats(const float* out, const float* w, const int32_t* kind, co
     constexpr int NV = 4;
     static const char* names[NV] = {"prev", "wscal", "lag1", "cache"};
     static double ss = 0, ee[NV] = {}, sp[NV] = {}, pp[NV] = {}, w_all = 0, w_cached = 0, n_lw = 0, n_tl = 0;
+    constexpr int NT = 3;
+    static const float th[NT] = {0.05f, 0.10f, 0.20f};
+    static double ll[NT] = {};
     static std::vector<std::vector<float>> prev_s;   // per layer
     static std::vector<double> prev_wc;
     static std::vector<std::vector<float>> last_row;   // layer * n_expert + expert
@@ -3762,7 +3767,7 @@ void defer_proxy_stats(const float* out, const float* w, const int32_t* kind, co
         last_row.resize((size_t) (layer + 1) * (size_t) n_expert);
     }
     std::vector<float>& ps = prev_s[(size_t) layer];
-    static std::vector<float> s, s_prev_tok, pc;
+    static std::vector<float> s, s_prev_tok, pc, sl;   // sl: NT * H, the entries under each threshold
     s.assign((size_t) H, 0.0f);
     s_prev_tok.assign(ps.empty() ? (size_t) H : ps.size(), 0.0f);
     if (!ps.empty()) s_prev_tok = ps;
@@ -3770,6 +3775,7 @@ void defer_proxy_stats(const float* out, const float* w, const int32_t* kind, co
     for (int64_t t = 0; t < n_tok; ++t) {
         std::fill(s.begin(), s.end(), 0.0f);
         pc.assign((size_t) H, 0.0f);
+        sl.assign((size_t) NT * (size_t) H, 0.0f);
         double wc = 0;
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
@@ -3777,6 +3783,9 @@ void defer_proxy_stats(const float* out, const float* w, const int32_t* kind, co
             const float* row = out + (size_t) i * H;
             wc += w[i];
             for (int64_t d = 0; d < H; ++d) s[(size_t) d] += w[i] * row[d];
+            for (int q = 0; q < NT; ++q)
+                if (w[i] < th[q])
+                    for (int64_t d = 0; d < H; ++d) sl[(size_t) (q * H + d)] += w[i] * row[d];
             const std::vector<float>& lr = last_row[(size_t) (layer * n_expert + ids[i])];
             w_all += w[i];
             if (!lr.empty()) {
@@ -3795,6 +3804,7 @@ void defer_proxy_stats(const float* out, const float* w, const int32_t* kind, co
                 sp[v] += x * p[v];
                 pp[v] += p[v] * p[v];
             }
+            for (int q = 0; q < NT; ++q) ll[q] += (double) sl[(size_t) (q * H + d)] * sl[(size_t) (q * H + d)];
         }
         s_prev_tok = s;
         n_tl += 1;
@@ -3819,6 +3829,11 @@ void defer_proxy_stats(const float* out, const float* w, const int32_t* kind, co
     }
     std::snprintf(b, sizeof b, "; the cache holds %.1f%% of the CPU weight", w_all > 0 ? 100.0 * w_cached / w_all : 0.0);
     line += b;
+    line += "; HEAVY=<th> leaves sum|S_{w<th}|^2/sum|S|^2:";
+    for (int q = 0; q < NT; ++q) {
+        std::snprintf(b, sizeof b, " %.2f %.3f", th[q], ss > 0 ? ll[q] / ss : 0.0);
+        line += b;
+    }
     std::fprintf(stderr, "%s\n", line.c_str());
 }
 }  // namespace
