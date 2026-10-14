@@ -5045,6 +5045,7 @@ int main(int argc, char** argv) {
         if (const char* pn = std::getenv("STRATA_PIN_BY_NEED"); pn != nullptr && pn[0] != '\0' && pn[0] != '0') {
             const char* off_why = profile.empty() ? "it needs --expert-profile (the ranking)"
                                 : multi_gpu || o.peer_device >= 1 ? "not with a layer split or a peer GPU"
+                                : remote_main || stage_worker ? "not with a remote stage (its arena holds a layer range)"
                                 : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                               [](int n) { return n > 0; }) ? "not with helper caches on other GPUs"
                                 : nullptr;
@@ -10361,6 +10362,14 @@ int main(int argc, char** argv) {
                     // the prompt path's buffers out of this worker's cache, for the main process's chunk size (a
                     // loan that covers it stays for the rest of the prompt)
                     if (!lend(std::max<int64_t>(T, main_chunk), e)) return false;
+                    // 0.1.44 (#2090): a loan that does not fit is lent for a halved chunk - this worker would then read
+                    // the main process's chunk in pieces, and its rows (and a relay's link) are one reply per chunk
+                    if (sp.chunk() < T) {
+                        e = "stage worker: its expert cache cannot lend the prompt buffers for the main process's chunk of " +
+                            std::to_string(T) + " tokens (only " + std::to_string(sp.chunk()) + "): start the main process "
+                            "with a smaller --prefill, or this worker with a larger expert cache";
+                        return false;
+                    }
                     sp.set_hand_in(rows_in);
                     sp.set_single_chunk((flags & 1) != 0);
                     return sp.run(tokens, T, p0, e);

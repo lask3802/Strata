@@ -92,7 +92,11 @@ using sock_t = int;
 const sock_t kNoSock = -1;
 using sock_len = socklen_t;
 using poll_fd = pollfd;
+#if defined(MSG_NOSIGNAL)
 constexpr int kSendFlags = MSG_NOSIGNAL;   // a closed peer is an error, not SIGPIPE
+#else
+constexpr int kSendFlags = 0;              // macOS (0.1.44's Metal build): SO_NOSIGPIPE in tune_socket instead
+#endif
 constexpr int kListenOpt = SO_REUSEADDR;   // a restart binds over its own TIME_WAIT, never over a live listener
 int sock_close(sock_t s) { return ::close(s); }
 int sock_shutdown(sock_t s) { return ::shutdown(s, SHUT_RDWR); }
@@ -136,6 +140,9 @@ int io_timeout_s() {
 void tune_socket(sock_t fd) {
     set_opt<int>(fd, IPPROTO_TCP, TCP_NODELAY, 1);
     set_opt<int>(fd, SOL_SOCKET, SO_KEEPALIVE, 1);
+#if defined(SO_NOSIGPIPE)   // macOS: no MSG_NOSIGNAL, so the socket itself does not raise SIGPIPE
+    set_opt<int>(fd, SOL_SOCKET, SO_NOSIGPIPE, 1);
+#endif
     // a peer that vanished without a FIN (power, cable) is noticed in about a minute, not the default two hours
     // (seconds on both systems; Windows 10 1709 and later)
 #if defined(TCP_KEEPIDLE)

@@ -5397,6 +5397,18 @@ class OnDemandVision(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return f(*a)
 
+    def test_on_demand_wins_over_0_1_44s_elastic(self):
+        import serve.server as server
+        cfg = {"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf", "on_demand": True, "elastic": True,
+               "gpu": True}
+        with mock.patch.object(server, "popen", side_effect=AssertionError("started at construction")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            v = server.Vision(cfg)
+        self.addCleanup(lambda: shutil.rmtree(v.dir, ignore_errors=True))
+        self.assertTrue(v.on_demand)
+        self.assertFalse(v.elastic)                     # no idle thread, no vision_held: the lend alone
+        self.assertEqual(v.vram_mib, 1600)
+
     def test_nothing_runs_until_a_picture_and_after_it(self):
         v, events = self.make()
         self.assertEqual(events, [])
