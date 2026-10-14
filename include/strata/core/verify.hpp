@@ -471,8 +471,9 @@ private:
     unsigned long long* trace_h_ = nullptr;
     unsigned long long* trace_m_ = nullptr;
     size_t trace_n_ = 0;
-    static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
-                                      // half's up-stamp at slot 32 = the next layer's slot 0: D8)
+    static constexpr int kProfPer = 34;              // stamps per layer (32 left the hc-read second
+                                      // half's up-stamp at slot 32 = the next layer's slot 0: D8; 33 the
+                                      // STRATA_VERIFY_DEFER_FIX recompute, inside "late rows")
     bool prof_on_ = false;
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
     std::vector<unsigned long long> prof_h_;
@@ -551,6 +552,19 @@ private:
     bool defer_res_ = false;
     float* def_bo_ = nullptr;              ///< device: a deferred layer's full combine (T * n_embd)
     float* def_rsink_ = nullptr;           ///< device: the attention-side read's discarded R_out (T * hc * n_embd)
+    // STRATA_VERIFY_DEFER_FIX=1|2|3 (with =1 or =check): after a deferred layer's late addition, the next layer's
+    // entries of the window's tokens in the session state are computed again from the full residual - 1: a QSA
+    // layer's K/V cells and indexer keys, 2: a GDN layer's qkv / conv / gate / beta rows, from which the commit graph
+    // advances the conv history and the state (a one-token window then takes the commit graph too), 3: both.  The
+    // window's own outputs are still the deferred ones; the later windows read the recomputed entries.
+    int defer_fix_ = 0;
+    // STRATA_VERIFY_DEFER_HEAVY=<w> (0 < w <= 1, with =1 or =check): the pool computes the CPU rows whose routing weight
+    // is >= w first and raises h_pflag_; post(l) of a deferred layer waits for that and combines those rows, the
+    // lighter ones join late.  Not with STRATA_VERIFY_DEVICE_PLAN.
+    float defer_heavy_ = 0.0f;
+    uint32_t* h_pflag_ = nullptr; uint32_t* m_pflag_ = nullptr;
+    static void raise_partial(void* ctx);
+    bool publish_w_ = false;               ///< the doorbell carries the routing weights (HEAVY, STRATA_VERIFY_DEFER_STATS)
     bool defer_ok(int T, std::string* why) const;   ///< the T-token window may be captured with deferral
 
     // device

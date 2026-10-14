@@ -3677,6 +3677,67 @@ int tail_skip_rank() {
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
+namespace {
+// STRATA_VERIFY_DEFER_STATS (verify.cpp publishes the routing weights with the doorbell): where a window's routing
+// weight goes - per token and layer, the share on the GPU (VRAM and PCIe), on the CPU, skipped (the route tail skip);
+// how much of the CPU's share a weight test w >= th keeps, against the entries and the distinct experts (the CPU's
+// work) it takes; the CPU's share by routing rank.  Cumulative, printed every 9600 layer-windows (~200 windows).
+void defer_weight_stats(const float* w, const int32_t* kind, const int32_t* ids, int64_t n_tok, int64_t k) {
+    constexpr int NTH = 6;
+    static const float th[NTH] = {0.05f, 0.08f, 0.10f, 0.15f, 0.20f, 0.30f};
+    static double s_all = 0, s_gpu = 0, s_cpu = 0, s_skip = 0, n_cpu = 0, n_tl = 0, n_lw = 0, jobs = 0;
+    static double s_th[NTH] = {}, n_th[NTH] = {}, j_th[NTH] = {}, s_rank[16] = {}, n_rank[16] = {}, s_rall[16] = {};
+    const int64_t n = n_tok * k;
+    for (int64_t i = 0; i < n; ++i) {
+        const double x = w[i];
+        s_all += x;
+        if (i % k < 16) s_rall[i % k] += x;
+        if (kind[i] == -2) s_skip += x;
+        else if (kind[i] >= 0) s_gpu += x;
+        else {
+            s_cpu += x;
+            n_cpu += 1;
+            if (i % k < 16) { s_rank[i % k] += x; n_rank[i % k] += 1; }
+            for (int q = 0; q < NTH; ++q)
+                if (w[i] >= th[q]) { s_th[q] += x; n_th[q] += 1; }
+        }
+    }
+    for (int64_t i = 0; i < n; ++i) {   // distinct CPU experts (the pool's jobs), and those with a heavy entry
+        if (kind[i] != -1) continue;
+        bool first = true;
+        for (int64_t j = 0; j < i && first; ++j) first = !(kind[j] == -1 && ids[j] == ids[i]);
+        if (!first) continue;
+        jobs += 1;
+        for (int q = 0; q < NTH; ++q) {
+            bool hv = false;
+            for (int64_t j = i; j < n && !hv; ++j) hv = kind[j] == -1 && ids[j] == ids[i] && w[j] >= th[q];
+            j_th[q] += hv ? 1 : 0;
+        }
+    }
+    n_tl += (double) n_tok;
+    n_lw += 1;
+    if (std::fmod(n_lw, 9600.0) != 0.0) return;
+    std::string line = "strata defer stats: " + std::to_string((long long) n_lw) + " layer-windows; weight per token-layer";
+    char b[160];
+    std::snprintf(b, sizeof b, ": all %.3f, GPU %.3f, CPU %.3f, skipped %.3f; CPU entries %.2f, experts %.2f per layer-window",
+                  s_all / n_tl, s_gpu / n_tl, s_cpu / n_tl, s_skip / n_tl, n_cpu / n_tl, jobs / n_lw);
+    line += b;
+    line += "; w >= th keeps (CPU weight / entries / experts):";
+    for (int q = 0; q < NTH; ++q) {
+        std::snprintf(b, sizeof b, " %.2f %.2f/%.2f/%.2f", th[q], s_cpu > 0 ? s_th[q] / s_cpu : 0.0,
+                      n_cpu > 0 ? n_th[q] / n_cpu : 0.0, jobs > 0 ? j_th[q] / jobs : 0.0);
+        line += b;
+    }
+    line += "; by rank (mean w of all entries / of the CPU's, CPU entries per token-layer):";
+    for (int64_t r = 0; r < k && r < 16; ++r) {
+        std::snprintf(b, sizeof b, " %lld:%.3f/%.3f/%.3f", (long long) r, s_rall[r] / n_tl,
+                      n_rank[r] > 0 ? s_rank[r] / n_rank[r] : 0.0, n_rank[r] / n_tl);
+        line += b;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+}  // namespace
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -3963,12 +4024,38 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++jb.nt;
             ++d.multi_entries;
         }
+    const GpuPlanSink* ps = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) ? d.plan : nullptr;
+    if (ps != nullptr && ps->stats && ps->weights != nullptr) defer_weight_stats(ps->weights, kind, ids, n_tok, k);
+    // STRATA_VERIFY_DEFER_HEAVY (verify.cpp): the experts of the heavy CPU entries (routing weight >= ps->heavy) run
+    // first and ps->partial tells the GPU they are done; every row is computed as in one pass (the rows of a job never
+    // depend on the other jobs - run_split_multi* batches them the same way).  Not with a peer or a helper GPU, whose
+    // rows land only after the CPU's.
+    int nfirst = njobs;
+    const bool split = ps != nullptr && ps->partial != nullptr && ps->weights != nullptr && ps->heavy > 0.0f &&
+                       d.peer == nullptr && d.remote_count == 0;
+    if (split && njobs > 0) {
+        bool heavy_job[kMaxWindowEntries] = {};
+        for (int64_t i = 0; i < n; ++i)
+            if (kind[i] == -1 && ps->weights[i] >= ps->heavy) heavy_job[d.job_of[(size_t) ids[i]]] = true;
+        static thread_local std::vector<ExpertJobMulti> order;
+        order.clear();
+        for (int pass = 0; pass < 2; ++pass)
+            for (int j = 0; j < njobs; ++j)
+                if (heavy_job[j] == (pass == 0)) order.push_back(d.jobs_multi[(size_t) j]);
+        nfirst = 0;
+        for (int j = 0; j < njobs; ++j) nfirst += heavy_job[j] ? 1 : 0;
+        std::copy(order.begin(), order.end(), d.jobs_multi.begin());
+    }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
-    if (njobs > 0) {
-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-        else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
-    }
+    auto run_jobs = [&](ExpertJobMulti* jobs, int nj) {
+        if (nj <= 0) return;
+        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], jobs, nj);
+        else d.pool->run_split_multi(jobs, nj);
+    };
+    run_jobs(d.jobs_multi.data(), nfirst);
+    if (split) ps->partial(ps->ctx);
+    run_jobs(d.jobs_multi.data() + nfirst, njobs - nfirst);
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)

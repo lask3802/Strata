@@ -399,7 +399,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
     // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
-    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
+    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, h_pflag_})
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
@@ -431,7 +431,8 @@ void Verifier::trace_dump(std::FILE* f) const {
     static const char* names[kProfPer] = {"pre", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "kv-idx",
                                           "k/v rope", "kv append", "q", "scores+topk", "kv-resolve", "attention",
                                           "gate", "out-proj", "late rows", "router+ring", "shared", "waitA", "VRAM hits",
-                                          "waitB", "PCIe grp", "waitCPU", "combine", "", "head", "", "", "", "", "", ""};
+                                          "waitB", "PCIe grp", "waitCPU", "combine", "", "head", "", "", "", "", "", "",
+                                          "fix-up"};
     const uint64_t end = g_trace_next.load();
     const uint64_t n = end < 160 ? end : 160;
     std::fprintf(f, "strata verify trace (#649): the last %llu handshake events (host clock, us before the last; "
@@ -675,6 +676,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER=%s is not 1 or check: no deferral\n", v);
         const char* r = std::getenv("STRATA_VERIFY_DEFER_RES");
         defer_res_ = defer_ && r != nullptr && std::atoi(r) != 0;
+        const char* f = std::getenv("STRATA_VERIFY_DEFER_FIX");
+        defer_fix_ = defer_ && f != nullptr ? (std::atoi(f) & 3) : 0;
+        const char* h = std::getenv("STRATA_VERIFY_DEFER_HEAVY");
+        const float hv = defer_ && h != nullptr ? (float) std::atof(h) : 0.0f;
+        defer_heavy_ = hv > 0.0f && hv <= 1.0f ? hv : 0.0f;
+        publish_w_ = defer_heavy_ > 0.0f || env_on("STRATA_VERIFY_DEFER_STATS");
     }
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
@@ -693,7 +700,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
-              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
+              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_) &&
+              (defer_heavy_ <= 0.0f || mapped(64, (void**) &h_pflag_, (void**) &m_pflag_));
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
@@ -716,6 +724,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sink_.publish = &Verifier::publish_plan;
         sink_.fetch = &Verifier::fetch_dma;
         sink_.ctx = this;
+        sink_.heavy = defer_heavy_;   // STRATA_VERIFY_DEFER_HEAVY / _STATS (run sets the weights per group)
+        sink_.partial = defer_heavy_ > 0.0f ? &Verifier::raise_partial : nullptr;
+        sink_.stats = env_on("STRATA_VERIFY_DEFER_STATS");
     }
 
     // ---- the device arena: the same sequence counted, then carved
@@ -908,6 +919,23 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (defer_res_)
         std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_RES=1: the residual gets a deferred layer's write once, "
                              "from the default combine of all its rows (=check: expected byte-identical to no env)\n");
+    if (defer_fix_ != 0)
+        std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_FIX=%d: after a late addition the next layer's %s of the "
+                             "window's tokens are computed again from the full residual (=check: expected byte-identical "
+                             "to =check without it)%s\n", defer_fix_,
+                     defer_fix_ == 1 ? "QSA K/V and indexer keys" : defer_fix_ == 2 ? "GDN qkv/conv/gate/beta rows"
+                                                                               : "QSA K/V, indexer keys and GDN rows",
+                     (defer_fix_ & 2) ? "; one-token windows take the commit graph" : "");
+    if (defer_heavy_ > 0.0f && device_plan_) {
+        std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_HEAVY is not taken with STRATA_VERIFY_DEVICE_PLAN=1\n");
+        defer_heavy_ = 0.0f;
+        sink_.heavy = 0.0f;
+        sink_.partial = nullptr;
+    }
+    if (defer_heavy_ > 0.0f)
+        std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_HEAVY=%.3f: a deferred layer waits for its CPU rows of "
+                             "routing weight >= %.3f (the pool computes them first) and combines them; the lighter ones "
+                             "join late\n", defer_heavy_, defer_heavy_);
     return true;
 }
 
@@ -941,7 +969,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
-    const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
+    // (STRATA_VERIFY_DEFER_FIX=2|3 recomputes a GDN layer's rows after its mixer: the commit graph advances the state)
+    const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit() &&
+                             (defer_fix_ & 2) == 0;   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
@@ -968,6 +998,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // doorbell payload and h_ymiss_, starts only after the GPU has waited for flag l and copied layer l's rows.
     const bool dfr = defer_ok(T, nullptr);
     auto deferred = [&](int64_t l) { return dfr && l + 1 < le_ && !(ple_on && l == 0); };
+    // STRATA_VERIFY_DEFER_HEAVY: post(l) of a deferred layer waits for the partial flag and takes the CPU rows of routing
+    // weight >= defer_heavy_; late_add takes the others (copy_rows_by_weight, the plan's GPU rows zeroed as by
+    // copy_rows_from_mapped).  late_full (STRATA_VERIFY_DEFER_RES) copies them all, as before.
+    const bool heavy = dfr && defer_heavy_ > 0.0f && m_pflag_ != nullptr && !device_plan_;
     // STRATA_VERIFY_DEFER: layer dl's CPU rows, the copy post(dl) would have made, weighted as its combine weights them
     // and added to every stream as its pending write would have.  Where: pre(dl+1) before its FFN-side read (=1), or
     // post(dl) itself after its combine (=check: the default path's sums in another order, so a run that differs from
@@ -983,6 +1017,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             copy_or_zero_from_mapped(def_parts_, ym, (long long) n * K * N, skip_ + grp, ring_d, cs);
         } else {
             wait_flag_ge(m_flag_, ring_d, cs);
+#if !defined(STRATA_GPU_METAL)
+            if (heavy)   // the light rows (the heavy ones are in layer dl's combine already)
+                copy_rows_by_weight(def_parts_, ym, (int64_t) n * K, N, pl + 4 + MT * K + 1, pl + 1, w_ + tb * K,
+                                    defer_heavy_, false, cs);
+            else
+#endif
             if (dec_batch)   // the GPU's own rows (p_dst[0, counts[1])) are zeros
                 copy_rows_from_mapped(def_parts_, ym, (int64_t) n * K, N, pl + 4 + MT * K + 1, pl + 1, cs);
             else
@@ -1601,6 +1641,154 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!defer_check_ && !late_full(l - 1, grp)) return false;
             late_write(grp);
         } else if (!defer_check_ && l > lb_ && deferred(l - 1)) late_add(l - 1, grp);
+        // STRATA_VERIFY_DEFER_FIX: this layer's entries of the window's tokens in the session state again, from the
+        // residual as it is now (=1: with layer l-1's CPU rows; =check: the residual the mixer read, so the same values).
+        // The attention-side read once more, its pending write already in R and no inject: mixed_, lo_, rs_, xn_ and
+        // xq_ are scratch here until the FFN-side read and the router rewrite them.  The window's own rows (its
+        // attention, its recurrence) keep what the mixer computed; the commit graph and the later windows read these.
+        if (defer_fix_ != 0 && l > lb_ && deferred(l - 1) && (defer_fix_ & (is_qsa_layer(g, l) ? 1 : 2)) != 0) {
+            stamp(l, 33, grp);   // the profile: the recompute, out of "late rows"
+            FusedGrArgs fa[kFusedGrMaxT];
+            for (int t = tb; t < te; ++t) {
+                FusedGrArgs& a = fa[t - tb];
+                a.R = Rt(t); a.R_out = Rt(t); a.apply = false;
+                a.w_norm = (const float*) wn[0]->data; a.w_down = (const uint16_t*) wd[0]->data;
+                a.w_up = (const uint16_t*) wu[0]->data; a.w_inject = nullptr;
+                a.q8_down = (const uint8_t*) wd[0]->hc_q8; a.q8_up = (const uint8_t*) wu[0]->hc_q8;
+                a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC; a.mixed = mixed_ + t * N;
+            }
+            fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs);
+            native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+            il_ready = false;
+            try {
+                if (!is_qsa_layer(g, l)) {   // the rows the mixer saved: qkv (conv history), h, gate, beta
+                    const WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wa = need(v, "ssm_alpha.weight", err),
+                                    *wb = need(v, "ssm_beta.weight", err), *wc = need(v, "ssm_conv1d.weight", err),
+                                    *wdt = need(v, "ssm_dt.bias", err), *wsa = need(v, "ssm_a", err);
+                    if (!wqkv || !wa || !wb || !wc || !wdt || !wsa) return false;
+                    const int64_t gi = gdn_idx[(size_t) l];
+                    const float* conv = ss.gdn_state + (size_t) (gi - ss.gdn_ord0) * gdn_floats +
+                                        (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    float* qkv = qkv_L_ + (size_t) gi * MT * C;
+                    float* hb = h_L_ + (size_t) gi * MT * C;
+                    float* gate = gate_L_ + (size_t) gi * MT * HV;
+                    float* beta = beta_L_ + (size_t) gi * MT * HV;
+                    mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
+                    // the conv over the untouched history (no one-token self-commit with this switch: record_window)
+                    if (fuse_convab_on() && !br && !batch_rec_ && !prof_on_)
+                        gdn_conv_ab_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, tb,
+                                          false, xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data,
+                                          (const float*) wdt->data, (const float*) wsa->data, gate + (size_t) tb * HV,
+                                          beta + (size_t) tb * HV, (int) N, (int) HV, cs);
+                    else {
+                        gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
+                                          false);
+                        gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                     (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
+                                     (int) HV, n, cs);
+                    }
+                } else {   // the K/V cells written over, the indexer keys appended again from the tail snapshot
+                    const int64_t qi = qsa_idx[(size_t) l];
+                    const QsaState& st = ss.qsa_states[qi];
+                    const WeightRef *wik = need(v, "indexer.k_proj.weight", err), *wk = need(v, "attn_k.weight", err),
+                                    *wv = need(v, "attn_v.weight", err), *wkn = need(v, "attn_k_norm.weight", err),
+                                    *wikn = need(v, "indexer.k_norm.weight", err);
+                    if (!wik || !wk || !wv || !wkn || !wikn) return false;
+                    if (!native_of(wk, v.name("attn_k.weight"), err) || !native_of(wv, v.name("attn_v.weight"), err))
+                        return false;
+                    static const bool fix_qb_q4 = [] {   // the mixer's STRATA_DF_QB_Q4
+                        const char* e = std::getenv("STRATA_DF_QB_Q4");
+                        return e != nullptr && std::atoi(e) != 0;
+                    }();
+                    const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() &&
+                                    (!st.kv_q4 || fix_qb_q4);
+                    const bool fuse_nr = native_qsa_enabled() && native_rope_enabled() &&
+                                         native_norm_rope_usable((int) HD, (int) s.n_rot);
+                    auto norm_rope_k = [&](float* data, int rows, const int32_t* pos) {   // the mixer's norm_rope
+                        if (fuse_nr) {
+                            native_qsa_rms_norm_rope(data, (int) HD, (const float*) wkn->data, data, rows, (int) HD,
+                                                     (int) s.n_rot, EPS, rope_scaling(), pos, cs);
+                            return;
+                        }
+                        if (native_qsa_enabled())
+                            native_qsa_rms_norm_weighted(data, (const float*) wkn->data, data, (int) HD, rows, EPS, cs);
+                        else rms_norm_weighted(data, (const float*) wkn->data, rows, (int) HD, EPS, cs);
+                        if (native_rope_enabled()) native_rope_apply(data, data, rows, (int) HD, (int) s.n_rot, rope_scaling(), pos, cs);
+                        else rope_neox_apply(data, data, rows, (int) HD, (int) s.n_rot, st.cos_tab, st.sin_tab, pos, cs);
+                    };
+                    float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
+                    if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
+                    else for (int t = tb; t < te; ++t)
+                        bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
+                    mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                    mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                    if (qb) norm_rope_k(kcur_ + tb * NKV * HD, (int) (n * NKV), pos_k + tb * NKV);
+                    else for (int t = tb; t < te; ++t) norm_rope_k(kcur_ + t * NKV * HD, (int) NKV, pos_ + t * NH);
+                    if (st.kv_rot) {
+                        fwht256_inplace_cuda(kcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
+                        fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
+                    } else if (st.kv_hybrid) {
+                        fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
+                    }
+                    if (dec_batch && !g_no_batch_kv) {   // (no batch window defers)
+                        const int32_t* step_b = step_ + tb * kStepCount;
+                        const float* kc_b = kcur_ + tb * NKV * HD;
+                        const float* vc_b = vcur_ + tb * NKV * HD;
+                        if (st.kv_hybrid) {
+                            const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
+                            const bool mirror = st.host.present();
+                            kv_append_q8_steps(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_b, kStepCount,
+                                               kc_b, kc_b, (int) (NKV * HD), n, s, cs, mirror ? &hk : nullptr);
+                            kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_b, kStepCount, n, vc_b, vc_b, s, cs,
+                                               mirror ? &hv : nullptr);
+                        } else if (st.kv_q4)
+                            kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, n, kc_b, vc_b, s, cs,
+                                               &st.host);
+                        else if (st.kv_int8)
+                            kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_b, kStepCount,
+                                               kc_b, vc_b, (int) (NKV * HD), n, s, cs, &st.host);
+                        else
+                            for (int t = tb; t < te; ++t)
+                                kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount,
+                                               kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
+                    } else
+                    for (int t = tb; t < te; ++t) {
+                        const int32_t* step_t = step_ + t * kStepCount;
+                        if (st.kv_hybrid) {
+                            const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
+                            const bool mirror = st.host.present();
+                            kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
+                                              kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs, mirror ? &hk : nullptr);
+                            kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
+                                              vcur_ + t * NKV * HD, s, cs, mirror ? &hv : nullptr);
+                        } else if (st.kv_q4)
+                            kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
+                                              vcur_ + t * NKV * HD, s, cs, &st.host);
+                        else if (st.kv_int8)
+                            kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
+                                              kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
+                        else
+                            kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
+                                           vcur_ + t * NKV * HD, s, cs, &st.host);
+                    }
+                    // the indexer: its tail as before the window (the commit graph restores it the same way), then
+                    // the window's keys again; a one-token window's self-commit keeps these
+                    copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qi * TS, TS, cs);
+                    const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                    if (dec_batch && !g_no_batch_kv)
+                        native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
+                                                        n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                        rope_scaling(), cs);
+                    else
+                        for (int t = tb; t < te; ++t)
+                            native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+                                                      (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs);
+                }
+            } catch (const std::exception& e) {
+                err = "verify layer " + std::to_string(l) + " (STRATA_VERIFY_DEFER_FIX): " + e.what();
+                return false;
+            }
+        }
         stamp(l, 16, grp);
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
@@ -1681,7 +1869,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #endif
             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
             // whatever the device's residency table says (pipelined windows)
-            if (remote_opt_ || always_publish_)
+            // (STRATA_VERIFY_DEFER_HEAVY / _STATS: the host reads the weights too)
+            if (remote_opt_ || always_publish_ || publish_w_)
                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
             else {
@@ -1810,8 +1999,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 22, grp);
             // STRATA_VERIFY_DEFER: no wait, no CPU rows now (late_add adds them later): zeros, plus the hits
             if (deferred(l)) {
+                if (heavy) wait_flag_ge(m_pflag_, ring, cs);   // STRATA_VERIFY_DEFER_HEAVY: the heavy rows (waitCPU)
                 stamp(l, 23, grp);   // (no wait: the zeroing counts as copy+combine, as the copy it replaces)
 #if !defined(STRATA_GPU_METAL)   // (as late_add's defer_add_rows)
+                if (heavy)
+                    copy_rows_by_weight(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N, p_dst, p_counts + 1,
+                                        w_ + tb * K, defer_heavy_, true, cs);
+                else
                 fill_zero(parts_out, (long long) n * K * N, cs);
 #endif
             } else if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
@@ -2004,7 +2198,8 @@ std::string Verifier::profile_report() {
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
                                           "attention", "gate", "out-proj", "late rows", "router+plan+bell", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "  hc1 norm", "  hc1 down", "  hc1 up"};
+                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "  hc1 norm", "  hc1 down", "  hc1 up",
+                                          "fix-up"};
     std::string out;
     char b[80];
     double total = 0;
@@ -2355,6 +2550,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_pflag_ != nullptr) *(volatile uint32_t*) h_pflag_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -2395,6 +2591,13 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
                 prof_sum_[kind][31] += d1;
                 prof_sum_[kind][32] += u1;
                 prof_sum_[kind][17] -= gap(at(l, 32), at(l, 16));
+            }
+        }
+        {   // STRATA_VERIFY_DEFER_FIX: its recompute (33 to 16) out of "late rows"
+            const double fix = gap(at(l, 16), at(l, 33));
+            if (fix > 0 && gap(at(l, 33), at(l, 15)) > 0) {
+                prof_sum_[kind][33] += fix;
+                prof_sum_[kind][16] -= fix;
             }
         }
         if (l + 1 < le_) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
@@ -2565,6 +2768,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
+        sink_.weights = publish_w_ ? h_w_ + (size_t) tb * ss.k : nullptr;   // STRATA_VERIFY_DEFER_HEAVY / _STATS
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -2596,6 +2800,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             _mm_sfence();
             ms_host += ms_since(tp);
         }
+        if (h_pflag_ != nullptr) raise_flag(h_pflag_, want);   // STRATA_VERIFY_DEFER_HEAVY: (the pool raised it if it split)
         if (!(test_stall && k + 1 == steps)) *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
@@ -2767,6 +2972,15 @@ void Verifier::publish_plan(void* ctx) {
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
+// STRATA_VERIFY_DEFER_HEAVY: the pool has written the rows of the heavy CPU entries (expert_pool_dispatch_multi)
+void Verifier::raise_partial(void* ctx) {
+    Verifier* v = (Verifier*) ctx;
+    if (v->h_pflag_ == nullptr) return;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    raise_flag(v->h_pflag_, v->cur_layer_ + 1);
+}
+
 bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
                                std::string& err) {
     if (next_ != nullptr) return next_->window_logprobs(targets, T, pos0, extra_id, out, err);
@@ -2851,7 +3065,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && !always_publish_ && one_token_self_commit()) {
+    if (last_t_ == 1 && !always_publish_ && one_token_self_commit() && (defer_fix_ & 2) == 0) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -3787,6 +4001,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window (pipelined): the CPU experts of layer", l);
+        sink_.weights = publish_w_ ? h_w_ + (size_t) tb * ss.k : nullptr;   // STRATA_VERIFY_DEFER_HEAVY / _STATS
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -3806,6 +4021,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             raise_flag(h_flagB_, want);
         }
         if (fl_k_ == 0 && !gather_ple()) return -1;
+        if (h_pflag_ != nullptr) raise_flag(h_pflag_, want);   // STRATA_VERIFY_DEFER_HEAVY
         *(volatile uint32_t*) h_flag_ = want;
         ++fl_k_;
         ms_pool += ms_since(b);
