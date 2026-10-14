@@ -3737,6 +3737,88 @@ void defer_weight_stats(const float* w, const int32_t* kind, const int32_t* ids,
     }
     std::fprintf(stderr, "%s\n", line.c_str());
 }
+
+// STRATA_VERIFY_DEFER_STATS, the rows themselves (after the pool ran): how much of what a deferred layer's mixer misses,
+// S_t = the CPU entries' weighted sum of token t, a proxy the GPU could have before the CPU rows land would take away -
+// sum |S - P|^2 / sum |S|^2 (1: no proxy), at P as it is and at the best single scale a* = sum <S,P> / sum |P|^2:
+//   prev   the previous window's last token's S (what the GPU holds when this window's mixer runs)
+//   wscal  the same scaled by this token's CPU weight over that token's (no CPU entries: no proxy)
+//   lag1   token t-1's S inside the window (not available to the mixer: an upper bound for a one-token lag)
+//   cache  each CPU entry's expert's last output row in an earlier window, weighted by this token's weight
+// Plain statics as above; the expert cache is host memory, up to n_layers * n_expert rows (a measurement switch).
+void defer_proxy_stats(const float* out, const float* w, const int32_t* kind, const int32_t* ids, int64_t n_tok,
+                       int64_t k, int64_t H, int64_t layer, int64_t n_expert) {
+    constexpr int NV = 4;
+    static const char* names[NV] = {"prev", "wscal", "lag1", "cache"};
+    static double ss = 0, ee[NV] = {}, sp[NV] = {}, pp[NV] = {}, w_all = 0, w_cached = 0, n_lw = 0, n_tl = 0;
+    static std::vector<std::vector<float>> prev_s;   // per layer
+    static std::vector<double> prev_wc;
+    static std::vector<std::vector<float>> last_row;   // layer * n_expert + expert
+    if ((int64_t) prev_s.size() <= layer) {
+        prev_s.resize((size_t) layer + 1);
+        prev_wc.resize((size_t) layer + 1, 0.0);
+        last_row.resize((size_t) (layer + 1) * (size_t) n_expert);
+    }
+    std::vector<float>& ps = prev_s[(size_t) layer];
+    static std::vector<float> s, s_prev_tok, pc;
+    s.assign((size_t) H, 0.0f);
+    s_prev_tok.assign(ps.empty() ? (size_t) H : ps.size(), 0.0f);
+    if (!ps.empty()) s_prev_tok = ps;
+    double wc_prev = prev_wc[(size_t) layer];
+    for (int64_t t = 0; t < n_tok; ++t) {
+        std::fill(s.begin(), s.end(), 0.0f);
+        pc.assign((size_t) H, 0.0f);
+        double wc = 0;
+        for (int64_t j = 0; j < k; ++j) {
+            const int64_t i = t * k + j;
+            if (kind[i] != -1) continue;
+            const float* row = out + (size_t) i * H;
+            wc += w[i];
+            for (int64_t d = 0; d < H; ++d) s[(size_t) d] += w[i] * row[d];
+            const std::vector<float>& lr = last_row[(size_t) (layer * n_expert + ids[i])];
+            w_all += w[i];
+            if (!lr.empty()) {
+                w_cached += w[i];
+                for (int64_t d = 0; d < H; ++d) pc[(size_t) d] += w[i] * lr[(size_t) d];
+            }
+        }
+        const double scale = (ps.empty() || wc_prev <= 0.0) ? 0.0 : wc / wc_prev;
+        for (int64_t d = 0; d < H; ++d) {
+            const double x = s[(size_t) d];
+            const double p[NV] = {ps.empty() ? 0.0 : (double) ps[(size_t) d], ps.empty() ? 0.0 : scale * ps[(size_t) d],
+                                  (double) s_prev_tok[(size_t) d], (double) pc[(size_t) d]};
+            ss += x * x;
+            for (int v = 0; v < NV; ++v) {
+                ee[v] += (x - p[v]) * (x - p[v]);
+                sp[v] += x * p[v];
+                pp[v] += p[v] * p[v];
+            }
+        }
+        s_prev_tok = s;
+        n_tl += 1;
+    }
+    // what the next window's mixer would hold: this window's last token, and every computed expert row
+    ps = s;   // (the last token's S)
+    prev_wc[(size_t) layer] = 0;
+    for (int64_t j = 0; j < k; ++j)
+        if (kind[(n_tok - 1) * k + j] == -1) prev_wc[(size_t) layer] += w[(n_tok - 1) * k + j];
+    for (int64_t i = 0; i < n_tok * k; ++i)
+        if (kind[i] == -1) last_row[(size_t) (layer * n_expert + ids[i])].assign(out + (size_t) i * H, out + (size_t) (i + 1) * H);
+    n_lw += 1;
+    if (std::fmod(n_lw, 9600.0) != 0.0) return;
+    std::string line = "strata defer proxy stats: " + std::to_string((long long) n_lw) + " layer-windows, " +
+                       std::to_string((long long) n_tl) + " token-layers; error left sum|S-P|^2/sum|S|^2 (as is / a* / at a*):";
+    char b[160];
+    for (int v = 0; v < NV; ++v) {
+        const double a = pp[v] > 0 ? sp[v] / pp[v] : 0.0;
+        const double rs = ss > 0 ? (ss - 2 * a * sp[v] + a * a * pp[v]) / ss : 1.0;
+        std::snprintf(b, sizeof b, " %s %.3f / %.2f / %.3f", names[v], ss > 0 ? ee[v] / ss : 1.0, a, rs);
+        line += b;
+    }
+    std::snprintf(b, sizeof b, "; the cache holds %.1f%% of the CPU weight", w_all > 0 ? 100.0 * w_cached / w_all : 0.0);
+    line += b;
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
 }  // namespace
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
@@ -4076,6 +4158,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
+    if (ps != nullptr && ps->stats && ps->weights != nullptr)   // STRATA_VERIFY_DEFER_STATS: (after the timing above)
+        defer_proxy_stats(out, ps->weights, kind, ids, n_tok, k, H, d.layers, d.n_expert);
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     d.ms_plan += ms(c0, c1);
     d.ms_actq += ms(c1, c2);
