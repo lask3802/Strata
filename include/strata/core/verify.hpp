@@ -546,6 +546,11 @@ private:
                                            ///< itself (no deferral: the default's sums in another order)
     bool defer_said_ = false;              ///< the reason a window runs without deferral was printed
     float* def_parts_ = nullptr;           ///< device: a deferred layer's CPU rows (T * k * n_embd)
+    // STRATA_VERIFY_DEFER_RES=1 (with =1 or =check): the residual gets a deferred layer's write once, from the default's
+    // combine of all its rows, late; layer l+1's attention-side read writes its R + c*bo to a sink instead
+    bool defer_res_ = false;
+    float* def_bo_ = nullptr;              ///< device: a deferred layer's full combine (T * n_embd)
+    float* def_rsink_ = nullptr;           ///< device: the attention-side read's discarded R_out (T * hc * n_embd)
     bool defer_ok(int T, std::string* why) const;   ///< the T-token window may be captured with deferral
 
     // device

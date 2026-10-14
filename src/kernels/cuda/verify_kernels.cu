@@ -1388,6 +1388,29 @@ void defer_add_rows(const float* parts, const float* w, const float* inject, flo
         parts, w, inject, R, n_embd, k, hc);
     check("defer_add_rows");
 }
+namespace {
+// fused_gr.cu's pending write (gr_up_kernel: fmaf(bo, 2.0f * sigmoidf_(inj / (float) HC), R)); neither file is built
+// with --use_fast_math, so the division is IEEE in both
+__global__ void defer_write_rows_kernel(const float* __restrict__ bo, const float* __restrict__ inject,
+                                        float* __restrict__ R, int64_t n_embd, int hc) {
+    const int64_t t = blockIdx.y;
+    const int64_t d = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= n_embd) return;
+    const float b = bo[t * n_embd + d];
+    const float* inj = inject + t * hc;
+    float* r = R + t * hc * n_embd + d;
+    for (int c = 0; c < hc; ++c) {
+        const float gw = 2.0f * (1.0f / (1.0f + __expf(-(inj[c] / (float) hc))));
+        r[(int64_t) c * n_embd] = fmaf(b, gw, r[(int64_t) c * n_embd]);
+    }
+}
+}  // namespace
+void defer_write_rows(const float* bo, const float* inject, float* R, int64_t n_embd, int hc, int n_tok, void* stream) {
+    if (n_tok <= 0 || n_embd <= 0) return;
+    defer_write_rows_kernel<<<dim3((unsigned) ((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, (cudaStream_t) stream>>>(
+        bo, inject, R, n_embd, hc);
+    check("defer_write_rows");
+}
 
 namespace {
 __global__ void wait_copy_i32_kernel(const volatile uint32_t* flag, uint32_t value, int32_t* __restrict__ dst,

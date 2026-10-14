@@ -673,6 +673,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         defer_ = defer_check_ || (v != nullptr && std::strcmp(v, "1") == 0);
         if (!defer_ && v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0)
             std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER=%s is not 1 or check: no deferral\n", v);
+        const char* r = std::getenv("STRATA_VERIFY_DEFER_RES");
+        defer_res_ = defer_ && r != nullptr && std::atoi(r) != 0;
     }
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
@@ -757,6 +759,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
         // STRATA_VERIFY_DEFER (record_window), after everything else: the default layout is unchanged
         if (defer_) def_parts_ = b.take<float>(T * K * N);
+        if (defer_res_) { def_bo_ = b.take<float>(T * N); def_rsink_ = b.take<float>(T * HC * N); }
     };
     Bump count;
     carve(count);
@@ -902,6 +905,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER=1 (changes the output): the CPU's expert rows of layer l "
                              "join the residual before layer l+1's FFN-side read (its mixer runs without them; the "
                              "stage's last layer exact)\n");
+    if (defer_res_)
+        std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_RES=1: the residual gets a deferred layer's write once, "
+                             "from the default combine of all its rows (=check: expected byte-identical to no env)\n");
     return true;
 }
 
@@ -984,6 +990,45 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
 #if !defined(STRATA_GPU_METAL)   // (the Metal window is metal/src/engine/window.cpp: no deferral, no entry point there)
         defer_add_rows(def_parts_, w_ + tb * K, inj2_ + tb * HC, Rt(tb), N, (int) K, (int) HC, n, cs);
+#endif
+    };
+    // STRATA_VERIFY_DEFER_RES: layer dl's combine as post(dl) makes it without deferral - its CPU rows copied as late_add
+    // copies them, its hit rows (hit_out_, untouched until post(dl+1)) added as moe_hit_add adds them, then the same
+    // combine launch on layer dl's weights and shared row - into def_bo_.  Where: pre(dl+1) before its FFN-side read
+    // (=1), or post(dl) after its partial combine (=check, so that pre(dl+1)'s attention-side read sees the full one)
+    auto late_full = [&](int64_t dl, int grp) -> bool {
+        const int tb = tb_[grp], n = te_[grp] - tb_[grp];
+        const uint32_t ring_d = (uint32_t) ((dl - lb_) * G + grp + 1);
+        const int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
+        const float* ym = m_ymiss_ + (size_t) tb * K * N;
+        if (device_plan_) {
+            wait_flag_ge_or(m_flag_, ring_d, skip_ + grp, cs);
+            copy_or_zero_from_mapped(def_parts_, ym, (long long) n * K * N, skip_ + grp, ring_d, cs);
+        } else {
+            wait_flag_ge(m_flag_, ring_d, cs);
+            if (dec_batch) copy_rows_from_mapped(def_parts_, ym, (int64_t) n * K, N, pl + 4 + MT * K + 1, pl + 1, cs);
+            else copy_from_mapped(def_parts_, ym, (int64_t) n * K * N, cs);
+        }
+        moe_hit_add(def_parts_, hit_out_ + (size_t) tb * K * N, pl + 4 + MT * K + 1, pl + 1, (int64_t) n * K, N, cs);
+        if (dec_batch && n > 1 && native_moe_combine_enabled()) {
+            try {
+                native_moe_combine_multi(def_parts_, w_ + tb * K, shared_ + tb * N, def_bo_ + tb * N, N, K, n, cs);
+            } catch (const std::exception& e) { err = "verify late combine: " + std::string(e.what()); return false; }
+            return true;
+        }
+        for (int t = tb; t < te_[grp]; ++t) {
+            MoEBuffers mb = ss.moe;
+            mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
+            if (!moe_combine_parts(g, dl, K, mb, def_parts_ + (size_t) (t - tb) * K * N, def_bo_ + t * N, cs, err))
+                return false;
+        }
+        return true;
+    };
+    // STRATA_VERIFY_DEFER_RES: layer dl's pending write from def_bo_, the one the fused read would have made
+    auto late_write = [&](int grp) {
+        const int tb = tb_[grp], n = te_[grp] - tb_[grp];
+#if !defined(STRATA_GPU_METAL)
+        defer_write_rows(def_bo_ + tb * N, inj2_ + tb * HC, Rt(tb), N, (int) HC, n, cs);
 #endif
     };
     // Programmatic dependent launch (pdl.hpp; sm_90+, opt-in: STRATA_DF_PDL=1): the window's quantizations and dense
@@ -1181,12 +1226,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             pending = false;
         }
+        // STRATA_VERIFY_DEFER_RES, layer l-1 deferred: the attention-side read applies layer l-1's write to what it reads
+        // (bo_, the partial combine, =1; def_bo_, the full one, =check) but writes R + c*bo to a sink - R gets that
+        // write once, from the full combine, before the FFN-side read (late_write).  The fused read takes R_out != R
+        // (fused_gr_parity runs it that way).
+        const bool res_sink = defer_res_ && l > lb_ && deferred(l - 1);
         auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
             FusedGrArgs fa[kFusedGrMaxT];
+            const bool sink = half == 0 && res_sink;
             for (int t = tb; t < te; ++t) {
                 FusedGrArgs& a = fa[t - tb];
-                a.R = Rt(t); a.R_out = Rt(t); a.apply = apply;
-                a.bo_prev = bo_ + t * N; a.inj_prev = inj_prev + t * HC;
+                a.R = Rt(t); a.R_out = sink ? def_rsink_ + (size_t) t * HC * N : Rt(t); a.apply = apply;
+                a.bo_prev = (sink && defer_check_ ? def_bo_ : bo_) + t * N; a.inj_prev = inj_prev + t * HC;
                 a.w_norm = (const float*) wn[half]->data; a.w_down = (const uint16_t*) wd[half]->data;
                 a.w_up = (const uint16_t*) wu[half]->data; a.w_inject = (const uint16_t*) wi[half]->data;
                 a.q8_down = (const uint8_t*) wd[half]->hc_q8; a.q8_up = (const uint8_t*) wu[half]->hc_q8;
@@ -1546,7 +1597,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 15, grp);   // the profile: the mixer's out-projection ends here
         // STRATA_VERIFY_DEFER=1: the previous layer's CPU rows join the residual here, before the FFN-side read (late_add;
         // the profile's "late rows", 15 to 16)
-        if (!defer_check_ && l > lb_ && deferred(l - 1)) late_add(l - 1, grp);
+        if (res_sink) {   // STRATA_VERIFY_DEFER_RES: (=1) the full combine now, then the write the read did not make
+            if (!defer_check_ && !late_full(l - 1, grp)) return false;
+            late_write(grp);
+        } else if (!defer_check_ && l > lb_ && deferred(l - 1)) late_add(l - 1, grp);
         stamp(l, 16, grp);
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
@@ -1815,7 +1869,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         stamp(l, 24, grp);
         // STRATA_VERIFY_DEFER=check (late_add): this layer's own rows, here; =1 adds them in pre(l + 1)
-        if (defer_check_ && deferred(l)) late_add(l, grp);
+        if (defer_check_ && deferred(l)) {   // STRATA_VERIFY_DEFER_RES: the full combine for pre(l + 1)'s reads
+            if (defer_res_) { if (!late_full(l, grp)) return false; }
+            else late_add(l, grp);
+        }
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
                 if (dec_batch && !g_no_multi_gr) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);

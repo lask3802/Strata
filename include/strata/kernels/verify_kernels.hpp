@@ -93,6 +93,10 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
 /// Graph-capturable.
 void defer_add_rows(const float* parts, const float* w, const float* inject, float* R, int64_t n_embd, int k, int hc,
                     int n_tok, void* stream);
+/// STRATA_VERIFY_DEFER_RES: the fused read's pending write alone, R[(t*hc + c)*n_embd + d] =
+/// fmaf(bo[t*n_embd + d], 2*sigmoid(inject[t*hc + c] / hc), R[...]) - bitwise the write the read would have made with
+/// this bo.  Graph-capturable.
+void defer_write_rows(const float* bo, const float* inject, float* R, int64_t n_embd, int hc, int n_tok, void* stream);
 /// n floats of +0.0 (n a multiple of 4, 16-byte aligned): a kernel node where a memset node would break the window's
 /// kernel-to-kernel chain (pdl.hpp).  Graph-capturable.
 void fill_zero(float* dst, long long n, void* stream);
