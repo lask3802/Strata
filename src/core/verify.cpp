@@ -725,7 +725,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sink_.fetch = &Verifier::fetch_dma;
         sink_.ctx = this;
         sink_.heavy = defer_heavy_;   // STRATA_VERIFY_DEFER_HEAVY / _STATS (run sets the weights per group)
-        sink_.partial = defer_heavy_ > 0.0f ? &Verifier::raise_partial : nullptr;
+        sink_.partial = nullptr;      // (run and service set it per layer: heavy_layer)
         sink_.stats = env_on("STRATA_VERIFY_DEFER_STATS");
     }
 
@@ -2261,6 +2261,14 @@ bool Verifier::defer_ok(int T, std::string* why) const {
     return true;
 }
 
+// record_window's `heavy && deferred(l)`: the layers whose pool splits its jobs and raises the partial flag (the others
+// run as one pass - no GPU waits for a partial flag there)
+bool Verifier::heavy_layer(int T, int64_t l) const {
+    if (defer_heavy_ <= 0.0f || h_pflag_ == nullptr || device_plan_ || l + 1 >= le_) return false;
+    if (l == 0 && ss_->ple.ready() && ple_stage()) return false;
+    return defer_ok(T, nullptr);
+}
+
 bool Verifier::capture(int T, std::string& err) {
     cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[T] : exec_[T];
     if (exec_t != nullptr) return true;
@@ -2769,6 +2777,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         sink_.weights = publish_w_ ? h_w_ + (size_t) tb * ss.k : nullptr;   // STRATA_VERIFY_DEFER_HEAVY / _STATS
+        sink_.partial = heavy_layer(T, l) ? &Verifier::raise_partial : nullptr;
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -3500,6 +3509,8 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         // The recorded graph consumes the helper mask and weighted sum just as
         // the solo graph does. Reset both and supply this layer's routing weights.
         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
+        sink_.weights = nullptr;   // (STRATA_VERIFY_DEFER_HEAVY / _STATS: not in a batch window, which never defers)
+        sink_.partial = nullptr;
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
         if (remote_opt_) remote_opt_->end();
         progress_tick();
@@ -3655,6 +3666,8 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         cur_layer_ = want - 1;
         set_plan_slot(0);
         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
+        sink_.weights = nullptr;   // (as run_slot_rows)
+        sink_.partial = nullptr;
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
         if (remote_opt_) remote_opt_->end();
         progress_tick();
@@ -4002,6 +4015,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window (pipelined): the CPU experts of layer", l);
         sink_.weights = publish_w_ ? h_w_ + (size_t) tb * ss.k : nullptr;   // STRATA_VERIFY_DEFER_HEAVY / _STATS
+        sink_.partial = heavy_layer(T, l) ? &Verifier::raise_partial : nullptr;
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);

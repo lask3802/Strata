@@ -3681,7 +3681,8 @@ namespace {
 // STRATA_VERIFY_DEFER_STATS (verify.cpp publishes the routing weights with the doorbell): where a window's routing
 // weight goes - per token and layer, the share on the GPU (VRAM and PCIe), on the CPU, skipped (the route tail skip);
 // how much of the CPU's share a weight test w >= th keeps, against the entries and the distinct experts (the CPU's
-// work) it takes; the CPU's share by routing rank.  Cumulative, printed every 9600 layer-windows (~200 windows).
+// work) it takes; the CPU's share by routing rank.  Cumulative, printed every 9600 layer-windows (~200 windows).  Plain
+// statics: one host loop drives the verify windows' pool (a measurement switch, not for a multi-stage or batch run).
 void defer_weight_stats(const float* w, const int32_t* kind, const int32_t* ids, int64_t n_tok, int64_t k) {
     constexpr int NTH = 6;
     static const float th[NTH] = {0.05f, 0.08f, 0.10f, 0.15f, 0.20f, 0.30f};
