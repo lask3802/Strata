@@ -565,7 +565,9 @@ private:
     uint32_t* h_pflag_ = nullptr; uint32_t* m_pflag_ = nullptr;
     static void raise_partial(void* ctx);
     bool publish_w_ = false;               ///< the doorbell carries the routing weights (HEAVY, STRATA_VERIFY_DEFER_STATS)
+    bool defer_stats_ = false;             ///< STRATA_VERIFY_DEFER_STATS (the pool counts only the deferred layers)
     bool defer_ok(int T, std::string* why) const;   ///< the T-token window may be captured with deferral
+    bool defer_layer(int T, int64_t l) const;       ///< record_window's deferred(l) for a T-token window
     bool heavy_layer(int T, int64_t l) const;       ///< STRATA_VERIFY_DEFER_HEAVY: post(l) waits for the partial flag
 
     // device

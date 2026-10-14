@@ -3743,9 +3743,11 @@ void defer_weight_stats(const float* w, const int32_t* kind, const int32_t* ids,
 // sum |S - P|^2 / sum |S|^2 (1: no proxy), at P as it is and at the best single scale a* = sum <S,P> / sum |P|^2:
 //   prev   the previous window's last token's S (what the GPU holds when this window's mixer runs)
 //   wscal  the same scaled by this token's CPU weight over that token's (no CPU entries: no proxy)
-//   lag1   token t-1's S inside the window (not available to the mixer: an upper bound for a one-token lag)
+//   lag1   token t-1's S inside the window (not available to the mixer: an upper bound for a one-token lag; at t = 0
+//          the previous window's last token, so in one-token windows lag1 is prev)
 //   cache  each CPU entry's expert's last output row in an earlier window, weighted by this token's weight
 // Plain statics as above; the expert cache is host memory, up to n_layers * n_expert rows (a measurement switch).
+// The verifier sets ps->stats only on the layers it defers, in windows it defers (not --spec-split's groups).
 void defer_proxy_stats(const float* out, const float* w, const int32_t* kind, const int32_t* ids, int64_t n_tok,
                        int64_t k, int64_t H, int64_t layer, int64_t n_expert) {
     constexpr int NV = 4;
