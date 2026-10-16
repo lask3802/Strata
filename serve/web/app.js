@@ -157,7 +157,8 @@ let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
 async function poll() {
   try {
-    // workers=1: the Monitor is open, so the server may ask a remote stage's node agents (now and then)
+    // workers=1: the Monitor is open, so the server reads the engine's log for a remote stage's link and may ask its
+    // node agents (now and then)
     const q = [reqShowAll ? "requests=all" : "", tab === "monitor" ? "workers=1" : ""].filter(Boolean).join("&");
     const r = await fetch(q ? `metrics?${q}` : "metrics", {headers: headers()});
     if (r.status === 401) {
@@ -232,7 +233,7 @@ function renderWorkers(s) {
     const row = `<tr${w.error ? ' class="wk-has-err"' : ""}>
       <td><span class="wk-name">${esc(name)}</span>${where ? `<span class="muted small wk-sub">${esc(where)}</span>` : ""}</td>
       <td>${span(w.layers)}${w.relay_to ? `<span class="muted small wk-sub" title="relays to the next worker">→ ${esc(w.relay_to)}</span>` : ""}</td>
-      <td><span class="st-badge ${cls}"${tip ? ` title="${esc(tip)}"` : ""}>${text}</span>${w.since ? `<span class="muted small wk-sub" title="${esc(text)} since ${esc(new Date(w.since * 1000).toLocaleString())}">${esc(clock(w.since))}</span>` : ""}</td>
+      <td><span class="st-badge ${cls}"${tip ? ` title="${esc(tip)}"` : ""}>${text}</span>${w.since ? `<span class="muted small wk-sub" title="${esc(text)} since ${esc(new Date(w.since * 1000).toLocaleString())}">${esc(clock(w.since))}</span>` : ""}${s.provisional ? `<span class="muted small wk-sub" title="The log is still being read: this state is as of the part read so far">catching up</span>` : ""}</td>
       <td class="num">${s.provisional && w.reconnects != null ? `<span title="Still counting: the log is read on at each look">≥ ${fmt(w.reconnects)}</span>` : fmt(w.reconnects)}</td>
       <td class="num">${ms(live ? w.round_trip_ms : null)}${split}</td>
       <td class="num">${ms(live ? w.own_ms : null)}</td>

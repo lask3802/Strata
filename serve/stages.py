@@ -72,7 +72,9 @@ class MainLog:
     READ_MAX was written since the last read, the lines before the last READ_MAX are scanned, not read one by one:
     the starts, connects and relinks in them counted, and the last line of each kind that changes the state read, in
     the log's order (the state reading every line would leave), SCAN_MAX of them per look; "behind": what is left
-    to scan (the counts are provisional until then).  The current run's first lines are read whole (its link)."""
+    to scan (the counts are provisional until then).  The current run's first lines are read whole (its link), from
+    where it began even when the line before never ended (an engine that died mid-line).  A log found shorter than
+    what was read, or with other first bytes (rotated in place, then grown past it before a look), was rotated."""
     STARTED = " engine started: "
     CONNECT = re.compile(r"strata serve: remote stage (\S+): layers (\d+)-(\d+) there \(prompt chunk (\d+), "
                          r"context (\d+)(?:, rows (\w+))?\)")
@@ -91,47 +93,56 @@ class MainLog:
                        r"the peer closed the connection|the two sides differ|"
                        r"the wait was cancelled|the worker refused|the worker was started without --vision|"
                        r"unexpected reply|bad message magic|a window's rows|an empty position table).*)")
-    # a scanned part of the log: the lines counted, and the lines looked for (the last of each kind; an error: the
-    # last "strata serve: remote stage" line that ERROR takes)
-    COUNTED = {"runs": STARTED.encode(), "connects": b" there (prompt chunk ", "relinks": b"): connected again"}
-    MARKS = {"start": STARTED.encode(), "connect": b" there (prompt chunk ", "relink": b"): connected again",
+    # a scanned part of the log: the lines counted, and the lines looked for (the last of each kind; a start: a line
+    # that begins "[strata]", as event() takes it; an error: the last line ERROR takes)
+    COUNTED = {"connects": b" there (prompt chunk ", "relinks": b"): connected again"}
+    MARKS = {"connect": b" there (prompt chunk ", "relink": b"): connected again",
              "wait": b"strata serve: remote stage: waiting for the worker at ", "windows": b" windows: mean ",
              "gap": b"strata remote: main process between windows "}
-    REMOTE = b"strata serve: remote stage"
+    STARTS = re.compile(rb"\n\[strata\][^\n]*" + re.escape(STARTED.encode()))
+    ERRORS = re.compile(ERROR.pattern.encode())
+    FINGERPRINT = 64       # the log's first bytes: other ones at a later look, a log rotated (though not shorter)
 
     def __init__(self):
         self.key, self.pos = None, 0
         self.read_at = 0.0             # when the log was last read
         self.lock = threading.Lock()   # two pages (or a scraper) reading at once must not count a line twice
+        self.head = b""                # the log's first FINGERPRINT bytes at the last read
+        self.old_start = None          # a run's start in a log rotated since (no place in the new one)
+        self.err_seen = None           # the engine's ERR as last seen (a new one: placed in this log)
         # Each event carries where its line is in the log ("pos"), which orders it against the engine's stdout ERR
         # (the server notes the log's size when it reads one), and "at", when it was read (a lazy read sees it late:
         # shown, never compared).  "link": the current run's last connect or relink; "run_pos": where that run began;
-        # "size": the log's size at this read; "rotated": the log was found emptied or cut short (a rotation) -
-        # "by": the places read move that much before its start, "at": the read before (an ERR then is of the old log)
+        # "stage_err": the engine's ERR with its place; "size": the log's size at this read; "rotated": the last
+        # rotation seen (the log emptied, cut short or begun again) - "by": the places read moved that much, before
+        # the new log's start, "at": the read before it
         self.state = {"connect": None, "connects": 0, "relinks": 0, "waiting": None, "error": None, "link": None,
                       "windows": None, "gap_ms": None, "runs": 0, "run_pos": None, "run_connected": False,
-                      "behind": 0, "size": 0, "rotated": None}
+                      "stage_err": None, "behind": 0, "size": 0, "rotated": None}
 
-    def poll(self, path, first, start) -> dict:
+    def poll(self, path, first, start, err=None) -> dict:
         """The state after the log's new lines.  `first`: where the engine's first run in this server began (read
-        from there once), `start`: where its current run began."""
+        from there once), `start`: where its current run began, `err`: the engine's last ERR (its text, when, the
+        log's size then)."""
         if not path or start is None:
             return dict(self.state)
         with self.lock:
             st = self.state
             if self.key != path:
-                self.key, self.pos = path, start if first is None else first
+                self.key, self.pos, self.head = path, start if first is None else first, b""
+            run_start = start
+            if start == self.old_start:                 # this run began in a log rotated since: no place in this one
+                start = -1
+            rot, size = None, None
             try:
                 size = os.path.getsize(path)
-                if size < self.pos:     # emptied, replaced or cut short (a rotation): what was read keeps its order,
-                    by = self.pos       # before the new log's first line
-                    for k in ("link", "error", "waiting"):
-                        if st[k]:
-                            st[k] = {**st[k], "pos": st[k]["pos"] - by}
-                    if st["run_pos"] is not None:
-                        st["run_pos"] -= by
-                    st["rotated"], self.pos = {"by": by, "at": self.read_at}, 0
                 with open(path, "rb") as f:
+                    head = f.read(min(self.FINGERPRINT, size))
+                    n = min(len(head), len(self.head))
+                    if size < self.pos or head[:n] != self.head[:n]:   # emptied, cut short or begun again: rotated
+                        rot = self.rotated()
+                        self.old_start, start = run_start, -1
+                    self.head = head
                     budget = SCAN_MAX
                     while size - self.pos > READ_MAX and budget > 0:
                         if self.pos == start:           # the current run's first lines: read
@@ -146,8 +157,12 @@ class MainLog:
                         if self.pos < start < stop:
                             stop = start
                         n = self.scan(f, self.pos, stop)
-                        if not n:                       # no whole line in it: the budget is spent, or a line
-                            budget = 0 if stop < size - READ_MAX else budget   # runs into the end (read below)
+                        if not n:
+                            if stop == start:           # the run's first line, after a line that never ended
+                                self.pos = start
+                                continue
+                            # no whole line in it: the budget is spent, or a line runs into the end (read below)
+                            budget = 0 if stop < size - READ_MAX else budget
                             break
                         self.pos, budget = self.pos + n, budget - n
                     behind = size - self.pos > READ_MAX and budget <= 0
@@ -155,12 +170,35 @@ class MainLog:
                     f.seek(self.pos)
                     data = b"" if behind else f.read(size - self.pos)
             except OSError:
-                return dict(self.state)
+                data = b""
+            if self.pos < start <= self.pos + len(data):   # the same, read line by line: the lines before it
+                n = start - self.pos
+                self.feed(data[:n], self.pos)
+                data, self.pos = data[n:], start
             end = data.rfind(b"\n") + 1                 # whole lines only: the rest is read next time
             self.feed(data[:end], self.pos)
             self.pos += end
-            self.read_at, st["size"] = time.time(), size
+            if err != self.err_seen:                    # a new ERR (an older one moved at each rotation): of the old
+                self.err_seen = err                     # log, if one was rotated since it came, past the new end
+                pos = err[2] if err and len(err) > 2 and err[2] is not None else float("-inf")   # (unknown: first)
+                if err and rot and size is not None and pos > size:
+                    pos = min(pos - rot["by"], -1)
+                st["stage_err"] = {"text": err[0], "at": err[1], "pos": pos} if err else None
+            if size is not None:
+                self.read_at, st["size"] = time.time(), size
             return dict(st)
+
+    def rotated(self) -> dict:
+        """The log was rotated: what was read keeps its order, before the new log's first line, and is read from
+        its start.  An ERR of the old log moves with it once, here."""
+        st, by = self.state, self.pos
+        for k in ("link", "error", "waiting", "stage_err"):
+            if st[k]:
+                st[k] = {**st[k], "pos": min(st[k]["pos"] - by, -1)}
+        if st["run_pos"] is not None:
+            st["run_pos"] -= by
+        st["rotated"], self.pos = {"by": by, "at": self.read_at}, 0
+        return st["rotated"]
 
     @staticmethod
     def line_at(buf: bytes, i: int, base: int) -> tuple[int, str]:
@@ -178,25 +216,29 @@ class MainLog:
             if not chunk:
                 break
             left -= len(chunk)
-            buf = carry + chunk
+            buf = b"\n" + carry + chunk                 # (a line end before its first line: STARTS takes it too)
             end = buf.rfind(b"\n") + 1
             carry = buf[end:]
-            if not end:
+            if end == 1:
                 continue
+            base = pos - 1
             for k, pat in self.COUNTED.items():
                 self.state[k] += buf.count(pat, 0, end)
             for kind, mark in self.MARKS.items():
                 i = buf.rfind(mark, 0, end)
                 if i >= 0:
-                    last[kind] = self.line_at(buf, i, pos)
-            hi = end
-            while (i := buf.rfind(self.REMOTE, 0, hi)) >= 0:
-                at, line = self.line_at(buf, i, pos)
-                if self.ERROR.search(line):
-                    last["error"] = (at, line)
-                    break
-                hi = at - pos
-            pos += end
+                    last[kind] = self.line_at(buf, i, base)
+            m = None
+            for m in self.STARTS.finditer(buf, 0, end):
+                self.state["runs"] += 1
+            if m:
+                last["start"] = self.line_at(buf, m.start() + 1, base)
+            m = None
+            for m in self.ERRORS.finditer(buf, 0, end):
+                pass
+            if m:
+                last["error"] = self.line_at(buf, m.start(), base)
+            pos += end - 1
         now = time.time()
         for at, line in sorted(last.values()):         # in the log's order
             self.event(line, at, now, count=False)
@@ -477,7 +519,7 @@ class StageMonitor:
         env = spawn[4] if len(spawn) > 4 and isinstance(spawn[4], dict) else None
         token = (env or os.environ).get("STRATA_STAGE_TOKEN", "")
         log = self.main_log.poll(getattr(engine, "log_path", None), getattr(engine, "first_log_start", None),
-                                 getattr(engine, "log_start", None))
+                                 getattr(engine, "log_start", None), getattr(engine, "stage_err", None))
         # the chain: the main process's worker, then each relay's next worker as its log names it
         chain = [first]
         while len(chain) < CHAIN_MAX:
@@ -550,17 +592,9 @@ class StageMonitor:
         if not getattr(engine, "log_path", None):              # the run config has no "log": nothing says how it goes
             return ("nolog" if alive else "connecting" if starting else "down"), None, None
         # this run's errors only: the log's (a failed start), the ERR of a request (from this run's start on)
-        run_pos, rot = log["run_pos"], log["rotated"]
-        errs = [e for e in (log["error"],) if e and (run_pos is None or e["pos"] > run_pos)]
-        se = getattr(engine, "stage_err", None)
-        if se:
-            # its place: unknown (the log's size could not be read) is before every line; one of the log before a
-            # rotation (an ERR before the read that saw the old log, or past the new log's end) moves with it
-            pos = se[2] if len(se) > 2 and se[2] is not None else float("-inf")
-            if rot and (se[1] <= rot["at"] or pos > log["size"]):
-                pos = min(pos - rot["by"], -1)
-            if run_pos is None or pos > run_pos:      # (an ERR at run_pos came before the start)
-                errs.append({"text": se[0], "at": se[1], "pos": pos})
+        # (an ERR at run_pos came before the start; its place as MainLog.poll keeps it)
+        run_pos = log["run_pos"]
+        errs = [e for e in (log["error"], log["stage_err"]) if e and (run_pos is None or e["pos"] > run_pos)]
         err = max(errs, key=lambda e: e["pos"]) if errs else None
         link, wait = log["link"], log["waiting"]
         closed = False         # the link was closed after it was made, the engine kept: the next request connects again

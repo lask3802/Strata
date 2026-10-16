@@ -539,8 +539,11 @@ the link's state (Connected, Connecting, Reconnecting, Idle: the link closed wit
 connects again; Down), the links made again since the server started, and the round trip per verify window. These
 come from the main engine's log, so the run config needs `"log"`; the round trips also need
 `STRATA_REMOTE_TIMING=1` in its `"env"`. The server reads the log only while a Monitor tab is open; a long log
-since the last look is counted at up to 256 MiB per look (the reconnects show as "≥ N" until then). A log rotated
-in place (emptied or cut short, as `copytruncate` does) is followed: what was read keeps its order.
+since the last look is counted at up to 256 MiB per look (the reconnects show as "≥ N" and the state "catching up"
+until then). A log rotated in place (emptied or cut short, as `copytruncate` does) is followed: what was read keeps
+its order. A rotation is seen by the log being shorter than what was read, or by its first 64 bytes being other ones
+(a rotated log grown past that before the next look); a new log that begins with the old one's first 64 bytes and
+has grown past it is not seen as one.
 
 The worker's GPU, VRAM, expert cache, engine version and its own time per window come from that PC's node agent
 (`GET /info` and `GET /log`). The server asks the agents only when the run config says so, at most every 15 s and

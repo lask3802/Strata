@@ -831,6 +831,7 @@ class StrataEngine:
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0  # where this start's lines begin (start_failure_hint)
         self.log_start = log_start                      # #596: the Monitor's conversation cache reads from here
+        self.stage_err = None                           # (the ERR of an earlier process: not this one's)
         if self.first_log_start is None:                # (kept across restarts: they run __init__ again)
             self.first_log_start = log_start
         if log:

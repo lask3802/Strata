@@ -348,6 +348,49 @@ class MainLogTest(LogCase):
                 v = mon.view(RemoteEngine(ByteTokenizer(), self.log))
         self.assertEqual(v["workers"][0]["reconnects"], 20)
 
+    def test_a_start_after_a_line_that_never_ended(self):
+        """The engine before died mid-line: the next start's line begins there, after no line end.  Read from there,
+        scanned up to it (no stop short of it at every look) or read line by line."""
+        filler = b"strata serve: request done: some line of the engine's own\n" * 100
+        with open(self.log, "ab") as f:
+            f.write((STARTED + MAIN_RUN).encode() + filler + b"strata generate: loading 45%")
+        start = os.path.getsize(self.log)
+        with open(self.log, "ab") as f:
+            f.write((STARTED + MAIN_RUN.replace("26-47 there", "26-40 there")).encode() + filler * 3)
+        for small in ({"READ_MAX": 4096, "SCAN_MAX": 32768, "HEAD_MAX": 2048}, {"READ_MAX": stages.READ_MAX}):
+            ml = stages.MainLog()
+            with mock.patch.multiple(stages, **small):
+                for _ in range(5):
+                    s = ml.poll(self.log, 0, start)
+            self.assertEqual((s["behind"], s["runs"], s["connects"], s["run_pos"], s["connect"]["layers"]),
+                             (0, 2, 2, start, [26, 40]), small)
+            self.assertEqual(ml.pos, os.path.getsize(self.log))
+
+    def test_a_scanned_start_begins_its_line(self):
+        """A scanned part takes a start where a line is read as one: a line that begins "[strata]"."""
+        filler = "strata serve: request done: some line of the engine's own\n" * 100
+        self.append(filler * 2 + STARTED + MAIN_RUN + filler + "strata serve: request done: a prompt that says "
+                    "\"[strata] x engine started: y\"\n" + filler * 5)
+        ml = stages.MainLog()
+        with mock.patch.object(stages, "READ_MAX", 4096), mock.patch.object(stages, "HEAD_MAX", 2048):
+            s = ml.poll(self.log, None, 0)
+        self.assertEqual((s["runs"], s["run_pos"], s["run_connected"]),
+                         (1, Path(self.log).read_bytes().index(b"[strata]"), True))
+
+    def test_a_scanned_part_s_last_error(self):
+        """A scanned part's error is its last line ERROR takes (not a later remote stage line that is not one)."""
+        filler = "strata serve: request done: some line of the engine's own\n" * 100
+        refused = "strata serve: remote stage: cannot connect to 10.10.10.2:7841: refused ({})\n"
+        self.append(STARTED + filler * 2 + refused.format(1) + filler + refused.format(2) +
+                    "strata serve: remote stage: checkpoint 3 at 900 tokens saved on the worker\n" + filler * 5)
+        ml = stages.MainLog()
+        with mock.patch.object(stages, "READ_MAX", 4096), mock.patch.object(stages, "HEAD_MAX", 2048):
+            s = ml.poll(self.log, None, 0)
+        self.assertEqual((s["error"]["text"], s["error"]["pos"]),
+                         ("remote stage: cannot connect to 10.10.10.2:7841: refused (2)",
+                          Path(self.log).read_bytes().index(b"strata serve: remote stage: cannot connect to "
+                                                            b"10.10.10.2:7841: refused (2)")))
+
 
 class WorkerLogTest(unittest.TestCase):
     def test_worker_and_relay(self):
@@ -839,6 +882,76 @@ class MonitorTest(LogCase):
         Path(self.log).write_text(relink, encoding="utf-8")
         self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
 
+    def test_two_rotations(self):
+        """An ERR of a log rotated twice since moves once at each rotation: before a link made again in between."""
+        filler = "strata serve: request done: some line of the engine's own\n"
+        relink = "strata serve: remote stage: the link to 10.10.10.2:7841 was lost (x): connected again\n"
+        self.append(STARTED + MAIN_RUN + filler * 100)
+        mon, e = stages.StageMonitor(), RemoteEngine(self.tok, self.log)
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+        time.sleep(0.05)
+        self.stage_err(e, "remote stage: the peer closed the connection")
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "idle")
+        time.sleep(0.05)
+        Path(self.log).write_bytes(b"")
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "idle")
+        self.append(filler * 20 + relink + filler * 200)
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+        time.sleep(0.05)
+        Path(self.log).write_bytes(b"")
+        w = mon.view(e)["workers"][0]
+        self.assertEqual((w["state"], w["error"], w["reconnects"]), ("connected", None, 1))
+
+    def test_an_err_past_the_last_line_read(self):
+        """An ERR whose place is past the last whole line read (half a line after it), then a rotation: of the old
+        log all the same, before a relink at the new log's start."""
+        self.append(STARTED + MAIN_RUN + "strata serve: request done: half a li")
+        mon, e = stages.StageMonitor(), RemoteEngine(self.tok, self.log)
+        self.stage_err(e, "remote stage: the peer closed the connection")
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "idle")
+        time.sleep(0.05)
+        Path(self.log).write_bytes(b"")
+        mon.view(e)
+        self.append("strata serve: remote stage: the link to 10.10.10.2:7841 was lost (x): connected again\n")
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+
+    def test_a_rotated_log_grown_past_the_last_read(self):
+        """Rotated, then grown past what was read before the next look: its first bytes say it was rotated."""
+        relink = "strata serve: remote stage: the link to 10.10.10.2:7841 was lost (x): connected again\n"
+        self.append(STARTED + MAIN_RUN)
+        mon, e = stages.StageMonitor(), RemoteEngine(self.tok, self.log)
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+        self.stage_err(e, "remote stage: the peer closed the connection")
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "idle")
+        time.sleep(0.05)
+        Path(self.log).write_text(relink + "strata serve: request done: x\n" * 50, encoding="utf-8")
+        w = mon.view(e)["workers"][0]
+        self.assertEqual((w["state"], w["reconnects"]), ("connected", 1))
+
+    def test_a_start_of_a_rotated_log(self):
+        """After a rotation the current run's start is a place in the old log, not in the new one: a line there
+        is read whole (here a relink across it)."""
+        filler = b"strata serve: request done: some line of the engine's own\n"
+        relink = b"strata serve: remote stage: the link to 10.10.10.2:7841 was lost (x): connected again\n"
+        with open(self.log, "ab") as f:
+            f.write(filler * 300)
+        e = RemoteEngine(self.tok, self.log)
+        e.log_start = os.path.getsize(self.log)
+        with open(self.log, "ab") as f:
+            f.write((STARTED + MAIN_RUN).encode())
+        mon = stages.StageMonitor()
+        with mock.patch.multiple(stages, READ_MAX=4096, SCAN_MAX=32768, HEAD_MAX=2048):
+            self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+            Path(self.log).write_bytes(b"x" * 7 + b"\n")
+            mon.view(e)
+            with open(self.log, "ab") as f:                         # the relink begins 10 bytes before that place
+                f.write(b"y" * (e.log_start - 19) + b"\n" + relink + filler * 1000)
+            for _ in range(10):
+                v = mon.view(e)
+                if not v["provisional"]:
+                    break
+        self.assertEqual((v["provisional"], v["workers"][0]["reconnects"]), (False, 1))
+
     def test_an_err_without_its_place(self):
         """The log's size could not be read when the ERR came: it is older than every line, not newer."""
         self.append(STARTED + MAIN_RUN)
@@ -1026,7 +1139,9 @@ class EngineWiring(unittest.TestCase):
     def test_restart_before_the_first_look(self):
         """The Monitor opened after the engine was started again: that start's link is a reconnect all the same."""
         self.lose_the_link()
+        self.assertIsNotNone(self.e.stage_err)
         self.request()                                              # the next request starts the engine again
+        self.assertIsNone(self.e.stage_err)                         # the earlier process's ERR is not this one's
         w = self.svc.metrics(workers=True)["stages"]["workers"][0]
         self.assertEqual((w["state"], w["reconnects"], w["error"]), ("connected", 1, None))
 
