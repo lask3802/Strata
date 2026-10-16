@@ -98,6 +98,7 @@ def main():
     args = common_args(cfg, a.spec) + ['--conversation-cache-mib', str(a.cache_mib), '--conversation-cache-slots', '4']
     env = child_env(cfg)
     env['STRATA_STATE_HASH'] = '1'
+    env['STRATA_VERIFY_DEFER_CPU'] = '0'   # the exact path (Strata Link defers by default)
     env['STRATA_SNAPSHOT_VERIFY'] = '1'
     env['STRATA_MTP_BATCH'] = '1'
     a.output.mkdir(mode=0o700, parents=False, exist_ok=False)

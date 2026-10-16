@@ -1736,7 +1736,7 @@ from the old default, as any change of the share does (CPU and GPU round differe
 (run-to-run floor 0.0013) and 0.0011 on the A4000 (floor 0.0012; at that time the share was 0.25).
 The sweeps behind the constant: `phaseA-tests/notes-142-pciefrac.md`.
 
-## A layer's CPU experts join at the next layer's FFN half (opt-in, `STRATA_VERIFY_DEFER_CPU=1`, changes the answers)
+## A layer's CPU experts join at the next layer's FFN half (Strata Link: on by default, `STRATA_VERIFY_DEFER_CPU=0` turns it off; changes the answers)
 
 In a decode window with CPU experts, every layer waits for the CPU pool's rows before its combine, so the GPU idles
 while the CPU computes. **`STRATA_VERIFY_DEFER_CPU=1`** lets layer l combine without the CPU's rows (shared expert, VRAM
@@ -1745,10 +1745,27 @@ and adds them to the residual with layer l's own routing weights and residual-wr
 reads it. The CPU computes layer l while the GPU runs layer l+1's mixer; that mixer is the only part of the model that
 runs without layer l's CPU rows. The stage's last layer is never deferred, nor layer 0 when layer 1 runs the PLE block.
 
-It changes the answers (teacher-forced KL against the default: see below). Windows that run without it (one start-up
+**Strata Link turns it on by default** (upstream Strata keeps it opt-in): unset or empty is `=1` with the split at
+`STRATA_VERIFY_DEFER_CPU_BELOW` 0.1 (below), and **`STRATA_VERIFY_DEFER_CPU=0`** (or `off`) is the exact path, the same
+steps as a build without this section. A value that is not `0`, `off`, `1` or `check` gets one line and is taken as `1`,
+so a typo never turns it off unnoticed. Where the split cannot run (`--peer-device`, a helper cache,
+`STRATA_VERIFY_DEVICE_PLAN=1`, below) the default is off, with one line saying so: deferring every CPU row measured KL
+0.556 on one PC and 0.176 on two (the table's setups), and `=1` still asks for it, as does
+`STRATA_VERIFY_DEFER_CPU_BELOW` of 1 or more. HIP builds keep it opt-in (never built or measured on AMD). The
+trade-off, measured on the same prompts with the engine as it is otherwise (KL per position against the exact path on
+the first tokens of each answer; the tail-skip column is the default `STRATA_ROUTE_TAIL_SKIP=7` measured the same way,
+for scale):
+
+| setup | decode speed | KL, deferral | KL, tail skip |
+|---|---:|---:|---:|
+| 1 PC: RTX 3080, official IQ3_S, low context | +15.8% | 0.096 | 0.071 |
+| 2 PCs: RTX 3080 (layers 0-25) + RTX 2080 Ti (26-47), 10 GbE, `--pipeline-windows 2`, low context | +9.1% | 0.038 | 0.041 |
+
+It changes the answers (teacher-forced KL against `=0`: above). Windows that run without it (one start-up
 line says why): batch windows, `--spec-split` token groups, `--remote-expert-opt`, the all-resident graph (no CPU
 rows), a stage with no layer to defer, a control vector on the stage. Start-up lines when on:
-`STRATA_VERIFY_DEFER_CPU=1 (changes the output)`, then the split's (below)
+`STRATA_VERIFY_DEFER_CPU=1 (the Strata Link default; STRATA_VERIFY_DEFER_CPU=0 turns it off) (changes the output)`
+(without the default's part when it is set), then the split's (below)
 `STRATA_VERIFY_DEFER_CPU_BELOW=0.1 (the default): a deferred layer waits for its CPU rows of routing weight >= 0.1 ...`
 (without `(the default)` when it is set; `STRATA_VERIFY_DEFER_CPU_BELOW=<w>: every CPU row joins late` for `w` >= 1),
 and `capturing the N-token window (...), deferred`. With
@@ -1756,11 +1773,7 @@ and `capturing the N-token window (...), deferred`. With
 not been built or run there; SYCL and Metal do not have it.
 
 **`STRATA_VERIFY_DEFER_CPU=check`** runs the same steps but adds the rows back right after layer l's own combine: no
-deferral, the default's sums in another order, so its answers should differ from the default's only as two runs of the
-default do. It checks the late addition's copy and arithmetic, not the order of the wait in the next layer.
-
-<!-- TODO before the PR: decode speed (interleaved pairs, fresh engines, low and high context) and teacher-forced KL
-     against the default with the tail-skip section's protocol, each with the machine it was measured on. -->
+deferral, `=0`'s sums in another order, so its answers should differ from `=0`'s only as two runs of `=0` do. It checks the late addition's copy and arithmetic, not the order of the wait in the next layer.
 
 **`STRATA_VERIFY_DEFER_CPU_BELOW=<w>`** (read with `STRATA_VERIFY_DEFER_CPU=1` or `check`; **0.1 when unset**) defers
 only the CPU rows whose routing weight is below `w` and keeps the heavier ones on time. In a deferred layer the pool
@@ -1782,9 +1795,11 @@ with `STRATA_VERIFY_PROFILE` the wait for the heavy rows shows as `waitCPU` of t
 The split is turned off at start-up, with one line saying so (`STRATA_VERIFY_DEFER_CPU: the heavy rows (weight >=
 0.1, the default) are not kept on time with ...` when `w` was not set), and every CPU row joins late (as with
 `w` >= 1), when the verifier takes the device plan (`STRATA_VERIFY_DEVICE_PLAN=1`) and with `--peer-device` or a helper
-cache (`--expert-cache-device1..3`), whose rows land after the CPU's. The doorbell carries the routing weights in the windows
+cache (`--expert-cache-device1..3`), whose rows land after the CPU's. With `STRATA_VERIFY_DEFER_CPU` unset (the Strata
+Link default) the deferral is off there instead: `STRATA_VERIFY_DEFER_CPU: off with ... (the Strata Link default needs
+the heavy rows on time; =1 defers every CPU row)`. The doorbell carries the routing weights in the windows
 that defer (`doorbell_publish`, as `--remote-expert-opt` uses it), so those windows copy the layer's input to the host
-even when all its experts are in VRAM. Without `STRATA_VERIFY_DEFER_CPU`, nothing of it runs: no flag is allocated and
+even when all its experts are in VRAM. With `STRATA_VERIFY_DEFER_CPU=0`, nothing of it runs: no flag is allocated and
 no kernel or host step changes; a `STRATA_VERIFY_DEFER_CPU_BELOW` set then gets one line,
 `STRATA_VERIFY_DEFER_CPU_BELOW=<w> ignored (it needs STRATA_VERIFY_DEFER_CPU=1 or check)`.
 

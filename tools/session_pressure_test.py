@@ -27,7 +27,7 @@ for t, i in vocab.items():
 tok = ST.Tokenizer(toks, (tp / "merges.txt").read_text().split("\n"), json.loads((tp / "token_type.json").read_text()))
 args = cfg["args"] + os.environ.get("STRATA_EXTRA_ARGS", "").split()
 eng = StrataEngine(os.environ.get("STRATA_EXE", cfg["exe"]), args, cwd=cfg.get("cwd"),
-                   log=os.environ.get("SMOKE_LOG", cfg["log"]), env=child_env(cfg))
+                   log=os.environ.get("SMOKE_LOG", cfg["log"]), env={**child_env(cfg), 'STRATA_VERIFY_DEFER_CPU': '0'})   # exact (Strata Link defers by default)
 GEN = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 

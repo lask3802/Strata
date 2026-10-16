@@ -69,7 +69,7 @@ def main():
     D = chat(body + "\nWhat are the three most important ideas in the text above?")
     E = chat("Describe the life cycle of a star like the Sun.")
     print(f"prompts: A {len(A)}, B {len(B)}, C {len(C)} tokens", flush=True)
-    eng = Engine(a.exe, cfg, 3, {"STRATA_IQ_MT_MIN": "1"}, a.extra.split())
+    eng = Engine(a.exe, cfg, 3, {"STRATA_IQ_MT_MIN": "1", "STRATA_VERIFY_DEFER_CPU": "0"}, a.extra.split())
     eng.pending = []
     out = eng.lines()
     ids = lambda v: ",".join(map(str, v))

@@ -132,6 +132,7 @@ def main():
                   '<|im_start|>assistant\n<think>\n\n</think>\n\n')]
     a.output.mkdir(parents=False, exist_ok=False)
     env = child_env(cfg)
+    env['STRATA_VERIFY_DEFER_CPU'] = '0'   # the exact path (Strata Link defers by default)
     base_args = override(cfg['args'], parse_sets(a.set) + [('--adapt-swaps', '0'), ('--prompt-cache', '6')])
     results = {'prompt_tokens': len(A), 'args': base_args}
     sides = [('baseline', 0), ('candidate', a.cache_mib)]

@@ -670,12 +670,24 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 
     bool below_set = false;   // STRATA_VERIFY_DEFER_CPU_BELOW given (the start-up line says so)
     float below = 0.0f;       // the weight in use (>= 1: every CPU row deferred)
-    {   // STRATA_VERIFY_DEFER_CPU=1 or =check (opt-in): read before the allocations (one buffer more, see record_window)
+    bool by_default = false;  // STRATA_VERIFY_DEFER_CPU unset: on as Strata Link's default (the start-up line says so)
+    {   // STRATA_VERIFY_DEFER_CPU=1 or =check: read before the allocations (one buffer more, see record_window).
+        // Strata Link: unset is =1 (upstream: off); 0 or off is the exact path.  On AMD it stays opt-in (not measured).
         const char* v = std::getenv("STRATA_VERIFY_DEFER_CPU");
-        defer_check_ = v != nullptr && std::strcmp(v, "check") == 0;
-        defer_ = defer_check_ || (v != nullptr && std::strcmp(v, "1") == 0);
-        if (!defer_ && v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0)
-            std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_CPU=%s is not 1 or check: no deferral\n", v);
+        const bool v_set = v != nullptr && v[0] != '\0';
+        const bool off = v_set && (std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0);
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+        constexpr bool link_on = false;   // (an unknown value stays off too, as upstream)
+#else
+        constexpr bool link_on = true;
+#endif
+        by_default = link_on && !v_set;
+        const bool one = v_set && std::strcmp(v, "1") == 0;
+        defer_check_ = v_set && std::strcmp(v, "check") == 0;
+        defer_ = defer_check_ || one || by_default || (link_on && v_set && !off);
+        if (v_set && !off && !defer_check_ && !one)   // (a typo never turns it off)
+            std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_CPU=%s is not 0, off, 1 or check: %s\n", v,
+                         link_on ? "taken as 1" : "no deferral");
         // STRATA_VERIFY_DEFER_CPU_BELOW=<w>: only the CPU rows of routing weight below w are deferred, the others are
         // waited for in their own layer.  Unset: 0.1.  w >= 1: every CPU row deferred, no split (no partial flag).
         constexpr float kBelowDefault = 0.1f;
@@ -695,7 +707,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                                  "STRATA_VERIFY_DEFER_CPU=1 or check)\n", h);
         }
         if (defer_heavy_ > 0.0f && pool_gpu_helper() != nullptr) {   // its rows land after the CPU's: nothing to split
-            if (below_set)
+            if (by_default) {   // the default is the split; every row late measured KL 0.18-0.56: off, as upstream
+                std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_CPU: off with %s (the Strata Link default needs "
+                                     "the heavy rows on time; =1 defers every CPU row)\n", pool_gpu_helper());
+                defer_ = false;
+            } else if (below_set)
                 std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_CPU_BELOW is not taken with %s (its rows land "
                                      "after the CPU's): every CPU row joins late\n", pool_gpu_helper());
             else
@@ -928,15 +944,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
-    if (defer_check_)
-        std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_CPU=check (a check of the late addition): the CPU's expert "
-                             "rows of layer l are left out of its combine and added back right after it - no deferral\n");
-    else if (defer_)
-        std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_CPU=1 (changes the output): the CPU's expert rows of layer l "
-                             "join the residual before layer l+1's FFN-side read (its mixer runs without them; the "
-                             "stage's last layer exact)\n");
     if (defer_heavy_ > 0.0f && device_plan_) {
-        if (below_set)
+        if (by_default) {   // (as with a GPU helper above)
+            std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_CPU: off with STRATA_VERIFY_DEVICE_PLAN=1 (the Strata "
+                                 "Link default needs the heavy rows on time; =1 defers every CPU row)\n");
+            defer_ = false;
+        } else if (below_set)
             std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_CPU_BELOW is not taken with "
                                  "STRATA_VERIFY_DEVICE_PLAN=1: every CPU row joins late\n");
         else
@@ -949,6 +962,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         h_pflag_ = nullptr;
         m_pflag_ = nullptr;
     }
+    if (defer_check_)
+        std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_CPU=check (a check of the late addition): the CPU's expert "
+                             "rows of layer l are left out of its combine and added back right after it - no deferral\n");
+    else if (defer_)
+        std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_CPU=1%s (changes the output): the CPU's expert rows of "
+                             "layer l join the residual before layer l+1's FFN-side read (its mixer runs without them; "
+                             "the stage's last layer exact)\n",
+                     by_default ? " (the Strata Link default; STRATA_VERIFY_DEFER_CPU=0 turns it off)" : "");
     if (defer_heavy_ > 0.0f)
         std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_CPU_BELOW=%g%s: a deferred layer waits for its CPU rows "
                              "of routing weight >= %g (the pool computes them first) and combines them; the lighter "
@@ -1002,7 +1023,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
     if (!batch_rec_) groups_[T] = G;
-    // STRATA_VERIFY_DEFER_CPU=1 (opt-in, changes the output; defer_ok says which windows): post(l) of a deferred layer
+    // STRATA_VERIFY_DEFER_CPU=1 (Strata Link's default, changes the output; defer_ok says which windows): post(l) of a deferred layer
     // combines without the CPU's rows (shared expert, VRAM hits and the PCIe share only) and does not wait for them, and
     // pre(l+1) adds them to the residual before its FFN-side read: the CPU computes layer l while the GPU runs layer
     // l+1's mixer, which is the only part that runs without them.  The addition is the pending write's own
@@ -1021,8 +1042,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool heavy = dfr && defer_heavy_ > 0.0f;
     // STRATA_VERIFY_DEFER_CPU: layer dl's CPU rows, the copy post(dl) would have made, weighted as its combine weights them
     // and added to every stream as its pending write would have.  Where: pre(dl+1) before its FFN-side read (=1), or
-    // post(dl) itself after its combine (=check: the default path's sums in another order, so a run that differs from
-    // the default by more than its own run-to-run noise has a wrong copy or wrong arithmetic; it does not exercise the
+    // post(dl) itself after its combine (=check: the exact path's (=0) sums in another order, so a run that differs from
+    // =0 by more than its own run-to-run noise has a wrong copy or wrong arithmetic; it does not exercise the
     // host computing layer dl while the GPU runs layer dl+1)
     auto late_add = [&](int64_t dl, int grp) {
         const int tb = tb_[grp], n = te_[grp] - tb_[grp];

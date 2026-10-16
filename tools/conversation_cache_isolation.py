@@ -98,6 +98,7 @@ def main():
     fixtures(args.output, width)
     env = child_env(cfg)
     env['STRATA_STATE_HASH'] = '1'
+    env['STRATA_VERIFY_DEFER_CPU'] = '0'   # the exact path (Strata Link defers by default)
     results = {'engine_info': {}}
     for label, budget in [('baseline', 0), ('candidate', 8192)]:
         log = args.output / (label + '.log')

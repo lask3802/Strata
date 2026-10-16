@@ -37,7 +37,8 @@ SEGMENTS = ["code", "docs", "english", "multilingual", "agent"]
 TOPK = 64
 FIXED = ["--expert-cache", "1", "--adapt-every", "100000", "--pcie-frac", "0", "--suffix-draft", "0",
          "--prompt-cache", "0", "--kv", "fp16"]
-FIXED_ENV = {"STRATA_ROUTE_TAIL_SKIP": "0", "STRATA_PREFILL_CPU_SHARE": "0", "STRATA_PCIE_FRAC_DEFAULT": "old"}
+FIXED_ENV = {"STRATA_ROUTE_TAIL_SKIP": "0", "STRATA_PREFILL_CPU_SHARE": "0", "STRATA_PCIE_FRAC_DEFAULT": "old",
+             "STRATA_VERIFY_DEFER_CPU": "0"}   # (Strata Link defers by default)
 # config args the yardstick replaces (value-taking) or drops (flags)
 DROP_VALUE = {"--expert-cache", "--adapt-every", "--pcie-frac", "--suffix-draft", "--prompt-cache", "--max-context",
               "--prefill", "--prompt-cache-every", "--short-read", "--conversation-cache-mib", "--eos-ids",

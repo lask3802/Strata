@@ -540,11 +540,11 @@ private:
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
-    // STRATA_VERIFY_DEFER_CPU=1 (opt-in, changes the output): a decode window's layer l adds the CPU's expert rows to the
+    // STRATA_VERIFY_DEFER_CPU=1 (Strata Link's default, changes the output): a decode window's layer l adds the CPU's expert rows to the
     // residual before layer l+1's FFN-side read instead of waiting for them in its own combine (record_window)
     bool defer_ = false;
     bool defer_check_ = false;             ///< STRATA_VERIFY_DEFER_CPU=check: the same steps, the rows added back in layer l
-                                           ///< itself (no deferral: the default's sums in another order)
+                                           ///< itself (no deferral: =0's sums in another order)
     bool defer_said_ = false;              ///< the reason a window runs without deferral was printed
     float* def_parts_ = nullptr;           ///< device: a deferred layer's CPU rows (T * k * n_embd)
     // STRATA_VERIFY_DEFER_CPU_BELOW=<w> (with =1 or =check; 0.1 when unset, 0 when w >= 1): the pool computes the CPU

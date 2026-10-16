@@ -129,6 +129,7 @@ def main():
     env = child_env(cfg)
     env.pop('STRATA_SNAPSHOT_VERIFY', None)
     env['STRATA_STATE_HASH'] = '1'
+    env['STRATA_VERIFY_DEFER_CPU'] = '0'   # the exact path (Strata Link defers by default)
     env['STRATA_MTP_BATCH'] = '1'
     a.output.mkdir(mode=0o700, parents=False, exist_ok=False)
     results = {'config': cfg, 'paragraphs': a.paragraphs, 'spec': a.spec, 'arms': [], 'requests': [],

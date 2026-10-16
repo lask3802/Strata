@@ -92,7 +92,9 @@ def main():
             filler = "".join(para % i for i in range(a.long_tokens // per + 1))
             text = f"<|im_start|>user\n{filler}\n\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         prompts.append(tok.encode(text, parse_special=True))
-    env = {"STRATA_DECODE_TIMING": "1", **({"STRATA_VERIFY_PROFILE": "1"} if os.environ.get("PROF") else {})}
+    # STRATA_VERIFY_DEFER_CPU=0: the exact path (Strata Link defers by default; batch windows never do)
+    env = {"STRATA_DECODE_TIMING": "1", "STRATA_VERIFY_DEFER_CPU": "0",
+           **({"STRATA_VERIFY_PROFILE": "1"} if os.environ.get("PROF") else {})}
     if a.mt_min:
         env["STRATA_IQ_MT_MIN"] = a.mt_min
     eng = Engine(a.exe, cfg, a.batch, env, a.extra.split())
