@@ -532,6 +532,29 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 
 `main.json` is a server config with the token in its `"env"`; keep it private.
 
+### The Monitor's Workers card
+
+With a remote stage the web app's Monitor tab shows one row per worker (a relay's next worker after it): its layers,
+the link's state (Connected, Connecting, Reconnecting, Idle: the link closed with the engine kept, the next request
+connects again; Down), the links made again since the server started, and the round trip per verify window. These
+come from the main engine's log, so the run config needs `"log"`; the round trips also need
+`STRATA_REMOTE_TIMING=1` in its `"env"`.
+
+The worker's GPU, VRAM, expert cache, engine version and its own time per window come from that PC's node agent
+(`GET /info` and `GET /log`). The server asks the agents only when the run config says so, at most every 15 s and
+only while a Monitor tab is open:
+
+- `"stage_agents"` not set, or `false` (the default): no agent is asked.
+- `"stage_agents": true`: each worker's agent at the worker's host, port 7840, a relay's next worker's too. These
+  hosts already receive the stage token through the link.
+- `"stage_agents": {"192.0.2.11:7841": "http://192.0.2.21:7840"}`: the agents it names, and no other (a worker
+  that is not in it is shown without them). Use it when the agent listens on another address than the worker, for
+  example a second network card.
+
+The server sends the engine's `STRATA_STAGE_TOKEN` as `X-Stage-Token` straight to that URL: no proxy, and a redirect
+is not followed. The token never goes to the browser. The run config is read when the server starts: restart it
+after changing these settings.
+
 ## What is turned off or refused
 
 - **Refused at start** with a remote stage: `--batch`, `--peer-device`, `--control-vector` (and the speed

@@ -205,6 +205,8 @@ function render(m) {
 // after it). The link's state is the main process's; GPU, VRAM, cache, engine and own time come from each node agent.
 const WK_STATE = {connected: ["st-badge--generating", "Connected"], connecting: ["st-badge--queued", "Connecting"],
                   reconnecting: ["st-badge--queued", "Reconnecting"], down: ["st-badge--error", "Down"],
+                  idle: ["", "Idle", "The link closed with the engine kept: the next request connects again"],
+                  nolog: ["", "No engine log", "The run config has no \"log\": the link's state is read from the engine's log"],
                   unloaded: ["", "Unloaded"], unknown: ["", "Unknown"]};
 function clock(t) {
   if (!t) return "";
@@ -219,20 +221,21 @@ function renderWorkers(s) {
   const ms = (v) => (v == null ? "–" : `${fmt(v, 1)} ms`);
   const span = (l) => (l ? `${l[0]}–${l[1]}` : "–");
   $("wk-body").innerHTML = ws.map((w) => {
-    const [cls, text] = WK_STATE[w.state] || WK_STATE.unknown;
+    const [cls, text, tip] = WK_STATE[w.state] || WK_STATE.unknown;
+    const live = w.state === "connected";          // a link that is not up: its last times are not shown as current
     const g = w.gpu || {};
     const name = g.name || w.host || w.address;
     const where = name === w.address ? "" : [w.address, g.name && w.host ? w.host : ""].filter(Boolean).join(" · ");
     const vram = g.vram_mib ? `${gb(g.used_mib * 1048576)} / ${gb(g.vram_mib * 1048576, 0)} GB` : "–";
     const vpct = g.vram_mib ? Math.min(100, (100 * g.used_mib) / g.vram_mib) : 0;
-    const split = w.worker_ms != null && w.link_ms != null ? `<span class="muted small wk-sub" title="the worker + the link">${fmt(w.worker_ms, 1)} + ${fmt(w.link_ms, 1)}</span>` : "";
+    const split = live && w.worker_ms != null && w.link_ms != null ? `<span class="muted small wk-sub" title="the worker + the link">${fmt(w.worker_ms, 1)} + ${fmt(w.link_ms, 1)}</span>` : "";
     const row = `<tr${w.error ? ' class="wk-has-err"' : ""}>
       <td><span class="wk-name">${esc(name)}</span>${where ? `<span class="muted small wk-sub">${esc(where)}</span>` : ""}</td>
       <td>${span(w.layers)}${w.relay_to ? `<span class="muted small wk-sub" title="relays to the next worker">→ ${esc(w.relay_to)}</span>` : ""}</td>
-      <td><span class="st-badge ${cls}">${text}</span>${w.since ? `<span class="muted small wk-sub" title="${esc(text)} since ${esc(new Date(w.since * 1000).toLocaleString())}">${esc(clock(w.since))}</span>` : ""}</td>
+      <td><span class="st-badge ${cls}"${tip ? ` title="${esc(tip)}"` : ""}>${text}</span>${w.since ? `<span class="muted small wk-sub" title="${esc(text)} since ${esc(new Date(w.since * 1000).toLocaleString())}">${esc(clock(w.since))}</span>` : ""}</td>
       <td class="num">${fmt(w.reconnects)}</td>
-      <td class="num">${ms(w.round_trip_ms)}${split}</td>
-      <td class="num">${ms(w.own_ms)}</td>
+      <td class="num">${ms(live ? w.round_trip_ms : null)}${split}</td>
+      <td class="num">${ms(live ? w.own_ms : null)}</td>
       <td>${vram}${g.vram_mib ? `<div class="st-progress"${vpct > 95 ? ' data-tone="danger"' : ""}><div class="st-progress__bar" style="width:${vpct}%"></div></div>` : ""}</td>
       <td class="num">${fmt(w.cache_slots)}${w.cache_gib ? `<span class="muted small wk-sub">${fmt(w.cache_gib, 1)} GB</span>` : ""}</td>
       <td>${w.version ? `v${esc(w.version)}` : "–"}</td></tr>`;
@@ -244,9 +247,17 @@ function renderWorkers(s) {
   const notes = s.agents ? ws.filter((w) => w.agent && w.agent.ok === false).map((w) =>
     `No node agent answered at ${w.agent.url} (${w.agent.error}): the GPU, VRAM, cache, engine and own-layer columns come from it ("stage_agents" in the run config can name another address; the server reads it when it starts).`)
     : ["The GPU, VRAM, cache, engine and own-layer columns come from each worker PC's node agent (tools/stage_node.py): add \"stage_agents\": true to the run config and start the server again to ask them."];
-  if (ws.length && ws[0].state === "connected" && ws[0].round_trip_ms == null)
-    notes.push("Round trips show after 64 decode windows with STRATA_REMOTE_TIMING=1 in the run config's env.");
   $("wk-note").textContent = notes.join(" ");
+  // what the main engine's settings leave out, once for the card
+  const up = ws.some((w) => w.state === "connected");
+  const hints = [];
+  if (ws.length && ws[0].state === "nolog")
+    hints.push("Add \"log\" to the run config to see the link's state (the server reads it when it starts).");
+  if (!ws.some((w) => w.round_trip_ms != null))
+    hints.push(!s.timing ? "Round trips need STRATA_REMOTE_TIMING=1 in the main engine's environment (the run config's \"env\"; the server reads it when it starts)."
+      : up ? "Round trips show after 64 decode windows." : "");
+  if (up && !s.rows) hints.push("This engine's log does not name the hand-off rows' format (an earlier build).");
+  $("wk-hint").textContent = hints.filter(Boolean).join(" ");
 }
 
 // #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole

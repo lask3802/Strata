@@ -777,7 +777,7 @@ class StrataEngine:
     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
-    stage_err = None                     # a remote stage's last `ERR remote stage...` and when (the Workers card)
+    stage_err = None                     # a remote stage's last `ERR remote stage...`, when, the log's size then (Workers card)
     stage_wait_at = None                 # when it last said a request waits for its worker (INFO remote_stage_wait=)
     ready_at = None                      # when the engine said READY (a remote stage's link is made just before)
     first_log_start = None               # where this server's first engine start began in the log (the Workers card)
@@ -1010,8 +1010,12 @@ class StrataEngine:
                 except (IndexError, ValueError):
                     pass
             if line.startswith(("ERR remote stage", "INFO remote_stage_wait=")) and self.proc is proc:
-                if line[0] == "E":                      # the Workers card says it (the request reads it as well)
-                    self.stage_err = (line[4:].strip(), time.time())
+                if line[0] == "E":                      # the Workers card says it (the request reads it as well),
+                    try:                                # after the log's lines so far (its order among them)
+                        pos = os.path.getsize(self.log_path) if self.log_path else None
+                    except OSError:
+                        pos = None
+                    self.stage_err = (line[4:].strip(), time.time(), pos)
                 else:                                   # a request waits for the worker (every 10 s meanwhile)
                     self.stage_wait_at = time.time()
             lines.put(line)
@@ -5572,7 +5576,8 @@ def make_handler(svc: Service):
                 if self._authorized():
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
                     q = urlsplit(self.path).query
-                    self._json(200, svc.metrics(all_requests="requests=all" in q, workers="workers=1" in q))
+                    self._json(200, svc.metrics(all_requests="requests=all" in q,
+                                                workers="1" in parse_qs(q).get("workers", [])))
                 return
             if path == "/api/requests" and svc.api_monitor:
                 if self._authorized():
