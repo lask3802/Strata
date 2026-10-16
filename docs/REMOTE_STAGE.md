@@ -211,6 +211,8 @@ K (`--layer-split K` on the main PC, `--stage-begin K` on the worker). The worke
 `--spec` must be at least the main process's. Everything else is each PC's own choice: `--expert-cache`,
 `--kv-resident`, `--vram-reserve-mib`, the CPU threads. A worker takes no `--mtp`: the draft layer runs in the main
 process, with the head (a worker started with it stops and says so).
+The K/V check covers `--kv` only, not `STRATA_KV_ROT`: no K/V bytes cross the link (the messages carry tokens, the
+hand-off rows, image positions and checkpoint ids; each side keeps its own layers' K/V and checkpoint parts).
 
 `STRATA_ROUTE_TAIL_SKIP` changes answers and its default differs by build and by card: 7 on CUDA serve since 0.1.42,
 and since 0.1.43 also on RDNA 4 (HIP), but off when 90% or more of the experts are in the GPU cache (60% on a HIP
