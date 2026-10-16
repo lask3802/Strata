@@ -57,9 +57,9 @@ Out (forced off or refused in remote mode, each with a stderr line):
 - Mid-prompt checkpoints (`--prompt-cache-every`, `--prompt-cache-tail`): forced 0 / off. They would need a one-way
   "save after this chunk" flag in Prefill and the main's part saved in `on_stage_chunk` (the main's `on_chunk` runs
   on the remote receive thread, past `done`). A later step if prompts that diverge mid-way matter.
-- Parking (`--conversation-cache-mib`): with checkpoints on, ignored (forced 0, stderr line) instead of refused by
-  the one-GPU split check, so a config with both still starts; without `--prompt-cache` it is refused there as
-  before. A later step: the worker would keep its K/V images under a park id.
+- Parking (`--conversation-cache-mib`): ignored on a remote main (forced 0, stderr line), with or without
+  checkpoints, as #1748 does, so a config with both still starts. A later step: the worker would keep its K/V images
+  under a park id.
 - Session files: refused with a remote stage (the existing guard checks `stages`/`multi_gpu`, which a remote main has
   neither of).
 
@@ -85,7 +85,9 @@ Retention is decided by the main alone; the worker never evicts on its own:
 - The worker prunes to `keep[]` only when the operation succeeds. CkptSave that cannot store (the 64-entry limit after
   pruning, or the host allocation failing) replies `CkptSaveOk a=0` and leaves the store as it was; the main then
   creates no checkpoint and evicts nothing (the chain is as before the cut). The request goes on.
-- The worker clears its store on disconnect (a new main is a new id space).
+- The worker clears its store on disconnect (a new main is a new id space). So after the main process connects again
+  (a worker restarted, a take-over; ENGINEERING.md, "Recovery") the worker holds no part and no session: see
+  [After a reconnect](#after-a-reconnect).
 - Ids the main dropped without a message (the non-prefix erase at request start, a from_live request) stay on the
   worker until the next Reset / CkptSave / CkptRestore prunes them: at most one chain's worth.
 
@@ -93,9 +95,10 @@ Failure classes (not every save failure can be skipped):
 
 - Not stored (admission): skip the checkpoint, go on.
 - State or transport: a position mismatch, a pending deferred Commit error, a CUDA / copy failure, a relay's
-  downstream error, a broken link. The worker's session can no longer be trusted, so the main prints `ERR` and the
-  engine exits, as it does for a failed Reset; the server starts it again, the worker sees a disconnect and clears
-  its store, and the next request reads from 0.
+  downstream error, a link broken in the middle of a request. The worker's session can no longer be trusted, so the
+  main prints `ERR` and the engine exits, as it does for a failed Reset; the server starts it again, the worker sees
+  a disconnect and clears its store, and the next request reads from 0. A link lost at a request's start (its
+  CkptRestore included) is made again instead: [After a reconnect](#after-a-reconnect).
 - CkptRestore of an id the worker does not have (should not happen; a store bug or a restarted relay): the main falls
   back to reading from 0 within the same request (below). A missing id is the only non-fatal restore error; the
   worker distinguishes it from state errors in the Error text (a fixed prefix).
@@ -129,15 +132,17 @@ Main side:
 - Ordering: CkptSave follows the part's last window on the same ordered connection. The worker gets one window at a
   time: each Run waits for the worker's reply, and the window's one-way Commit goes out before the next message, so
   the worker has run that Commit when it reads the CkptSave, and a Commit that failed comes back as the CkptSave's
-  error. With `--pipeline-windows` a Run waits on a job thread, so every link message from the request's own thread
-  (CkptSave, CkptRestore, Reset) comes after a `pl_drain`, which ends with no Run in flight (one that stops at an
+  error. With `--pipeline-windows` a Run waits on a job thread, so every use of the link from the request's own
+  thread (CkptSave, CkptRestore, Reset, Positions, the `alive()` look at a request's start) comes after a
+  `pl_drain`, which ends with no Run in flight (one that stops at an
   error first waits for a window still waiting on the worker, and gives it up without its Commit); that error is set
   aside (`pl_drain_err`): no CkptSave over it, and no live continuation after a decode it ended, so the worker's
   session is next replaced by a Reset or a CkptRestore.
 - Request start, checkpoint path: after the main's restore, `CkptRestore(c.remote_id, resume, keep)`. On the
   missing-id Error: one shared helper zeroes the main's session, sends Reset (keep = {}), and sets `resume = 0`,
   `from_live = false`, `reread_to = -1`, `checks.clear()`; everything after (MTP `kv_restore`, `read_from`,
-  `limit_reuse`, the cuts) is computed later from `resume`, so the request then reads from 0. Any other error: fatal.
+  `limit_reuse`, the cuts) is computed later from `resume`, so the request then reads from 0. A lost link is made
+  again ([After a reconnect](#after-a-reconnect)); any other error: fatal.
 - STRATA_CKPT_REREAD in remote mode zeroes and Resets the worker too (keep = the chain), so the comparison holds.
 - `resume == 0`: Reset with keep = the surviving checkpoints' ids (normally empty).
 - After non-finite logits (#879, docs/DETAILS.md) the next request drops every checkpoint first, so its Reset
@@ -148,6 +153,38 @@ worker's copy (~55 MB for ~17 GDN layers). The prompt is read in parts at the cu
 
 Memory: the worker holds up to prompt_cache + 1 parts in RAM plus at most one stale chain (~55 MB each for layers
 26-47 of a 48-layer model). The RAM check at hello (As built) counts the prompt_cache + 1 parts, not the stale chain.
+
+### After a reconnect
+
+A main process connects again when a request's start finds the link lost (ENGINEERING.md, "Recovery"). The worker it
+reaches then is a new process, or the same one on a new connection: its session is zeroed and its store is empty. A
+request that continued the live session or mounted a checkpoint there would run the worker's layers from `resume` on
+an empty session, so:
+
+- At each request's start, before its positions are sent and before it decides where to resume, the main process
+  checks the link with nothing sent (`StageClient::alive`: a poll of 0 ms, then a 1-byte peek). The worker sends
+  nothing unasked, so a socket with something to read means the worker's end closed or failed, or the link is out of
+  step; the link is then made again. Without this check a request that continues the live session, which sends
+  nothing before its first window, found the loss only there: the engine ended, the server started it again (the
+  model loaded anew, the conversation cache lost) and the client got a 503.
+- Whenever the link is made again in a request (that check, its positions, its Reset, its CkptRestore), the main
+  process drops its live session and every checkpoint (on a remote main each has a part on the worker), and the next
+  request that runs - normally this one; one that first ends with an error, such as a picture that cannot be read,
+  leaves it to the next - reads its prompt from token 0 with a Reset that keeps nothing. After the line that says the
+  link was made again, one more says so when there was something to drop (`the worker holds no session or checkpoint
+  after connecting again: ...`; on a CkptRestore, `the worker holds no checkpoint after connecting again: ...`); a
+  link made again at the Reset of a request that read from token 0 anyway has only the first.
+- A CkptRestore that finds the link lost makes it again and falls back as for a missing id. If connecting again
+  fails, or the worker reports an error of its own, the `ERR` line starts with that error (`remote stage: ...`,
+  `remote stage (worker): ...`), so the server answers 503, not 400.
+- A CkptSave that finds the link lost, or that the worker fails, is in the middle of a request (after the part's
+  windows): the engine ends as for a lost window, the `ERR` line again starting with the link's or the worker's error.
+- What the check cannot see: a worker PC that vanished without closing (power, cable) looks alive until TCP
+  keepalive notices it (about a minute); a request in that time finds the loss at its first message, as before. A
+  loss between the check and the request's first window is found at that window, and the engine ends. With a
+  relay, the check sees only the main process's own link: a next worker that restarted while the main process was
+  idle is found by the relay at the request's first message to it, an error that ends the engine (read from the
+  code; relays were not run).
 
 ## Checks
 
@@ -169,6 +206,9 @@ Memory: the worker holds up to prompt_cache + 1 parts in RAM plus at most one st
 - Fallback: a worker debug env (STRATA_REMOTE_CKPT_DROP=1: empty the store before a restore) -> the request reads
   from 0 and finishes.
 - Speed: the replay at the served flags; per-turn time to the first token against one GPU.
+- After a reconnect (not run on GPUs yet): the worker restarted, or taken over by another main process, between
+  two turns of a chat; the next turn must read from token 0 (the log lines above) and answer as a run without
+  `--prompt-cache` does.
 - Builds: CUDA Linux, MSVC (the Windows worker), HIP; SYCL untouched (it has no remote stage).
 
 ## As built
@@ -218,9 +258,11 @@ Memory: the worker holds up to prompt_cache + 1 parts in RAM plus at most one st
 - Unit checks: `stage_ckpt_store_test`, `stage_link_test` (loopback: the hello refusals, the messages' fields and
   keep[], positions, a=0, missing vs other restore errors and a relay's forwarded missing id, a failed Commit
   reported on CkptSave and dropped by CkptRestore, the position after a reset and a restore, a too long keep[], the
-  store cleared on disconnect, a failed image position table reported on a CkptRestore and a CkptSave; its
-  handlers are the test's own: the worker's real ones in `generate.cpp` run only in the GPU checks) and the
-  explicit-length cases in `conversation_transfer_test`.
+  store cleared on disconnect, a failed image position table reported on a CkptRestore and a CkptSave,
+  `StageClient::alive` on an idle link, after a take-over, after the worker stopped and after bytes no message asked
+  for, none of its checks over 100 ms; its handlers are the test's own: the worker's real ones in `generate.cpp` run
+  only in the GPU checks) and the explicit-length cases in `conversation_transfer_test`. What `generate.cpp` does
+  after a reconnect (the dropped session and checkpoints, the read from 0) has no unit test: read from the code.
 
 ## GPU results
 
@@ -228,7 +270,8 @@ Memory: the worker holds up to prompt_cache + 1 parts in RAM plus at most one st
 drafter; `--prefill 5888`) and an RTX 2080 Ti worker (layers 26-47) over 10 GbE, RVN IQ3_S, `--max-context 131072`.
 The build measured is this branch plus one commit proposed on its own, a guard that checks each window's logits for
 NaN or infinity (#879) and changes nothing while they are finite; the base build is #1748 as it was then, on both
-PCs. The checks after the rebase onto 0.1.42 follow [below](#after-the-rebase-onto-0142-2026-10-11). The replay: two chats
+PCs. The checks after the rebases onto 0.1.42 and 0.1.43 follow below
+([0.1.42](#after-the-rebase-onto-0142-2026-10-11), [0.1.43](#after-the-rebase-onto-0143-2026-10-12)). The replay: two chats
 of four turns on one shared system prompt of about 16,000 tokens, each turn sent with the earlier ones and their
 answers as a chat client does, greedy. "Exact flags": `--pcie-frac 0 --adapt-every 0 --adapt-swaps 0` on both PCs,
 `--mtp-max-t 1 --suffix-draft 0` on the main, `STRATA_IQ_MT_MIN=1 STRATA_PREFILL_CPU_SHARE=0` on both.
@@ -288,7 +331,61 @@ compile; `stage_link_test`, `stage_ckpt_store_test`, `conv_cache_test`, `convers
 `draft_kv_plan_test` pass), HIP (ROCm 7.0, gfx1100) and the SYCL port (oneAPI 2026.1.1; no remote stage there), both
 compile only.
 
+### After the rebase onto 0.1.43 (2026-10-12)
+
+#1748 was rebased onto upstream main 7695859a (engine 0.1.43) and gained images: the main process sends the worker
+its M-RoPE position table (protocol 5). This branch went on top without a textual conflict and is now protocol 6.
+A failed position table outlives a CkptRestore as it outlives a Reset, because it belongs to the request being
+started.
+
+The setup was the same pair, the same replay and the same flags as before. This branch's build ran against #1748's
+build on 0.1.43:
+
+| Check | Result |
+|---|---|
+| Default path on the split (no `--prompt-cache`, exact flags) | one run of each build: 8 of 8 answers byte-identical to #1748's build |
+| Repeated turns | 8 of 8 repeats byte-identical; 15 restores on both sides, 0 errors |
+| Repeated turns, thinking on | 8 of 8; 15 restores |
+| Cancellation | 8 of 8, and all 8 answers equal the run without cancels; 23 restores |
+| Fallback (`STRATA_REMOTE_CKPT_DROP=1`) | the one restore missed; that request read its prompt from 0 and finished; 0 errors |
+| Pictures (`--vision` on both PCs): two-turn picture chats, the second turn sent twice | the second turn resumed through a checkpoint or continued the live session (2 restores, 2 live continuations); the re-sent turn byte-identical; all 6 answers equal those of a run without `--prompt-cache` |
+| Live continuation, adaptive tier on, 15 minutes | 165 requests, 158 continued the live session, 97 of them read 1,000 new tokens or more: 0 replies of `!` |
+
+In these runs the worker's adaptive overlap was on (#1748's build then followed upstream's default on the worker
+too). A worker now runs without it unless `STRATA_ADAPT_OVERLAP=1`: the worker's path of the 0.1.42 runs above,
+where the same live-continuation check gave 161 requests and 0 replies of `!`.
+
+Time to the first token at the served flags, thinking on, 400 tokens:
+- **Without checkpoints (#1748's build):** 14.19-15.06 s on every turn (mean 14.62).
+- **With checkpoints, the first turn:** 14.50 s.
+- **With checkpoints, the 7 later turns:** 0.32-0.44 s (mean 0.37), with 7 restores on both sides.
+
+Decode averaged 63.5 tok/s with checkpoints and 61.1 without. The answers differ, so these two are not like for like.
+
+Builds:
+- **CUDA 13.0 on Linux** (GCC 13, sm_75 + sm_86): `stage_link_test`, `stage_ckpt_store_test`, `conv_cache_test`,
+  `conversation_cache_test`, `conversation_validation_test` and `conversation_transfer_test` pass.
+- **MSVC 2022 + CUDA 13.0:** the touched files compile; `stage_link_test`, `stage_ckpt_store_test`,
+  `conv_cache_test`, `conversation_cache_test`, `conversation_validation_test` and `draft_kv_plan_test` pass
+  (`conversation_transfer_test` is built on Linux only).
+- **HIP** (ROCm 7.0, gfx1100) and **the SYCL port** (oneAPI 2026.1.1; no remote stage there), in containers: both
+  compile.
+
 The feature was first validated on a build with the remote decode pipelined (`--pipeline-windows 2` on a remote main,
 on an earlier base), on an RTX 3080 main + an RTX 2080 Ti worker over 10 GbE: the answers after a
 restore matched the request that saved the checkpoint byte for byte, the default path matched its base build, and a
 forced restore miss read from 0 and finished. Those numbers belong to that build and are not repeated here.
+On this branch with `--pipeline-windows 2`, the same PCs and model, exact flags, `--expert-cache 1951` and
+`STRATA_ROUTE_TAIL_SKIP=0` on the main process:
+
+| Check | Result |
+|---|---|
+| Repeated turns (every request sent twice) | 8 of 8 repeats byte-identical; 15 restores on both sides, 0 errors |
+| Repeated turns, thinking on (300 tokens) | 8 of 8; 15 restores |
+| Cancellation | 8 of 8, and all 8 answers equal the run without cancels; 23 restores |
+| Fallback (`STRATA_REMOTE_CKPT_DROP=1`) | 2 restores missed in 16 requests (two passes over the 8 turns, one miss in each: the second chat's first request); those requests read their prompt from 0 and finished; 0 errors |
+| Default path (no `--prompt-cache`), the first replay on fresh servers, against the first `--pipeline-windows 0` server of the branch this one is built on | `0`: 4, 8 and 8 of 8; `2`: 8 and 7 of 8 |
+
+The runs at 4 and 7 of 8 took another word partway into an answer. In the same session, #1887's head (no
+`--pipeline-windows` on a remote main) gave 5 and 5 of 8 against the same run, and 2 of 8 against each other, so a
+single fresh server does not settle the default path here; three of this branch's five matched it.

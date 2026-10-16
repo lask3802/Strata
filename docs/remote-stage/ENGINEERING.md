@@ -2,7 +2,7 @@
 
 How the layer split across PCs works inside, how it got to its present speed, every number measured on it, and what
 is still open. Using it: [../REMOTE_STAGE.md](../REMOTE_STAGE.md). Raw numbers:
-[bench/results/2026-10-10-remote-stage](../../bench/results/2026-10-10-remote-stage/README.md). Code:
+[lask3802/Strata, branch remote-stage-data](https://github.com/lask3802/Strata/blob/remote-stage-data/bench/results/2026-10-10-remote-stage/README.md). Code:
 `include/strata/net/stage_link.hpp` (the protocol), `src/net/stage_link.cpp` (the sockets, POSIX and Winsock), the
 `remote_main` / `stage_worker` / `stage_relay` parts of `src/program/generate.cpp`, `Verifier::set_remote` /
 `set_no_head` (`src/core/verify.cpp`), `Prefill::remote_send` / `remote_recv` (`src/prefill/prefill.cpp`),
@@ -57,16 +57,80 @@ process checks the worker's hello for it too. The hello is 192 bytes in
 every protocol, so an older peer is refused for its protocol number. A peer that sends no hello within 10 s is dropped; after
 the hello the worker waits for messages without a time limit (the next prompt may be hours away), while sends and the
 main process's receives time out after `STRATA_REMOTE_TIMEOUT_S` (300 s). Sockets: `TCP_NODELAY`, 8 MiB buffers,
-keepalive after 30 s idle, 3 probes 10 s apart. The engine's stall watchdog (issue #29, `STRATA_WATCHDOG_S`) watches
-each message a worker serves (a window, a prompt chunk, a commit, a reset, a position table) and is idle between
-them, so a worker stuck on its GPU ends with its stall report instead of holding every later main process at the
-hello. A relay's waits for its next worker (a connect, its taking a prompt chunk, a window's or a reset's reply) get an allowance of
-`STRATA_REMOTE_TIMEOUT_S` + 150 s instead: the link's timeouts end them, and a stuck next worker ends alone, with its
+keepalive after 30 s idle, 3 probes 10 s apart.
+
+**Recovery.** The worker serves one connection at a time. A new one stays in the listen backlog, unread, until the
+served one has had no message read, being read, or a reply going out for `STRATA_REMOTE_TAKEOVER_S` (30 s; 0:
+never) - the time counts from the last of those, so a relay's reply that waited long on its next worker starts it
+anew - and only then does the worker watch the listen socket, accept the new one and read its hello on a thread
+of its own (a shorter pause is no sign the main process went away: inside one request it can leave the worker
+waiting while it runs its own layers of a prompt chunk). A hello it accepts (the token,
+the hello's checks against the hello it gave the served main process, the worker's own checks) takes the worker over:
+the old connection ends as a closed one does (`disconnected`: the positions back to the identity, a relay's next link
+closed), and the new one is served; the log says how long the old one had been silent. A refused hello leaves the
+old connection alone; when the old connection closes, the new one is accepted at once as before. When the served
+one sends again before the new one's hello is decided, the new one is closed without an error message (one line on
+the worker's stderr, `connected while ... was served`): its main process sees the connection closed, a lost link,
+and connects again every 2 s within `STRATA_REMOTE_CONNECT_S`, so a stale hello never takes over later. So a main
+process that started again after its PC lost power, while its old connection still looks open on the worker, is
+served within `STRATA_REMOTE_TAKEOVER_S`, and two live main processes pointed at one worker take turns (each takes it
+over after the other's 30 s without a message; every request then starts by connecting again). After its
+hello the receiving thread polls for the next message (250 ms) instead of blocking in `recv`: on Windows a socket's
+`shutdown` does not wake a `recv` blocked on it, and a connection taken over is still open (the wait ended only when
+Windows dropped the half-closed connection, 120 s later). A new connection's hello is read the same way, every read
+polled (50 ms) within 10 s in all: with a blocking read, closing a silent one held the served main process's next
+message for more than 1 s in `stage_link_test` on Windows (by the code, until the hello's 10 s read timeout, and a
+peer sending a byte at a time could hold it longer). The main process
+connects at its start, and again when a
+request's start finds the link lost (closed, reset, timed out, a send or receive failed, the name did
+not resolve: `stage_link_lost`), with the same hello: its check with nothing sent (`StageClient::alive`, a 0 ms poll
+and a 1-byte peek: the worker sends nothing unasked, so anything to read means its end closed, failed or is out of
+step), its positions, its reset or its checkpoint restore. Nothing else is per connection on either side (the reset
+zeroes the worker's session, the hello carries the tail-skip rank, `--vision` and the chunk) but the worker's
+conversation checkpoint parts, which go with the old connection: the main process then drops its live session and
+checkpoints and reads the prompt from token 0 ([CHECKPOINTS.md](CHECKPOINTS.md#after-a-reconnect)). The request's
+positions are sent again.
+While the name does not resolve, nothing listens or the network does not reach the worker, it tries every 2 s for
+`STRATA_REMOTE_CONNECT_S` (180 s), each try with its own watchdog allowance; a refusal is not tried again. That is
+the whole wait: each try's connect and its hello's reply are polled against what is left of it (a hello waiting in a
+worker's backlog for its reply used to add up to `STRATA_REMOTE_TIMEOUT_S`), and within a request a STOP ends it
+([The recovery's open points](#the-recoverys-open-points-2026-10-13)). Within a request a helper thread prints `INFO remote_stage_wait=S` (the
+seconds so far) on stdout every 10 s for the whole wait, including a try that blocks, and is joined before the
+connect returns: the server's frozen-engine check (`ENGINE_STALL_S`, 90 s without a line, CPU or I/O) would end the
+engine first, and the request would get "frozen" instead of the link's error. Not at the engine's start: the server
+then waits for READY and reads INFO lines as settings. A worker
+down for longer is still found: the engine ends with the error, and the server's next request starts it again,
+which tries anew. A link lost in the middle of a request still ends the main engine; the server answers an
+`ERR remote stage: ...`, and the worker's own `ERR remote stage (worker): ...`, with 503 `server_error` and
+`Retry-After: 30` (`RemoteStageLost` in `serve/server.py`; an error event once a stream has started), not a 400. A
+Commit's error that the next Reset drops is written on the worker's stderr first. `stage_link_test` covers the
+take-over over loopback with `STRATA_REMOTE_TAKEOVER_S=1` (a second main not served while the first sends a message
+every 0.5 s, served once the first is silent past 1 s, served at once when the first closes; a wrong token or
+another model refused while the old one stays; a peer accepted while the first was idle with 8 bytes of its hello
+sent, closed as soon as the first sends again, the first answered at once, and the rest of that hello sent then not
+taking over at the first's next idle second; a chunk's reply held 1.5 s by a relay's handler, then
+0.4 s until the first's next message: not taken over), with `STRATA_REMOTE_TAKEOVER_S=0` (a second main not served
+while the first is silent for 2.5 s), which errors count as a lost link, and `alive` (true on an idle link; false,
+as lost, after a take-over, after the worker stopped and after bytes no message asked for; no check over 100 ms).
+The main process's reconnect, its `INFO remote_stage_wait` lines and the agent's restarts were run on GPUs later, by
+injecting faults ([The recovery's open points](#the-recoverys-open-points-2026-10-13)). The node agent
+(`tools/stage_node.py`) starts a
+worker that ended by itself again (5 s, doubling to 300 s; node.json `"restart": false` turns it off), keeping the
+log of its last run that listened as `stage-worker-PORT.prev.log` (a restart that fails before it listens
+overwrites only the current log); a refused `/start` leaves its port's worker and supervision as they were.
+
+The engine's stall watchdog (issue #29, `STRATA_WATCHDOG_S`) watches
+each message a worker serves (a window, a prompt chunk, a commit, a reset, a position table, a checkpoint save or
+restore) and is idle between them, so a worker stuck on its GPU ends with its stall report instead of holding every
+later main process at the hello. A relay's waits for its next worker (a connect, its taking a prompt chunk, a window's,
+a reset's or a checkpoint's reply) get an allowance of `STRATA_REMOTE_TIMEOUT_S` + 150 s instead: the link's timeouts
+end them, and a stuck next worker ends alone, with its
 own report. `STRATA_REMOTE_STALL_AT=N` (a test hook) blocks the worker's Nth window. Checked on CUDA (the 3080 + 2080 Ti
 pair, `STRATA_REMOTE_STALL_AT=60 STRATA_WATCHDOG_S=20` on the worker): the worker wrote its stall report 20 s into the
 blocked window and exited; the request in flight failed 25-26 s after it was sent (`remote stage: the peer closed the
 connection`), and the next request failed after 66-68 s (two runs), when the server's three starts had each ended with
-`cannot connect to HOST:PORT: Connection refused`, since nothing starts a worker again.
+`cannot connect to HOST:PORT: Connection refused`, since nothing started a worker again then (its agent does now:
+"Recovery" above; run on GPUs after a `kill -9`, not after a stall report).
 
 **Bytes, Qwen3.8-Flash-Next** (n_embd 2560, 4 hyper-connection streams, everything fp32):
 
@@ -106,7 +170,9 @@ connection`), and the next request failed after 66-68 s (two runs), when the ser
 
 Decode is sequential: a window's time is the main process's layers, head and drafter, plus every worker's layers,
 plus every hop's round trip. More PCs add VRAM for the expert cache and RAM pools; they do not run at the same time on
-one conversation. Prompt chunks do overlap across stages, so the prompt rate is set by the slowest stage.
+one conversation. Prompt chunks do overlap across stages, so the prompt rate is set by the slowest stage. (Opt-in,
+`--pipeline-windows 2` on the main process lets its layers run the next window, on a guess, while the worker and the
+head run this one: [REMOTE_STAGE.md](../REMOTE_STAGE.md#overlapping-the-decode-windows---pipeline-windows-2).)
 
 ### More than two stages (relay workers)
 
@@ -140,7 +206,7 @@ sends nothing for text, so a worker puts a picture's table back to the identity 
 relay forwards the table to the next worker first, making its link to the next worker if a new main process's hello
 dropped it, and a relay started with `--vision` checks at its start that the next worker has it too. Positions is one
 way, like a commit, and its failure (or a malformed table) comes back as the next reply's error. A Reset drops a
-pending commit error (it belongs to the request before), but not a Positions error, because the positions belong to
+pending commit error (it belongs to the request before; the worker writes it on its stderr), but not a Positions error, because the positions belong to
 the request the Reset begins, which must not run on the old table. A later table replaces an earlier one's failure:
 the main process sent no Reset for a request it then refused (a prompt longer than the context, say).
 `STRATA_STAGE_POSITIONS=0` on the main process (a test switch) sends no table, to show what the positions change.
@@ -232,7 +298,7 @@ What went wrong on the way, and why:
   11-26 ms for 8 layers where the 2080 Ti waited 4.6-5.9 ms; sampling its P-state showed why (below). Locking its
   clocks brought it to 3.7-4.1 ms.
 - **The relay's link.** On 1 GbE the middle PC carried every prompt chunk in and out, each way: its link ran at line
-  rate for one long prompt: 2.6 GB each way in the ~38 s it crossed, at up to 123 MB/s ([data/nic-pc-b-1gbe-3pc.txt](../../bench/results/2026-10-10-remote-stage/data/nic-pc-b-1gbe-3pc.txt)). 10 GbE between PCs A and B took most of it away (100K prompt:
+  rate for one long prompt: 2.6 GB each way in the ~38 s it crossed, at up to 123 MB/s ([data/nic-pc-b-1gbe-3pc.txt](https://github.com/lask3802/Strata/blob/remote-stage-data/bench/results/2026-10-10-remote-stage/data/nic-pc-b-1gbe-3pc.txt)). 10 GbE between PCs A and B took most of it away (100K prompt:
   1,248 -> 1,576 tok/s).
 - **Shipping into WSL2 and Windows.** Writing 16.6 GiB into WSL2 left 17.9 GB of page cache in the VM, which Windows
   did not get back; the agent now syncs and drops what it wrote and what a worker read. On Windows the shipped files
@@ -299,7 +365,7 @@ From the timing lines (each stage's own time for a full chunk, divided by its la
 | 5888 | 106 | 18 us | 130-134 | 22-23 us | tuner, K=26 and K=27 |
 | 8192 | 125 | 15 us | 160 | 20 us | tuner, K=28 with the reserve |
 
-The tuner rows divide each stage's chunk time in [the first tuner run's report](../../bench/results/2026-10-10-remote-stage/data/tuner-rvn-2pc-report.md)
+The tuner rows divide each stage's chunk time in [the first tuner run's report](https://github.com/lask3802/Strata/blob/remote-stage-data/bench/results/2026-10-10-remote-stage/data/tuner-rvn-2pc-report.md)
 by its layers; the 2048 row is from the sweep's timing lines (not kept).
 
 A layer's experts are 1.11 GiB; streaming that over a ~13 GB/s link takes ~85-92 ms (an estimate from the probe's
@@ -391,7 +457,7 @@ largest expert blob, filled with this worker's smaller blobs, and capped by free
 as administrator with `gpu_clocks`, so every start of C's worker locked its clocks. Goal: 32,000-token prompts, a
 500-token answer, the profile 30% 8K / 50% 32K / 20% 100K, max context 131072; chunk 5888 only, at most 8 searched
 runs, `init_splits` [24, 40]; C with `--expert-cache 1000` (1,248 slots, ~5.3 GB of VRAM used) and at most 14 layers,
-B at most 24. Its whole report: [data/tuner-q4xl-3pc-report.md](../../bench/results/2026-10-10-remote-stage/data/tuner-q4xl-3pc-report.md).
+B at most 24. Its whole report: [data/tuner-q4xl-3pc-report.md](https://github.com/lask3802/Strata/blob/remote-stage-data/bench/results/2026-10-10-remote-stage/data/tuner-q4xl-3pc-report.md).
 
 | stages | prefill | decode | short | request s | per stage: chunk ms / window ms |
 |---|---:|---:|---:|---:|---|
@@ -445,8 +511,8 @@ Without `--remote-stage` or `--stage-worker` nothing of this should run, and the
 and by upstream main's build (the merge base then, fb58e0d, engine 0.1.41; the same build options) once, between them; greedy answers (temperature
 0, top-k 1, at most 200 tokens, reasoning off) to five prompts: code, prose, Chinese, arithmetic, and a 9,364-token
 document (two prompt chunks). The three result files are byte-identical (the same MD5): text, token counts and finish
-reasons. The script and the files: [default_path_check.py](../../bench/results/2026-10-10-remote-stage/default_path_check.py),
-[data/default-path-*.json](../../bench/results/2026-10-10-remote-stage/data/).
+reasons. The script and the files: [default_path_check.py](https://github.com/lask3802/Strata/blob/remote-stage-data/bench/results/2026-10-10-remote-stage/default_path_check.py),
+[data/default-path-*.json](https://github.com/lask3802/Strata/tree/remote-stage-data/bench/results/2026-10-10-remote-stage/data).
 
 ### After the rebase onto 0.1.42 (2026-10-11)
 
@@ -480,6 +546,172 @@ the GPU cache, which counts the process's own layers. Checked on PC A and PC B (
 The measurements above this section were taken on the 0.1.41 base. 0.1.42 turned `STRATA_ROUTE_TAIL_SKIP` on by
 default for CUDA serve. Upstream measured 1.13-1.16x decode with it on single cards that miss experts, and nothing on a
 split that holds nearly every expert (docs/DETAILS.md). The tables were not run again.
+
+### After the rebase onto 0.1.43 (2026-10-12)
+
+The branch was rebased onto upstream main 7695859a (engine 0.1.43, 72 commits after 61b3fb5) without a textual
+conflict. Three follow-ups to 0.1.43's decode changes:
+- A worker can let the adaptive tier's copies land while its next window runs (`STRATA_ADAPT_OVERLAP`), as the main
+  process's decode loop does since 0.1.43. On a worker it is opt-in (`STRATA_ADAPT_OVERLAP=1`), because it was not
+  measured faster there (below).
+- The tail-skip default's "90% of the experts cached" counts only the process's own layers.
+- A remote main keeps the probed PCIe share under `STRATA_PCIE_AUTO_SPLIT=1`.
+
+Then images ([Images](#images)). Checked on PC A and PC B (RVN IQ3_S, 10 GbE, K=26):
+
+- **The default path.** The 0.1.42 check ran again: fixed expert sets, the 16,000-token chat replay, 8 turns. This
+  branch's build and upstream 0.1.43's ran in the order: branch, 0.1.43, 0.1.43, branch. All four pairs were
+  byte-identical, 8 of 8 turns: each build's two runs, and the two builds in each half. No run was an outlier this
+  time.
+- **Images: the position table.** Six picture prompts and one text prompt after them, at the fixed expert sets and
+  `STRATA_ROUTE_TAIL_SKIP=0` on every process. The split's first-token distribution was compared with the same model
+  on one card (KL divergence):
+  - Text: 1.6e-4, with or without the table.
+  - The pictures: the geometric mean is 43% lower with the table than with `STRATA_STAGE_POSITIONS=0`.
+    - It is better on 3 of the 6, the table picture the most (7.4e-4 against 1.7e-2).
+    - It is slightly worse on the other 3. Why was not measured; a guess is that layers 26-47 react little to the
+      positions, so other differences between the split and one card show through.
+  - With the tail skip on (the default), the skip's own choices outweigh the table: an arithmetic mean of 0.146 with
+    it, 0.149 without.
+- **Images: the answers.** With the served flags they were right: the shapes, a table's largest count and its CSV, a
+  chart, a screenshot, and the text after the pictures.
+- **Images: a main restart.** A main process restarted after a picture got the same text reply from the worker as
+  before the picture. Before the worker put its table back to the identity at a disconnect, it did not.
+- **The overlap on the worker.** It was on in the runs above and in the speed runs below (the build then followed
+  upstream's default on the worker too):
+  - The 16,000-token replay: 133-137 windows took swaps still landing, and the worker's layers waited 0.03 ms in all.
+    The main process's layers waited 1.4-1.8 s over about 150 windows.
+  - A 40-prompt run: 583-600 windows, 23-30 ms of waiting.
+
+  Whether it changes answers could not be told byte for byte: with the adaptive tier on, two runs of the same
+  setting agreed on only 3 and 4 of 8 turns.
+- **Speed** (the served flags, 40 prompts x 200 tokens, speculative decoding with the draft layer, two runs each):
+  | Build | Decode tok/s |
+  |---|---|
+  | This branch on 0.1.43 | 62.7, 63.2 |
+  | The same, with `STRATA_ADAPT_OVERLAP=0` on both PCs | 63.2, 63.8 |
+  | This branch on 0.1.42 | 63.5, 64.0 |
+
+  The overlap's runs were the slowest: about 0.9% below the runs without it and 1.3% below 0.1.42. Two runs of one
+  setting differed by 0.8-0.95%, so two runs each cannot tell whether that difference is real.
+- **The worker's overlap alone.** The same flags and prompts; the main process's overlap on in every run, the
+  worker's on and off in 6 interleaved pairs (PC B's 10 GbE card had been replaced since the runs above):
+  | | The worker's overlap on | Off |
+  |---|---|---|
+  | Decode, median of 6 runs | 64.19 tok/s | 64.33 tok/s |
+  | The worker's own time per window, median | 15.85 ms | 15.85 ms |
+
+  With it on, decode was faster in 2 of 6 pairs and the worker's time per window shorter in 3 of 6; two runs of one
+  setting differed by 0.39% (median), up to 1.24%. Its layers waited 26-42 ms per run in all: the worker's copies
+  land while the main process runs its own layers, so there is little left to hide. Not faster, so a worker turns it
+  on only with `STRATA_ADAPT_OVERLAP=1`. The main process keeps upstream's default (on for Linux CUDA), as on one
+  card: upstream's overlap needs a process whose layers are on one GPU (a layer split across GPUs in one process
+  leaves it off), and each PC of a remote stage is one such process.
+- **The link test.** `stage_link_test` (the images change's 22 checks) passes on Linux (GCC 13) and on Windows
+  (MSVC 2022).
+- **Builds.** CUDA 13.0 on Linux (sm_75 + sm_86) and on Windows (MSVC 2022, sm_86); HIP (ROCm 7.0, gfx1100) and
+  the SYCL port (oneAPI 2026.1.1), both in containers.
+
+### After the rebase onto 0.1.43.1 (2026-10-13)
+
+The branch was rebased onto upstream main a0116b27 (engine 0.1.43.1, 33 commits after 7695859a). One textual
+conflict: #2090 changed the prompt path's loan (`lend`) at its old place in `main()`, which this branch had moved up
+so a worker can use it; the moved copy took the change, and it is the same as upstream's. Three follow-ups:
+- #2090 halves a prompt chunk whose loan does not fit the cache, instead of ending the engine. A worker reads the main
+  process's chunk whole (its rows go back as one reply, and a relay forwards it as one chunk), so a worker whose loan
+  comes out smaller than the chunk it was sent answers an error that names the `--prefill` that fits (now only when
+  it cannot lend for its own chunk either: [below](#the-recoverys-open-points-2026-10-13)). Before 0.1.43.1 that
+  worker failed the loan's relayout with an error too; halved without the check, it would have answered wrong rows,
+  and a relay would have lost step with its next worker.
+- 0.1.43.1 made `STRATA_ADAPT_OVERLAP` opt-in on every backend (#2010). The worker's own opt-in clause is gone: the
+  same switch now holds on both PCs, and neither overlaps by default. In the runs above the main process's overlap
+  was on.
+- The server's 503 for a remote stage's error sends its Retry-After through `_json`'s headers, which upstream added
+  too; the merge had sent the field twice, and the server's test now checks it is sent once.
+
+### The recovery's open points (2026-10-13)
+
+Faults injected on A + B (RTX 3080 main, RTX 2080 Ti worker, 10 GbE, RVN IQ3_S, K=26) with the branch on 0.1.43
+(371b400f), its agent and server, each followed by requests; none needed a hand:
+
+| Fault | That request | The next request |
+|---|---|---|
+| the worker killed (`kill -9`) while idle | waited for the agent's restart (5 s, then 40 s to load), answered after 45.6 s | - |
+| the worker killed in the middle of an answer | 503, `Retry-After: 30`, "remote stage: the peer closed the connection" (2.9 s) | answered after 50.2 s |
+| the same, streamed | an error event of the `server_error` kind | answered after 44.8 s |
+| the worker stopped and started through its agent | - | answered in 1.6 s |
+| the main engine killed while idle | the server started it again, it took the worker over: answered after 20.5 s | 1.2 s |
+| the main engine killed in the middle of an answer | the server's 503 for an engine that stopped | answered after 13.4 s |
+| the worker stopped while a request waited, started again 70 s later | answered after 109.6 s, past the 90 s frozen-engine check | - |
+
+Four cases were left waiting too long or failing; each now ends in no error or a clear one within a bound:
+- **A reconnect's whole wait is `STRATA_REMOTE_CONNECT_S`.** `StageClient::connect` takes a deadline and a stop flag.
+  The connect is non-blocking (`select` on Windows, where `WSAPoll` misses a failed connect before Windows 10 2004;
+  `poll` elsewhere; then `SO_ERROR`), and the hello's reply is polled; a name's addresses but the last get 10 s each
+  at most. Before, a try could block for the system's SYN retries, and a worker that took the connection into its
+  backlog without answering (it served another main process) held the hello for `STRATA_REMOTE_TIMEOUT_S` (300 s)
+  on top of the 180 s.
+- **A STOP ends that wait.** The server sends STOP when the client goes away. The wait ends with
+  `ERR remote stage: the wait was cancelled`, which `stage_link_lost` does not count, or with the lost link of a try
+  the STOP came in during and could not cut short (the name's lookup, a connect refused at once); either way the
+  engine goes on to the next request, and the link stays closed, so that request connects again. Before, the engine went on waiting for the
+  worker until its window ran out, and then ended.
+- **A worker lends for its own chunk** when it cannot lend the buffers for the main process's chunk whole: a smaller
+  chunk can need more slots than a larger one (#2090), and a multi-GPU worker reads short requests in its
+  `STRATA_SPLIT_SMALL_OWN` chunks (#340). `lend()` would then lend for fewer tokens than the main process sends, and
+  the worker answered every long prompt with an error. The hello decides it (`lend_whole`, `lend()`'s own test) and
+  the worker says so; the error stays for a worker that can lend neither.
+- **A relay looks at its next worker while idle**, about once a second while its main process sends nothing
+  (`StageHandlers::idle`, `StageClient::alive`: a poll and a one-byte `MSG_PEEK`), and when that link is gone it
+  closes its main process's connection. Before, the main process's next request found its own link fine, its first
+  message failed at the relay, and the main engine ended.
+
+The first two on the same pair, the main process with `STRATA_REMOTE_CONNECT_S=60`. "This branch" is these fixes'
+first build (their review's changes, run once more on the same faults, gave 58.2 s and 60.0 s again); "before" is
+the build of both PRs on 0.1.43.1 before them (0936f027, the checkpoints PR on top: its request start already checks
+the link with `alive()`, and it waits for the worker as this branch did):
+
+| Fault | This branch | Before |
+|---|---|---|
+| the worker stopped; a streamed request whose client leaves after 20 s, then at once a second request | the engine ended the first at the STOP and waited for the second: 503, `Retry-After: 30` after 58.2 s (its own 60 s), `cannot connect` | the engine waited out the first one's 60 s and ended (exit code 1): the second got the server's 503 for an engine that stopped, after 37.9 s |
+| the worker started again, a request | answered after 15.5 s (the second's failed reconnect had ended the engine, as before) | answered after 12.8 s |
+| the worker's port taken by a listener that never answers, a request | 503, `Retry-After: 30` after 60.0 s, `receive failed: timed out (no reply to the hello)` | 503, `Retry-After: 30` after 310.5 s (`STRATA_REMOTE_TIMEOUT_S` for the one hello) |
+| the listener gone, the worker started again, a request | answered after 12.7 s | answered after 12.7 s |
+
+Not run on GPUs: a worker's own chunk (with the agent's explicit `--prefill` on one card the loan grows with the
+chunk, so the case did not arise on this pair) and a relay's look (it needs three PCs; `stage_link_test` covers it
+over loopback, with a stand-in for the relay's hook).
+
+### A reader's report: what a peer can make a process do (2026-10-13)
+
+A reader of the link's code (building a SYCL worker on this branch) found that a worker's receiving thread parsed any
+message before the hello and multiplied a window's T by its row width before bounding T. A `Run` header with
+T = 2^62 makes `T * handoff_floats` and `T * 4` wrap to 0 (both are multiples of 4), so a header claiming 0 bytes
+passed the size check, and the token vector's resize threw on the receiving thread, which ends the process. Any host
+that can reach the port could send it: no hello, no token. A `Prefill` header the same. Fixed:
+
+- **A worker reads nothing but a hello first.** The first message is read as a waiting connection's hello is: whole
+  within 10 s in all, and nothing else (before, each recv had its own 10 s, so a peer that sent a byte every few
+  seconds held the worker for over half an hour). Another first message, or a hello of a wrong size, is answered
+  (`hello first`, `bad hello`) and its connection closed, its body neither waited for nor drained.
+- **After a hello, nothing is read until its token is taken** (the first hello, or another a served main process
+  sends). A refused peer's next header, with a body that never comes, held the receiving thread in a recv; shutting
+  the socket down does not wake that on Windows, and the worker waited for the thread for good. (A review of this
+  fix found it; on Linux the shutdown wakes the recv.)
+- **A window's and a chunk's T are bounded before any product with them** (T at most the buffer's floats over a
+  row's), so a served main process that sends such a header gets the malformed-message answer, and the worker serves
+  on.
+- **The main process takes no size on trust either:** an error reply over 64 KiB is not read (at the hello an
+  unexpected reply; later a link out of step, which connecting again mends), and a hello's reply is read whole
+  within the connect's deadline and stop flag (before, only its first byte was: a peer that sent part of it held the
+  main process for `STRATA_REMOTE_TIMEOUT_S`).
+- Smaller ones from the same report: `--stage-begin` at or past the layer count stops at start (the report saw it
+  reach the session's setup with a layer out of range); a worker started with `--mtp` stops at start saying the
+  draft layer runs in the main process (it stopped later, at the draft layer's setup); `StageClient`'s failed-link
+  flag is an atomic (written by the sending side, read by the receiving one under another lock).
+
+`stage_link_test` sends these headers by hand over loopback (and a hello a byte a second), and each fix undone fails
+it; the wait for the token only on Windows, where the recv it prevents is not woken.
 
 ## Lessons
 
@@ -522,19 +754,23 @@ split that holds nearly every expert (docs/DETAILS.md). The tables were not run 
 ## Open work
 
 - **The default path beyond one configuration:** checked byte-identical for one single-GPU configuration on 0.1.41
-  ([The default path](#the-default-path)) and at fixed expert sets on 0.1.42
-  ([After the rebase](#after-the-rebase-onto-0142-2026-10-11)); an in-process multi-GPU split, other models and a
-  Windows build against upstream's Windows build were not compared.
+  ([The default path](#the-default-path)) and at fixed expert sets on 0.1.42 and 0.1.43
+  ([0.1.42](#after-the-rebase-onto-0142-2026-10-11), [0.1.43](#after-the-rebase-onto-0143-2026-10-12)); an in-process
+  multi-GPU split, other models and a Windows build against upstream's Windows build were not compared.
+- **Images beyond two PCs:** a relay worker forwards the position table (covered by `stage_link_test` over loopback),
+  but no picture went through three PCs; the image checks used RVN IQ3_S only.
 - **Running on AMD and Intel:** the branch builds with CUDA 13.0 on Linux (GCC, sm_75 + sm_86) and Windows (MSVC
   2022, sm_86), with HIP (ROCm 7.0, gfx1100) and the SYCL port (oneAPI 2026.1.1, which also compiles the shared
-  `include/strata/prefill/prefill.hpp` this feature changed); the last two in containers, on 2026-10-10. The remote
-  stage ran on NVIDIA cards only. The SYCL port keeps its own copies of `generate.cpp`, `verify.cpp`,
+  `include/strata/prefill/prefill.hpp` this feature changed); the last two in containers, on 2026-10-10 and again
+  after the rebase onto 0.1.43. The remote stage ran on NVIDIA cards only. The SYCL port keeps its own copies of `generate.cpp`, `verify.cpp`,
   `expert_source.cpp` and `prefill.cpp`, so the Intel engine has no remote stage.
 - **Correctness check** against the in-process split (`--layer-split K --split-device 0`) with the caches fixed: not
   done. So far the start of every benchmark answer (the 100-160 characters the benchmark keeps) was read: coherent and
   on topic in every configuration.
-- **Reconnecting** without restarting the main engine (a broken link now ends the main engine at the next prompt's
-  reset, and the server starts it again; read from the code, not tested); conversation checkpoints across stages
+- **Reconnecting** in the middle of a request (a link lost between requests is made again at the next request's
+  start; one lost mid-request ends the main engine, and the server starts it again). Faults run on GPUs: two PCs,
+  Linux on both ([The recovery's open points](#the-recoverys-open-points-2026-10-13)); a relay's next worker, a
+  network partition and a Windows PC on either side were not; conversation checkpoints across stages
   ([CHECKPOINTS.md](CHECKPOINTS.md): built, opt-in with `--prompt-cache N`, checked on two GPUs; a relay is not
   run).
 - **A ring topology** for three or more PCs.
