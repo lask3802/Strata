@@ -8,7 +8,12 @@
 # One job per program (the engine, the image encoder) per zip, so no job comes near the 6 h limit; the pack job zips
 # them.  The CUDA versions are the ones whose cuBLAS setup.py installs from pip (CUDA_WHEELS / CUDA12_WHEELS): 13.0
 # Update 1 (cuBLAS 13.0.2.14) and 12.9 Update 1 (cuBLAS 12.9.1.4).  The archs are upstream's releases' (cuobjdump
-# of the 0.1.44.1 zips).  The AMD (HIP) zip is not built here: tools/hip/build_windows.bat.
+# of the 0.1.44.1 zips).  The AMD (HIP) zip is not built here: tools/hip/build_windows.bat.  The Linux zip is built on
+# Rocky Linux 8 (glibc 2.28) with libstdc++ linked in, and run on the oldest distributions before a release.
+#
+# LINK_VERSION (<CMakeLists.txt's version>-link.<n>): bump n for a release that installed engines should be replaced
+# by; an upstream merge that changes the version starts again at <new version>-link.1.  Publish the release before
+# the commit that bumps it reaches main: until then setup finds no engine for it (it asks again a day later).
 name: release
 
 on:
@@ -140,8 +145,15 @@ jobs:
     timeout-minutes: 350
     permissions:
       contents: read
-    # Ubuntu 22.04 (glibc 2.35): the engine runs on it and on newer distributions
-    container: ubuntu:jammy-20260924.1@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf026486401
+    # Rocky Linux 8 (glibc 2.28) with gcc-toolset-13, libstdc++ and libgcc linked in (LDFLAGS, CMake's initial
+    # CMAKE_EXE/SHARED_LINKER_FLAGS): the programs need glibc 2.28 and nothing of the system's C++ runtime, so they run
+    # on RHEL 8, Debian 10 and Ubuntu 20.04 and newer (the linux-floor job runs them there)
+    container: rockylinux/rockylinux:8.10@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6
+    env:
+      CC: /opt/rh/gcc-toolset-13/root/usr/bin/gcc
+      CXX: /opt/rh/gcc-toolset-13/root/usr/bin/g++
+      CUDAHOSTCXX: /opt/rh/gcc-toolset-13/root/usr/bin/g++
+      LDFLAGS: -static-libstdc++ -static-libgcc
     strategy:
       fail-fast: false
       matrix:
@@ -150,27 +162,23 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: build tools, and CUDA 13.0 Update 1 from NVIDIA's apt repository
-        env:
-          DEBIAN_FRONTEND: noninteractive
+      - name: build tools, and CUDA 13.0 Update 1 from NVIDIA's rhel8 repository
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends build-essential binutils ca-certificates curl git python3 python3-venv
-          curl -fsSL -o /tmp/cuda-keyring.deb \
-            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-          dpkg -i /tmp/cuda-keyring.deb
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            cuda-nvcc-13-0=13.0.88-1 cuda-crt-13-0=13.0.88-1 libnvvm-13-0=13.0.88-1 libnvptxcompiler-13-0=13.0.88-1 \
-            cuda-cudart-13-0=13.0.88-1 cuda-cudart-dev-13-0=13.0.88-1 cuda-driver-dev-13-0=13.0.88-1 \
-            cuda-cccl-13-0=13.0.85-1 cuda-culibos-dev-13-0=13.0.85-1 libcublas-13-0=13.0.2.14-1 libcublas-dev-13-0=13.0.2.14-1
+          dnf install -y -q dnf-plugins-core
+          dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+          dnf install -y -q --setopt=install_weak_deps=False gcc-toolset-13-gcc-c++ gcc-toolset-13-libstdc++-devel \
+            binutils git python3.12 tar gzip findutils \
+            cuda-nvcc-13-0-13.0.88-1 cuda-crt-13-0-13.0.88-1 libnvvm-13-0-13.0.88-1 libnvptxcompiler-13-0-13.0.88-1 \
+            cuda-cudart-13-0-13.0.88-1 cuda-cudart-devel-13-0-13.0.88-1 cuda-driver-devel-13-0-13.0.88-1 \
+            cuda-cccl-13-0-13.0.85-1 cuda-culibos-devel-13-0-13.0.85-1 libcublas-13-0-13.0.2.14-1 libcublas-devel-13-0-13.0.2.14-1
+          echo /opt/rh/gcc-toolset-13/root/usr/bin >> "$GITHUB_PATH"
           /usr/local/cuda-13.0/bin/nvcc --version
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: cmake and ninja (requirements.txt's)
         run: |
-          python3 -m venv /opt/venv
+          python3.12 -m venv /opt/venv
           /opt/venv/bin/pip install $(grep -E '^(cmake|ninja)==' requirements.txt | tr -d '\r')
           echo /opt/venv/bin >> "$GITHUB_PATH"
       - id: pins
@@ -185,14 +193,25 @@ jobs:
         run: >-
           python3 .github/scripts/build_release.py ${{ matrix.part }} --build build --cuda /usr/local/cuda-13.0
           --llama third_party/llama.cpp --archs "75-real;86-real;89-real;120"
-      - name: what it needs (libraries, glibc)
+      - name: what it needs (libraries, glibc 2.28 at most, no libstdc++ / libgcc_s)
         run: |
+          bad=0
           for f in build/strata build/libstrata_kq.so build/bin/strata-vision; do
             [ -f "$f" ] || continue
-            echo "$f: $(readelf -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')"
-            echo "  newest glibc symbol: $(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+            needed=$(readelf -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')
+            glibc=$(readelf -V --wide "$f" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)
+            echo "$f: $needed"
+            echo "  newest glibc symbol: $glibc"
+            case " $needed" in *" libstdc++.so"* | *" libgcc_s.so"*) echo "::error::$f needs the system's C++ runtime"; bad=1 ;; esac
+            if readelf -V --wide "$f" | grep -qE 'GLIBCXX_|CXXABI_|GCC_[0-9]'; then
+              echo "::error::$f needs libstdc++ / libgcc_s symbol versions"; bad=1
+            fi
+            if [ "$(printf '%s\n' GLIBC_2.28 "$glibc" | sort -V | tail -1)" != GLIBC_2.28 ]; then
+              echo "::error::$f needs $glibc, newer than Rocky Linux 8's 2.28"; bad=1
+            fi
           done
           ls -l build/strata build/libstrata_kq.so build/bin/strata-vision 2>/dev/null || true
+          exit $bad
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: build-linux-cuda13-${{ matrix.part }}
@@ -237,10 +256,53 @@ jobs:
           compression-level: 0
           path: dist/
 
+  linux-floor:
+    name: the Linux zip on old distributions
+    needs: [version, pack]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-${{ needs.version.outputs.link }}
+          path: dist
+      - name: strata --version on Rocky Linux 8 / 9, Debian 11, Ubuntu 20.04, with setup.py's CUDA wheels
+        run: |
+          python3 -m pip install --disable-pip-version-check -q --no-deps --target "$RUNNER_TEMP/wheels" \
+            $(python3 -c "import setup; print(' '.join(setup.CUDA_WHEELS))")
+          unzip -q dist/strata-linux-x64.zip -d "$RUNNER_TEMP/zip"
+          bash .github/scripts/linux_floor.sh "$RUNNER_TEMP/zip" "$RUNNER_TEMP/wheels/nvidia/cu13/lib" \
+            rockylinux/rockylinux:8.10@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6 \
+            rockylinux/rockylinux:9.6@sha256:91bbb8eb52ca462611c1f9ce5c4cede4172a31bfe64f336e82f29648694a3cfe \
+            debian:11@sha256:6f519a81440354a85eb592c5f32109ab80605f6b892455983a6f618bf87fabe9 \
+            ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214
+
+  tests:
+    name: setup and serve tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check -q -r requirements.txt pytest==9.0.2
+      - name: setup.py
+        run: python -m pytest -q -p no:cacheprovider tools/test_setup*.py tools/test_make_release.py
+      - name: serve
+        run: python -m pytest -q -p no:cacheprovider serve
+
   release:
     name: draft release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [version, pack]
+    needs: [version, pack, linux-floor, tests]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
