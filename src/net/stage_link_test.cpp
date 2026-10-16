@@ -428,12 +428,15 @@ int main() {
     buf.handoff_floats = kHbf;
     buf.pf_row_floats = kD;
     Shared w;
-    std::atomic<int32_t> worker_vision{1};
+    std::atomic<int32_t> worker_vision{1}, worker_kv_type{0};
+    std::atomic<uint32_t> worker_kv_bits{0};   // (section 16: the worker's K/V element type in its hello)
     std::atomic<bool> refuse_save{false}, fail_commit{false}, fail_positions{false}, stale_text{false};
     std::atomic<int> disconnects{0};
     StageHandlers h;
     h.hello = [&](const StageHello&, StageHello& mine, std::string&) {
         mine = hello_of(worker_vision.load());
+        mine.kv_type = worker_kv_type.load();
+        mine.row_formats |= worker_kv_bits.load();
         return true;
     };
     h.run = [&](int T, const int32_t*, int64_t, std::string&) {
@@ -1419,6 +1422,47 @@ int main() {
                   "a chunk of more than one conversion slice (a part slice last) comes back whole, rounded to bf16");
             cl.close();
             wkb.stop();
+        }
+    }
+
+    // 16. the K/V element type (row_formats' kStageCapKvElem): compared when both hellos carry it, kv_type not
+    {
+        const uint32_t int8 = stage_kv_elem_bits("int8"), fp16 = stage_kv_elem_bits("fp16");
+        check(int8 != 0 && fp16 != 0 && int8 != fp16 && (int8 & kStageCapKvElem) != 0 &&
+                  (int8 & kStageRowsAll) == 0 && stage_kv_elem_bits("q4_0") != 0 && stage_kv_elem_bits("k8v4") != 0 &&
+                  stage_kv_elem_bits("bf16") == 0,
+              "the --kv names have bits of their own, above the row formats");
+        Worker wk16;
+        if (!wk16.start(h, buf)) {
+            check(false, "a worker for the K/V types");
+        } else {
+            std::string err;
+            StageHello peer;
+            auto greet16 = [&](uint32_t main_bits, int32_t main_kv_type) {
+                StageClient cl;
+                StageHello mine = hello_of();
+                mine.row_formats |= main_bits;
+                mine.kv_type = main_kv_type;
+                const bool ok = cl.connect(wk16.where, mine, peer, err);
+                cl.close();
+                return ok;
+            };
+            worker_kv_bits = int8;
+            worker_kv_type = 1;
+            check(greet16(int8, 0) && (peer.row_formats & ~kStageRowsAll) == int8,
+                  "both carry int8: served, the K/V placement (kv_type) not compared, the worker's bits in its reply");
+            check(!greet16(fp16, 1) && contains(err, "the worker refused:") && contains(err, "differ") &&
+                      contains(err, "--kv fp16/int8"),
+                  "both carry it, fp16 against int8: refused, the two named");
+            check(greet16(0, 0), "a main process without it (an earlier build), another placement: served, not compared");
+            worker_kv_bits = 0;
+            check(greet16(fp16, 0) && (peer.row_formats & kStageCapKvElem) == 0,
+                  "a worker without it: served by a main process with it, not compared");
+            check(!greet16(0, 0) && contains(err, "differ") && contains(err, "K/V type 0/1"),
+                  "neither carries it (two earlier builds): kv_type compared as they compare it, another refused");
+            check(greet16(0, 1), "... the same one served");
+            worker_kv_type = 0;
+            wk16.stop();
         }
     }
 

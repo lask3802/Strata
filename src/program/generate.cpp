@@ -10272,6 +10272,8 @@ int main(int argc, char** argv) {
             me.layer_begin = (int32_t) (stage_worker ? own_lo : split_at[0]);
             me.max_t = (int32_t) std::max(o.spec, 1);
             me.kv_type = g.n_qsa_layers() > 0 ? (int32_t) ss.qsa_states[ss.qsa_primary()].kv_mode : -1;
+            // the K/V element type (--kv; none without attention K/V), which both sides must store alike
+            me.row_formats |= g.n_qsa_layers() > 0 ? strata::net::stage_kv_elem_bits(o.kv) : strata::net::kStageCapKvElem;
             me.max_context = o.max_context;
             me.chunk = sp.chunk();
             me.handoff_floats = HBF;
@@ -10320,6 +10322,9 @@ int main(int argc, char** argv) {
                              "rows %s)\n", o.remote_stage.c_str(), remote_peer.layer_begin, remote_peer.n_layers - 1,
                              (long long) remote_peer.chunk, (long long) remote_peer.max_context,
                              strata::net::stage_rows_name(remote_link.rows()));
+                if ((remote_peer.row_formats & strata::net::kStageCapKvElem) == 0)
+                    std::fprintf(stderr, "strata serve: remote stage: the worker's hello predates the K/V element "
+                                         "check: --kv must match by hand\n");
             } else {
                 // remote-stage worker: serve the main process instead of stdin.  A prompt starts with a reset; windows,
                 // commits and chunks arrive in order, each whole, and run here one at a time.
@@ -10598,7 +10603,9 @@ int main(int argc, char** argv) {
                     mine_next.tail_skip = (int32_t) strata::core::tail_skip_rank();   // the main process's, as above
                     mine_next.vision = main_vision;   // the main process's (a worker started with --vision has it)
                     mine_next.ckpt_max = main_ckpt_max;
-                    mine_next.row_formats = main_rows;   // (the main process's: until its hello, fp32)
+                    // the main process's formats (until its hello, fp32), this worker's own K/V type
+                    mine_next.row_formats = (main_rows & strata::net::kStageRowsAll) |
+                                            (me.row_formats & ~strata::net::kStageRowsAll);
                     std::memcpy(mine_next.token, stage_token.data(), stage_token.size());
                     for (int i = 0;; ++i) {
                         // each try can block (a connect's SYN tries, the hello's reply): its own allowance (as in

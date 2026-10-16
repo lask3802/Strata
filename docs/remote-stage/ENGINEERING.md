@@ -48,8 +48,17 @@ added `CkptSave` / `CkptRestore`, a keep list on `Reset` and the hello's `ckpt_m
 | Error | | the message | |
 
 **The hello** carries what both sides must agree on, and each side checks the other's: the protocol, `n_embd`, `hc`,
-`n_layers`, `n_expert`, the first remote layer (K), the floats per window row, the K/V element type, and a
-fingerprint of the pack (FNV-1a over the pack's `index.txt` and `native_experts.txt`). The worker also refuses a main
+`n_layers`, `n_expert`, the first remote layer (K), the floats per window row, the K/V element type (`--kv`), and a
+fingerprint of the pack (FNV-1a over the pack's `index.txt` and `native_experts.txt`). `row_formats` is
+not all row formats: bits 0-15 are the formats (a new one takes the next free bit of these), bits 16-23 a value and
+bits 24-31 capability bits; a peer reads only the format bits it has, so neither of the others is ever a row format.
+Bit 31 (`kStageCapKvElem`) says bits 16-23 hold the side's K/V element type. Earlier protocol 7 builds compared
+`kv_type`, which holds each side's K/V placement (a K/V streaming mode), not the element type, so a `--kv` mismatch
+went through and two sides that place their K/V differently were refused. Now, when both hellos have bit 31 the
+element types must match and `kv_type` is not compared; when one lacks it (an earlier build, which still compares
+`kv_type` itself) no K/V type is compared here and each side logs `... hello predates the K/V element check: --kv must
+match by hand`; when both lack it, `kv_type` is compared as before. `kv_type` still carries the placement, for the
+earlier builds. The worker also refuses a main
 process whose prompt chunk, context or window is larger than its own, and a wrong `STRATA_STAGE_TOKEN` (the token is
 the hello's last field; the worker's own hello carries none). The main process's `STRATA_ROUTE_TAIL_SKIP` rank rides
 along and the worker takes it (a relay passes it on), so every layer skips as in one process. So does whether the

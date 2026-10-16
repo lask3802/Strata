@@ -83,6 +83,19 @@ size_t stage_rows_bytes(StageRows f, size_t rows, size_t width) {
     return rows * width * (f == StageRows::BF16 ? 2 : 4);
 }
 
+// the K/V element types a hello names, by their id in row_formats' bits 16-23 (0: none)
+constexpr const char* kKvElems[] = {"", "fp16", "int8", "q4_0", "k8v4"};
+
+uint32_t stage_kv_elem_bits(const std::string& kv) {
+    for (uint32_t i = 1; i < sizeof kKvElems / sizeof *kKvElems; ++i)
+        if (kv == kKvElems[i]) return kStageCapKvElem | i << 16;
+    return 0;
+}
+
+bool stage_kv_elem_both(const StageHello& a, const StageHello& b) {
+    return (a.row_formats & b.row_formats & kStageCapKvElem) != 0;
+}
+
 // ---- bf16 rows: kernels::bf16_from_f32 (to nearest even; a NaN stays one, quieted) and f32_from_bf16 (exact), on n
 // values, one instruction set each
 namespace {
@@ -584,9 +597,12 @@ constexpr const char* kLost[] = {"remote stage: cannot resolve ", "remote stage:
 
 bool hello_matches(const StageHello& a, const StageHello& b, std::string& err) {
     char buf[512];
+    // the K/V type (kStageCapKvElem): two hellos without it compare kv_type as earlier builds do; one without it
+    // (an earlier build's, a peer that compares kv_type itself) and one with it: no K/V type is compared here
+    const bool neither = ((a.row_formats | b.row_formats) & kStageCapKvElem) == 0;
     if (a.protocol != b.protocol || a.n_embd != b.n_embd || a.hc != b.hc || a.n_layers != b.n_layers ||
         a.n_expert != b.n_expert || a.layer_begin != b.layer_begin || a.handoff_floats != b.handoff_floats ||
-        a.kv_type != b.kv_type || a.pack_hash != b.pack_hash) {
+        (neither && a.kv_type != b.kv_type) || a.pack_hash != b.pack_hash) {
         std::snprintf(buf, sizeof buf,
                       "remote stage: the two sides differ (protocol %u/%u, n_embd %d/%d, hc %d/%d, layers %d/%d, "
                       "experts %d/%d, first remote layer %d/%d, hand-off floats %lld/%lld, K/V type %d/%d, "
@@ -595,6 +611,15 @@ bool hello_matches(const StageHello& a, const StageHello& b, std::string& err) {
                       b.n_expert, a.layer_begin, b.layer_begin, (long long) a.handoff_floats,
                       (long long) b.handoff_floats, a.kv_type, b.kv_type, (unsigned long long) a.pack_hash,
                       (unsigned long long) b.pack_hash);
+        err = buf;
+        return false;
+    }
+    // both carry the K/V element type: it must match, and kv_type (each side's K/V placement) is not compared
+    const uint32_t ea = (a.row_formats >> 16) & 0xffu, eb = (b.row_formats >> 16) & 0xffu;
+    if (stage_kv_elem_both(a, b) && ea != eb) {
+        constexpr uint32_t n = sizeof kKvElems / sizeof *kKvElems;
+        std::snprintf(buf, sizeof buf, "remote stage: the two sides differ (K/V type --kv %s/%s)",
+                      ea < n ? kKvElems[ea] : "?", eb < n ? kKvElems[eb] : "?");
         err = buf;
         return false;
     }
@@ -1556,7 +1581,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     keep = false;
                     break;
                 }
-                mine.row_formats = kStageRowsAll;   // (the conversions are this link's own)
+                mine.row_formats |= kStageRowsAll;   // (the conversions are this link's own)
                 const StageRows fmt = stage_rows_agreed(in.hello.row_formats, mine.row_formats);
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::HelloOk;
@@ -1575,6 +1600,9 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 std::fprintf(stderr, "strata stage worker: main process %s: layers %d.. here, context %lld, chunk %lld, "
                              "rows %s\n", host.c_str(), in.hello.layer_begin, (long long) in.hello.max_context,
                              (long long) in.hello.chunk, stage_rows_name(fmt));
+                if ((in.hello.row_formats & kStageCapKvElem) == 0 && (mine.row_formats & kStageCapKvElem) != 0)
+                    std::fprintf(stderr, "strata stage worker: main process %s: its hello predates the K/V element "
+                                 "check: --kv must match by hand\n", host.c_str());
                 std::fflush(stderr);
                 break;
             }

@@ -112,6 +112,19 @@ size_t stage_rows_bytes(StageRows f, size_t rows, size_t width);
 /// bf16 runs on SSE2 (every x86-64 CPU) or AVX2 (when the CPU has it), elsewhere value by value.
 void stage_rows_encode(StageRows f, const float* src, size_t rows, size_t width, void* dst);
 void stage_rows_decode(StageRows f, const void* src, size_t rows, size_t width, float* dst);
+
+/// row_formats is not all row formats: bits 0-15 are the formats (a new format takes the next free one of these),
+/// bits 16-23 a value, bits 24-31 capability bits - a peer reads only the format bits it has (kStageRowsAll), so
+/// neither of the others is ever a row format.  Bit 31 (kStageCapKvElem): bits 16-23 hold this side's K/V element
+/// type (--kv).  Two hellos with it must store the same, and kv_type (each side's K/V placement, which earlier
+/// builds compared as the element type) is not compared; one with it and one without (an earlier protocol 7 build,
+/// which still compares kv_type itself): no K/V type is compared here, and each side logs a line (--kv must
+/// match by hand); two without it: kv_type compared, as earlier builds do.
+inline constexpr uint32_t kStageCapKvElem = 1u << 31;
+/// the row_formats bits for a K/V element type as --kv names it (fp16, int8, q4_0, k8v4); 0 for another name
+uint32_t stage_kv_elem_bits(const std::string& kv);
+/// both hellos carry their K/V element type
+bool stage_kv_elem_both(const StageHello& a, const StageHello& b);
 namespace detail {
 /// (tests, benchmarks) the bf16 conversion of n values with one instruction set: 0 value by value, 1 SSE2, 2 AVX2;
 /// false (nothing written) when this build or CPU lacks it
