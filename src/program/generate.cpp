@@ -10363,7 +10363,8 @@ int main(int argc, char** argv) {
                 // main process's chunks whole (on_chunk writes one T-row reply, a relay forwards one chunk).  Then it
                 // lends for its own chunk, which fit at its start: larger buffers, still one T-row reply per chunk.
                 // The slots do not change after the start, so the hello decides it.  (lend_whole: lend()'s own test,
-                // for a prompt of `tokens`; --prefill-head-alias keeps its start-up loan and halves nothing.)
+                // for a prompt of `tokens`; its --prefill-head-alias branch is lend()'s, though a remote stage refuses
+                // that flag.)
                 int64_t lend_chunk = pf_chunk;
                 auto lend_whole = [&](int64_t tokens) {
                     const int64_t want_full = equal_chunk(tokens, o.prefill_chunk);
@@ -10567,8 +10568,9 @@ int main(int argc, char** argv) {
                     // worker's own (lend_chunk, the hello's choice; a loan that covers it stays for the rest of the
                     // prompt)
                     if (!lend(std::max<int64_t>(T, lend_chunk), e)) return false;
-                    // 0.1.44 (#2090): a loan that does not fit is lent for a halved chunk - this worker would then read
-                    // the main process's chunk in pieces, and its rows (and a relay's link) are one reply per chunk
+                    // a chunk lend() halved anyway (#2090: neither the main process's chunk nor this worker's own fit)
+                    // would have this worker read the main process's chunk in pieces, and its rows (and a relay's
+                    // link) are one reply per chunk: an error, not a wrong reply
                     if (sp.chunk() < T) {
                         e = "stage worker: its expert cache cannot lend the prompt buffers for the main process's chunk of " +
                             std::to_string(T) + " tokens (only " + std::to_string(sp.chunk()) + "): start the main process "
