@@ -1,0 +1,717 @@
+"""The Monitor's Workers card (serve/stages.py): the main process's log, a worker's log, and the node agent's answers
+- with tools/stage_node.py's own HTTP handler in this process (no GPU, no engine, no network beyond 127.0.0.1).
+
+    python -m unittest serve.test_stages
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+import unittest
+import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from unittest import mock
+
+from serve import stages
+from serve.frontend import ChatTemplate
+from serve.server import ByteTokenizer, MockEngine, Service, serve
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import stage_node as sn  # noqa: E402
+
+TOKEN = "the-shared-secret"
+STARTED = "[strata] 2026-10-16 09:00:00 engine started: strata --serve --layer-split 26 ...\n"
+MAIN_RUN = ("strata generate: remote stage: this process holds layers 0-25\n"
+            "strata serve: layer split: layers 0-25 (CUDA0), 26-47 (10.10.10.2:7841), the head (CUDA0), one hand-off "
+            "per window\n"
+            "strata serve: remote stage 10.10.10.2:7841: layers 26-47 there (prompt chunk 5888, context 131072, rows fp32)\n")
+MAIN_TIMING = ("strata remote: 64 windows: mean 23.04 ms a round trip = worker 21.87 + link 1.17 (last: T=4 at 900, "
+               "22.10 = 21.00 + 1.10)\n"
+               "strata remote: main process between windows 25.32 ms each (64 windows: head, drafter, layers 0-K)\n")
+WORKER_LOG = """strata generate: session is up (engine 0.1.44.1)
+strata generate: expert cache 2345 slots, 9.14 GiB of VRAM; policy is
+strata serve: stage worker: layers 26-47, no head, prompt chunk 5888, port 7841
+strata stage worker: listening on 10.10.10.2:7841 (a token is required)
+strata stage worker: connection from 192.168.1.140
+strata stage worker: main process 192.168.1.140: layers 26.. here, context 131072, chunk 5888, rows fp32
+strata stage worker: windows: own layers 11.08 ms each (64 windows; wait for the GPU 10.42, pool + plan 0.41, host staging 0.00)
+"""
+RELAY_LOG = """strata generate: session is up (engine 0.1.44.1)
+strata generate: expert cache 1800 slots, 7.02 GiB of VRAM; policy is
+strata serve: relay: layers 40-47 on 10.10.10.3:7841 (rows fp32)
+strata serve: stage worker: layers 26-39, relaying to 10.10.10.3:7841, prompt chunk 5888, port 7841
+strata stage worker: listening on 10.10.10.2:7841 (a token is required)
+strata stage worker: main process 192.168.1.140: layers 26.. here, context 131072, chunk 5888, rows fp32
+strata stage worker: windows: own layers 7.50 ms, next worker 9.25 ms each (64 windows; wait for the GPU 7.00, pool + plan 0.30, host staging 0.00)
+"""
+LAST_LOG = """strata generate: session is up (engine 0.1.44.1)
+strata generate: expert cache 1500 slots, 5.80 GiB of VRAM; policy is
+strata serve: stage worker: layers 40-47, no head, prompt chunk 5888, port 7841
+strata stage worker: listening on 10.10.10.3:7841 (a token is required)
+strata stage worker: main process 10.10.10.2: layers 40.. here, context 131072, chunk 5888, rows fp32
+strata stage worker: windows: own layers 8.40 ms each (64 windows; wait for the GPU 8.00, pool + plan 0.30, host staging 0.00)
+"""
+GPU = [{"name": "NVIDIA GeForce RTX 2080 Ti", "vram_mib": 11264, "free_mib": 1100, "used_mib": 10164, "pcie_gen": "3",
+        "pcie_width": "16", "pcie_width_max": "16"}]
+_gpus = threading.local()
+
+
+class FakeAgent:
+    """tools/stage_node.py's handler on 127.0.0.1 with a worker log of our own (`log`, None: no worker started)."""
+
+    def __init__(self, log: str | None, running: bool = True, gpus=None):
+        self.dir = tempfile.TemporaryDirectory()
+        cfg = {"_token": TOKEN, "bind": "127.0.0.1", "log_dir": self.dir.name}
+        self.workers = sn.Workers(cfg)
+        self.running = running
+        self.workers.running = lambda: [7841] if self.running else []
+        self.workers.reap = lambda: None
+        self.set_log(log)
+        self.gpus = GPU if gpus is None else gpus
+        # each agent its own GPUs: the module's gpu_info answers what the request's own handler set (one thread each)
+        self.patch = mock.patch.object(sn, "gpu_info", lambda: _gpus.value)
+        self.patch.start()
+        agent = self
+
+        class Handler(sn.make_handler(cfg, self.workers, sn.Store(cfg))):
+            def log_message(self, *a):                              # no request lines on stderr
+                pass
+
+            def do_GET(self):
+                _gpus.value = agent.gpus
+                super().do_GET()
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def set_log(self, text: str | None) -> None:
+        p = self.workers.log_path(7841)
+        if text is None:
+            p.unlink(missing_ok=True)
+        else:
+            p.write_text(text, encoding="utf-8")
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.patch.stop()
+        self.dir.cleanup()
+
+
+class FakeProc:
+    def __init__(self, rc=None):
+        self.rc = rc
+
+    def poll(self):
+        return self.rc
+
+
+class RemoteEngine(MockEngine):
+    """A StrataEngine's face as serve/stages.py reads it: its spawn (args, env), its log, alive or not."""
+
+    def __init__(self, tok, log_path: str, args=None, env=None):
+        super().__init__(tok, "Hello.")
+        args = args or ["--layer-split", "26", "--split-device", "0", "--remote-stage", "10.10.10.2:7841"]
+        self.spawn = ("strata", args, None, log_path, {"STRATA_STAGE_TOKEN": TOKEN} if env is None else env, False,
+                      None)
+        self.log_path, self.log_start = log_path, 0
+        self.running, self.unloaded, self.proc = True, False, FakeProc()
+        self.ready_at = 1_000_000.0
+
+    def alive(self):
+        return self.running
+
+
+def wait_agents(mon: stages.StageMonitor, timeout=10.0) -> None:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        with mon.lock:
+            if not mon.busy:
+                return
+        time.sleep(0.02)
+    raise AssertionError("the agents' thread did not finish")
+
+
+def view_now(mon: stages.StageMonitor, engine) -> dict:
+    """A view after the agents were asked once (the first call asks, on a thread)."""
+    mon.asked_at = 0.0
+    mon.view(engine, ask=True)
+    wait_agents(mon)
+    return mon.view(engine)
+
+
+class LogCase(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.log = os.path.join(self.dir.name, "strata.log")
+        Path(self.log).write_text("", encoding="utf-8")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def append(self, text: str) -> None:
+        with open(self.log, "a", encoding="utf-8") as f:
+            f.write(text)
+
+
+class MainLogTest(LogCase):
+    def test_connect_timing_and_restarts(self):
+        ml = stages.MainLog()
+        self.append("older lines of an earlier server: strata serve: remote stage 1.2.3.4:1: layers 9-9 there "
+                    "(prompt chunk 1, context 1)\n")
+        start = os.path.getsize(self.log)
+        self.append(STARTED + MAIN_RUN)
+        s = ml.poll(self.log, None, start)
+        self.assertEqual(s["connects"], 1)                          # the line before this run's start is not read
+        self.assertTrue(s["run_connected"])
+        self.assertEqual(s["connect"]["address"], "10.10.10.2:7841")
+        self.assertEqual(s["connect"]["layers"], [26, 47])
+        self.assertEqual((s["connect"]["chunk"], s["connect"]["context"], s["connect"]["rows"]), (5888, 131072, "fp32"))
+        self.assertIsNone(s["windows"])
+        self.append(MAIN_TIMING + "strata serve: rem")               # half a line: read next time
+        s = ml.poll(self.log, None, start)
+        self.assertEqual((s["windows"]["round_trip_ms"], s["windows"]["worker_ms"], s["windows"]["link_ms"]),
+                         (23.04, 21.87, 1.17))
+        self.assertEqual(s["gap_ms"], 25.32)
+        # the engine ended and was started again: a new run that connects is a reconnect
+        self.append("ote stage: checkpoint 3 at 900 tokens saved on the worker\n")
+        start2 = os.path.getsize(self.log)
+        self.append(STARTED)
+        s = ml.poll(self.log, None, start2)
+        self.assertFalse(s["run_connected"])
+        self.assertEqual(s["runs"], 2)
+        self.assertIsNone(s["windows"])                             # the earlier link's round trips are gone
+        self.append(MAIN_RUN.replace("rows fp32", "rows bf16"))
+        s = ml.poll(self.log, None, start2)
+        self.assertEqual(s["connects"], 2)
+        self.assertEqual(s["connect"]["rows"], "bf16")
+        self.assertTrue(s["run_connected"])
+        # the remote stage before main-next: no rows in the line
+        self.append(STARTED + MAIN_RUN.replace(", rows fp32", ""))
+        s = ml.poll(self.log, None, start2)
+        self.assertEqual((s["connects"], s["connect"]["rows"], s["connect"]["layers"]), (3, None, [26, 47]))
+
+    def test_waiting_relink_and_errors(self):
+        ml = stages.MainLog()
+        self.append(STARTED + "strata serve: remote stage: waiting for the worker at 10.10.10.2:7841 (remote stage: "
+                    "cannot connect to 10.10.10.2:7841: connection refused), up to 120 s (STRATA_REMOTE_CONNECT_S)\n")
+        s = ml.poll(self.log, None, 0)
+        self.assertEqual(s["waiting"]["address"], "10.10.10.2:7841")
+        self.assertFalse(s["run_connected"])
+        self.append(MAIN_RUN)
+        s = ml.poll(self.log, None, 0)
+        self.assertIsNone(s["waiting"])
+        self.append("strata serve: remote stage: the link to 10.10.10.2:7841 was lost (remote stage: the peer closed "
+                    "the connection): connected again\n")
+        s = ml.poll(self.log, None, 0)
+        self.assertEqual((s["connects"], s["relinks"]), (1, 1))
+        self.assertTrue(s["connect"]["relinked"])
+        self.assertEqual(s["error"]["text"], "remote stage: the peer closed the connection")
+        self.append(STARTED + "strata serve: remote stage: cannot connect to 10.10.10.2:7841: Connection refused\n")
+        s = ml.poll(self.log, None, 0)
+        self.assertFalse(s["run_connected"])
+        self.assertEqual(s["error"]["text"], "remote stage: cannot connect to 10.10.10.2:7841: Connection refused")
+        # a start that waited and gave up: not waiting any more
+        self.append(STARTED + "strata serve: remote stage: waiting for the worker at 10.10.10.2:7841 (x), up to 120 s "
+                    "(STRATA_REMOTE_CONNECT_S)\nstrata serve: remote stage: cannot connect to 10.10.10.2:7841: timed "
+                    "out\n")
+        self.assertIsNone(ml.poll(self.log, None, 0)["waiting"])
+        # the hello's check of the two sides, as the start prints it
+        self.append("strata serve: remote stage: the two sides differ: kv type 1 here, 2 there\n")
+        self.assertEqual(ml.poll(self.log, None, 0)["error"]["text"],
+                         "remote stage: the two sides differ: kv type 1 here, 2 there")
+        self.append("strata serve: remote stage: cannot connect to 10.10.10.2:7841: Connection refused\n")
+        # informational remote-stage lines are not errors
+        self.append("strata serve: remote stage: continuing the live session at 900 tokens\n"
+                    "strata serve: remote stage: checkpoint 3 at 900 tokens saved on the worker\n")
+        self.assertEqual(ml.poll(self.log, None, 0)["error"]["text"],
+                         "remote stage: cannot connect to 10.10.10.2:7841: Connection refused")
+
+
+    def test_from_the_first_start_and_a_long_log(self):
+        """Restarts before the first look count (read from this server's first start), and a log too long to read
+        on still gives the current run's link (its start's lines, then the end)."""
+        ml = stages.MainLog()
+        self.append(STARTED + MAIN_RUN)
+        start2 = os.path.getsize(self.log)
+        self.append(STARTED + MAIN_RUN)
+        s = ml.poll(self.log, 0, start2)
+        self.assertEqual((s["connects"], s["runs"]), (2, 2))
+        filler = "strata serve: request done: some line of the engine's own\n" * 200
+        start3 = os.path.getsize(self.log)
+        self.append(filler + STARTED + MAIN_RUN.replace("26-47 there", "26-40 there") + filler * 5 + MAIN_TIMING)
+        start3 += len(filler.encode()) + filler.count("\n") * (os.linesep == "\r\n")   # where the run's line begins
+        with mock.patch.object(stages, "READ_MAX", 4096), mock.patch.object(stages, "HEAD_MAX", 2048):
+            s = ml.poll(self.log, 0, start3)
+        self.assertEqual((s["connects"], s["runs"], s["connect"]["layers"]), (3, 3, [26, 40]))
+        self.assertTrue(s["run_connected"])
+        self.assertEqual(s["windows"]["round_trip_ms"], 23.04)
+        self.append("strata remote: main process between windows 30.00 ms each (64 windows: ...)\n")
+        self.assertEqual(ml.poll(self.log, 0, start3)["gap_ms"], 30.0)   # read on as usual afterwards
+
+
+class WorkerLogTest(unittest.TestCase):
+    def test_worker_and_relay(self):
+        f = stages.WorkerLog.parse(WORKER_LOG.splitlines())
+        self.assertEqual(f["version"], "0.1.44.1")
+        self.assertEqual((f["cache_slots"], f["cache_gib"]), (2345, 9.14))
+        self.assertEqual((f["layers"], f["next"]), ([26, 47], None))
+        self.assertEqual((f["own_ms"], f["next_ms"]), (11.08, None))
+        self.assertEqual(f["peer"], "192.168.1.140")
+        f = stages.WorkerLog.parse(["strata stage worker: 192.168.1.140 disconnected: remote stage: the peer closed "
+                                    "the connection"], f)
+        self.assertIsNone(f["peer"])
+        self.assertEqual(f["version"], "0.1.44.1")                   # kept from the earlier lines
+        r = stages.WorkerLog.parse(RELAY_LOG.splitlines())
+        self.assertEqual((r["layers"], r["next"], r["next_layers"], r["next_ok"]),
+                         ([26, 39], "10.10.10.3:7841", [40, 47], True))
+        self.assertEqual((r["own_ms"], r["next_ms"]), (7.5, 9.25))
+        r = stages.WorkerLog.parse(["strata serve: relay: remote stage: cannot connect to 10.10.10.3:7841: refused"], r)
+        self.assertEqual((r["next_ok"], r["next_error"]), (False, "remote stage: cannot connect to 10.10.10.3:7841: refused"))
+        r = stages.WorkerLog.parse(["strata serve: relay: layers 40-47 on 10.10.10.3:7841"], r)
+        self.assertTrue(r["next_ok"])                               # linked again at the next reset
+        # the next worker failed in a window: the relay's main connection ends with the error naming it
+        r = stages.WorkerLog.parse(["strata stage worker: 192.168.1.140 disconnected: remote stage: cannot connect to "
+                                    "10.10.10.3:7841: timed out"], r)
+        self.assertFalse(r["next_ok"])
+        r = stages.WorkerLog.parse(["strata stage worker: 192.168.1.140 disconnected: remote stage: the peer closed "
+                                    "the connection"], {**r, "next_ok": True})
+        self.assertTrue(r["next_ok"])                               # the main process went: not the next worker
+
+    def test_args(self):
+        self.assertEqual(stages.remote_args(["--layer-split", "26", "--remote-stage", "h:1"]), ("h:1", 26))
+        self.assertEqual(stages.remote_args(["--layer-split", "26"]), (None, 26))
+        self.assertEqual(stages.host_of("[fe80::1]:7841"), "fe80::1")
+        self.assertEqual(stages.port_of("10.0.0.2:7841"), 7841)
+
+
+class MonitorTest(LogCase):
+    def setUp(self):
+        super().setUp()
+        self.tok = ByteTokenizer()
+        self.agents = []
+
+    def tearDown(self):
+        for a in self.agents:
+            a.close()
+        super().tearDown()
+
+    def agent(self, *a, **kw) -> FakeAgent:
+        x = FakeAgent(*a, **kw)
+        self.agents.append(x)
+        return x
+
+    def test_no_remote_stage(self):
+        mon = stages.StageMonitor()
+        self.assertIsNone(mon.view(MockEngine(self.tok, "x")))
+        e = RemoteEngine(self.tok, self.log, args=["--layer-split", "26", "--split-device", "0"])
+        self.assertIsNone(mon.view(e, ask=True))
+        self.assertEqual(mon.agents, {})                            # no agent is asked either
+
+    def test_one_worker(self):
+        ag = self.agent(WORKER_LOG)
+        self.append(STARTED + MAIN_RUN + MAIN_TIMING)
+        mon = stages.StageMonitor()
+        mon.agents_cfg = {"10.10.10.2:7841": ag.url}
+        e = RemoteEngine(self.tok, self.log)
+        v = view_now(mon, e)
+        self.assertEqual(v["local_layers"], [0, 25])
+        self.assertEqual(v["gap_ms"], 25.32)
+        (w,) = v["workers"]
+        self.assertEqual((w["state"], w["since"], w["reconnects"], w["error"]), ("connected", 1_000_000.0, 0, None))
+        self.assertEqual((w["address"], w["layers"], w["relay_to"]), ("10.10.10.2:7841", [26, 47], None))
+        self.assertEqual((w["round_trip_ms"], w["worker_ms"], w["link_ms"], w["own_ms"]), (23.04, 21.87, 1.17, 11.08))
+        self.assertEqual(w["gpu"], {"name": "NVIDIA GeForce RTX 2080 Ti", "vram_mib": 11264, "used_mib": 10164})
+        self.assertEqual((w["version"], w["cache_slots"], w["cache_gib"]), ("0.1.44.1", 2345, 9.14))
+        self.assertTrue(w["agent"]["ok"])
+        self.assertNotIn(TOKEN, json.dumps(v))                      # the token never leaves the server
+        # the worker process ended (the agent no longer runs it): down, though the main process has not noticed
+        ag.running = False
+        ag.set_log(WORKER_LOG + "strata stage worker: 192.168.1.140 disconnected: CUDA error: an illegal memory "
+                                "access\n")
+        w = view_now(mon, e)["workers"][0]
+        self.assertEqual(w["state"], "down")
+        self.assertIn("the worker process ended", w["error"]["text"])
+        self.assertIn("illegal memory access", w["error"]["text"])
+
+    def test_agent_tail_and_restart(self):
+        ag = self.agent(WORKER_LOG)
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        mon.agents_cfg = {"10.10.10.2:7841": ag.url}
+        e = RemoteEngine(self.tok, self.log)
+        view_now(mon, e)
+        # many lines later the start-up lines are out of the tail: the facts read from them stay
+        ag.set_log(WORKER_LOG + "strata stage worker: chunk T=5888 at 0: read in 2704 ms\n" * (stages.LOG_TAIL + 50) +
+                   "strata stage worker: windows: own layers 12.50 ms each (64 windows; ...)\n")
+        w = view_now(mon, e)["workers"][0]
+        self.assertEqual((w["version"], w["cache_slots"], w["own_ms"]), ("0.1.44.1", 2345, 12.5))
+        # the agent started a new worker (another engine, another cache): read whole again
+        ag.set_log(WORKER_LOG.replace("0.1.44.1", "0.1.45").replace("2345 slots", "2000 slots"))
+        w = view_now(mon, e)["workers"][0]
+        self.assertEqual((w["version"], w["cache_slots"]), ("0.1.45", 2000))
+        # ... also when it wrote more than a tail before the next look (its start-up lines are not in the tail)
+        ag.set_log(WORKER_LOG.replace("0.1.44.1", "0.1.46").replace("2345 slots", "1900 slots").replace(
+            "no head", "relaying to 10.10.10.3:7841") + "strata stage worker: chunk T=5888 at 0: read in 2704 ms\n" * 400)
+        w = view_now(mon, e)["workers"][0]
+        self.assertEqual((w["version"], w["cache_slots"], w["relay_to"]), ("0.1.46", 1900, "10.10.10.3:7841"))
+
+    def test_relay_chain(self):
+        a1, a2 = self.agent(RELAY_LOG), self.agent(LAST_LOG, gpus=[{**GPU[0], "name": "NVIDIA GeForce RTX 3070"}])
+        self.append(STARTED + MAIN_RUN.replace("26-47 there", "26-39 there"))
+        mon = stages.StageMonitor()
+        mon.agents_cfg = {"10.10.10.2:7841": a1.url, "10.10.10.3:7841": a2.url}
+        e = RemoteEngine(self.tok, self.log)
+        view_now(mon, e)                                            # the relay's log names its next worker ...
+        v = view_now(mon, e)                                        # ... whose agent is asked from then on
+        w1, w2 = v["workers"]
+        self.assertEqual((w1["layers"], w1["relay_to"], w1["state"]), ([26, 39], "10.10.10.3:7841", "connected"))
+        self.assertEqual((w2["address"], w2["layers"], w2["state"], w2["round_trip_ms"], w2["own_ms"]),
+                         ("10.10.10.3:7841", [40, 47], "connected", 9.25, 8.4))
+        self.assertEqual((w1["gpu"]["name"], w2["gpu"]["name"]), ("NVIDIA GeForce RTX 2080 Ti", "NVIDIA GeForce RTX 3070"))
+        self.assertIsNone(w2["reconnects"])                         # only the main process's link is counted
+        a1.set_log(RELAY_LOG + "strata serve: relay: remote stage: cannot connect to 10.10.10.3:7841: refused\n")
+        w2 = view_now(mon, e)["workers"][1]
+        self.assertEqual(w2["state"], "down")
+        self.assertIn("cannot connect", w2["error"]["text"])
+
+    def test_states(self):
+        self.append(STARTED)
+        mon = stages.StageMonitor()
+        mon.agents_cfg = False                                      # no agent is asked
+        e = RemoteEngine(self.tok, self.log)
+        e.running = False                                           # starting: the process runs, no READY yet
+        w = mon.view(e, ask=True)["workers"][0]
+        self.assertEqual((w["state"], w["agent"], w["gpu"]), ("connecting", None, None))
+        self.append(MAIN_RUN)
+        e.running = True
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+        # the link failed in a request: the engine's ERR ends it
+        e.stage_err = ("remote stage: the peer closed the connection", time.time())
+        e.running, e.proc = False, FakeProc(rc=1)
+        w = mon.view(e)["workers"][0]
+        self.assertEqual((w["state"], w["error"]["text"]), ("down", "remote stage: the peer closed the connection"))
+        # the next request starts it again: reconnecting, then connected with one reconnect
+        e.proc = FakeProc()
+        self.append(STARTED)
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "reconnecting")
+        self.append(MAIN_RUN)
+        e.running, e.ready_at = True, time.time()
+        w = mon.view(e)["workers"][0]
+        self.assertEqual((w["state"], w["reconnects"], w["error"]), ("connected", 1, None))
+        # it ends later of something else: the earlier link's error is not its cause
+        e.running, e.proc = False, FakeProc(rc=-9)
+        w = mon.view(e)["workers"][0]
+        self.assertEqual((w["state"], w["error"]), ("down", None))
+        e.running, e.proc = True, FakeProc()
+        e.unloaded = True
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "unloaded")
+
+    def test_waiting_for_the_worker(self):
+        """The recovery branch's start waits for its worker and says why: connecting, the last try's error."""
+        self.append(STARTED + "strata serve: remote stage: waiting for the worker at 10.10.10.2:7841 (remote stage: "
+                    "cannot connect to 10.10.10.2:7841: timed out), up to 120 s (STRATA_REMOTE_CONNECT_S)\n")
+        mon = stages.StageMonitor()
+        mon.agents_cfg = False
+        e = RemoteEngine(self.tok, self.log)
+        e.running = False
+        w = mon.view(e)["workers"][0]
+        self.assertEqual((w["state"], w["error"]["text"]),
+                         ("connecting", "remote stage: cannot connect to 10.10.10.2:7841: timed out"))
+        self.assertIsNotNone(w["since"])
+
+    def test_wrong_token_and_no_agent(self):
+        ag = self.agent(WORKER_LOG)
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        mon.agents_cfg = {"10.10.10.2:7841": ag.url}
+        e = RemoteEngine(self.tok, self.log, env={"STRATA_STAGE_TOKEN": "not it"})
+        w = view_now(mon, e)["workers"][0]
+        self.assertEqual((w["state"], w["agent"]["ok"], w["agent"]["error"]),
+                         ("connected", False, "the agent refused the token (X-Stage-Token)"))
+        self.assertIsNone(w["gpu"])
+        mon.agents_cfg = {"10.10.10.2:7841": "http://127.0.0.1:9"}  # nothing listens there
+        w = view_now(mon, RemoteEngine(self.tok, self.log))["workers"][0]
+        self.assertFalse(w["agent"]["ok"])
+        self.assertTrue(w["agent"]["error"])
+        mon.agents_cfg = None                                       # the default: no agent is asked (opt-in)
+        self.assertIsNone(mon.agent_for("10.10.10.2:7841"))
+        mon.agents_cfg = True                                       # each worker's host, port 7840
+        self.assertEqual(mon.agent_for("10.10.10.2:7841").url, "http://10.10.10.2:7840")
+        self.assertEqual(mon.agent_for("[fe80::1]:7841").url, "http://[fe80::1]:7840")
+        mon.agents_cfg = {"10.10.10.2:7841": 7840, "10.10.10.3:7841": False, "10.10.10.4:7841": "ftp://x"}
+        self.assertEqual([mon.agent_for(f"10.10.10.{i}:7841") for i in (2, 3, 4)], [None, None, None])
+        self.assertEqual(mon.agent_for("10.10.10.5:7841").url, "http://10.10.10.5:7840")   # not in the map
+        self.assertEqual(stages.Agent("http://u:secret@h:7840", 7841).view()["url"], "http://h:7840")
+
+    def test_token_never_in_an_error(self):
+        """An error message that quotes the request (http.client's invalid header value quotes the token whole) is
+        not shown; the network's words are, without the token or the URL's user:password."""
+        ag = self.agent(WORKER_LOG)
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        mon.agents_cfg = {"10.10.10.2:7841": ag.url}
+        secret = "bad\r\nsecret-xyz"
+        v = view_now(mon, RemoteEngine(self.tok, self.log, env={"STRATA_STAGE_TOKEN": secret}))
+        self.assertEqual(v["workers"][0]["agent"]["error"], "the agent's request failed (ValueError)")
+        self.assertNotIn("secret-xyz", json.dumps(v))
+        mon.agents_cfg = {"10.10.10.2:7841": "http://user:pw-123@127.0.0.1:9"}
+        with mock.patch.object(stages.Agent, "get",
+                               side_effect=OSError(f"failed with {TOKEN} for http://user:pw-123@127.0.0.1:9")):
+            v = view_now(mon, RemoteEngine(self.tok, self.log))
+        err = v["workers"][0]["agent"]["error"]
+        self.assertIn("failed with", err)
+        for s in (TOKEN, "pw-123"):
+            self.assertNotIn(s, json.dumps(v))
+
+    def test_a_request_waits_for_the_worker(self):
+        """main-next: a request that finds the link lost waits for the worker (INFO remote_stage_wait= every 10 s);
+        connected again, or its ERR ends the wait with the engine kept and the link closed."""
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        e = RemoteEngine(self.tok, self.log)
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+        wait = ("strata serve: remote stage: waiting for the worker at 10.10.10.2:7841 (remote stage: cannot connect to "
+                "10.10.10.2:7841: Connection refused), up to 180 s (STRATA_REMOTE_CONNECT_S)\n")
+        self.append(wait)
+        w = mon.view(e)["workers"][0]
+        self.assertEqual((w["state"], w["error"]["text"]),
+                         ("reconnecting", "remote stage: cannot connect to 10.10.10.2:7841: Connection refused"))
+        e.stage_wait_at = time.time()                               # a heartbeat
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "reconnecting")
+        # its ERR: the wait is over, the engine stays with the link closed
+        e.stage_err = ("remote stage: the peer closed the connection; connecting again: timed out", time.time())
+        w = mon.view(e)["workers"][0]
+        self.assertEqual((w["state"], w["error"]["text"]),
+                         ("down", "remote stage: the peer closed the connection; connecting again: timed out"))
+        # the next request: connected again at once
+        self.append("strata serve: remote stage: the link to 10.10.10.2:7841 was lost (remote stage: the peer closed "
+                    "the connection): connected again\n")
+        w = mon.view(e)["workers"][0]
+        self.assertEqual((w["state"], w["reconnects"], w["error"]), ("connected", 1, None))
+
+    def test_a_wait_read_late(self):
+        """The log read after the wait's ERR (no Monitor open meanwhile): the wait is over all the same."""
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        e = RemoteEngine(self.tok, self.log)
+        mon.view(e)
+        self.append("strata serve: remote stage: waiting for the worker at 10.10.10.2:7841 (x), up to 180 s (y)\n")
+        e.stage_err = ("remote stage: lost; connecting again: timed out", time.time())
+        time.sleep(0.05)                                            # (Windows' clock: not the same tick)
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "down")
+
+    def test_a_new_wait_after_an_older_error(self):
+        """An earlier request's ERR, then a new wait read late: its heartbeat says it still waits."""
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        e = RemoteEngine(self.tok, self.log)
+        mon.view(e)
+        time.sleep(0.05)
+        e.stage_err = ("remote stage: lost; connecting again: timed out", time.time())
+        time.sleep(0.05)
+        self.append("strata serve: remote stage: waiting for the worker at 10.10.10.2:7841 (x), up to 180 s (y)\n")
+        e.stage_wait_at = time.time()
+        time.sleep(0.05)
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "reconnecting")
+
+    def test_a_silent_wait_is_over(self):
+        """No heartbeat for WAIT_STALE_S (an ERR the server did not see): not waiting any more."""
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        e = RemoteEngine(self.tok, self.log)
+        mon.view(e)
+        self.append("strata serve: remote stage: waiting for the worker at 10.10.10.2:7841 (x), up to 180 s (y)\n")
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "reconnecting")
+        later = time.time() + stages.WAIT_STALE_S + 1
+        with mock.patch.object(stages.time, "time", return_value=later):
+            self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+            e.running, e.proc = False, FakeProc()                   # a start waits as long as it runs
+            self.assertEqual(mon.view(e)["workers"][0]["state"], "reconnecting")
+
+    def test_agents_off_by_default(self):
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        e = RemoteEngine(self.tok, self.log)
+        with mock.patch.object(stages.Agent, "refresh") as refresh:
+            v = mon.view(e, ask=True)
+            wait_agents(mon)
+        refresh.assert_not_called()
+        self.assertEqual((v["agents"], v["workers"][0]["agent"], v["workers"][0]["state"]), (False, None, "connected"))
+
+    def test_agent_failures_are_its_state(self):
+        """Any failure of one agent (a reply that is not an agent's) is that agent's error; the next is still asked."""
+        good = self.agent(WORKER_LOG)
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        mon.agents_cfg = {"10.10.10.2:7841": good.url}
+        e = RemoteEngine(self.tok, self.log)
+        with mock.patch.object(stages.Agent, "get", side_effect=AttributeError("'list' object has no attribute")):
+            w = view_now(mon, e)["workers"][0]
+        self.assertEqual((w["agent"]["ok"], w["state"]), (False, "connected"))
+        self.assertFalse(mon.busy)
+        self.assertTrue(view_now(mon, e)["workers"][0]["agent"]["ok"])
+
+    def test_worker_log_tail(self):
+        """The tail is read on from the last read's end; a new start in it, or no end of the last read, reads the
+        whole log again (a new worker: another engine, maybe no cache)."""
+        filler = "".join(f"strata stage worker: chunk T=5888 at {i * 5888}: read in {2700 + i} ms\n"
+                         for i in range(stages.LOG_TAIL + 20))
+        ag = self.agent(WORKER_LOG + filler)
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        mon.agents_cfg = {"10.10.10.2:7841": ag.url}
+        e = RemoteEngine(self.tok, self.log)
+        wholes = []
+        real = stages.Agent.log
+        with mock.patch.object(stages.Agent, "log", lambda self, t, whole: (wholes.append(whole), real(self, t, whole))[1]):
+            view_now(mon, e)
+            ag.set_log(WORKER_LOG + filler + "strata stage worker: windows: own layers 12.50 ms each (64 windows; ...)\n")
+            w = view_now(mon, e)["workers"][0]
+            self.assertEqual((w["version"], w["cache_slots"], w["own_ms"]), ("0.1.44.1", 2345, 12.5))
+            self.assertEqual(wholes, [True, False])                # the second look read the tail only
+            # the agent started a new worker (no expert cache this time) that wrote more than a tail since
+            ag.set_log(WORKER_LOG.replace("0.1.44.1", "0.1.47").replace(
+                "strata generate: expert cache 2345 slots, 9.14 GiB of VRAM; policy is\n", "") + filler)
+            w = view_now(mon, e)["workers"][0]
+            self.assertEqual(wholes, [True, False, False, True])   # its tail, then all of it
+        self.assertEqual((w["version"], w["cache_slots"]), ("0.1.47", None))
+
+    def test_restart_with_the_same_last_line(self):
+        """A new worker whose short log ends as the last one did is still read from its start."""
+        last = "strata stage worker: main process 192.168.1.140: layers 26.. here, context 131072, chunk 5888\n"
+        ag = self.agent(WORKER_LOG + last)
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        mon.agents_cfg = {"10.10.10.2:7841": ag.url}
+        e = RemoteEngine(self.tok, self.log)
+        view_now(mon, e)
+        ag.set_log(WORKER_LOG.replace("0.1.44.1", "0.1.48") + last)
+        self.assertEqual(view_now(mon, e)["workers"][0]["version"], "0.1.48")
+
+    def test_a_port_the_agent_never_ran(self):
+        """A worker started by hand: the agent does not run it, and its port's log there is an old one - not down."""
+        ag = self.agent(WORKER_LOG, running=False)
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        mon.agents_cfg = {"10.10.10.2:7841": ag.url}
+        self.assertEqual(view_now(mon, RemoteEngine(self.tok, self.log))["workers"][0]["state"], "connected")
+
+    def test_agents_asked_now_and_then(self):
+        ag = self.agent(WORKER_LOG)
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        mon.agents_cfg = {"10.10.10.2:7841": ag.url}
+        e = RemoteEngine(self.tok, self.log)
+        calls = []
+        real = stages.Agent.refresh
+        with mock.patch.object(stages.Agent, "refresh", lambda self, t: (calls.append(t), real(self, t))):
+            mon.view(e)                                             # without the Monitor open: not asked
+            self.assertEqual(calls, [])
+            for _ in range(5):
+                mon.view(e, ask=True)
+                wait_agents(mon)
+        self.assertEqual(calls, [TOKEN])                            # once in AGENT_EVERY_S
+
+    def test_metrics_endpoint(self):
+        ag = self.agent(WORKER_LOG)
+        self.append(STARTED + MAIN_RUN)
+        e = RemoteEngine(self.tok, self.log)
+        svc = Service(e, self.tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        svc.stages.agents_cfg = {"10.10.10.2:7841": ag.url}
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            with urllib.request.urlopen(base + "/metrics", timeout=10) as r:
+                m = json.loads(r.read())
+            self.assertEqual(m["stages"]["workers"][0]["state"], "connected")
+            self.assertIsNone(m["stages"]["workers"][0]["agent"])     # not asked without ?workers=1
+            with urllib.request.urlopen(base + "/metrics?requests=all&workers=1", timeout=10) as r:
+                r.read()
+            wait_agents(svc.stages)
+            with urllib.request.urlopen(base + "/metrics?workers=1", timeout=10) as r:
+                m = json.loads(r.read())
+            self.assertEqual(m["stages"]["workers"][0]["gpu"]["name"], "NVIDIA GeForce RTX 2080 Ti")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        svc = Service(MockEngine(self.tok, "x"), self.tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        self.assertNotIn("stages", svc.metrics(workers=True))      # the payload as before: no key
+
+
+FAKE_MAIN = r'''
+import sys
+from pathlib import Path
+state = Path(sys.argv[sys.argv.index("--state") + 1])
+sys.stderr.write("strata serve: remote stage 10.10.10.2:7841: layers 26-47 there (prompt chunk 5888, context 131072, rows fp32)\n")
+sys.stderr.flush()
+print("READY 4096 stop", flush=True)
+for line in sys.stdin:
+    if line.startswith("QUIT"):
+        break
+    if line.startswith(("GEN", "BGEN")):
+        if not state.exists():   # the first request finds the link gone, and the engine ends
+            state.write_text("lost")
+            print("ERR remote stage: the peer closed the connection", flush=True)
+            sys.exit(1)
+        print("T 90\nDONE 1 1 0 1 stop", flush=True)
+'''
+
+
+class EngineWiring(unittest.TestCase):
+    """serve/server.py's StrataEngine with a fake engine process: its log, READY time and ERR line reach the card."""
+
+    def setUp(self):
+        from serve.server import StrataEngine
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        py = root / "native.py"
+        py.write_text(FAKE_MAIN)
+        if os.name == "nt":   # no shebangs on Windows: a .cmd runs the same fake engine
+            exe = root / "native.cmd"
+            exe.write_text(f'@"{sys.executable}" "{py}" %*\r\n')
+        else:
+            exe = py
+            py.write_text("#!" + sys.executable + "\n" + FAKE_MAIN)
+            py.chmod(0o700)
+        self.e = StrataEngine(str(exe), ["--state", str(root / "state"), "--layer-split", "26", "--split-device", "0",
+                                         "--remote-stage", "10.10.10.2:7841"],
+                              log=str(root / "engine.log"), env=dict(os.environ, STRATA_STAGE_TOKEN=TOKEN))
+        self.addCleanup(lambda: self.svc.engine.close())
+        self.svc = Service(self.e, ByteTokenizer(), ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        self.svc.stages.agents_cfg = False
+
+    def request(self):
+        return list(self.svc.run([1], False, [], 8, {}, threading.Event()))
+
+    def lose_the_link(self):
+        with self.assertRaises(Exception):
+            self.request()
+        end = time.monotonic() + 5
+        while self.e.alive() and time.monotonic() < end:
+            time.sleep(0.01)
+
+    def test_link_lost_in_a_request(self):
+        w = self.svc.metrics(workers=True)["stages"]["workers"][0]
+        self.assertEqual((w["state"], w["since"], w["layers"], w["reconnects"]),
+                         ("connected", self.e.ready_at, [26, 47], 0))
+        self.lose_the_link()
+        w = self.svc.metrics()["stages"]["workers"][0]
+        self.assertEqual((w["state"], w["error"]["text"]), ("down", "remote stage: the peer closed the connection"))
+
+    def test_restart_before_the_first_look(self):
+        """The Monitor opened after the engine was started again: that start's link is a reconnect all the same."""
+        self.lose_the_link()
+        self.request()                                              # the next request starts the engine again
+        w = self.svc.metrics()["stages"]["workers"][0]
+        self.assertEqual((w["state"], w["reconnects"], w["error"]), ("connected", 1, None))
+
+
+if __name__ == "__main__":
+    unittest.main()

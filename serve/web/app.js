@@ -157,7 +157,9 @@ let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
 async function poll() {
   try {
-    const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
+    // workers=1: the Monitor is open, so the server may ask a remote stage's node agents (now and then)
+    const q = [reqShowAll ? "requests=all" : "", tab === "monitor" ? "workers=1" : ""].filter(Boolean).join("&");
+    const r = await fetch(q ? `metrics?${q}` : "metrics", {headers: headers()});
     if (r.status === 401) {
       setPill("error", "API key needed");
       if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
@@ -195,7 +197,56 @@ function render(m) {
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
+  if (tab === "monitor") renderWorkers(m.stages);
   if (tab === "about") renderAbout(eng, hw, st);
+}
+
+// A remote stage (docs/REMOTE_STAGE.md): the PCs that run the later layers, one row each (a relay's next worker
+// after it). The link's state is the main process's; GPU, VRAM, cache, engine and own time come from each node agent.
+const WK_STATE = {connected: ["st-badge--generating", "Connected"], connecting: ["st-badge--queued", "Connecting"],
+                  reconnecting: ["st-badge--queued", "Reconnecting"], down: ["st-badge--error", "Down"],
+                  unloaded: ["", "Unloaded"], unknown: ["", "Unknown"]};
+function clock(t) {
+  if (!t) return "";
+  const d = new Date(t * 1000);
+  const opts = Date.now() - d > 86400000 ? {weekday: "short", hour: "2-digit", minute: "2-digit"} : {hour: "2-digit", minute: "2-digit"};
+  return d.toLocaleString([], opts);
+}
+function renderWorkers(s) {
+  $("wk-card").hidden = !s;
+  if (!s) return;                                  // no remote stage (or an older server)
+  const ws = s.workers || [];
+  const ms = (v) => (v == null ? "–" : `${fmt(v, 1)} ms`);
+  const span = (l) => (l ? `${l[0]}–${l[1]}` : "–");
+  $("wk-body").innerHTML = ws.map((w) => {
+    const [cls, text] = WK_STATE[w.state] || WK_STATE.unknown;
+    const g = w.gpu || {};
+    const name = g.name || w.host || w.address;
+    const where = name === w.address ? "" : [w.address, g.name && w.host ? w.host : ""].filter(Boolean).join(" · ");
+    const vram = g.vram_mib ? `${gb(g.used_mib * 1048576)} / ${gb(g.vram_mib * 1048576, 0)} GB` : "–";
+    const vpct = g.vram_mib ? Math.min(100, (100 * g.used_mib) / g.vram_mib) : 0;
+    const split = w.worker_ms != null && w.link_ms != null ? `<span class="muted small wk-sub" title="the worker + the link">${fmt(w.worker_ms, 1)} + ${fmt(w.link_ms, 1)}</span>` : "";
+    const row = `<tr${w.error ? ' class="wk-has-err"' : ""}>
+      <td><span class="wk-name">${esc(name)}</span>${where ? `<span class="muted small wk-sub">${esc(where)}</span>` : ""}</td>
+      <td>${span(w.layers)}${w.relay_to ? `<span class="muted small wk-sub" title="relays to the next worker">→ ${esc(w.relay_to)}</span>` : ""}</td>
+      <td><span class="st-badge ${cls}">${text}</span>${w.since ? `<span class="muted small wk-sub" title="${esc(text)} since ${esc(new Date(w.since * 1000).toLocaleString())}">${esc(clock(w.since))}</span>` : ""}</td>
+      <td class="num">${fmt(w.reconnects)}</td>
+      <td class="num">${ms(w.round_trip_ms)}${split}</td>
+      <td class="num">${ms(w.own_ms)}</td>
+      <td>${vram}${g.vram_mib ? `<div class="st-progress"${vpct > 95 ? ' data-tone="danger"' : ""}><div class="st-progress__bar" style="width:${vpct}%"></div></div>` : ""}</td>
+      <td class="num">${fmt(w.cache_slots)}${w.cache_gib ? `<span class="muted small wk-sub">${fmt(w.cache_gib, 1)} GB</span>` : ""}</td>
+      <td>${w.version ? `v${esc(w.version)}` : "–"}</td></tr>`;
+    const err = w.error ? `<tr class="wk-err"><td colspan="9"><div class="wk-err__text">${icon("error", "st-icon st-icon--sm")}<span>${esc(clock(w.error.at))}${w.error.at ? " · " : ""}${esc(w.error.text || "")}</span></div></td></tr>` : "";
+    return row + err;
+  }).join("") || `<tr><td colspan="9" class="muted">No worker yet</td></tr>`;
+  const here = s.local_layers ? `This PC runs layers ${span(s.local_layers)} and the head${s.gap_ms != null ? ` (${fmt(s.gap_ms, 1)} ms a window)` : ""}` : "";
+  $("wk-sum").textContent = [here, s.rows ? `hand-off rows ${s.rows}` : ""].filter(Boolean).join(" · ");
+  const notes = s.agents ? ws.filter((w) => w.agent && w.agent.ok === false).map((w) =>
+    `No node agent answered at ${w.agent.url} (${w.agent.error}): the GPU, VRAM, cache, engine and own-layer columns come from it ("stage_agents" in the run config can name another address; the server reads it when it starts).`)
+    : ["The GPU, VRAM, cache, engine and own-layer columns come from each worker PC's node agent (tools/stage_node.py): add \"stage_agents\": true to the run config and start the server again to ask them."];
+  if (ws.length && ws[0].state === "connected" && ws[0].round_trip_ms == null)
+    notes.push("Round trips show after 64 decode windows with STRATA_REMOTE_TIMING=1 in the run config's env.");
+  $("wk-note").textContent = notes.join(" ");
 }
 
 // #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole

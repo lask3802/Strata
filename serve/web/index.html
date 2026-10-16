@@ -116,6 +116,23 @@
         <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
       </div>
 
+      <div class="st-card wk-card" id="wk-card" hidden>
+        <div class="req-head"><span class="card-title">Workers</span><span class="muted small" id="wk-sum"></span></div>
+        <div class="table-wrap" id="wk-wrap">
+          <table class="st-table">
+            <thead><tr><th>Worker</th><th>Layers</th><th>Link</th>
+              <th class="num" title="Links made again since this server started (an engine restart makes one too)">Reconnects</th>
+              <th class="num" title="Mean per verify window as the stage before it measures it: the main process's round trip (the worker's time + the link), or a relay's wait for its next worker">Round trip</th>
+              <th class="num" title="The worker's own layers per verify window, from its log (mean of the last 64 windows)">Own layers</th>
+              <th title="The worker PC's GPU memory, from its node agent">VRAM</th>
+              <th class="num" title="Expert cache slots on the worker's GPU, and their size">Expert cache</th>
+              <th>Engine</th></tr></thead>
+            <tbody id="wk-body"></tbody>
+          </table>
+        </div>
+        <p class="muted small wk-note" id="wk-note"></p>
+      </div>
+
       <div class="monitor-row">
         <div class="st-card ctx-card">
           <span class="card-title">Context fill</span>

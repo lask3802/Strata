@@ -68,6 +68,7 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve.stages import StageMonitor  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -776,6 +777,10 @@ class StrataEngine:
     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
+    stage_err = None                     # a remote stage's last `ERR remote stage...` and when (the Workers card)
+    stage_wait_at = None                 # when it last said a request waits for its worker (INFO remote_stage_wait=)
+    ready_at = None                      # when the engine said READY (a remote stage's link is made just before)
+    first_log_start = None               # where this server's first engine start began in the log (the Workers card)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
@@ -826,6 +831,8 @@ class StrataEngine:
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0  # where this start's lines begin (start_failure_hint)
         self.log_start = log_start                      # #596: the Monitor's conversation cache reads from here
+        if self.first_log_start is None:                # (kept across restarts: they run __init__ again)
+            self.first_log_start = log_start
         if log:
             threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
                              daemon=True).start()
@@ -922,6 +929,7 @@ class StrataEngine:
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
         if self.info.get("engine"):
             self.info["version"] = str(self.info["engine"])
+        self.ready_at = time.time()
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
@@ -1001,6 +1009,11 @@ class StrataEngine:
                     continue
                 except (IndexError, ValueError):
                     pass
+            if line.startswith(("ERR remote stage", "INFO remote_stage_wait=")) and self.proc is proc:
+                if line[0] == "E":                      # the Workers card says it (the request reads it as well)
+                    self.stage_err = (line[4:].strip(), time.time())
+                else:                                   # a request waits for the worker (every 10 s meanwhile)
+                    self.stage_wait_at = time.time()
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
@@ -3166,6 +3179,7 @@ class Service:
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
+        self.stages = StageMonitor()                    # a remote stage's workers (the Monitor's Workers card)
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -3875,9 +3889,10 @@ class Service:
                     | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
                     for r in reversed(records)]
 
-    def metrics(self, all_requests=False) -> dict:
+    def metrics(self, all_requests=False, workers=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
-        the hardware (with a minute of history per series)."""
+        the hardware (with a minute of history per series).  `workers`: the Monitor tab is open, so a remote stage's
+        node agents may be asked (on a thread, now and then: serve/stages.py)."""
         with self.status_lock:
             s = dict(self.status)
             if self.live_reqs:                          # parallel requests: the newest one's status
@@ -3923,11 +3938,15 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
-                "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
-                "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
-                "hardware_static":
-                tel["static"], "history": tel["history"], "time": now}
+        out = {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+               "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+               "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
+               "hardware_static":
+               tel["static"], "history": tel["history"], "time": now}
+        stages = self.stages.view(self.engine, ask=workers)
+        if stages is not None:                          # a remote stage only: the Workers card
+            out["stages"] = stages
+        return out
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -5552,7 +5571,8 @@ def make_handler(svc: Service):
                     return
                 if self._authorized():
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
-                    self._json(200, svc.metrics(all_requests="requests=all" in self.path))
+                    q = urlsplit(self.path).query
+                    self._json(200, svc.metrics(all_requests="requests=all" in q, workers="workers=1" in q))
                 return
             if path == "/api/requests" and svc.api_monitor:
                 if self._authorized():
@@ -7073,6 +7093,7 @@ def main() -> int:
         print("[strata] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
               else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
+    svc.stages.agents_cfg = cfg.get("stage_agents")     # opt-in: a remote stage's node agents (serve/stages.py)
     if svc.api_monitor:
         print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
               "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),

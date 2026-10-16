@@ -127,6 +127,17 @@ main { flex: 1; min-height: 0; display: flex; }
 .cc-note { margin: 0; }
 .cc-note:empty { display: none; }
 .mcp-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
+.wk-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
+#wk-wrap .st-table th,
+#wk-wrap .st-table td { white-space: nowrap; padding-inline: 8px; vertical-align: top; }
+.wk-name { color: var(--st-ink); font-weight: var(--st-fw-medium); }
+.wk-sub { display: block; margin-top: 4px; }
+#wk-wrap .st-progress { height: 6px; margin-top: 6px; min-width: 96px; }
+#wk-wrap .wk-has-err td { border-bottom: 0; }
+#wk-wrap .wk-err td { padding-top: 0; white-space: normal; color: var(--st-danger-text); font-size: var(--st-fs-sm); }
+.wk-err__text { display: flex; align-items: center; gap: 6px; }
+.wk-note { margin: 0; }
+.wk-note:empty { display: none; }
 .cfg-form { display: grid; grid-template-columns: minmax(180px, max-content) minmax(0, 1fr); gap: var(--st-s-3) var(--st-s-4);
             align-items: center; }
 .cfg-form label { font-size: var(--st-fs-sm); font-weight: var(--st-fw-medium); }
