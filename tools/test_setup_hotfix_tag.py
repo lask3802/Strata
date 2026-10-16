@@ -32,12 +32,13 @@ class HotfixTag(unittest.TestCase):
     def test_the_engine_zips_are_found_for_a_hotfix_tag(self):
         # a hotfix that keeps CMakeLists.txt at the engine's version: the v0.1.40 release still holds the zips
         bases = setup.prebuilt_bases(setup.PREBUILT_URL)
-        self.assertEqual(bases[0], setup.PREBUILT_TAG_URL.format(version=setup.source_version()))
+        self.assertEqual(bases[0], setup.PREBUILT_TAG_URL.format(version=setup.link_version()))
         self.assertEqual(bases[-1], setup.PREBUILT_URL)
-        # and if a four-part project version ever exists, its tag is tried first, the latest release is the fallback
-        with mock.patch.object(setup, "source_version", return_value="0.1.40.1"):
+        # and a Link release of a four-part version: its tag is tried first, the latest release is the fallback
+        with mock.patch.object(setup, "link_version", return_value="0.1.40.1-link.2"):
             self.assertEqual(setup.prebuilt_bases(setup.PREBUILT_URL),
-                             ["https://github.com/Niko1221/Strata/releases/download/v0.1.40.1/", setup.PREBUILT_URL])
+                             [f"https://github.com/{setup.REPO}/releases/download/v0.1.40.1-link.2/",
+                              setup.PREBUILT_URL])
 
     def test_an_engine_that_says_four_parts_is_read_as_four(self):
         with tempfile.TemporaryDirectory() as d:

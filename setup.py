@@ -172,12 +172,14 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
 # "https://github.com/<you>/Strata/releases/latest/download/" (or pass --prebuilt / set STRATA_PREBUILT_URL).
 # With the default, the release of this checkout's own version (PREBUILT_TAG_URL, CMakeLists.txt's version) is
 # tried first and the latest release is the fallback (#214): an older checkout keeps the engine it shipped with.
-PREBUILT_URL = "https://github.com/Niko1221/Strata/releases/latest/download/"
+# Strata Link: the fork's own releases (.github/workflows/release.yml), tagged v<LINK_VERSION> (link_version(), e.g.
+# v0.1.44.1-link.1) instead of CMakeLists.txt's version; a renamed repository changes REPO alone.
 # The repository the release assets and their SHA-256 come from; `engine_digest` reads the API here even
 # when --prebuilt points the download somewhere else, because the hash is only worth having if it comes
 # from somewhere the download does not.
-REPO = "Niko1221/Strata"
-PREBUILT_TAG_URL = "https://github.com/Niko1221/Strata/releases/download/v{version}/"
+REPO = "lask3802/Strata"
+PREBUILT_URL = f"https://github.com/{REPO}/releases/latest/download/"
+PREBUILT_TAG_URL = f"https://github.com/{REPO}/releases/download/v{{version}}/"
 PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
@@ -2811,7 +2813,7 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
             break
         except OSError as e:
             if i + 1 < len(bases):
-                say(f"  No ready-made AMD engine for v{source_version()} ({e}): the latest release instead")
+                say(f"  No ready-made AMD engine for v{link_version()} ({e}): the latest release instead")
                 continue
             warn(f"no ready-made AMD engine at {base} ({e})")
             return None
@@ -3404,7 +3406,7 @@ def prebuilt_bases(url_base) -> list[str]:
     base = url_base if url_base.endswith(("/", "\\")) else url_base + "/"
     if base != PREBUILT_URL:
         return [base]
-    return [PREBUILT_TAG_URL.format(version=source_version()), base]
+    return [PREBUILT_TAG_URL.format(version=link_version()), base]
 
 
 PREVIOUS_ENGINE = ".previous"
@@ -3503,10 +3505,10 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             warn(f"the installed engine is built for {', '.join(str(a) for a in have)}; your GPU is "
                  f"{', '.join(str(x) for x in miss)}: compiling instead")
             return None
-        if ver >= MIN_ENGINE:
+        if ver >= MIN_ENGINE and not link_outdated(meta):
             ok("ready-made engine already installed")
             return eng
-        say(f"  Updating the ready-made engine ({meta.get('version')} -> {'.'.join(map(str, MIN_ENGINE))} or newer) ...")
+        say(f"  Updating the ready-made engine ({meta.get('link') or meta.get('version')} -> {link_version()} or newer) ...")
         info.replace(eng / "BUILD.json.prev")   # kept for the .previous copy
     if not url_base:
         return None
@@ -3522,7 +3524,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             break
         except OSError as e:
             if i + 1 < len(bases):                     # #214: this checkout's release is not published (yet)
-                say(f"  No ready-made engine for v{source_version()} ({e}): the latest release instead")
+                say(f"  No ready-made engine for v{link_version()} ({e}): the latest release instead")
                 continue
             warn(f"no ready-made engine at {base} ({e})" + ("" if updating else ": compiling instead"))
             return None
@@ -3542,14 +3544,15 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
         drop_archive(z)                                # every later run fail on it instead of downloading it again
         raise
     meta = json.loads((tmp / "BUILD.json").read_text(encoding="utf-8"))
-    if tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit()) < MIN_ENGINE:
-        need = ".".join(map(str, MIN_ENGINE))
+    if tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit()) < MIN_ENGINE or \
+            link_outdated(meta):
+        need = link_version()
         if updating:                                   # these files are newer than the published release (#58)
             warn(f"engine {need} is not published yet (the release may still be uploading): run this again "
                  f"in a few minutes to update it")
         else:
-            warn(f"the ready-made engine at {base} is version {meta.get('version')}; this setup needs "
-                 f"{need}: compiling instead")
+            warn(f"the ready-made engine at {base} is version {meta.get('link') or meta.get('version')}; this setup "
+                 f"needs {need}: compiling instead")
         shutil.rmtree(tmp, ignore_errors=True)
         drop_archive(z)
         return None
@@ -3571,7 +3574,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
         for x in (EXE, VEXE):
             if (eng / x).exists():
                 (eng / x).chmod(0o755)
-    ok(f"ready-made engine {meta.get('version', '')} for {', '.join('sm_' + str(a) for a in archs)} (CUDA "
+    ok(f"ready-made engine {meta.get('link') or meta.get('version', '')} for {', '.join('sm_' + str(a) for a in archs)} (CUDA "
        f"{meta.get('cuda', '?')})")
     return eng
 
@@ -3652,7 +3655,7 @@ def update_installed_engine(url_base, toolkit=None) -> None:
         if meta.get("src") == source_hash(ENGINE_SOURCES) and not stale_binary(eng / EXE) and \
                 (vision == "none" or meta.get("vision_src") == source_hash(VISION_SOURCES)):
             return
-    elif ver >= MIN_ENGINE:
+    elif ver >= MIN_ENGINE and not link_outdated(meta):
         return
     try:                                               # a running engine cannot be replaced (Windows keeps it locked)
         for x in (EXE, VEXE):
@@ -4651,6 +4654,29 @@ def source_version() -> str:
     """The engine version the source tree builds (CMakeLists.txt's project version)."""
     m = re.search(r"project\(strata VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
     return m.group(1) if m else "0"
+
+
+def link_version() -> str:
+    """Strata Link's release of this checkout (the LINK_VERSION file, e.g. 0.1.44.1-link.1): the tag its ready-made
+    engine is published under, and the "link" its BUILD.json carries.  The engine's own version stays
+    CMakeLists.txt's, so every MIN_ENGINE comparison reads it as before."""
+    try:
+        return (ROOT / "LINK_VERSION").read_text(encoding="utf-8").strip() or source_version()
+    except OSError:
+        return source_version()
+
+
+def link_key(v) -> tuple:
+    """'0.1.44.1-link.2' -> ((0, 1, 44, 1), 2), comparable; anything else (an upstream engine has no "link") is
+    ((), 0), older than every Link release."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)*)-link\.(\d+)", str(v or "").strip())
+    return (tuple(int(x) for x in m.group(1).split(".")), int(m.group(2))) if m else ((), 0)
+
+
+def link_outdated(meta: dict) -> bool:
+    """A ready-made CUDA engine (BUILD.json source "release") older than this checkout's Link release, or not a Link
+    release at all (upstream's, without the remote stage): replaced like one below MIN_ENGINE."""
+    return meta.get("source") == "release" and link_key(meta.get("link")) < link_key(link_version())
 
 
 def binary_engine_version(exe) -> str | None:

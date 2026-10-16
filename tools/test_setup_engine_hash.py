@@ -295,6 +295,10 @@ class WhatARefusalDoesToTheCaller(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         (Path(self.tmp.name) / "engine").mkdir(parents=True, exist_ok=True)
+        # the release is published (get_prebuilt's HEAD), without asking GitHub: a fork's has no release yet
+        patcher = mock.patch.object(setup.urllib.request, "urlopen", lambda req, timeout=None: io.BytesIO())
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def fake_download(self, url, dst, what=None):
         with zipfile.ZipFile(dst, "w") as z:
