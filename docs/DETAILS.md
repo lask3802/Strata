@@ -1753,9 +1753,10 @@ so a typo never turns it off unnoticed. Where the split cannot run (`--peer-devi
 `STRATA_VERIFY_DEVICE_PLAN=1`, below) the default is off, with one line saying so: deferring every CPU row measured KL
 0.556 on one PC and 0.176 on two (the table's setups), and `=1` still asks for it, as does
 `STRATA_VERIFY_DEFER_CPU_BELOW` of 1 or more. HIP builds keep it opt-in (never built or measured on AMD). The
-trade-off, measured on the same prompts with the engine as it is otherwise (KL per position against the exact path on
-the first tokens of each answer; the tail-skip column is the default `STRATA_ROUTE_TAIL_SKIP=7` measured the same way,
-for scale):
+trade-off, measured on the same prompts with the engine as it is otherwise (KL teacher-forced against the exact path:
+`STRATA_LOGPOS`, top 20, 4 slices of plain text, 5,257 positions, read through the verify windows with
+`--short-read 100000` so every position takes the decode path; the tail-skip column is the default
+`STRATA_ROUTE_TAIL_SKIP=7` measured the same way, for scale):
 
 | setup | decode speed | KL, deferral | KL, tail skip |
 |---|---:|---:|---:|
