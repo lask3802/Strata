@@ -10638,6 +10638,9 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: relay: layers %d-%d on %s (rows %s)\n", peer_next.layer_begin,
                                  peer_next.n_layers - 1, o.stage_next.c_str(),
                                  strata::net::stage_rows_name(next_link.rows()));
+                    if ((peer_next.row_formats & strata::net::kStageCapKvElem) == 0)
+                        std::fprintf(stderr, "strata serve: relay: the next worker's hello predates the K/V element "
+                                             "check: --kv must match by hand\n");
                     return true;
                 };
                 if (stage_relay && !connect_next(err)) {

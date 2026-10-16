@@ -77,7 +77,7 @@ struct StageHello {
     int32_t n_embd = 0, hc = 0, n_layers = 0, n_expert = 0;
     int32_t layer_begin = 0;      ///< the worker's first layer (the main process's K)
     int32_t max_t = 0;            ///< the widest verify window
-    int32_t kv_type = 0;          ///< the K/V element type id (both sides must store the same)
+    int32_t kv_type = 0;          ///< the K/V placement (kv_mode); compared only when neither hello has kStageCapKvElem
     int64_t max_context = 0;
     int64_t chunk = 0;            ///< the largest prompt chunk the main process sends
     int64_t handoff_floats = 0;   ///< floats per verify-window row
