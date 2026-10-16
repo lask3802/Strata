@@ -142,7 +142,9 @@ def pack(engine: Path, vision: Path, out: Path, platform: str, link: str, commit
     archs, ptx = cuda_archs(ec.get("CMAKE_CUDA_ARCHITECTURES", ""), engine)
     varchs, _ = cuda_archs(vc.get("CMAKE_CUDA_ARCHITECTURES", ""), vision)
     files = [program(engine, exe)]
-    if (engine / kq).is_file():                  # STRATA_MMQ_KQUANTS (on by default): the K-quant prompt kernels
+    if ec.get("STRATA_MMQ_KQUANTS", "ON").upper() != "OFF":   # on by default: the K-quant prompt kernels' library
+        if not (engine / kq).is_file():           # a zip without it would move the user's aside (install_unpacked)
+            sys.exit(f"{engine}: no {kq}, and STRATA_MMQ_KQUANTS is on")
         files.append(engine / kq)
     files.append(program(vision, vexe))
     said = re.search(rb"engine=(\d+\.\d+\.\d+(?:\.\d+)?)\n", files[0].read_bytes())

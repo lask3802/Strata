@@ -40,10 +40,9 @@ jobs:
         run: |
           link=$(python3 -c "import setup; print(setup.link_version())")
           engine=$(python3 -c "import setup; print(setup.source_version())")
-          case "$link" in
-            "$engine"-link.[0-9]*) ;;
-            *) echo "::error::LINK_VERSION is '$link'; CMakeLists.txt's version is $engine: it must be $engine-link.<n>"; exit 1 ;;
-          esac
+          if ! printf '%s' "$link" | grep -Eqx '[0-9.]+-link\.[0-9]+' || [ "${link%-link.*}" != "$engine" ]; then
+            echo "::error::LINK_VERSION is '$link'; CMakeLists.txt's version is $engine: it must be $engine-link.<n>"; exit 1
+          fi
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$link" ]; then
             echo "::error::the tag is $GITHUB_REF_NAME, LINK_VERSION says v$link"; exit 1
           fi
@@ -221,9 +220,11 @@ jobs:
           pattern: build-*
           path: parts
       - name: tools/make_release.py
+        env:
+          LINK: ${{ needs.version.outputs.link }}
         run: |
           for z in windows-cuda13 windows-cuda12 linux-cuda13; do
-            python3 tools/make_release.py --platform "${z%%-*}" --link "${{ needs.version.outputs.link }}" \
+            python3 tools/make_release.py --platform "${z%%-*}" --link "$LINK" \
               --engine "parts/build-$z-engine" --vision "parts/build-$z-vision" --out dist
           done
           ls -l dist

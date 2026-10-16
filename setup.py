@@ -2535,6 +2535,8 @@ def amd_parse_gpus(text, amd) -> list:
 # numbered as the HIP runtime numbers them (`strata-device --list-devices`): an integrated Radeon takes HIP's device 0
 # and pushes the discrete card to 1, which the display-adapter order does not show (#325).
 WIN_HIP_ASSET = "strata-windows-x64-hip.zip"
+# Strata Link builds no AMD engine (.github/workflows/release.yml): by default it comes from upstream's releases, as before
+WIN_HIP_REPO = "Niko1221/Strata"
 WIN_HIP_MIN_ENGINE = max(MIN_ENGINE, (0, 1, 33))         # the first release with a Windows HIP engine
 WIN_AMD_DRIVER = "https://www.amd.com/en/support/download/drivers.html"
 # PCI device ids (VEN_1002) of the cards the AMD backend knows; the names below cover a card whose id is not listed
@@ -2804,6 +2806,9 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
     eng.mkdir(exist_ok=True)
     z = eng / WIN_HIP_ASSET
     bases = prebuilt_bases(url_base)
+    if bases[-1] == PREBUILT_URL:                      # the default: upstream's release of this version, then its latest
+        bases = [f"https://github.com/{WIN_HIP_REPO}/releases/download/v{source_version()}/",
+                 f"https://github.com/{WIN_HIP_REPO}/releases/latest/download/"]
     for i, base in enumerate(bases):
         if not base.startswith(("http://", "https://")):
             break
@@ -2813,7 +2818,7 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
             break
         except OSError as e:
             if i + 1 < len(bases):
-                say(f"  No ready-made AMD engine for v{link_version()} ({e}): the latest release instead")
+                say(f"  No ready-made AMD engine for v{source_version()} ({e}): the latest release instead")
                 continue
             warn(f"no ready-made AMD engine at {base} ({e})")
             return None

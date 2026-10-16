@@ -126,6 +126,7 @@ class Pack(unittest.TestCase):
             "stale binary": dict(e=dict(said="0.1.40")),
             "an unnamed arch list": dict(e=dict(archs="native")),
             "two toolkits": dict(v=dict(cuda="12.9.86")),
+            "no strata_kq": dict(e=dict(kq=False)),
         }
         for why, kw in cases.items():
             with self.subTest(why), tempfile.TemporaryDirectory() as d:

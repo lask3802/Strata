@@ -157,6 +157,26 @@ class GetPrebuilt(unittest.TestCase):
         self.assertIn(f"engine {self.LINK} is not published yet", out)
         self.assertFalse((self.root / "engine" / setup.PREBUILT_ASSET).exists())
 
+    def test_the_amd_engine_still_comes_from_upstream(self):
+        """Strata Link builds no HIP zip: the default AMD engine is upstream's release of this engine version, then
+        upstream's latest - not the fork's releases, which have none (an AMD install would stop)."""
+        heads = []
+
+        def urlopen(req, timeout=None):
+            heads.append(req.full_url)
+            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+
+        with mock.patch.object(setup.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(setup, "source_version", lambda: "0.1.44.1"):
+            eng, _ = quiet(setup.get_prebuilt_hip, setup.PREBUILT_URL, {"arch": "gfx1100"})
+        self.assertIsNone(eng)
+        self.assertEqual(heads, [f"https://github.com/Niko1221/Strata/releases/download/v0.1.44.1/{setup.WIN_HIP_ASSET}",
+                                 f"https://github.com/Niko1221/Strata/releases/latest/download/{setup.WIN_HIP_ASSET}"])
+        heads.clear()
+        with mock.patch.object(setup.urllib.request, "urlopen", urlopen):   # an explicit --prebuilt is still only that
+            quiet(setup.get_prebuilt_hip, "https://mirror.example/x/", {"arch": "gfx1100"})
+        self.assertEqual(heads, [f"https://mirror.example/x/{setup.WIN_HIP_ASSET}"])
+
     def test_update_installed_engine_leaves_a_current_link_engine_alone(self):
         self.installed(source="release", link=self.LINK)
         with mock.patch.object(setup, "get_prebuilt", side_effect=AssertionError("asked to update")):
