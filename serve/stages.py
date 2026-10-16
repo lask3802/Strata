@@ -74,7 +74,8 @@ class MainLog:
     the log's order (the state reading every line would leave), SCAN_MAX of them per look; "behind": what is left
     to scan (the counts are provisional until then).  The current run's first lines are read whole (its link), from
     where it began even when the line before never ended (an engine that died mid-line).  A log found shorter than
-    what was read, or with other first bytes (rotated in place, then grown past it before a look), was rotated."""
+    what was read, or with other first bytes (rotated in place, then grown past it before a look), was rotated: the
+    current run began in the old log, unless its start line is at its place in the new one (started after it)."""
     STARTED = " engine started: "
     CONNECT = re.compile(r"strata serve: remote stage (\S+): layers (\d+)-(\d+) there \(prompt chunk (\d+), "
                          r"context (\d+)(?:, rows (\w+))?\)")
@@ -129,10 +130,12 @@ class MainLog:
         with self.lock:
             st = self.state
             if self.key != path:
-                self.key, self.pos, self.head = path, start if first is None else first, b""
+                self.key, self.pos, self.head, self.old_start = path, start if first is None else first, b"", None
             run_start = start
             if start == self.old_start:                 # this run began in a log rotated since: no place in this one
                 start = -1
+            else:                                       # (a later run: the rotated one's place is of no use now)
+                self.old_start = None
             rot, size = None, None
             try:
                 size = os.path.getsize(path)
@@ -142,6 +145,8 @@ class MainLog:
                     if size < self.pos or head[:n] != self.head[:n]:   # emptied, cut short or begun again: rotated
                         rot = self.rotated()
                         self.old_start, start = run_start, -1
+                    if start == -1 and self.starts_at(f, run_start, size):   # unless the run's start line is here:
+                        self.old_start, start = None, run_start              # it began after the rotation
                     self.head = head
                     budget = SCAN_MAX
                     while size - self.pos > READ_MAX and budget > 0:
@@ -199,6 +204,14 @@ class MainLog:
             st["run_pos"] -= by
         st["rotated"], self.pos = {"by": by, "at": self.read_at}, 0
         return st["rotated"]
+
+    def starts_at(self, f, at: int, size: int) -> bool:
+        """The server's start line at byte `at` of the log (as event() takes it)."""
+        if not 0 <= at < size:
+            return False
+        f.seek(at)
+        line = f.read(128).split(b"\n")[0]   # ("[strata] YYYY-MM-DD HH:MM:SS engine started: " is 46 bytes)
+        return line.startswith(b"[strata]") and self.STARTED.encode() in line
 
     @staticmethod
     def line_at(buf: bytes, i: int, base: int) -> tuple[int, str]:

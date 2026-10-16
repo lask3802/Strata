@@ -952,6 +952,32 @@ class MonitorTest(LogCase):
                     break
         self.assertEqual((v["provisional"], v["workers"][0]["reconnects"]), (False, 1))
 
+    def test_a_start_after_a_rotation(self):
+        """Rotated, then the engine started again after a line the dead engine never ended, before the next look
+        (and with a look in between, and at the old run's own place): the new run's start is at its place in the
+        new log, read as without the rotation."""
+        filler = "strata serve: request done: some line of the engine's own\n"
+        for rotate, look, same in ((False, False, False), (True, False, False), (True, True, False),
+                                   (True, True, True)):
+            with self.subTest(rotate=rotate, look=look, same=same):
+                Path(self.log).write_text(filler * 3, encoding="utf-8")
+                mon, e = stages.StageMonitor(), RemoteEngine(self.tok, self.log)
+                e.log_start, e.ready_at = os.path.getsize(self.log), None
+                self.append(STARTED + MAIN_RUN + filler * 100)
+                self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+                if rotate:
+                    Path(self.log).write_bytes(b"x" * (e.log_start - 12) + b"\n" if same else b"")
+                self.append("loading 45%")
+                if look:                                            # the rotation seen while the old run is current
+                    mon.view(e)
+                self.assertEqual(os.path.getsize(self.log) == e.log_start, same)
+                e.log_start = os.path.getsize(self.log)
+                self.append(STARTED + filler * 5)
+                v, st = mon.view(e), mon.main_log.state
+                self.assertEqual((v["workers"][0]["state"], st["runs"], st["run_pos"], st["link"]),
+                                 ("unknown", 2, e.log_start, None))
+                self.assertIsNone(mon.main_log.old_start)           # (a later run: the rotated one's place is gone)
+
     def test_an_err_without_its_place(self):
         """The log's size could not be read when the ERR came: it is older than every line, not newer."""
         self.append(STARTED + MAIN_RUN)
@@ -1144,6 +1170,29 @@ class EngineWiring(unittest.TestCase):
         self.assertIsNone(self.e.stage_err)                         # the earlier process's ERR is not this one's
         w = self.svc.metrics(workers=True)["stages"]["workers"][0]
         self.assertEqual((w["state"], w["reconnects"], w["error"]), ("connected", 1, None))
+
+    def test_an_err_of_the_old_process_while_starting_again(self):
+        """The earlier process's pump can write its ERR until the new process is started: not this one's."""
+        import serve.server as server
+        real = server.popen
+
+        def popen(*a, **kw):
+            self.e.stage_err = ("remote stage: the peer closed the connection", time.time(), 1 << 30)   # (late)
+            return real(*a, **kw)
+        with mock.patch.object(server, "popen", popen):
+            self.e.restart()
+        self.assertIsNone(self.e.stage_err)
+
+    def test_a_start_after_a_line_that_never_ended(self):
+        """An engine that died mid-line: the next start line begins a line of its own all the same."""
+        self.e.close()
+        with open(self.e.log_path, "ab") as f:
+            f.write(b"loading 45%")
+        self.e.restart()
+        log = Path(self.e.log_path).read_bytes()
+        self.assertEqual(log[self.e.log_start - 1:self.e.log_start], b"\n")
+        self.assertTrue(log[self.e.log_start:].startswith(b"[strata] "))
+        self.assertIn(b"\nloading 45%\r\n" if os.name == "nt" else b"\nloading 45%\n", log)
 
 
 if __name__ == "__main__":

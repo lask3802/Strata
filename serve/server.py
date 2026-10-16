@@ -828,10 +828,18 @@ class StrataEngine:
             return
         self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
+        if log:                                         # the start line begins a line, even after an engine that
+            try:                                        # died mid-line (the Workers card counts the starts by it)
+                with open(log, "rb") as f:
+                    f.seek(-1, os.SEEK_END)             # (an empty log: OSError)
+                    if f.read(1) != b"\n":
+                        self.log.write("\n")
+                        self.log.flush()
+            except OSError:
+                pass
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0  # where this start's lines begin (start_failure_hint)
         self.log_start = log_start                      # #596: the Monitor's conversation cache reads from here
-        self.stage_err = None                           # (the ERR of an earlier process: not this one's)
         if self.first_log_start is None:                # (kept across restarts: they run __init__ again)
             self.first_log_start = log_start
         if log:
@@ -855,6 +863,8 @@ class StrataEngine:
         spawned_at = time.monotonic()
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
+        self.stage_err = None                            # the ERR of an earlier process is not this one's (its pump
+                                                         # writes one only while self.proc is its process: not now)
         contain(self.proc)                               # ends with the server, however it ends (Windows)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
