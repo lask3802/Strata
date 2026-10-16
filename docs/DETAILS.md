@@ -1747,7 +1747,8 @@ runs without layer l's CPU rows. The stage's last layer is never deferred, nor l
 
 **Strata Link turns it on by default** (upstream Strata keeps it opt-in): unset or empty is `=1` with the split at
 `STRATA_VERIFY_DEFER_CPU_BELOW` 0.1 (below), and **`STRATA_VERIFY_DEFER_CPU=0`** (or `off`) is the exact path, the same
-steps as a build without this section. A value that is not `0`, `off`, `1` or `check` gets one line and is taken as `1`,
+steps as a build without this section. Spaces around the value and its case are ignored (cmd's `set X=0 && ...` gives
+`0 `). A value that is not `0`, `off`, `1` or `check` gets one line and is taken as `1`,
 so a typo never turns it off unnoticed. Where the split cannot run (`--peer-device`, a helper cache,
 `STRATA_VERIFY_DEVICE_PLAN=1`, below) the default is off, with one line saying so: deferring every CPU row measured KL
 0.556 on one PC and 0.176 on two (the table's setups), and `=1` still asks for it, as does

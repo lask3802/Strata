@@ -2274,7 +2274,9 @@ def unsloth_default_env(family: str, model: str, hip: bool, in_budget: bool) -> 
     STRATA_MMQ_KQ=1 (the K-quant MMQ prompt kernels) for UD-Q5_K_XL and UD-Q6_K_XL, where its prompt-path KL is equal
     or better than the FP16 path's; UD-Q4_K_XL keeps it opt-in.  STRATA_HC_Q8=1 on CUDA for the UD-* files (the
     GGUF's own Q8_0 hyper-connection projections, closer to the file and faster; the GSQ-RCO packs are untouched).
-    STRATA_ROUTE_TAIL_SKIP=0 where every expert is in RAM (the skip costs KL there); the RAM-budget mode keeps it."""
+    STRATA_ROUTE_TAIL_SKIP=0 where every expert is in RAM (the skip costs KL there); the RAM-budget mode keeps it.
+    Strata Link: STRATA_VERIFY_DEFER_CPU=0 there too (where the owner turns the tail skip off for KL, the deferral,
+    which costs more KL, is off as well)."""
     env = {}
     if family != "unsloth":
         return env
@@ -2284,6 +2286,7 @@ def unsloth_default_env(family: str, model: str, hip: bool, in_budget: bool) -> 
         env["STRATA_HC_Q8"] = "1"
     if not in_budget:
         env["STRATA_ROUTE_TAIL_SKIP"] = "0"
+        env["STRATA_VERIFY_DEFER_CPU"] = "0"
     return env
 
 
@@ -4415,11 +4418,11 @@ def write_config(path: Path, cfg: dict):
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "backend", "env",
                         "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision"})
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP", "STRATA_MMQ_KQ", "STRATA_HC_Q8",
-                       "STRATA_ROUTE_TAIL_SKIP"})   # the "env" entries setup writes
-# 0.1.44 added these three, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
-# user's own (STRATA_ROUTE_TAIL_SKIP=0 to turn the tail skip off, STRATA_MMQ_KQ=1 ...): a setup run again keeps them there
-# (0.1.44 dropped them with the rest of SETUP_ENV).
-SETUP_ENV_UNSLOTH = frozenset({"STRATA_MMQ_KQ", "STRATA_HC_Q8", "STRATA_ROUTE_TAIL_SKIP"})
+                       "STRATA_ROUTE_TAIL_SKIP", "STRATA_VERIFY_DEFER_CPU"})   # the "env" entries setup writes
+# 0.1.44 added these three (Strata Link: four), written for Unsloth's files only (unsloth_default_env).  In any other model's
+# config they are the user's own (STRATA_ROUTE_TAIL_SKIP=0 to turn the tail skip off, STRATA_MMQ_KQ=1 ...): a setup run again
+# keeps them there (0.1.44 dropped them with the rest of SETUP_ENV).
+SETUP_ENV_UNSLOTH = frozenset({"STRATA_MMQ_KQ", "STRATA_HC_Q8", "STRATA_ROUTE_TAIL_SKIP", "STRATA_VERIFY_DEFER_CPU"})
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
 

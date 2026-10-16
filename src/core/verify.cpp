@@ -59,6 +59,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -673,20 +674,24 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     bool by_default = false;  // STRATA_VERIFY_DEFER_CPU unset: on as Strata Link's default (the start-up line says so)
     {   // STRATA_VERIFY_DEFER_CPU=1 or =check: read before the allocations (one buffer more, see record_window).
         // Strata Link: unset is =1 (upstream: off); 0 or off is the exact path.  On AMD it stays opt-in (not measured).
-        const char* v = std::getenv("STRATA_VERIFY_DEFER_CPU");
-        const bool v_set = v != nullptr && v[0] != '\0';
-        const bool off = v_set && (std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0);
+        const char* raw = std::getenv("STRATA_VERIFY_DEFER_CPU");
+        std::string v = raw != nullptr ? raw : "";   // trimmed, lower case: cmd's `set X=0 && ...` gives "0 "
+        v.erase(0, v.find_first_not_of(" \t\r\n"));
+        v.erase(v.find_last_not_of(" \t\r\n") + 1);
+        for (char& c : v) c = (char) std::tolower((unsigned char) c);
+        const bool v_set = !v.empty();
+        const bool off = v == "0" || v == "off";
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
         constexpr bool link_on = false;   // (an unknown value stays off too, as upstream)
 #else
         constexpr bool link_on = true;
 #endif
         by_default = link_on && !v_set;
-        const bool one = v_set && std::strcmp(v, "1") == 0;
-        defer_check_ = v_set && std::strcmp(v, "check") == 0;
+        const bool one = v == "1";
+        defer_check_ = v == "check";
         defer_ = defer_check_ || one || by_default || (link_on && v_set && !off);
         if (v_set && !off && !defer_check_ && !one)   // (a typo never turns it off)
-            std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_CPU=%s is not 0, off, 1 or check: %s\n", v,
+            std::fprintf(stderr, "strata verify: STRATA_VERIFY_DEFER_CPU=%s is not 0, off, 1 or check: %s\n", raw,
                          link_on ? "taken as 1" : "no deferral");
         // STRATA_VERIFY_DEFER_CPU_BELOW=<w>: only the CPU rows of routing weight below w are deferred, the others are
         // waited for in their own layer.  Unset: 0.1.  w >= 1: every CPU row deferred, no split (no partial flag).

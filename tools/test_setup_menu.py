@@ -126,6 +126,12 @@ class UnslothDefaultEnv(unittest.TestCase):
         self.assertEqual(f("unsloth", "UD-Q4_K_XL", False, False)["STRATA_ROUTE_TAIL_SKIP"], "0")
         self.assertNotIn("STRATA_ROUTE_TAIL_SKIP", f("unsloth", "UD-Q4_K_XL", False, True))   # budget mode keeps the skip
 
+    def test_deferral_off_with_the_tail_skip(self):   # Strata Link: the deferral costs more KL than the skip
+        f = setup.unsloth_default_env
+        for hip in (False, True):
+            self.assertEqual(f("unsloth", "UD-Q4_K_XL", hip, False)["STRATA_VERIFY_DEFER_CPU"], "0")
+            self.assertNotIn("STRATA_VERIFY_DEFER_CPU", f("unsloth", "UD-Q4_K_XL", hip, True))
+
     def test_other_families_are_untouched(self):
         for fam, m in (("qwen", "IQ3_S"), ("swift", "Q2_0"), ("coder", "IQ1_M"), ("nvfp4", "NVFP4")):
             self.assertEqual(setup.unsloth_default_env(fam, m, False, False), {}, fam)
