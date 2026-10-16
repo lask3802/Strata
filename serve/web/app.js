@@ -233,7 +233,7 @@ function renderWorkers(s) {
       <td><span class="wk-name">${esc(name)}</span>${where ? `<span class="muted small wk-sub">${esc(where)}</span>` : ""}</td>
       <td>${span(w.layers)}${w.relay_to ? `<span class="muted small wk-sub" title="relays to the next worker">→ ${esc(w.relay_to)}</span>` : ""}</td>
       <td><span class="st-badge ${cls}"${tip ? ` title="${esc(tip)}"` : ""}>${text}</span>${w.since ? `<span class="muted small wk-sub" title="${esc(text)} since ${esc(new Date(w.since * 1000).toLocaleString())}">${esc(clock(w.since))}</span>` : ""}</td>
-      <td class="num">${fmt(w.reconnects)}</td>
+      <td class="num">${s.provisional && w.reconnects != null ? `<span title="Still counting: the log is read on at each look">≥ ${fmt(w.reconnects)}</span>` : fmt(w.reconnects)}</td>
       <td class="num">${ms(live ? w.round_trip_ms : null)}${split}</td>
       <td class="num">${ms(live ? w.own_ms : null)}</td>
       <td>${vram}${g.vram_mib ? `<div class="st-progress"${vpct > 95 ? ' data-tone="danger"' : ""}><div class="st-progress__bar" style="width:${vpct}%"></div></div>` : ""}</td>

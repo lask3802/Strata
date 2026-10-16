@@ -3895,8 +3895,9 @@ class Service:
 
     def metrics(self, all_requests=False, workers=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
-        the hardware (with a minute of history per series).  `workers`: the Monitor tab is open, so a remote stage's
-        node agents may be asked (on a thread, now and then: serve/stages.py)."""
+        the hardware (with a minute of history per series).  `workers`: the Monitor tab is open: a remote stage's
+        Workers card ("stages"), from the engine's log and its node agents (on a thread, now and then:
+        serve/stages.py)."""
         with self.status_lock:
             s = dict(self.status)
             if self.live_reqs:                          # parallel requests: the newest one's status
@@ -3947,8 +3948,9 @@ class Service:
                "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                "hardware_static":
                tel["static"], "history": tel["history"], "time": now}
-        stages = self.stages.view(self.engine, ask=workers)
-        if stages is not None:                          # a remote stage only: the Workers card
+        # the Workers card (a remote stage only): with the Monitor open only - it reads the engine's log
+        stages = self.stages.view(self.engine, ask=True) if workers else None
+        if stages is not None:
             out["stages"] = stages
         return out
 

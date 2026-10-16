@@ -33,8 +33,8 @@ LOG_OVERLAP = 5            # the last lines of a read that the next tail must ho
 CHAIN_MAX = 8              # relays followed at most (a loop in a broken config ends here)
 READ_MAX = 1 << 20         # at most the last MiB of the main log's new lines per read ...
 HEAD_MAX = 256 << 10       # ... and the first 256 KiB of the engine's current run (its link's start-up lines)
+SCAN_MAX = 256 << 20       # the lines before those: at most this much scanned per look (the rest at the next)
 WAIT_STALE_S = 25.0        # a request's wait for its worker says so every 10 s (INFO remote_stage_wait=)
-INF = float("inf")
 
 
 def remote_args(args) -> tuple[str | None, int | None]:
@@ -68,7 +68,11 @@ def port_of(addr: str) -> int | None:
 class MainLog:
     """The main process's link as its log tells it, read on from where it was last read (as ConvCacheLog does).
     Unlike the conversation cache, the link's history spans engine starts: each start that connects after the first
-    is a reconnect.  The server's own "[strata] ... engine started:" line marks where a start begins."""
+    is a reconnect.  The server's own "[strata] ... engine started:" line marks where a start begins.  When more than
+    READ_MAX was written since the last read, the lines before the last READ_MAX are scanned, not read one by one:
+    the starts, connects and relinks in them counted, and the last line of each kind that changes the state read, in
+    the log's order (the state reading every line would leave), SCAN_MAX of them per look; "behind": what is left
+    to scan (the counts are provisional until then).  The current run's first lines are read whole (its link)."""
     STARTED = " engine started: "
     CONNECT = re.compile(r"strata serve: remote stage (\S+): layers (\d+)-(\d+) there \(prompt chunk (\d+), "
                          r"context (\d+)(?:, rows (\w+))?\)")
@@ -87,17 +91,26 @@ class MainLog:
                        r"the peer closed the connection|the two sides differ|"
                        r"the wait was cancelled|the worker refused|the worker was started without --vision|"
                        r"unexpected reply|bad message magic|a window's rows|an empty position table).*)")
-    # the same lines' fixed parts, counted in a part of the log too long to read (Reconnects stays whole)
+    # a scanned part of the log: the lines counted, and the lines looked for (the last of each kind; an error: the
+    # last "strata serve: remote stage" line that ERROR takes)
     COUNTED = {"runs": STARTED.encode(), "connects": b" there (prompt chunk ", "relinks": b"): connected again"}
+    MARKS = {"start": STARTED.encode(), "connect": b" there (prompt chunk ", "relink": b"): connected again",
+             "wait": b"strata serve: remote stage: waiting for the worker at ", "windows": b" windows: mean ",
+             "gap": b"strata remote: main process between windows "}
+    REMOTE = b"strata serve: remote stage"
 
     def __init__(self):
         self.key, self.pos = None, 0
+        self.read_at = 0.0             # when the log was last read
         self.lock = threading.Lock()   # two pages (or a scraper) reading at once must not count a line twice
         # Each event carries where its line is in the log ("pos"), which orders it against the engine's stdout ERR
         # (the server notes the log's size when it reads one), and "at", when it was read (a lazy read sees it late:
-        # shown, never compared).  "link": the current run's last connect or relink; "run_pos": where that run began
+        # shown, never compared).  "link": the current run's last connect or relink; "run_pos": where that run began;
+        # "size": the log's size at this read; "rotated": the log was found emptied or cut short (a rotation) -
+        # "by": the places read move that much before its start, "at": the read before (an ERR then is of the old log)
         self.state = {"connect": None, "connects": 0, "relinks": 0, "waiting": None, "error": None, "link": None,
-                      "windows": None, "gap_ms": None, "runs": 0, "run_pos": None, "run_connected": False}
+                      "windows": None, "gap_ms": None, "runs": 0, "run_pos": None, "run_connected": False,
+                      "behind": 0, "size": 0, "rotated": None}
 
     def poll(self, path, first, start) -> dict:
         """The state after the log's new lines.  `first`: where the engine's first run in this server began (read
@@ -105,112 +118,142 @@ class MainLog:
         if not path or start is None:
             return dict(self.state)
         with self.lock:
+            st = self.state
             if self.key != path:
                 self.key, self.pos = path, start if first is None else first
             try:
                 size = os.path.getsize(path)
-                if size < self.pos:                     # the log was emptied or replaced
-                    self.pos = 0
+                if size < self.pos:     # emptied, replaced or cut short (a rotation): what was read keeps its order,
+                    by = self.pos       # before the new log's first line
+                    for k in ("link", "error", "waiting"):
+                        if st[k]:
+                            st[k] = {**st[k], "pos": st[k]["pos"] - by}
+                    if st["run_pos"] is not None:
+                        st["run_pos"] -= by
+                    st["rotated"], self.pos = {"by": by, "at": self.read_at}, 0
                 with open(path, "rb") as f:
-                    if size - self.pos > READ_MAX:      # too much to read: the current run's start, and the end
-                        cut = size - READ_MAX
-                        head = b""
-                        if self.pos <= start < cut:
-                            self.skip(f, self.pos, start)
+                    budget = SCAN_MAX
+                    while size - self.pos > READ_MAX and budget > 0:
+                        if self.pos == start:           # the current run's first lines: read
                             f.seek(start)
-                            head = f.read(min(HEAD_MAX, cut - start))
-                            head = head[:head.rfind(b"\n") + 1]
-                            self.feed(head, start)
-                        elif start >= cut:
-                            cut = start
-                        f.seek(cut)
-                        data = f.read(size - cut)
-                        if cut != start:                # it starts inside a line: from the next one
-                            nl = data.find(b"\n") + 1
-                            data = data[nl:]
-                            self.skip(f, start + len(head) if self.pos <= start else self.pos, cut + nl)
-                            cut += nl
-                        else:
-                            self.skip(f, self.pos, cut)
-                        self.pos = cut
-                    else:
-                        f.seek(self.pos)
-                        data = f.read(size - self.pos)
+                            head = f.read(min(HEAD_MAX, size - READ_MAX - start))
+                            n = head.rfind(b"\n") + 1
+                            if n:
+                                self.feed(head[:n], start)
+                                self.pos, budget = self.pos + n, budget - n
+                                continue
+                        stop = min(size - READ_MAX, self.pos + budget)
+                        if self.pos < start < stop:
+                            stop = start
+                        n = self.scan(f, self.pos, stop)
+                        if not n:                       # no whole line in it: the budget is spent, or a line
+                            budget = 0 if stop < size - READ_MAX else budget   # runs into the end (read below)
+                            break
+                        self.pos, budget = self.pos + n, budget - n
+                    behind = size - self.pos > READ_MAX and budget <= 0
+                    st["behind"] = size - READ_MAX - self.pos if behind else 0
+                    f.seek(self.pos)
+                    data = b"" if behind else f.read(size - self.pos)
             except OSError:
                 return dict(self.state)
             end = data.rfind(b"\n") + 1                 # whole lines only: the rest is read next time
             self.feed(data[:end], self.pos)
             self.pos += end
-            return dict(self.state)
+            self.read_at, st["size"] = time.time(), size
+            return dict(st)
 
-    def skip(self, f, a: int, b: int) -> None:
-        """The lines from byte a to b, not read: only the starts, connects and relinks in them are counted."""
-        if b <= a:
-            return
+    @staticmethod
+    def line_at(buf: bytes, i: int, base: int) -> tuple[int, str]:
+        """The line of buf that holds byte i: where it begins in the log (buf begins at `base`), and its text."""
+        a = buf.rfind(b"\n", 0, i) + 1
+        b = buf.find(b"\n", i)
+        return base + a, buf[a:b].decode("utf-8", "replace").rstrip("\r")
+
+    def scan(self, f, a: int, b: int) -> int:
+        """The whole lines from byte a to b, scanned (see the class): the bytes scanned, up to the last line end."""
         f.seek(a)
-        left, carry, n = b - a, b"", dict.fromkeys(self.COUNTED, 0)
+        pos, left, carry, last = a, b - a, b"", {}
         while left > 0:
             chunk = f.read(min(left, 8 << 20))
             if not chunk:
                 break
             left -= len(chunk)
-            chunk = carry + chunk
-            end = chunk.rfind(b"\n") + 1 if left > 0 else len(chunk)
+            buf = carry + chunk
+            end = buf.rfind(b"\n") + 1
+            carry = buf[end:]
+            if not end:
+                continue
             for k, pat in self.COUNTED.items():
-                n[k] += chunk.count(pat, 0, end)
-            carry = chunk[end:]
-        for k, v in n.items():                          # (earlier runs: the current one's start line is read)
-            self.state[k] += v
+                self.state[k] += buf.count(pat, 0, end)
+            for kind, mark in self.MARKS.items():
+                i = buf.rfind(mark, 0, end)
+                if i >= 0:
+                    last[kind] = self.line_at(buf, i, pos)
+            hi = end
+            while (i := buf.rfind(self.REMOTE, 0, hi)) >= 0:
+                at, line = self.line_at(buf, i, pos)
+                if self.ERROR.search(line):
+                    last["error"] = (at, line)
+                    break
+                hi = at - pos
+            pos += end
+        now = time.time()
+        for at, line in sorted(last.values()):         # in the log's order
+            self.event(line, at, now, count=False)
+        return pos - a
 
     def feed(self, data: bytes, base: int) -> None:
         """Whole lines that begin at byte `base` of the log."""
         now = time.time()
-        st = self.state
         pos = base
         for raw in data.split(b"\n")[:-1]:
             at, pos = pos, pos + len(raw) + 1
-            line = raw.decode("utf-8", "replace").rstrip("\r")
-            if line.startswith("[strata]") and self.STARTED in line:
-                st["runs"] += 1
-                st.update(run_pos=at, run_connected=False, waiting=None, link=None)
-                st["windows"] = st["gap_ms"] = None             # the timing of this run's link only
-                continue
-            if "remote" not in line:
-                continue
-            m = self.CONNECT.search(line)
-            if m:
-                st["connects"] += 1
-                st["run_connected"], st["waiting"] = True, None
-                st["link"] = {"pos": at, "at": now}
-                st["connect"] = {"address": m[1], "layers": [int(m[2]), int(m[3])], "chunk": int(m[4]),
-                                 "context": int(m[5]), "rows": m[6], "at": now, "relinked": False}
-                continue
-            m = self.RELINK.search(line)
-            if m:
-                st["relinks"] += 1
-                st["run_connected"], st["waiting"] = True, None
-                st["link"] = {"pos": at, "at": now}
-                st["error"] = {"text": m[2], "at": now, "pos": at, "run": st["runs"]}
-                if st["connect"]:
-                    st["connect"] = {**st["connect"], "at": now, "relinked": True}
-                continue
-            m = self.WAITING.search(line)
-            if m:
-                st["waiting"] = {"address": m[1], "why": m[2], "at": now, "pos": at}
-                continue
-            m = self.WINDOWS.search(line)
-            if m:
-                st["windows"] = {"n": int(m[1]), "round_trip_ms": float(m[2]), "worker_ms": float(m[3]),
-                                 "link_ms": float(m[4]), "at": now}
-                continue
-            m = self.GAP.search(line)
-            if m:
-                st["gap_ms"] = float(m[1])
-                continue
-            m = self.ERROR.search(line)
-            if m:
-                st["error"] = {"text": m[1], "at": now, "pos": at, "run": st["runs"]}
-                st["run_connected"], st["waiting"] = False, None   # (a start that waited and gave up ends)
+            self.event(raw.decode("utf-8", "replace").rstrip("\r"), at, now)
+
+    def event(self, line: str, at: int, now: float, count: bool = True) -> None:
+        """One line at byte `at` (`count`: a start, connect or relink is counted here, not by a scan)."""
+        st = self.state
+        if line.startswith("[strata]") and self.STARTED in line:
+            st["runs"] += count
+            st.update(run_pos=at, run_connected=False, waiting=None, link=None)
+            st["windows"] = st["gap_ms"] = None             # the timing of this run's link only
+            return
+        if "remote" not in line:
+            return
+        m = self.CONNECT.search(line)
+        if m:
+            st["connects"] += count
+            st["run_connected"], st["waiting"] = True, None
+            st["link"] = {"pos": at, "at": now}
+            st["connect"] = {"address": m[1], "layers": [int(m[2]), int(m[3])], "chunk": int(m[4]),
+                             "context": int(m[5]), "rows": m[6], "at": now, "relinked": False}
+            return
+        m = self.RELINK.search(line)
+        if m:
+            st["relinks"] += count
+            st["run_connected"], st["waiting"] = True, None
+            st["link"] = {"pos": at, "at": now}
+            st["error"] = {"text": m[2], "at": now, "pos": at}
+            if st["connect"]:
+                st["connect"] = {**st["connect"], "at": now, "relinked": True}
+            return
+        m = self.WAITING.search(line)
+        if m:
+            st["waiting"] = {"address": m[1], "why": m[2], "at": now, "pos": at}
+            return
+        m = self.WINDOWS.search(line)
+        if m:
+            st["windows"] = {"n": int(m[1]), "round_trip_ms": float(m[2]), "worker_ms": float(m[3]),
+                             "link_ms": float(m[4]), "at": now}
+            return
+        m = self.GAP.search(line)
+        if m:
+            st["gap_ms"] = float(m[1])
+            return
+        m = self.ERROR.search(line)
+        if m:
+            st["error"] = {"text": m[1], "at": now, "pos": at}
+            st["run_connected"], st["waiting"] = False, None   # (a start that waited and gave up ends)
 
 
 class WorkerLog:
@@ -453,7 +496,7 @@ class StageMonitor:
         timing = str((env or os.environ).get("STRATA_REMOTE_TIMING", "")).startswith("1")
         return {"local_layers": [0, k - 1] if k else None, "rows": rows, "chunk": c["chunk"] if c else None,
                 "context": c["context"] if c else None, "gap_ms": log["gap_ms"], "agents": on, "timing": timing,
-                "workers": workers}
+                "provisional": log["behind"] > 0, "workers": workers}
 
     def worker_view(self, i: int, addr: str, chain: list[str], engine, log: dict, on: bool) -> dict:
         a = self.agents.get(addr) if on else None
@@ -507,10 +550,15 @@ class StageMonitor:
         if not getattr(engine, "log_path", None):              # the run config has no "log": nothing says how it goes
             return ("nolog" if alive else "connecting" if starting else "down"), None, None
         # this run's errors only: the log's (a failed start), the ERR of a request (from this run's start on)
-        errs = [e for e in (log["error"],) if e and e["run"] == log["runs"]]
-        se, run_pos = getattr(engine, "stage_err", None), log["run_pos"]
+        run_pos, rot = log["run_pos"], log["rotated"]
+        errs = [e for e in (log["error"],) if e and (run_pos is None or e["pos"] > run_pos)]
+        se = getattr(engine, "stage_err", None)
         if se:
-            pos = se[2] if len(se) > 2 and se[2] is not None else INF
+            # its place: unknown (the log's size could not be read) is before every line; one of the log before a
+            # rotation (an ERR before the read that saw the old log, or past the new log's end) moves with it
+            pos = se[2] if len(se) > 2 and se[2] is not None else float("-inf")
+            if rot and (se[1] <= rot["at"] or pos > log["size"]):
+                pos = min(pos - rot["by"], -1)
             if run_pos is None or pos > run_pos:      # (an ERR at run_pos came before the start)
                 errs.append({"text": se[0], "at": se[1], "pos": pos})
         err = max(errs, key=lambda e: e["pos"]) if errs else None

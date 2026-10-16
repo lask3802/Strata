@@ -538,7 +538,9 @@ With a remote stage the web app's Monitor tab shows one row per worker (a relay'
 the link's state (Connected, Connecting, Reconnecting, Idle: the link closed with the engine kept, the next request
 connects again; Down), the links made again since the server started, and the round trip per verify window. These
 come from the main engine's log, so the run config needs `"log"`; the round trips also need
-`STRATA_REMOTE_TIMING=1` in its `"env"`.
+`STRATA_REMOTE_TIMING=1` in its `"env"`. The server reads the log only while a Monitor tab is open; a long log
+since the last look is counted at up to 256 MiB per look (the reconnects show as "≥ N" until then). A log rotated
+in place (emptied or cut short, as `copytruncate` does) is followed: what was read keeps its order.
 
 The worker's GPU, VRAM, expert cache, engine version and its own time per window come from that PC's node agent
 (`GET /info` and `GET /log`). The server asks the agents only when the run config says so, at most every 15 s and

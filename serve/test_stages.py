@@ -321,6 +321,33 @@ class MainLogTest(LogCase):
         self.assertEqual((s["runs"], s["connects"], s["relinks"]), (2, 2, 2))
         self.assertEqual((s["run_pos"], s["link"]["pos"] > start, s["windows"]["n"]), (start, True, 64))
 
+    def test_a_scan_in_parts(self):
+        """At most SCAN_MAX scanned per look: the counts are provisional ("behind") until the scan is through."""
+        ml = stages.MainLog()
+        relink = ("strata serve: remote stage: the link to 10.10.10.2:7841 was lost (remote stage: the peer closed the "
+                  "connection): connected again\n")
+        filler = "strata serve: request done: some line of the engine's own\n" * 100
+        self.append(STARTED + MAIN_RUN + (filler + relink) * 20 + filler * 3)
+        looks = []
+        small = {"READ_MAX": 4096, "SCAN_MAX": 32768, "HEAD_MAX": 2048}
+        with mock.patch.multiple(stages, **small):
+            for _ in range(20):
+                s = ml.poll(self.log, None, 0)
+                looks.append(s["behind"])
+                if not s["behind"]:
+                    break
+        self.assertGreater(len(looks), 3)
+        self.assertEqual(looks, sorted(looks, reverse=True))        # less behind at each look
+        self.assertEqual((s["connects"], s["relinks"], s["link"]["pos"] > 0), (1, 20, True))
+        self.assertEqual(s["error"]["text"], "remote stage: the peer closed the connection")
+        mon = stages.StageMonitor()
+        with mock.patch.multiple(stages, **small):
+            v = mon.view(RemoteEngine(ByteTokenizer(), self.log))
+            self.assertTrue(v["provisional"])
+            while v["provisional"]:
+                v = mon.view(RemoteEngine(ByteTokenizer(), self.log))
+        self.assertEqual(v["workers"][0]["reconnects"], 20)
+
 
 class WorkerLogTest(unittest.TestCase):
     def test_worker_and_relay(self):
@@ -748,6 +775,78 @@ class MonitorTest(LogCase):
             b.refresh(TOKEN)
         self.assertEqual((b.ok, b.facts["own_ms"], b.read_whole), (True, 12.5, True))
 
+    def test_a_relink_in_a_scanned_part(self):
+        """A wait ended (Idle), the Monitor closed; the next request linked again and more than READ_MAX was written:
+        the scanned part's relink is the link, and a wait after it in that part is the state."""
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        e = RemoteEngine(self.tok, self.log)
+        mon.view(e)
+        self.append("strata serve: remote stage: waiting for the worker at 10.10.10.2:7841 (x), up to 180 s (y)\n")
+        self.stage_err(e, "remote stage: the wait was cancelled")
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "idle")
+        filler = "strata serve: request done: some line of the engine's own\n" * 200
+        relink = ("strata serve: remote stage: the link to 10.10.10.2:7841 was lost (remote stage: the peer closed the "
+                  "connection): connected again\n")
+        # a later wait, then the relink, both in the scanned part: the later one is the state
+        self.append(filler + "strata serve: remote stage: waiting for the worker at 10.10.10.2:7841 (w), up to 180 s "
+                    "(y)\n" + filler + relink + filler)
+        with mock.patch.object(stages, "READ_MAX", 4096):
+            w = mon.view(e)["workers"][0]
+            self.assertEqual((w["state"], w["reconnects"], w["error"]), ("connected", 1, None))
+            self.append(filler + "strata serve: remote stage: waiting for the worker at 10.10.10.2:7841 (z), up to "
+                        "180 s (y)\n" + filler)
+            e.stage_wait_at = time.time()
+            w = mon.view(e)["workers"][0]
+        self.assertEqual((w["state"], w["error"]["text"]), ("reconnecting", "z"))
+
+    def test_a_rotated_log(self):
+        """The log emptied or cut short (copytruncate): what was read keeps its order before the new log's lines."""
+        self.append(STARTED + MAIN_RUN + "strata serve: request done: some line of the engine's own\n" * 50)
+        mon = stages.StageMonitor()
+        e = RemoteEngine(self.tok, self.log)
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+        self.stage_err(e, "remote stage: the peer closed the connection; connecting again: timed out")
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "idle")
+        time.sleep(0.05)                                            # (Windows' clock: the next ERR on a later tick)
+        Path(self.log).write_text("strata serve: request done: x\n", encoding="utf-8")
+        w = mon.view(e)["workers"][0]
+        self.assertEqual((w["state"], w["error"]["text"]),
+                         ("idle", "remote stage: the peer closed the connection; connecting again: timed out"))
+        relink = "strata serve: remote stage: the link to 10.10.10.2:7841 was lost (x): connected again\n"
+        self.append(relink)                                         # before the old ERR's place: later all the same
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+        time.sleep(0.05)
+        self.stage_err(e, "remote stage: the peer closed the connection")   # a new ERR in the new log counts
+        w = mon.view(e)["workers"][0]
+        self.assertEqual((w["state"], w["error"]["text"]), ("idle", "remote stage: the peer closed the connection"))
+        # an ERR read before the rotation, whose place is inside the new (shorter) log: of the old log all the same
+        Path(self.log).write_text(STARTED + MAIN_RUN, encoding="utf-8")
+        mon, e = stages.StageMonitor(), RemoteEngine(self.tok, self.log)
+        self.stage_err(e, "remote stage: the peer closed the connection")
+        self.append("strata serve: request done: some line of the engine's own\n" * 50)
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "idle")
+        time.sleep(0.05)
+        Path(self.log).write_text(relink + "strata serve: request done: x\n" * 20, encoding="utf-8")
+        self.assertGreater(os.path.getsize(self.log), e.stage_err[2])
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+        # an ERR after the last read, then the rotation: its place, past the new log's end, is of the old log
+        Path(self.log).write_text(STARTED + MAIN_RUN + "strata serve: request done: x\n" * 20, encoding="utf-8")
+        mon, e = stages.StageMonitor(), RemoteEngine(self.tok, self.log)
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+        time.sleep(0.05)
+        self.stage_err(e, "remote stage: the peer closed the connection")
+        Path(self.log).write_text(relink, encoding="utf-8")
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+
+    def test_an_err_without_its_place(self):
+        """The log's size could not be read when the ERR came: it is older than every line, not newer."""
+        self.append(STARTED + MAIN_RUN)
+        mon = stages.StageMonitor()
+        e = RemoteEngine(self.tok, self.log)
+        e.stage_err = ("remote stage: the peer closed the connection", time.time(), None)
+        self.assertEqual(mon.view(e)["workers"][0]["state"], "connected")
+
     def test_agents_off_by_default(self):
         self.append(STARTED + MAIN_RUN)
         mon = stages.StageMonitor()
@@ -841,13 +940,12 @@ class MonitorTest(LogCase):
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         try:
-            with urllib.request.urlopen(base + "/metrics", timeout=10) as r:
-                m = json.loads(r.read())
-            self.assertEqual(m["stages"]["workers"][0]["state"], "connected")
-            self.assertIsNone(m["stages"]["workers"][0]["agent"])     # not asked without ?workers=1
-            with urllib.request.urlopen(base + "/metrics?workers=10&xworkers=1", timeout=10) as r:
-                r.read()
-            self.assertEqual(svc.stages.asked_at, 0.0)                # nor with another value or parameter
+            # without ?workers=1 (another tab, a scraper): no card, and neither the log nor an agent is read
+            with mock.patch.object(stages.MainLog, "poll", side_effect=AssertionError("the log read")):
+                for q in ("", "?workers=10&xworkers=1"):
+                    with urllib.request.urlopen(base + "/metrics" + q, timeout=10) as r:
+                        self.assertNotIn("stages", json.loads(r.read()))
+            self.assertEqual(svc.stages.asked_at, 0.0)
             with urllib.request.urlopen(base + "/metrics?requests=all&workers=1", timeout=10) as r:
                 r.read()
             wait_agents(svc.stages)
@@ -919,7 +1017,7 @@ class EngineWiring(unittest.TestCase):
         self.assertEqual((w["state"], w["since"], w["layers"], w["reconnects"]),
                          ("connected", self.e.ready_at, [26, 47], 0))
         self.lose_the_link()
-        w = self.svc.metrics()["stages"]["workers"][0]
+        w = self.svc.metrics(workers=True)["stages"]["workers"][0]
         self.assertEqual((w["state"], w["error"]["text"]), ("down", "remote stage: the peer closed the connection"))
         # the ERR's place among the log's lines: after the connect line the engine wrote before it
         pos, log = self.e.stage_err[2], self.svc.stages.main_log.state
@@ -929,7 +1027,7 @@ class EngineWiring(unittest.TestCase):
         """The Monitor opened after the engine was started again: that start's link is a reconnect all the same."""
         self.lose_the_link()
         self.request()                                              # the next request starts the engine again
-        w = self.svc.metrics()["stages"]["workers"][0]
+        w = self.svc.metrics(workers=True)["stages"]["workers"][0]
         self.assertEqual((w["state"], w["reconnects"], w["error"]), ("connected", 1, None))
 
 
