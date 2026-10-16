@@ -1,0 +1,260 @@
+# Strata Link's ready-made engines: the zips setup.py downloads (tools/make_release.py), built here instead of by hand.
+#
+#   a tag v<LINK_VERSION> (v0.1.44.1-link.1): build every zip, then a DRAFT release with them and SHA256.txt; the
+#                                             owner reads it over and publishes it
+#   a push to ci/**:                          build every zip, as workflow artifacts only (no release)
+#   Run workflow (workflow_dispatch):         the same as the ref it is run on
+#
+# One job per program (the engine, the image encoder) per zip, so no job comes near the 6 h limit; the pack job zips
+# them.  The CUDA versions are the ones whose cuBLAS setup.py installs from pip (CUDA_WHEELS / CUDA12_WHEELS): 13.0
+# Update 1 (cuBLAS 13.0.2.14) and 12.9 Update 1 (cuBLAS 12.9.1.4).  The archs are upstream's releases' (cuobjdump
+# of the 0.1.44.1 zips).  The AMD (HIP) zip is not built here: tools/hip/build_windows.bat.
+name: release
+
+on:
+  push:
+    tags: ["v*-link.*"]
+    branches: ["ci/**"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  version:
+    name: LINK_VERSION
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      link: ${{ steps.v.outputs.link }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: v
+        name: LINK_VERSION is this engine's version, and the tag's
+        run: |
+          link=$(python3 -c "import setup; print(setup.link_version())")
+          engine=$(python3 -c "import setup; print(setup.source_version())")
+          case "$link" in
+            "$engine"-link.[0-9]*) ;;
+            *) echo "::error::LINK_VERSION is '$link'; CMakeLists.txt's version is $engine: it must be $engine-link.<n>"; exit 1 ;;
+          esac
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$link" ]; then
+            echo "::error::the tag is $GITHUB_REF_NAME, LINK_VERSION says v$link"; exit 1
+          fi
+          echo "link=$link" >> "$GITHUB_OUTPUT"
+          echo "Strata Link $link (engine $engine)"
+
+  windows:
+    name: windows ${{ matrix.zip }} ${{ matrix.part }}
+    needs: version
+    runs-on: windows-2022
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {zip: cuda13, part: engine, cuda: "13.0.1", archs: "75-real;86-real;89-real;120", defs: ""}
+          # the encoder as upstream's: the static CUDA runtime and no driver-API memory pool (it imports cuBLAS alone)
+          - {zip: cuda13, part: vision, cuda: "13.0.1", archs: "75-real;86-real;89-real;120",
+             defs: "-D GGML_STATIC=ON -D GGML_CUDA_NO_VMM=ON"}
+          # the experimental Pascal / Volta engine (setup.py engine_defs: STRATA_EXPERIMENTAL_SM60 for every CUDA 12 one)
+          - {zip: cuda12, part: engine, cuda: "12.9.1", archs: "60-real;61-real;70-real;75-real;80-real;86-real;89",
+             defs: "-D STRATA_EXPERIMENTAL_SM60=ON"}
+          - {zip: cuda12, part: vision, cuda: "12.9.1", archs: "60-real;61-real;70-real;75-real;80-real;86-real;89",
+             defs: ""}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: cmake and ninja (requirements.txt's)
+        run: python -m pip install $(grep -E '^(cmake|ninja)==' requirements.txt | tr -d '\r')
+      - id: pins
+        run: |
+          echo "llama=$(python -c 'import setup; print(setup.LLAMA_CPP_COMMIT)')" >> "$GITHUB_OUTPUT"
+          echo "CUDA_ROOT=$RUNNER_TEMP\\cuda-${{ matrix.cuda }}" >> "$GITHUB_ENV"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cuda-cache
+        with:
+          path: ${{ env.CUDA_ROOT }}
+          key: cuda-redist-windows-${{ matrix.cuda }}-${{ matrix.zip }}-${{ hashFiles('.github/scripts/cuda_redist.py') }}
+      - name: CUDA ${{ matrix.cuda }} (NVIDIA's redistributable archives)
+        if: steps.cuda-cache.outputs.cache-hit != 'true'
+        run: |
+          parts="cuda_nvcc cuda_cudart libcublas cuda_cccl"
+          case "${{ matrix.cuda }}" in 13.*) parts="$parts cuda_crt libnvvm" ;; esac   # separate packages since 13.0
+          python .github/scripts/cuda_redist.py --version "${{ matrix.cuda }}" --dest "$CUDA_ROOT" $parts
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: third_party/llama.cpp
+          key: llama.cpp-${{ steps.pins.outputs.llama }}-windows
+      - name: llama.cpp at setup.py's commit
+        run: python -c "import setup; setup.get_llama_cpp()"
+      - name: build ${{ matrix.part }}
+        run: >-
+          python .github/scripts/build_release.py ${{ matrix.part }} --build build --cuda "$CUDA_ROOT"
+          --llama third_party/llama.cpp --archs "${{ matrix.archs }}" ${{ matrix.defs }}
+      - name: what it imports
+        run: |
+          python -m pip install --disable-pip-version-check -q pefile==2024.8.26
+          for f in build/strata.exe build/strata_kq.dll build/bin/strata-vision.exe; do
+            [ -f "$f" ] && python -c "import pefile, sys; pe = pefile.PE(sys.argv[1]); print(sys.argv[1], [e.dll.decode() for e in pe.DIRECTORY_ENTRY_IMPORT])" "$f"
+          done
+          ls -l build/*.exe build/*.dll build/bin/*.exe 2>/dev/null || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-windows-${{ matrix.zip }}-${{ matrix.part }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            build/strata.exe
+            build/strata_kq.dll
+            build/bin/strata-vision.exe
+            build/CMakeCache.txt
+            build/CMakeFiles/*/CMakeCUDACompiler.cmake
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: matrix.part == 'engine'
+        with:
+          name: pdb-windows-${{ matrix.zip }}
+          retention-days: 90
+          path: |
+            build/strata.pdb
+            build/strata_kq.pdb
+
+  linux:
+    name: linux cuda13 ${{ matrix.part }}
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    # Ubuntu 22.04 (glibc 2.35): the engine runs on it and on newer distributions
+    container: ubuntu:jammy-20260924.1@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf026486401
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [engine, vision]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: build tools, and CUDA 13.0 Update 1 from NVIDIA's apt repository
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential binutils ca-certificates curl git python3 python3-venv
+          curl -fsSL -o /tmp/cuda-keyring.deb \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          dpkg -i /tmp/cuda-keyring.deb
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            cuda-nvcc-13-0=13.0.88-1 cuda-crt-13-0=13.0.88-1 libnvvm-13-0=13.0.88-1 libnvptxcompiler-13-0=13.0.88-1 \
+            cuda-cudart-13-0=13.0.88-1 cuda-cudart-dev-13-0=13.0.88-1 cuda-driver-dev-13-0=13.0.88-1 \
+            cuda-cccl-13-0=13.0.85-1 cuda-culibos-dev-13-0=13.0.85-1 libcublas-13-0=13.0.2.14-1 libcublas-dev-13-0=13.0.2.14-1
+          /usr/local/cuda-13.0/bin/nvcc --version
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: cmake and ninja (requirements.txt's)
+        run: |
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install $(grep -E '^(cmake|ninja)==' requirements.txt | tr -d '\r')
+          echo /opt/venv/bin >> "$GITHUB_PATH"
+      - id: pins
+        run: echo "llama=$(python3 -c 'import setup; print(setup.LLAMA_CPP_COMMIT)')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: third_party/llama.cpp
+          key: llama.cpp-${{ steps.pins.outputs.llama }}-linux
+      - name: llama.cpp at setup.py's commit
+        run: python3 -c "import setup; setup.get_llama_cpp()"
+      - name: build ${{ matrix.part }}
+        run: >-
+          python3 .github/scripts/build_release.py ${{ matrix.part }} --build build --cuda /usr/local/cuda-13.0
+          --llama third_party/llama.cpp --archs "75-real;86-real;89-real;120"
+      - name: what it needs (libraries, glibc)
+        run: |
+          for f in build/strata build/libstrata_kq.so build/bin/strata-vision; do
+            [ -f "$f" ] || continue
+            echo "$f: $(readelf -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')"
+            echo "  newest glibc symbol: $(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          done
+          ls -l build/strata build/libstrata_kq.so build/bin/strata-vision 2>/dev/null || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-linux-cuda13-${{ matrix.part }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            build/strata
+            build/libstrata_kq.so
+            build/bin/strata-vision
+            build/CMakeCache.txt
+            build/CMakeFiles/*/CMakeCUDACompiler.cmake
+
+  pack:
+    name: zips and SHA256.txt
+    needs: [version, windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: build-*
+          path: parts
+      - name: tools/make_release.py
+        run: |
+          for z in windows-cuda13 windows-cuda12 linux-cuda13; do
+            python3 tools/make_release.py --platform "${z%%-*}" --link "${{ needs.version.outputs.link }}" \
+              --engine "parts/build-$z-engine" --vision "parts/build-$z-vision" --out dist
+          done
+          ls -l dist
+          (cd dist && sha256sum -c SHA256.txt)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ needs.version.outputs.link }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          path: dist/
+
+  release:
+    name: draft release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [version, pack]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-${{ needs.version.outputs.link }}
+          path: dist
+      - name: the draft (published by hand)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LINK: ${{ needs.version.outputs.link }}
+        run: |
+          (cd dist && sha256sum -c SHA256.txt)
+          printf 'Strata Link %s, built by the release workflow from %s (run %s).\n\nSHA256.txt: the SHA-256 of each zip.\n' \
+            "$LINK" "$GITHUB_SHA" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag --title "Strata Link $LINK" --notes-file notes.md
