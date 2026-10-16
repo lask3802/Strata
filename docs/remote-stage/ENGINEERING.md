@@ -651,6 +651,64 @@ so a worker can use it; the moved copy took the change, and it is the same as up
 - The server's 503 for a remote stage's error sends its Retry-After through `_json`'s headers, which upstream added
   too; the merge had sent the field twice, and the server's test now checks it is sent once.
 
+### After the rebase onto 0.1.44.1 (2026-10-14)
+
+The branch was rebased onto upstream main 296b59d2 (engine 0.1.44.1, 282 commits after a0116b27). The textual
+conflicts were in three of its commits:
+- **The expert arena** (`ArenaExpertSource`): 0.1.44's pin by need (`STRATA_PIN_BY_NEED=1`, opt-in) lays the arena
+  out with a page-aligned blob stride, and this branch cuts a worker's arena to its layer range. A layer range keeps
+  the packed layout (its `base_` is shifted back by the range's first byte, which a stride would not match), so pin by
+  need is off with a remote stage: the log says so, and the prefix pinning stays. `load_experts_gguf` takes both the
+  padded map and the range; `blob_at` (0.1.44's async adaptive tier reads the arena through it) answers null outside
+  the range, as `blob` does.
+- **The prompt path's loan** (`lend`, which this branch had moved up so a worker can use it): 0.1.44 added
+  `--prefill-head-alias` to it at its old place. The moved copy took the change and is upstream's, whitespace aside.
+- The tail-skip default's 90% rule (0.1.44 adds an NVFP4 clause next to it), the drafter's batched K/V plan
+  (0.1.44's `mtp_first`), and the Metal backend's lines next to this branch's job thread in `verify.cpp` and its
+  checkpoint calls in `conversation_state.cpp`: both sides kept.
+
+In the first commit (so every commit of the branch builds where 0.1.44 does):
+- The Metal build compiles `generate.cpp`, so it links the link's code (and `send` asks for no SIGPIPE through
+  `SO_NOSIGPIPE` where there is no `MSG_NOSIGNAL`). Not built here (no Mac).
+- A worker's arena read could wait for most or all of its registration slices under `STRATA_DEFERRED_REGISTER=1`
+  (Windows, opt-in): the readers counted the slices from layer 0, the arena from the range's first layer. They count
+  from the range's first layer now, so a layer is read once its own slice and the next are registered. Read from the
+  code, not run.
+
+Follow-ups (one commit), each a check of this branch's own (the flags of a remote stage):
+- `--prefill-head-alias` is refused with a remote stage: a worker has no head, and the alias needs one GPU.
+- A Qwen3.6-35B-A3B file is refused with the remote stage's flags (`--flag value` or `--flag=value`). 0.1.44 runs
+  that family from the same binary on its own engine path, which has no layer split and skips an option it does not
+  know in serve mode: a main process would have run every layer itself, and a worker would never have listened.
+- A remote stage is refused on the Metal build, since the Metal window runs init, run and commit itself, past the
+  remote stage's hooks.
+- 0.1.44 lets `--adapt-async 1` run in the expert arena's mode. With a remote stage it is turned off there with a
+  line on both PCs: a worker runs the blocking adaptive tier between its windows (it never reaches the async tier's
+  loop), and on the main PC that tier has not been measured with a remote stage; it stays off until it is. (With
+  `--pipeline-windows 2` too, the main process has already turned the pipelining off for `--adapt-async`, so neither
+  runs: say `--pipeline-windows 2` without `--adapt-async`.)
+- 0.1.44 caps a layer split's automatic prompt chunk at 8192 on gfx12 (its 16384 ceiling fills and drains the
+  stages' pipeline). A remote main reads its chunks through the worker as the same pipeline, so it takes the cap too
+  (`STRATA_SPLIT_CHUNK16K=1` keeps 16384). Without it, a gfx12 main on `--prefill auto` took 16384 chunks, and a
+  worker on `auto` that is not gfx12 (8192) refused its hello. Not run: no AMD card here.
+
+Checked without a change (the CUDA engine's code):
+- `STRATA_COMMIT_BATCH` (on by default): the batched commit counts the GDN and QSA layers of the Verifier's own range
+  `[lb_, le_)`, from the ordinals before `lb_`, as the per-layer loop does, so a worker's and a main process's
+  commits cover their layers only.
+- The multi-GPU changes (`--layer-split auto`, the drafter on the first card) need `stages`, which a remote main does
+  not have: its split is `--split-device 0`.
+- The server's start retries leave an engine that wrote a line alone, and a remote main writes its layer range first;
+  the picture key of #2228 is the main process's (the worker gets the position table, not the pictures).
+- The pipelined default from two stages needs an in-process split; a remote main resolves `--pipeline-windows` to 0
+  unless asked, as before. The measured PCIe share in the pipelined loop stays off on a remote main:
+  `STRATA_PCIE_AUTO_SPLIT` has no later local stage to refine there, so the share is the probed one.
+- `STRATA_HC_Q8=1` (opt-in, one GPU) quantizes a process's own layers only: its loop follows the dense weights' layer
+  range.
+- The geometry read from the GGUF: the layer count must still be the compiled 48, so the flags' checks hold, and the
+  hello compares the expert counts each PC read from its own file.
+- A long read giving way to a short request (#656) is the `--batch` path's, which a remote stage refuses.
+
 ### The recovery's open points (2026-10-13)
 
 Faults injected on A + B (RTX 3080 main, RTX 2080 Ti worker, 10 GbE, RVN IQ3_S, K=26) with the branch on 0.1.43

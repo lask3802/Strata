@@ -390,3 +390,17 @@ On this branch with `--pipeline-windows 2`, the same PCs and model, exact flags,
 The runs at 4 and 7 of 8 took another word partway into an answer. In the same session, #1887's head (no
 `--pipeline-windows` on a remote main) gave 5 and 5 of 8 against the same run, and 2 of 8 against each other, so a
 single fresh server does not settle the default path here; three of this branch's five matched it.
+
+### After the rebase onto 0.1.44.1 (2026-10-14)
+
+#1748 was rebased onto upstream main 296b59d2 (engine 0.1.44.1) and this branch on top of it. One textual conflict:
+0.1.44's Metal backend hands `conversation_checkpoint_save` to its decode window, where this branch had split the
+function to take a token count (the worker saves its layers' part for the main process's count). The Metal hand-over
+stays in the function every caller of one GPU uses; the range-taking overloads stay on the session's buffers, and a
+remote stage is refused on Metal (#1748). 0.1.44 keys a picture by the server's hash of its bytes (#2228) instead of
+its embeddings: the keys a checkpoint is matched by are the main process's, and a worker keeps its part by the
+checkpoint's id, so the change reaches both sides alike. The protocol is unchanged.
+
+Builds: MSVC 2022 + CUDA 13.0 (the touched files; `stage_link_test`, `stage_ckpt_store_test`, `conv_cache_test`,
+`conversation_cache_test`, `conversation_validation_test`, `draft_kv_plan_test` pass). The GPU checks above were not
+run again on this base yet.

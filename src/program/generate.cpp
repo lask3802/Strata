@@ -1915,7 +1915,19 @@ int main(int argc, char** argv) {
         } catch (const std::exception&) {
             // not readable here: the normal path below reports it
         }
-        if (qwen35) return strata::qwen35::run(argc, argv);
+        if (qwen35) {
+            // remote stage: that engine path has no layer split, and its serve mode skips options it does not have -
+            // a --remote-stage main would run every layer itself, a --stage-worker would never listen (`--flag=value`
+            // too: this parser refuses it, that one skips it)
+            for (int j = 1; j < argc; ++j)
+                for (const char* f : {"--remote-stage", "--stage-worker", "--stage-begin", "--stage-end", "--stage-next"})
+                    if (const size_t n = std::strlen(f); std::strncmp(argv[j], f, n) == 0 && (argv[j][n] == 0 || argv[j][n] == '=')) {
+                        std::fprintf(stderr, "strata generate: remote stage: not with a Qwen3.6-35B-A3B file (%s; its "
+                                             "engine path runs the whole model on one GPU)\n", f);
+                        return 2;
+                    }
+            return strata::qwen35::run(argc, argv);
+        }
         break;
     }
 #endif
@@ -2491,6 +2503,10 @@ int main(int argc, char** argv) {
             why = "it does not carry --control-vector (or a speed projection) to the worker's layers";
         else if (o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)
             why = "it does not support --expert-cache-remote";
+#if defined(STRATA_GPU_METAL)
+        // 0.1.44: the Metal window runs init/run/commit itself (verify.cpp), past the remote stage's hooks
+        if (why == nullptr) why = "not on the Metal backend";
+#endif
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: remote stage: %s\n", why);
             return 2;
@@ -6764,7 +6780,8 @@ int main(int argc, char** argv) {
     // 0.1.44: a layer split reads a prompt as a pipeline of chunks (the later card reads chunk c while the first reads c+1), so a
     // 32K prompt in two 16384 chunks fills and drains the pipe for most of its time.  8192 chunks, same tokens: 2x R9700
     // pp32k +14%, 4x +19%, pp64k +4% / +16%.  STRATA_SPLIT_CHUNK16K=1 keeps the gfx12 16384 ceiling on a split.
-    if (multi_gpu && o.prefill_gfx12_16k) {
+    // (remote-stage: the main process's chunks run through the worker as the same pipeline; not measured on AMD)
+    if ((multi_gpu || remote_main) && o.prefill_gfx12_16k) {
         static const char* keep16 = std::getenv("STRATA_SPLIT_CHUNK16K");
         if (!(keep16 != nullptr && std::atoi(keep16) != 0)) {
             auto_ceiling = std::min<int64_t>(auto_ceiling, 8192);
@@ -7131,6 +7148,9 @@ int main(int argc, char** argv) {
                         : o.adapt_every <= 0 || o.adapt_swaps <= 0 ? "the adaptive tier is off"
                         : !o.resident_cpu_experts && srcp != &arena_src ? "it needs the resident RAM mode, --resident-experts, or the expert arena"
                         : multi_gpu && srcp == &arena_src ? "not with a layer split in the arena mode"
+                        : stage_worker ? "a remote stage worker runs the blocking tier between its windows"
+                        // 0.1.44's arena tier on a remote main: its own layers only, not measured there
+                        : remote_main && srcp == &arena_src ? "not on a remote stage's main process in the arena mode (not measured there)"
                         : o.pipeline_windows >= 2 && srcp == &arena_src ? "not with --pipeline-windows 2 in the arena mode"
                         : o.batch > 0 && o.batch_groups > 1 ? "not with --batch-groups (the pipelined slot groups)"
                         : peer.valid() ? "not with --peer-device"
@@ -10363,20 +10383,17 @@ int main(int argc, char** argv) {
                 // main process's chunks whole (on_chunk writes one T-row reply, a relay forwards one chunk).  Then it
                 // lends for its own chunk, which fit at its start: larger buffers, still one T-row reply per chunk.
                 // The slots do not change after the start, so the hello decides it.  (lend_whole: lend()'s own test,
-                // for a prompt of `tokens`; its --prefill-head-alias branch is lend()'s, though a remote stage refuses
-                // that flag.)
+                // for a prompt of `tokens`.)
                 int64_t lend_chunk = pf_chunk;
                 auto lend_whole = [&](int64_t tokens) {
                     const int64_t want_full = equal_chunk(tokens, o.prefill_chunk);
-                    const int64_t want = o.prefill_head_alias ? o.prefill_chunk
-                                       : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
+                    const int64_t want = split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
                                                                                       : want_full;
-                    if (!o.prefill_head_alias)
-                        for (const PfPart& p : pf_parts) {
-                            if (p.first < 0) continue;
-                            const int64_t need = part_slots(p, want);
-                            if (need <= 0 || need + 128 > p.cache->slots()) return false;
-                        }
+                    for (const PfPart& p : pf_parts) {
+                        if (p.first < 0) continue;
+                        const int64_t need = part_slots(p, want);
+                        if (need <= 0 || need + 128 > p.cache->slots()) return false;
+                    }
                     return want >= tokens;
                 };
                 int32_t main_ckpt_max = 0;       // the checkpoint parts the main process may have this worker keep
@@ -10568,13 +10585,11 @@ int main(int argc, char** argv) {
                     // worker's own (lend_chunk, the hello's choice; a loan that covers it stays for the rest of the
                     // prompt)
                     if (!lend(std::max<int64_t>(T, lend_chunk), e)) return false;
-                    // a chunk lend() halved anyway (#2090: neither the main process's chunk nor this worker's own fit)
-                    // would have this worker read the main process's chunk in pieces, and its rows (and a relay's
-                    // link) are one reply per chunk: an error, not a wrong reply
+                    // a chunk lend() halved anyway (#2090) would leave rows out: an error, not a wrong reply
                     if (sp.chunk() < T) {
-                        e = "stage worker: its expert cache cannot lend the prompt buffers for the main process's chunk of " +
-                            std::to_string(T) + " tokens (only " + std::to_string(sp.chunk()) + "): start the main process "
-                            "with a smaller --prefill, or this worker with a larger expert cache";
+                        e = "this worker lends the prompt path buffers for " + std::to_string(sp.chunk()) +
+                            " tokens, the main process sends chunks of " + std::to_string(T) +
+                            " (start the main process with --prefill " + std::to_string(sp.chunk()) + ")";
                         return false;
                     }
                     sp.set_hand_in(rows_in);

@@ -4348,10 +4348,11 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         return pad != nullptr ? pad->blob_off(l, e) : lay.blob_offset(l, e) - dst_off;
     };
     // `ready`: layer l is written only once *ready > l + 1 (a PinnedArena registering its slices meanwhile; the next
-    // slice too, since its registration starts on the page that may hold this layer's tail)
-    auto wait_ready = [ready](int64_t l) {
+    // slice too, since its registration starts on the page that may hold this layer's tail).  remote-stage: the
+    // slices are the range's, slice 0 = layer_lo
+    auto wait_ready = [ready, layer_lo](int64_t l) {
         if (ready != nullptr)
-            while (ready->load(std::memory_order_acquire) <= l + 1) std::this_thread::yield();
+            while (ready->load(std::memory_order_acquire) <= l - layer_lo + 1) std::this_thread::yield();
     };
     LoadStats st;
     st.layers = (uint64_t) lay.n_layers;

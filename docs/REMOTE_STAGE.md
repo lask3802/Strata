@@ -29,7 +29,8 @@ while the next window runs (`STRATA_ADAPT_OVERLAP`, then on for Linux CUDA), and
 backend: neither PC of a remote stage runs it unless `STRATA_ADAPT_OVERLAP=1` is set there. The checks after each
 rebase are in ENGINEERING.md: [0.1.42](remote-stage/ENGINEERING.md#after-the-rebase-onto-0142-2026-10-11),
 [0.1.43](remote-stage/ENGINEERING.md#after-the-rebase-onto-0143-2026-10-12),
-[0.1.43.1](remote-stage/ENGINEERING.md#after-the-rebase-onto-01431-2026-10-13).
+[0.1.43.1](remote-stage/ENGINEERING.md#after-the-rebase-onto-01431-2026-10-13),
+[0.1.44.1](remote-stage/ENGINEERING.md#after-the-rebase-onto-01441-2026-10-14).
 
 | | PC A (main) | PC B | PC C |
 |---|---|---|---|
@@ -532,16 +533,20 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 ## What is turned off or refused
 
 - **Refused at start** with a remote stage: `--batch`, `--peer-device`, `--control-vector` (and the speed
-  projection, which is one), `--expert-cache-remote`, and `--pipeline-windows` on a worker (the main process
-  takes it, see [Overlapping the decode windows](#overlapping-the-decode-windows---pipeline-windows-2)).
-- **Turned off without an error** (the main process's log says so): the prompt cache, conversation
+  projection, which is one), `--expert-cache-remote`, `--prefill-head-alias`, and `--pipeline-windows` on a worker
+  (the main process takes it, see [Overlapping the decode windows](#overlapping-the-decode-windows---pipeline-windows-2)).
+  So are a Qwen3.6-35B-A3B file (its own engine path, one GPU) and the Metal build.
+- **Turned off without an error** (the log says so): the prompt cache, conversation
   parking (`--conversation-cache-mib`) and mid-prompt checkpoints (each PC holds only its layers' state, so every
-  prompt is read from token 0), and `--kv-grow`. With `--prompt-cache N` given on the main process, conversation
-  checkpoints at the prompt's turn boundaries come back: the worker keeps its layers' part of each
-  ([remote-stage/CHECKPOINTS.md](remote-stage/CHECKPOINTS.md): later turns of a 16K-token chat get their first token
-  in 0.32-0.44 s instead of 14.2-15.1 s on an RTX 3080 + RTX 2080 Ti, engine 0.1.43). Mid-prompt checkpoints and
-  parking stay off, and session files are refused.
-- **Not checked** with a remote stage: `STRATA_PREFILL_HELP`, `--adapt-async 1`, `--resident-experts`,
+  prompt is read from token 0), `--kv-grow`, pin by need (`STRATA_PIN_BY_NEED=1`: the prefix pinning stays), and
+  `--adapt-async 1` on a worker (it runs the blocking adaptive tier between its windows) and in the expert arena's
+  mode on the main PC (0.1.44's copy-in tier: off until it is measured with a remote stage). With `--prompt-cache N`
+  given on the main process, conversation checkpoints at the prompt's turn boundaries come back: the worker keeps its
+  layers' part of each ([remote-stage/CHECKPOINTS.md](remote-stage/CHECKPOINTS.md): later turns of a 16K-token chat
+  get their first token in 0.32-0.44 s instead of 14.2-15.1 s on an RTX 3080 + RTX 2080 Ti, engine 0.1.43).
+  Mid-prompt checkpoints and parking stay off, and session files are refused.
+- **Not checked** with a remote stage: `STRATA_PREFILL_HELP`, `--adapt-async 1` on the main PC in the resident RAM
+  mode, `--resident-experts`,
   `--mmap-experts` / `--resident-budget-gib` (the mapped expert source gets no layer range; it maps the whole pack),
   `STRATA_PF_FUSED=1`.
 
@@ -563,7 +568,7 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 
 | | status |
 |---|---|
-| Model family | Qwen3.8-Flash-Next only (48 layers, 512 experts top-10, 4 hyper-connection streams, n_embd 2560). The hello checks the geometry |
+| Model family | Qwen3.8-Flash-Next only (48 layers, 512 experts top-10, 4 hyper-connection streams, n_embd 2560). The hello checks the geometry. A Qwen3.6-35B-A3B file (0.1.44 runs it from the same binary, on its own engine path) is refused at start |
 | RVN IQ3_S, native pack read from its GGUF | **measured** (two and three PCs) |
 | Huihui UD-Q4_K_XL (Unsloth UD layout), native pack read from its GGUF | **measured** (one, two and three PCs) |
 | Other quantizations and models of the family (the official IQ3_S, IQ3_XXS, IQ2_XS, Coder, Swift 1.5, UD-IQ4_XS) | not tested. The hand-off is fp32 rows whatever the quantization, the arena range is cut by layer from the pack's expert table and the shipper works by tensor name |
@@ -574,6 +579,7 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 | WSL2 (Windows 11, mirrored networking) | measured as a worker |
 | AMD (HIP) | builds (ROCm 7.0, gfx1100, in a container); not run: no AMD card was available |
 | Intel (SYCL) | the SYCL port builds (oneAPI 2026.1.1, in a container) but has no remote stage: it keeps its own copies of the engine files this feature changes |
+| Apple (Metal, 0.1.44) | refused at start: the Metal backend runs each verify window itself, past the remote stage's hooks. Its build compiles the link's code so the binary links (not built here: no Mac) |
 | Links | measured on 1 GbE and on 10 GbE (limited to ~400 MB/s by its slot) |
 
 ## Troubleshooting

@@ -940,8 +940,9 @@ public:
     /// --native shard, and native_experts.txt names the other shards beside it (per layer, or per role in v4).
     void set_gguf(const std::string& native) { gguf_ = native; }
     /// REMOTE STAGE: hold only layers [lo, hi) (-1: to the last) - a process that runs only
-    /// those layers.  The other layers' experts are absent: blob() is null for them.  Set before `open`; a native
-    /// pack read from its GGUF only (no experts.bin, no STRATA_ARENA_MMAP, no shared arena).
+    /// those layers.  The other layers' experts are absent: blob() and blob_at() are null for them.  Set before
+    /// `open`; a native pack read from its GGUF only (no experts.bin, no STRATA_ARENA_MMAP, no shared arena, no pin
+    /// by need).
     void set_layer_range(int64_t lo, int64_t hi) { lo_ = lo; hi_ = hi; }
     void close();
 
