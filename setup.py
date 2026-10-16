@@ -3491,6 +3491,83 @@ def rollback_engine(toolkit=13) -> int:
     return 0
 
 
+# Strata Link: what get_prebuilt learned about this checkout's release (link_version()), in the engine folder, so a
+# start does not download the same ~150 MB again: "unpublished" (its tag is not out and the latest release is older:
+# only the tag is asked again, a day later) or "does not start" (prebuilt_runs: not again for this release).
+RELEASE_NOTE = ".release-check.json"
+RELEASE_RECHECK_S = 24 * 3600
+RELEASE_RECHECK = False                                # --update (update_install): ask again now, whatever the note says
+UNCHECKED_ENGINES: set = set()                         # installed by get_prebuilt in this run, not yet run (prebuilt_runs)
+
+
+def release_note(eng: Path) -> dict | None:
+    """The note an earlier run left about this checkout's release, or None (none, another release's, or --update)."""
+    try:
+        note = json.loads((eng / RELEASE_NOTE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if RELEASE_RECHECK or not isinstance(note, dict) or note.get("link") != link_version():
+        return None
+    return note
+
+
+def note_release(eng: Path, why: str, found=None, detail=None) -> None:
+    try:
+        (eng / RELEASE_NOTE).write_text(json.dumps({"link": link_version(), "why": why, "found": found,
+                                                   "detail": detail, "checked": int(time.time())}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def engine_starts(eng: Path, toolkit=13) -> str | None:
+    """None when the engine starts on this PC (`strata --version`, which exits before it touches a GPU), with the CUDA
+    libraries pip put in (cuda_lib_dirs), else what stopped it: on Linux a C library older than the one the
+    ready-made engine is built for (Rocky Linux 8's glibc 2.28), or a missing library.  Not run on Windows, where a
+    missing DLL is a dialog box that waits for a click."""
+    if WIN:
+        return None
+    env = {**os.environ, "LD_LIBRARY_PATH": os.pathsep.join([*cuda_lib_dirs(toolkit),
+                                                             os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)}
+    try:
+        r = subprocess.run([str(eng / EXE), "--version"], capture_output=True, text=True, timeout=120, env=env)
+    except (OSError, subprocess.SubprocessError) as e:
+        return str(e)
+    if r.returncode == 0 and r.stdout.startswith("strata "):
+        return None
+    lines = (r.stderr.strip() or r.stdout.strip()).splitlines()
+    return lines[0].strip() if lines else f"exit code {r.returncode}"
+
+
+def prebuilt_runs(eng: Path, toolkit=13, updating=False) -> bool:
+    """A ready-made engine get_prebuilt installed in this run, once pip_cuda_libs put its CUDA libraries in: does it
+    start (engine_starts)?  If not, the engine it replaced (eng/.previous) is put back, or it is removed when it
+    replaced none, a note keeps the next runs from downloading it again, and False: compile instead (updating: the
+    installed engine starts).  An engine this run did not install: True, not run again."""
+    if eng not in UNCHECKED_ENGINES:
+        return True
+    UNCHECKED_ENGINES.discard(eng)
+    why = engine_starts(eng, toolkit)
+    if why is None:
+        return True
+    try:
+        link = json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("link")
+    except (OSError, ValueError):
+        link = None
+    prev = eng / PREVIOUS_ENGINE
+    for name in (EXE, VEXE, KQ_LIB, "BUILD.json"):
+        (eng / name).unlink(missing_ok=True)
+    back = prev.is_dir() and any(prev.iterdir())
+    if back:
+        for p in list(prev.iterdir()):
+            shutil.move(str(p), str(eng / p.name))
+    shutil.rmtree(prev, ignore_errors=True)
+    note_release(eng, "does not start", link, why)
+    warn(f"the ready-made engine {link or ''} does not start on this PC ({why}): "
+         + ("the engine it replaced is back" if back else "it is removed")
+         + ("" if updating else "; compiling instead"))
+    return False
+
+
 def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | None:
     """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
     updating: called to replace an installed engine, which starts instead when this fails (no compile).
@@ -3520,6 +3597,18 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     eng.mkdir(exist_ok=True)
     z = eng / asset
     bases = prebuilt_bases(url_base)
+    note = release_note(eng) if len(bases) > 1 else None   # the default releases, not an explicit --prebuilt
+    if note and note.get("why") == "does not start":
+        warn(f"the ready-made engine {note.get('found') or link_version()} did not start on this PC "
+             f"({note.get('detail')})" + ("" if updating else ": compiling instead"))
+        return None
+    if note:                                           # "unpublished": the latest release was older when last asked
+        ago = time.time() - float(note.get("checked") or 0)
+        if 0 <= ago < RELEASE_RECHECK_S:
+            say(f"  Engine {link_version()} was not published yet {ago / 3600:.0f} h ago (the latest release was "
+                f"{note.get('found')}): asked again a day later, or now by {'UPDATE.bat' if WIN else './update.sh'}")
+            return None
+        bases = bases[:1]                              # a day later: its tag alone, not the older latest again
     for i, base in enumerate(bases):
         if not base.startswith(("http://", "https://")):
             break
@@ -3531,6 +3620,10 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             if i + 1 < len(bases):                     # #214: this checkout's release is not published (yet)
                 say(f"  No ready-made engine for v{link_version()} ({e}): the latest release instead")
                 continue
+            if note:
+                note_release(eng, "unpublished", note.get("found"))
+                say(f"  Engine {link_version()} is still not published ({e}): asked again a day later")
+                return None
             warn(f"no ready-made engine at {base} ({e})" + ("" if updating else ": compiling instead"))
             return None
     say("  Downloading the ready-made Strata engine" + (" (CUDA 12, experimental)" if int(toolkit) == 12 else "") + " ...")
@@ -3552,6 +3645,8 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     if tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit()) < MIN_ENGINE or \
             link_outdated(meta):
         need = link_version()
+        if base == PREBUILT_URL and link_outdated(meta):   # its tag is not out, the latest is older: not again today
+            note_release(eng, "unpublished", meta.get("link") or meta.get("version"))
         if updating:                                   # these files are newer than the published release (#58)
             warn(f"engine {need} is not published yet (the release may still be uploading): run this again "
                  f"in a few minutes to update it")
@@ -3573,6 +3668,8 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     install_unpacked(tmp, eng)
     shutil.rmtree(tmp, ignore_errors=True)
     drop_archive(z)
+    (eng / RELEASE_NOTE).unlink(missing_ok=True)
+    UNCHECKED_ENGINES.add(eng)                         # run once its CUDA libraries are in (prebuilt_runs)
     if not (eng / EXE).exists():
         fail("the ready-made engine archive has no " + EXE)
     if not WIN:
@@ -3697,6 +3794,8 @@ def update_installed_engine(url_base, toolkit=None) -> None:
         warn(f"could not update the engine: starting the installed {meta.get('version')}")
         return
     pip_cuda_libs(toolkit)
+    if not prebuilt_runs(new, toolkit, updating=True):  # the engine it replaced is back
+        warn(f"could not update the engine: starting the installed {meta.get('link') or meta.get('version')}")
 
 
 def pip_cuda_libs(toolkit=13) -> None:
@@ -4664,7 +4763,7 @@ def source_version() -> str:
 def link_version() -> str:
     """Strata Link's release of this checkout (the LINK_VERSION file, e.g. 0.1.44.1-link.1): the tag its ready-made
     engine is published under, and the "link" its BUILD.json carries.  The engine's own version stays
-    CMakeLists.txt's, so every MIN_ENGINE comparison reads it as before."""
+    CMakeLists.txt's, so every MIN_ENGINE comparison reads it as before.  When it changes: release.yml's header."""
     try:
         return (ROOT / "LINK_VERSION").read_text(encoding="utf-8").strip() or source_version()
     except OSError:
@@ -4860,6 +4959,8 @@ def update_install(have: list, a) -> int:
     setup needs a newer one (MIN_ENGINE; a compiled engine when its source changed), each installed model's config
     upgrades and its draft subset.  No question is asked and the model files are not touched; a model still running
     keeps its engine (update_installed_engine says to close it and run this again)."""
+    global RELEASE_RECHECK
+    RELEASE_RECHECK = True                             # an update asks for the release again (release_note)
     have = [p for p in have if model_config(p)]        # #549: a strata-*.json that is no model config is skipped
     if not have:
         say("  No model is installed in this Strata folder yet: run START-HERE.bat (Linux: ./setup.sh) to set it up -")
@@ -5387,7 +5488,7 @@ def get_cuda12_engine(url_base, gpu, vision, yes, build=False) -> Path:
     eng = None if build else get_prebuilt(url_base, gpu, vision, toolkit=12)
     if eng is not None and json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("source") != "local":
         pip_cuda_libs(12)
-        if vision != "none" and not (eng / VEXE).exists():
+        if not prebuilt_runs(eng, 12) or vision != "none" and not (eng / VEXE).exists():
             eng = None
     return eng if eng is not None else build_engine(gpu, vision, yes, get_llama_cpp(), toolkit=12)
 
@@ -5524,7 +5625,9 @@ def engine_step(a, gpu, hip, amd, cuda_tk, vision):
                                                                                     else {}))
     if eng is not None and not hip and json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("source") != "local":
         pip_cuda_libs(cuda_tk)
-        if vision != "none" and not (eng / VEXE).exists():
+        if not prebuilt_runs(eng, cuda_tk):
+            eng = None
+        elif vision != "none" and not (eng / VEXE).exists():
             warn("the ready-made engine has no image encoder: compiling it")
             eng = None
         else:
