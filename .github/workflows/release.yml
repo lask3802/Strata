@@ -147,13 +147,14 @@ jobs:
       contents: read
     # Rocky Linux 8 (glibc 2.28) with gcc-toolset-13, libstdc++ and libgcc linked in (LDFLAGS, CMake's initial
     # CMAKE_EXE/SHARED_LINKER_FLAGS): the programs need glibc 2.28 and nothing of the system's C++ runtime, so they run
-    # on RHEL 8, Debian 10 and Ubuntu 20.04 and newer (the linux-floor job runs them there)
+    # on RHEL 8, Debian 10 and Ubuntu 20.04 and newer (the linux-floor job runs them there).  --as-needed as Ubuntu's
+    # gcc has it: CMakeLists.txt links CUDA::cuda_driver, which the engine does not call (it starts without libcuda)
     container: rockylinux/rockylinux:8.10@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6
     env:
       CC: /opt/rh/gcc-toolset-13/root/usr/bin/gcc
       CXX: /opt/rh/gcc-toolset-13/root/usr/bin/g++
       CUDAHOSTCXX: /opt/rh/gcc-toolset-13/root/usr/bin/g++
-      LDFLAGS: -static-libstdc++ -static-libgcc
+      LDFLAGS: -static-libstdc++ -static-libgcc -Wl,--as-needed
     strategy:
       fail-fast: false
       matrix:
@@ -203,6 +204,7 @@ jobs:
             echo "$f: $needed"
             echo "  newest glibc symbol: $glibc"
             case " $needed" in *" libstdc++.so"* | *" libgcc_s.so"*) echo "::error::$f needs the system's C++ runtime"; bad=1 ;; esac
+            case "$f $needed" in */strata-vision*) ;; *" libcuda.so"*) echo "::error::$f needs the driver's libcuda"; bad=1 ;; esac
             if readelf -V --wide "$f" | grep -qE 'GLIBCXX_|CXXABI_|GCC_[0-9]'; then
               echo "::error::$f needs libstdc++ / libgcc_s symbol versions"; bad=1
             fi
