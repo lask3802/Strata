@@ -11,9 +11,12 @@
 # of the 0.1.44.1 zips).  The AMD (HIP) zip is not built here: tools/hip/build_windows.bat.  The Linux zip is built on
 # Rocky Linux 8 (glibc 2.28) with libstdc++ linked in, and run on the oldest distributions before a release.
 #
-# LINK_VERSION (<CMakeLists.txt's version>-link.<n>): bump n for a release that installed engines should be replaced
-# by; an upstream merge that changes the version starts again at <new version>-link.1.  Publish the release before
-# the commit that bumps it reaches main: until then setup finds no engine for it (it asks again a day later).
+# LINK_VERSION (<CMakeLists.txt's version>-link.<n>): bump n only when the engine binary changes (its sources, its
+# build, the toolkit); an upstream merge that changes CMakeLists.txt's version starts again at <new version>-link.1.
+# Every installed engine older than it is replaced (~150 MB each), so a setup or serve change alone does not bump it.
+# setup.py's LINK_REQUIRED, the oldest release setup still installs, moves only when setup or serve needs a newer
+# engine.  Publish the release before the commit that bumps LINK_VERSION reaches main: until then setup installs or
+# keeps the latest (older) release and asks for the tag again a day later.
 name: release
 
 on:
@@ -111,13 +114,11 @@ jobs:
         run: >-
           python .github/scripts/build_release.py ${{ matrix.part }} --build build --cuda "$CUDA_ROOT"
           --llama third_party/llama.cpp --archs "${{ matrix.archs }}" ${{ matrix.defs }}
-      - name: what it imports
+      - name: what it imports (the pip wheels' CUDA libraries, the driver, Windows)
         run: |
           python -m pip install --disable-pip-version-check -q pefile==2024.8.26
-          for f in build/strata.exe build/strata_kq.dll build/bin/strata-vision.exe; do
-            [ -f "$f" ] && python -c "import pefile, sys; pe = pefile.PE(sys.argv[1]); print(sys.argv[1], [e.dll.decode() for e in pe.DIRECTORY_ENTRY_IMPORT])" "$f"
-          done
           ls -l build/*.exe build/*.dll build/bin/*.exe 2>/dev/null || true
+          python .github/scripts/check_imports.py build/strata.exe build/strata_kq.dll build/bin/strata-vision.exe
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: build-windows-${{ matrix.zip }}-${{ matrix.part }}
@@ -320,6 +321,12 @@ jobs:
           LINK: ${{ needs.version.outputs.link }}
         run: |
           (cd dist && sha256sum -c SHA256.txt)
+          # one release per tag: a draft left by an earlier run is not doubled (delete it first to build it again)
+          have=$(gh api "repos/$GH_REPO/releases?per_page=100" --paginate \
+            --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | \"\(.id) draft=\(.draft)\"")
+          if [ -n "$have" ]; then
+            echo "::error::$GITHUB_REF_NAME already has a release ($have): delete it to make the draft again"; exit 1
+          fi
           printf 'Strata Link %s, built by the release workflow from %s (run %s).\n\nSHA256.txt: the SHA-256 of each zip.\n' \
             "$LINK" "$GITHUB_SHA" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > notes.md
           gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag --title "Strata Link $LINK" --notes-file notes.md
