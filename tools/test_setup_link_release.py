@@ -102,6 +102,7 @@ class GetPrebuilt(unittest.TestCase):
                   mock.patch.object(setup, "RELEASE_RECHECK", False)):
             p.start()
             self.addCleanup(p.stop)
+        self.upstream_fail = setup.fail
 
     def installed(self, **meta):
         (self.root / "engine" / "BUILD.json").write_text(json.dumps({"version": MIN, "archs": [89], **meta}))
@@ -240,7 +241,34 @@ class GetPrebuilt(unittest.TestCase):
             eng, out = quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
         self.assertEqual(eng, self.root / "engine")
         self.assertIn("connection reset", out)
+        self.assertEqual(out.count("[!]"), 1, out)
         self.assertEqual(json.loads((self.root / "engine" / "BUILD.json").read_text())["link"], "0.1.44.1-link.1")
+
+    def test_no_url_keeps_the_installed_engine_with_one_warning(self):
+        self.installed(source="release", link="0.1.44.1-link.1")
+        with self.network([], {}) as (heads, got):
+            eng, out = quiet(setup.get_prebuilt, None, {"arch": 89}, "gpu")
+        self.assertEqual((eng, heads, got), (self.root / "engine", [], []))
+        self.assertEqual(out.count("[!]"), 1, out)
+        self.assertEqual(json.loads((self.root / "engine" / "BUILD.json").read_text())["link"], "0.1.44.1-link.1")
+
+    def test_a_stop_once_the_new_engine_is_in_still_stops_setup(self):
+        """fail() past install_unpacked (a zip without the engine): upstream's stop, banner and all."""
+        self.installed(source="release", link="0.1.44.1-link.1")
+        tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)
+        (self.root / "engine" / setup.EXE).unlink()
+
+        def download(url, dst, what=None):
+            with zipfile.ZipFile(dst, "w") as z:
+                z.writestr("BUILD.json", json.dumps(self.release(self.LINK)))
+
+        with self.network([tag], {}), mock.patch.object(setup, "download", download), \
+                mock.patch.object(setup, "engine_digest", lambda asset, base: (0, "")), \
+                mock.patch.object(setup, "verify_engine_archive", lambda *a: None), \
+                mock.patch.object(setup, "link_soft", lambda eng, gpu: (eng / "BUILD.json").read_text()), \
+                self.assertRaises(SystemExit):
+            quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
+        self.assertIs(setup.fail, self.upstream_fail)
 
     def test_a_download_that_stops_setup_keeps_the_installed_engine(self):
         """download() stops setup (SystemExit) when the server cannot be reached five times: the installed engine is
@@ -248,12 +276,20 @@ class GetPrebuilt(unittest.TestCase):
         self.installed(source="release", link="0.1.44.1-link.1")
         before = (self.root / "engine" / "BUILD.json").read_text()
         tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)
-        with self.network([tag], {}), mock.patch.object(setup, "download", side_effect=SystemExit(1)):
+        def download(url, dst, what=None):
+            setup.fail("cannot reach github.com (timed out)", "check your internet connection and run it again")
+
+        with self.network([tag], {}), mock.patch.object(setup, "download", download):
             eng, out = quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
         self.assertEqual(eng, self.root / "engine")
         self.assertEqual((self.root / "engine" / "BUILD.json").read_text(), before)
         self.assertFalse((self.root / "engine" / "BUILD.json.prev").exists())
-        self.assertIn("keeping the installed engine 0.1.44.1-link.1", out)
+        self.assertIn("could not be had (cannot reach github.com (timed out)): keeping the installed engine "
+                      "0.1.44.1-link.1", out)
+        self.assertEqual(out.count("[!]"), 1, out)
+        self.assertNotIn("[X]", out)
+        self.assertNotIn("Setup stopped", out)
+        self.assertIs(setup.fail, self.upstream_fail)                   # setup's own again
         eng, out, _, _ = self.run_get([], {})
         self.assertEqual(eng, self.root / "engine")
         self.assertNotIn("compiling instead", out)

@@ -7044,6 +7044,17 @@ def link_soft(eng: Path, gpu: dict) -> str | None:
     return text
 
 
+class LinkStopped(Exception):
+    """fail() while get_prebuilt below replaces an engine that still starts: not the end of setup."""
+
+    def __str__(self):
+        return str(self.args[0])
+
+
+def link_stopped(msg, hint=None):
+    raise LinkStopped(msg, hint)
+
+
 _upstream_get_prebuilt = get_prebuilt
 
 
@@ -7099,14 +7110,21 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
         url_base = prebuilt_bases(url_base)[0]         # a day later: its tag alone, not the older latest again
     say(f"  Updating the ready-made engine ({have} -> {link_version()}) ...")
     (eng / "BUILD.json").replace(eng / "BUILD.json.prev")
-    try:
-        got = _upstream_get_prebuilt(url_base, gpu, vision, True, toolkit)
-        err = None
-    except BaseException as e:                         # a failed download (download() stops setup: SystemExit) - the
-        if (eng / "BUILD.json").exists() or not isinstance(e, (Exception, SystemExit)):   # installed engine still
-            restore()                                  # starts; Ctrl+C, or a failure once the new one is in: as upstream
+    global fail
+    stop, fail = fail, link_stopped                    # download() stops setup when GitHub cannot be reached: here
+    try:                                               # the installed engine starts instead, no "Setup stopped"
+        try:
+            got = _upstream_get_prebuilt(url_base, gpu, vision, True, toolkit)
+            err = None
+        finally:
+            fail = stop
+    except BaseException as e:                         # a failed download: the installed engine still starts
+        if (eng / "BUILD.json").exists() or not isinstance(e, Exception):   # Ctrl+C, or a failure once the new
+            restore()                                  # one is in: as upstream
+            if isinstance(e, LinkStopped):
+                stop(*e.args)
             raise
-        got, err = None, "" if isinstance(e, SystemExit) else f" ({e})"
+        got, err = None, f" ({e})"
     if got is None:
         if note:
             note_release(eng, "unpublished", note.get("found"))
