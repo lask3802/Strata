@@ -242,6 +242,56 @@ class GetPrebuilt(unittest.TestCase):
         self.assertIn("connection reset", out)
         self.assertEqual(json.loads((self.root / "engine" / "BUILD.json").read_text())["link"], "0.1.44.1-link.1")
 
+    def test_a_download_that_stops_setup_keeps_the_installed_engine(self):
+        """download() stops setup (SystemExit) when the server cannot be reached five times: the installed engine is
+        kept, BUILD.json and all, and the next run offline keeps it again instead of compiling."""
+        self.installed(source="release", link="0.1.44.1-link.1")
+        before = (self.root / "engine" / "BUILD.json").read_text()
+        tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)
+        with self.network([tag], {}), mock.patch.object(setup, "download", side_effect=SystemExit(1)):
+            eng, out = quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
+        self.assertEqual(eng, self.root / "engine")
+        self.assertEqual((self.root / "engine" / "BUILD.json").read_text(), before)
+        self.assertFalse((self.root / "engine" / "BUILD.json.prev").exists())
+        self.assertIn("keeping the installed engine 0.1.44.1-link.1", out)
+        eng, out, _, _ = self.run_get([], {})
+        self.assertEqual(eng, self.root / "engine")
+        self.assertNotIn("compiling instead", out)
+
+    def test_ctrl_c_during_the_download_puts_build_json_back(self):
+        self.installed(source="release", link="0.1.44.1-link.1")
+        before = (self.root / "engine" / "BUILD.json").read_text()
+        tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)
+        with self.network([tag], {}), mock.patch.object(setup, "download", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
+        self.assertEqual((self.root / "engine" / "BUILD.json").read_text(), before)
+        self.assertFalse((self.root / "engine" / "BUILD.json.prev").exists())
+
+    def test_a_failure_once_the_new_engine_is_in_is_not_called_keeping_the_old_one(self):
+        self.installed(source="release", link="0.1.44.1-link.1")
+        tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)
+        real_ok = setup.ok
+
+        def ok(msg):                                                     # past install_unpacked, as a chmod would
+            if msg.startswith("ready-made engine "):
+                raise OSError("chmod")
+            real_ok(msg)
+
+        with self.network([tag], self.release(self.LINK)), mock.patch.object(setup, "ok", ok), \
+                self.assertRaises(OSError):
+            quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
+        self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"new")
+        self.assertEqual(json.loads((self.root / "engine" / "BUILD.json").read_text())["link"], self.LINK)
+
+    def test_one_warning_when_the_new_release_cannot_be_had(self):
+        self.installed(source="release", link="0.1.44.1-link.1")
+        for published, zipped in (([], {}), ([setup.PREBUILT_URL], self.release("0.1.44.1-link.1"))):
+            with self.subTest(published=published):
+                (self.root / "engine" / setup.RELEASE_NOTE).unlink(missing_ok=True)
+                _, out, _, _ = self.run_get(published, zipped)
+                self.assertEqual(out.count("[!]"), 1, out)
+
     def test_an_engine_below_min_engine_is_still_replaced_or_compiled(self):
         """MIN_ENGINE stays a must: an installed engine below it is not kept when nothing newer can be had."""
         (self.root / "engine" / "BUILD.json").write_text(json.dumps(
@@ -295,12 +345,13 @@ class GetPrebuilt(unittest.TestCase):
         tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)
         setup.note_release(self.root / "engine", "unpublished", "0.1.44.1-link.1")
         day = setup.RELEASE_RECHECK_S + 60
-        with mock.patch.object(setup.time, "time", lambda: self.note()["checked"] + day):
+        then = self.note()["checked"] + day
+        with mock.patch.object(setup.time, "time", lambda: then):
             eng, out, heads, got = self.run_get([setup.PREBUILT_URL], self.release("0.1.44.1-link.1"), updating=True)
         self.assertEqual((eng, heads, got), (self.root / "engine", [tag + setup.PREBUILT_ASSET], []))
         self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"old")
         checked = self.note()["checked"]
-        self.assertGreater(checked, 0)
+        self.assertEqual(checked, then)                                  # asked now: not again for a day
         with mock.patch.object(setup.time, "time", lambda: checked + day):            # published now
             eng, out, heads, got = self.run_get([tag], self.release(self.LINK), updating=True)
         self.assertEqual((eng, got), (self.root / "engine", [tag + setup.PREBUILT_ASSET]))
@@ -356,6 +407,43 @@ class GetPrebuilt(unittest.TestCase):
         self.assertEqual((eng2, heads, got), (eng, [], []))
         self.assertIn("did not start on this PC", out)
         self.assertEqual((eng / setup.EXE).read_bytes(), b"old")
+
+    def test_an_older_release_that_did_not_start_does_not_hold_back_link_version(self):
+        """LINK_VERSION link.3, its tag not out: the latest (link.2) did not start here.  Once link.3 is published it
+        is asked for a day later (its tag alone), not held back until the next LINK_VERSION."""
+        self.LINK = "0.1.44.1-link.3"
+        tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)
+        for installed in (True, False):                              # an older Link engine kept; a first install
+            with self.subTest(installed=installed):
+                for name in (setup.EXE, "BUILD.json", setup.RELEASE_NOTE):
+                    (self.root / "engine" / name).unlink(missing_ok=True)
+                if installed:
+                    self.installed(source="release", link="0.1.44.1-link.1")
+                setup.note_release(self.root / "engine", "does not start", "0.1.44.1-link.2", "GLIBC_2.34")
+                first = self.note()["checked"]
+                eng, out, heads, got = self.run_get([tag], self.release(self.LINK))     # the same day: not asked
+                self.assertEqual((heads, got), ([], []))
+                self.assertEqual(eng, self.root / "engine" if installed else None)
+                then = first + setup.RELEASE_RECHECK_S + 60
+                with mock.patch.object(setup.time, "time", lambda: then):               # a day later, not out yet
+                    eng, out, heads, got = self.run_get([setup.PREBUILT_URL], self.release("0.1.44.1-link.2"))
+                self.assertEqual((heads, got), ([tag + setup.PREBUILT_ASSET], []))
+                self.assertEqual((self.note()["why"], self.note()["checked"]), ("does not start", then))
+                with mock.patch.object(setup.time, "time", lambda: then + setup.RELEASE_RECHECK_S + 60):  # out
+                    eng, out, heads, got = self.run_get([tag], self.release(self.LINK))
+                self.assertEqual((eng, got), (self.root / "engine", [tag + setup.PREBUILT_ASSET]))
+                self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"new")
+
+    def test_an_engine_put_back_below_min_engine_is_compiled_over(self):
+        (self.root / "engine" / "BUILD.json").write_text(json.dumps(
+            {"version": "0.1.0", "archs": [89], "source": "release", "link": "0.1.0-link.1"}))
+        (self.root / "engine" / setup.EXE).write_bytes(b"old")
+        tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)
+        self.run_get([tag], self.release(self.LINK))
+        ok, out = self.prebuilt_runs("GLIBC_2.34 not found")
+        self.assertFalse(ok)
+        self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"old")
+        self.assertIn("compiling instead", out)
 
     def test_a_timeout_leaves_no_lasting_note(self):
         tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)

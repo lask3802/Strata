@@ -7019,7 +7019,7 @@ def link_accepts(eng: Path, meta: dict, base: str, updating=False) -> bool:
         prev = {}
     if prev.get("source") == "release" and engine_version_key(prev) >= MIN_ENGINE and \
             link_key(link) <= link_key(prev.get("link")):
-        say(f"  The ready-made engine at {base} is {link}, not newer than the installed one")
+        warn(f"the ready-made engine at {base} is {link}, not newer than the installed one")
         return False
     return True
 
@@ -7054,6 +7054,11 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     release does not start here: not downloaded again (compiled instead, or the installed engine kept)."""
     eng = engine_dir(toolkit)
     note = release_note(eng) if url_base and len(prebuilt_bases(url_base)) > 1 else None
+    retry = None
+    if note and note["why"] == "does not start" and note.get("found") not in (None, link_version()) and \
+            not 0 <= time.time() - note["checked"] < RELEASE_RECHECK_S:
+        retry, note = note, None                       # an older release (the latest) did not start: a day later,
+        url_base = prebuilt_bases(url_base)[0]         # LINK_VERSION's tag alone
     soft = link_soft(eng, gpu)
     if soft is None:
         try:
@@ -7064,16 +7069,23 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             warn(f"the ready-made engine {note.get('found') or link_version()} did not start on this PC "
                  f"({note.get('detail')})" + ("" if updating else ": compiling instead"))
             return None
-        return _upstream_get_prebuilt(url_base, gpu, vision, updating, toolkit)
+        got = _upstream_get_prebuilt(url_base, gpu, vision, updating, toolkit)
+        if got is None and retry:
+            note_release(eng, "does not start", retry.get("found"), retry.get("detail"))
+        return got
     installed = json.loads(soft)
     have = installed.get("link") or installed.get("version")
 
-    def keep(why: str) -> Path:
+    def restore() -> None:
         if not (eng / "BUILD.json").exists():
             (eng / "BUILD.json").write_text(soft, encoding="utf-8")
         (eng / "BUILD.json.prev").unlink(missing_ok=True)
-        warn(f"{why}: keeping the installed engine {have}" + ("" if installed.get("link") else
-             " (upstream's: Strata Link's own engine changes are off until it updates)"))
+
+    def keep(why: str, loud=True) -> Path:
+        restore()
+        (warn if loud else lambda m: say("  " + m))(
+            f"{why}: keeping the installed engine {have}" + ("" if installed.get("link") else
+            " (upstream's: Strata Link's own engine changes are off until it updates)"))
         return eng
 
     if note and note["why"] == "does not start":
@@ -7089,13 +7101,19 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     (eng / "BUILD.json").replace(eng / "BUILD.json.prev")
     try:
         got = _upstream_get_prebuilt(url_base, gpu, vision, True, toolkit)
-        err = ""
-    except Exception as e:                             # a failed download: the installed engine still starts
-        got, err = None, f" ({e})"
+        err = None
+    except BaseException as e:                         # a failed download (download() stops setup: SystemExit) - the
+        if (eng / "BUILD.json").exists() or not isinstance(e, (Exception, SystemExit)):   # installed engine still
+            restore()                                  # starts; Ctrl+C, or a failure once the new one is in: as upstream
+            raise
+        got, err = None, "" if isinstance(e, SystemExit) else f" ({e})"
     if got is None:
         if note:
             note_release(eng, "unpublished", note.get("found"))
-        return keep(f"Strata Link's engine {link_version()} could not be had{err}")
+        elif retry:
+            note_release(eng, "does not start", retry.get("found"), retry.get("detail"))
+        # upstream's get_prebuilt said why (a [!] line) unless it raised or had no URL
+        return keep(f"Strata Link's engine {link_version()} could not be had{err or ''}", err is not None or not url_base)
     return got
 
 

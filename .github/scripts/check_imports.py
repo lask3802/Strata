@@ -22,9 +22,11 @@ ALLOWED = {
 
 def main() -> int:
     bad = 0
-    for name in sys.argv[1:]:
-        if not Path(name).is_file():
-            continue
+    found = [name for name in sys.argv[1:] if Path(name).is_file()]   # a build part has some of them (engine, vision)
+    if not found:
+        print(f"::error::none of {sys.argv[1:]} was built: nothing to check")
+        return 1
+    for name in found:
         pe = pefile.PE(name, fast_load=True)
         pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
         dlls = [e.dll.decode() for e in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])]
