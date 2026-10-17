@@ -156,17 +156,33 @@ def record() -> dict:
     return res
 
 
-# Strata Link: these fail the same way (the same config diff) on main-next 0949eb20 itself, per platform - the
-# unsloth UD-Q4_K_XL baseline predates it.  Expected failures, so CI runs the rest; one that passes again fails.
-KNOWN_FAILING = {
-    "win32": {("test_yes", "96GB-1x16GB unsloth UD-Q4_K_XL"), ("test_yes", "128GB-1x24GB unsloth UD-Q4_K_XL"),
-              ("test_enter_for_every_question", "96GB-1x16GB unsloth UD-Q4_K_XL"),
-              ("test_enter_for_every_question", "128GB-1x24GB unsloth UD-Q4_K_XL")},
-    "linux": {("test_yes", f"{p} unsloth UD-Q4_K_XL")
-              for p in ("64GB-1x32GB", "32GB-2x24GB", "47GB-2x16GB", "96GB-1x16GB", "128GB-1x24GB")}
-             | {("test_enter_for_every_question", f"{p} unsloth UD-Q4_K_XL")
-                for p in ("64GB-1x32GB", "96GB-1x16GB", "128GB-1x24GB")},
+# Strata Link: the baseline's known differences, per platform - a case whose config is the baseline with exactly
+# these changes is skipped as a known failure; any other difference fails, and so does one that matches again.
+#   STRATA_VERIFY_DEFER_CPU "0": main-next's d884c0d0 (setup turns the deferral off with the tail skip), not
+#     recorded in the baseline; upstream main 296b59d2 passes these on Windows
+#   strata-vision: the unsloth UD-Q4_K_XL cases were recorded on Windows (strata-vision.exe); they fail on Linux on
+#     upstream main 296b59d2 too
+_DEFER_OFF = {"env.STRATA_VERIFY_DEFER_CPU": "0"}
+_VISION_EXE = {"vision.exe": "<T>/engine/strata-vision"}
+KNOWN_DIFFERENCES = {
+    "win32": {"96GB-1x16GB unsloth UD-Q4_K_XL": _DEFER_OFF, "128GB-1x24GB unsloth UD-Q4_K_XL": _DEFER_OFF},
+    "linux": {"64GB-1x32GB unsloth UD-Q4_K_XL": _VISION_EXE, "32GB-2x24GB unsloth UD-Q4_K_XL": _VISION_EXE,
+              "47GB-2x16GB unsloth UD-Q4_K_XL": _VISION_EXE,
+              "96GB-1x16GB unsloth UD-Q4_K_XL": {**_VISION_EXE, **_DEFER_OFF},
+              "128GB-1x24GB unsloth UD-Q4_K_XL": {**_VISION_EXE, **_DEFER_OFF}},
 }
+
+
+def with_differences(config: dict, changes: dict) -> dict:
+    """The baseline config with KNOWN_DIFFERENCES' changes ("a.b": value sets config["a"]["b"])."""
+    out = json.loads(json.dumps(config))
+    for path, value in changes.items():
+        *parents, name = path.split(".")
+        node = out
+        for p in parents:
+            node = node.setdefault(p, {})
+        node[name] = value
+    return out
 
 
 class Golden(unittest.TestCase):
@@ -176,13 +192,30 @@ class Golden(unittest.TestCase):
     def setUpClass(cls):
         cls.golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
 
-    def same_config(self, test, key, cfg, out):
-        if (test, key) not in KNOWN_FAILING.get(sys.platform, ()):
+    def same_config(self, key, cfg, out):
+        changes = KNOWN_DIFFERENCES.get(sys.platform, {}).get(key)
+        if changes is None:
             self.assertEqual(cfg, self.golden[key]["config"], out[-3000:])
             return
         if cfg == self.golden[key]["config"]:
-            self.fail(f"{key} matches the baseline again: take it off KNOWN_FAILING")
-        self.skipTest("a known failure (main-next 0949eb20 fails it the same way)")
+            self.fail(f"{key} matches the baseline again: take it off KNOWN_DIFFERENCES")
+        self.assertEqual(cfg, with_differences(self.golden[key]["config"], changes), out[-3000:])
+        self.skipTest(f"a known failure, the baseline with {sorted(changes)} changed")
+
+    def test_a_known_case_with_another_difference_fails(self):
+        key, changes = next(iter({**KNOWN_DIFFERENCES["linux"], **KNOWN_DIFFERENCES["win32"]}.items()))
+        cfg = with_differences(self.golden[key]["config"], {**changes, "args": ["--something-else"]})
+        with mock.patch.dict(KNOWN_DIFFERENCES, {sys.platform: {key: changes}}):
+            try:
+                self.same_config(key, cfg, "")
+            except unittest.SkipTest:                  # raised from here it would skip this test, not fail it
+                self.fail(f"{key} with another difference was skipped as a known failure")
+            except AssertionError:
+                pass
+            else:
+                self.fail(f"{key} with another difference passed")
+            with self.assertRaises(unittest.SkipTest):
+                self.same_config(key, with_differences(self.golden[key]["config"], changes), "")
 
     def cases(self):
         for prof, (ram, found) in PROFILES.items():
@@ -204,8 +237,8 @@ class Golden(unittest.TestCase):
             with self.subTest(key):
                 code, out, cfg, asked = install(ram, found, argv_for(family, model))
                 self.assertEqual(code, 0, out[-3000:])
-                self.same_config("test_yes", key, cfg, out)
                 self.assertEqual(asked, [])
+                self.same_config(key, cfg, out)
 
     def test_enter_for_every_question(self):
         for key, ram, found, family, model in self.cases():
@@ -214,7 +247,7 @@ class Golden(unittest.TestCase):
             with self.subTest(key):
                 code, out, cfg, asked = install(ram, found, argv_for(family, model), answers="")
                 self.assertEqual(code, 0, out[-3000:])
-                self.same_config("test_enter_for_every_question", key, cfg, out)
+                self.same_config(key, cfg, out)
 
     def test_the_refusals_with_yes_alone_stay(self):
         """A size the baseline refused with --yes and no explicit --model still stops (--yes alone is no consent)."""
