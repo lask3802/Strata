@@ -73,6 +73,10 @@ class TheCheckoutsRelease(unittest.TestCase):
         self.assertLess(keys[2], keys[3])
         self.assertLess(setup.link_key("0.1.44.1-link.9"), setup.link_key("0.1.44.1-link.10"))
 
+    def test_link_required_is_not_newer_than_link_version(self):
+        self.assertLessEqual(setup.link_key(setup.LINK_REQUIRED), setup.link_key(setup.link_version()))
+        self.assertIsNotNone(re.fullmatch(r"\d+(\.\d+)+-link\.\d+", setup.LINK_REQUIRED))
+
     def test_which_engines_are_outdated(self):
         with mock.patch.object(setup, "link_version", return_value="0.1.44.1-link.2"):
             self.assertTrue(setup.link_outdated({"version": MIN, "source": "release"}))     # upstream's
@@ -93,6 +97,7 @@ class GetPrebuilt(unittest.TestCase):
         (self.root / "engine").mkdir()
         for p in (mock.patch.object(setup, "ROOT", self.root),
                   mock.patch.object(setup, "link_version", lambda: self.LINK),
+                  mock.patch.object(setup, "source_version", lambda: self.LINK.split("-")[0]),
                   mock.patch.object(setup, "UNCHECKED_ENGINES", set()),
                   mock.patch.object(setup, "RELEASE_RECHECK", False)):
             p.start()
@@ -156,16 +161,22 @@ class GetPrebuilt(unittest.TestCase):
         eng, out, heads, got = self.run_get([setup.PREBUILT_URL], self.release("0.1.44.1-link.3"))
         self.assertEqual(eng, self.root / "engine")
         self.assertEqual(got, [setup.PREBUILT_URL + setup.PREBUILT_ASSET])
-        self.assertIn(f"No ready-made engine for v{self.LINK}", out)
+        self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"new")
+        self.assertIn("No ready-made engine for v", out)
 
-    def test_a_release_older_than_the_checkout_is_not_installed(self):
-        """The latest release is still the previous Link one (this checkout's is uploading): it is refused, as an
-        engine below MIN_ENGINE is (#58), and the installed engine stays."""
+    def test_a_release_not_newer_than_the_installed_one_is_not_installed(self):
+        """The latest release is still the installed Link one (this checkout's is uploading): the installed engine
+        stays, BUILD.json and all, and the tag is asked again a day later."""
         self.installed(source="release", link="0.1.44.1-link.1")
+        before = (self.root / "engine" / "BUILD.json").read_text()
         eng, out, heads, got = self.run_get([setup.PREBUILT_URL], self.release("0.1.44.1-link.1"), updating=True)
-        self.assertIsNone(eng)
-        self.assertIn(f"engine {self.LINK} is not published yet", out)
+        self.assertEqual(eng, self.root / "engine")
+        self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"old")
+        self.assertEqual((self.root / "engine" / "BUILD.json").read_text(), before)
+        self.assertFalse((self.root / "engine" / "BUILD.json.prev").exists())
         self.assertFalse((self.root / "engine" / setup.PREBUILT_ASSET).exists())
+        self.assertIn("keeping the installed engine 0.1.44.1-link.1", out)
+        self.assertEqual(self.note()["why"], "unpublished")
 
     def test_the_amd_engine_still_comes_from_upstream(self):
         """Strata Link builds no HIP zip: the default AMD engine is upstream's release of this engine version, then
@@ -201,6 +212,69 @@ class GetPrebuilt(unittest.TestCase):
         self.assertEqual(calls, [{"updating": True, "toolkit": 13}])
         self.assertIn("could not update the engine", out)          # nothing published here: the installed one starts
 
+    # ---- a newer Link release is wanted, not needed: the installed engine is kept when it cannot be had (a)
+
+    def test_setup_keeps_an_older_link_engine_when_the_new_release_cannot_be_had(self):
+        """--setup or a second model (not an update), offline: the installed engine of MIN_ENGINE or newer is used as
+        main-next did ("already installed"), with one warning - never compiled because its link number is older."""
+        self.installed(source="release", link="0.1.44.1-link.1")
+        before = (self.root / "engine" / "BUILD.json").read_text()
+        eng, out, heads, got = self.run_get([], {})
+        self.assertEqual((eng, got), (self.root / "engine", []))
+        self.assertEqual(len(heads), 2)                            # the tag, then the latest
+        self.assertEqual((self.root / "engine" / "BUILD.json").read_text(), before)
+        self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"old")
+        self.assertIn("keeping the installed engine 0.1.44.1-link.1", out)
+        self.assertNotIn("compiling instead", out)
+
+    def test_upstreams_engine_is_kept_offline_and_said_so(self):
+        self.installed(source="release")                           # Niko1221's 0.1.44.1, no "link"
+        eng, out, _, _ = self.run_get([], {})
+        self.assertEqual(eng, self.root / "engine")
+        self.assertIn("Strata Link's own engine changes are off until it updates", out)
+
+    def test_a_download_that_fails_keeps_the_installed_engine(self):
+        self.installed(source="release", link="0.1.44.1-link.1")
+        tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)
+        with self.network([tag], {}), mock.patch.object(setup, "download", side_effect=OSError("connection reset")):
+            eng, out = quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
+        self.assertEqual(eng, self.root / "engine")
+        self.assertIn("connection reset", out)
+        self.assertEqual(json.loads((self.root / "engine" / "BUILD.json").read_text())["link"], "0.1.44.1-link.1")
+
+    def test_an_engine_below_min_engine_is_still_replaced_or_compiled(self):
+        """MIN_ENGINE stays a must: an installed engine below it is not kept when nothing newer can be had."""
+        (self.root / "engine" / "BUILD.json").write_text(json.dumps(
+            {"version": "0.1.0", "archs": [89], "source": "release", "link": "0.1.0-link.1"}))
+        (self.root / "engine" / setup.EXE).write_bytes(b"old")
+        eng, out, _, _ = self.run_get([], {})
+        self.assertIsNone(eng)
+        self.assertIn("compiling instead", out)
+
+    # ---- a downloaded Link release: LINK_REQUIRED or newer, an older one than LINK_VERSION too (b)
+
+    def test_a_first_install_takes_the_older_latest_release_and_asks_for_the_tag_again(self):
+        """No engine yet, LINK_VERSION's tag not out: the latest (link.1, at least LINK_REQUIRED) is installed instead
+        of compiling, and noted, so the tag is asked again a day later."""
+        eng, out, heads, got = self.run_get([setup.PREBUILT_URL], self.release("0.1.44.1-link.1"))
+        self.assertEqual((eng, got), (self.root / "engine", [setup.PREBUILT_URL + setup.PREBUILT_ASSET]))
+        self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"new")
+        self.assertEqual((self.note()["why"], self.note()["found"]), ("unpublished", "0.1.44.1-link.1"))
+
+    def test_a_release_below_link_required_is_not_installed(self):
+        with mock.patch.object(setup, "LINK_REQUIRED", "0.1.44.1-link.2"):
+            eng, out, _, got = self.run_get([setup.PREBUILT_URL], self.release("0.1.44.1-link.1"))
+        self.assertIsNone(eng)
+        self.assertEqual(len(got), 1)
+        self.assertIn("needs Strata Link 0.1.44.1-link.2 or newer: compiling instead", out)
+        self.assertFalse((self.root / "engine" / setup.EXE).exists())
+
+    def test_upstreams_release_zip_is_not_installed(self):
+        upstream = {"version": MIN, "source": "release", "archs": [89], "ptx": True, "cuda": "13.0"}
+        eng, out, _, _ = self.run_get([setup.PREBUILT_URL], upstream)
+        self.assertIsNone(eng)
+        self.assertIn("compiling instead", out)
+
     # ---- between a LINK_VERSION bump and its release: one download, then a note instead of ~150 MB every start
 
     def note(self):
@@ -213,8 +287,8 @@ class GetPrebuilt(unittest.TestCase):
         self.assertEqual(len(got), 1)
         self.assertEqual((self.note()["why"], self.note()["found"]), ("unpublished", "0.1.44.1-link.1"))
         eng, out, heads, got = self.run_get([setup.PREBUILT_URL], older, updating=True)
-        self.assertEqual((eng, heads, got), (None, [], []))          # no network at all
-        self.assertIn(f"Engine {self.LINK} was not published yet", out)
+        self.assertEqual((eng, heads, got), (self.root / "engine", [], []))   # no network at all, the engine kept
+        self.assertIn(f"engine {self.LINK} was not published yet", out)
 
     def test_a_day_later_only_its_tag_is_asked(self):
         self.installed(source="release", link="0.1.44.1-link.1")
@@ -223,12 +297,14 @@ class GetPrebuilt(unittest.TestCase):
         day = setup.RELEASE_RECHECK_S + 60
         with mock.patch.object(setup.time, "time", lambda: self.note()["checked"] + day):
             eng, out, heads, got = self.run_get([setup.PREBUILT_URL], self.release("0.1.44.1-link.1"), updating=True)
-        self.assertEqual((eng, heads, got), (None, [tag + setup.PREBUILT_ASSET], []))   # not the older latest again
-        self.assertIn("still not published", out)
+        self.assertEqual((eng, heads, got), (self.root / "engine", [tag + setup.PREBUILT_ASSET], []))
+        self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"old")
         checked = self.note()["checked"]
+        self.assertGreater(checked, 0)
         with mock.patch.object(setup.time, "time", lambda: checked + day):            # published now
             eng, out, heads, got = self.run_get([tag], self.release(self.LINK), updating=True)
         self.assertEqual((eng, got), (self.root / "engine", [tag + setup.PREBUILT_ASSET]))
+        self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"new")
         self.assertFalse((self.root / "engine" / setup.RELEASE_NOTE).exists())
 
     def test_update_asks_again_now(self):
@@ -239,21 +315,27 @@ class GetPrebuilt(unittest.TestCase):
             eng, _, heads, got = self.run_get([tag], self.release(self.LINK), updating=True)
         self.assertEqual((eng, got), (self.root / "engine", [tag + setup.PREBUILT_ASSET]))
 
-    def test_another_releases_note_or_an_explicit_url_is_not_held_back(self):
+    def test_another_releases_note_a_damaged_note_or_an_explicit_url_is_not_held_back(self):
         self.installed(source="release", link="0.1.44.1-link.1")
         setup.note_release(self.root / "engine", "unpublished", "0.1.44.1-link.1")
         with mock.patch.object(setup, "link_version", lambda: "0.1.44.1-link.3"):   # LINK_VERSION moved on
             self.assertIsNone(setup.release_note(self.root / "engine"))
+        for checked in ("yesterday", None, [1]):
+            (self.root / "engine" / setup.RELEASE_NOTE).write_text(json.dumps(
+                {"link": self.LINK, "why": "unpublished", "checked": checked}))
+            self.assertIsNone(setup.release_note(self.root / "engine"), checked)
+        (self.root / "engine" / setup.RELEASE_NOTE).write_text("[1, 2]")
+        self.assertIsNone(setup.release_note(self.root / "engine"))
+        setup.note_release(self.root / "engine", "unpublished", "0.1.44.1-link.1")
         mirror = "https://mirror.example/x/"
-        with mock.patch.object(setup.urllib.request, "urlopen", lambda req, timeout=None: Response()), \
-                mock.patch.object(setup, "download", side_effect=RuntimeError("downloading")):
-            with self.assertRaisesRegex(RuntimeError, "downloading"):
-                quiet(setup.get_prebuilt, mirror, {"arch": 89}, "gpu", updating=True)
+        with self.network([mirror], self.release(self.LINK)) as (heads, got):
+            eng, _ = quiet(setup.get_prebuilt, mirror, {"arch": 89}, "gpu", updating=True)
+        self.assertEqual(got, [mirror + setup.PREBUILT_ASSET])
 
     # ---- the ready-made engine runs once it is installed (Linux: a glibc older than the build's)
 
-    def prebuilt_runs(self, starts, **kw):
-        with mock.patch.object(setup, "engine_starts", lambda eng, tk=13: starts):
+    def prebuilt_runs(self, starts, ran=True, **kw):
+        with mock.patch.object(setup, "engine_starts", lambda eng, tk=13: (starts, ran)):
             return quiet(setup.prebuilt_runs, self.root / "engine", 13, **kw)
 
     def test_an_engine_that_does_not_start_puts_the_replaced_one_back(self):
@@ -263,15 +345,24 @@ class GetPrebuilt(unittest.TestCase):
         eng = self.root / "engine"
         self.assertEqual((eng / setup.EXE).read_bytes(), b"new")
         ok, out = self.prebuilt_runs("/lib64/libc.so.6: version `GLIBC_2.34' not found", updating=True)
-        self.assertFalse(ok)
+        self.assertTrue(ok)                                          # the one it replaced starts instead
         self.assertEqual((eng / setup.EXE).read_bytes(), b"old")
         self.assertEqual(json.loads((eng / "BUILD.json").read_text())["link"], "0.1.44.1-link.1")
         self.assertFalse((eng / setup.PREVIOUS_ENGINE).exists())
         self.assertIn("GLIBC_2.34", out)
+        self.assertNotIn("compiling instead", out)
         self.assertEqual((self.note()["why"], self.note()["found"]), ("does not start", self.LINK))
-        _, out, heads, got = self.run_get([tag], self.release(self.LINK), updating=True)   # not downloaded again
-        self.assertEqual((heads, got), ([], []))
+        eng2, out, heads, got = self.run_get([tag], self.release(self.LINK))   # --setup: not downloaded again, kept
+        self.assertEqual((eng2, heads, got), (eng, [], []))
         self.assertIn("did not start on this PC", out)
+        self.assertEqual((eng / setup.EXE).read_bytes(), b"old")
+
+    def test_a_timeout_leaves_no_lasting_note(self):
+        tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)
+        self.run_get([tag], self.release(self.LINK))
+        ok, out = self.prebuilt_runs("Command '--version' timed out after 120 seconds", ran=False)
+        self.assertFalse(ok)
+        self.assertFalse((self.root / "engine" / setup.RELEASE_NOTE).exists())
 
     def test_a_first_engine_that_does_not_start_is_removed(self):
         tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)
@@ -281,6 +372,8 @@ class GetPrebuilt(unittest.TestCase):
         self.assertFalse((self.root / "engine" / setup.EXE).exists())
         self.assertFalse((self.root / "engine" / "BUILD.json").exists())
         self.assertIn("compiling instead", out)
+        eng, out, heads, got = self.run_get([tag], self.release(self.LINK))  # the next run: compiled, not downloaded
+        self.assertEqual((eng, heads, got), (None, [], []))
 
     def test_an_engine_that_starts_is_kept_and_run_once(self):
         tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)
@@ -293,6 +386,15 @@ class GetPrebuilt(unittest.TestCase):
         self.installed(source="release", link=self.LINK)
         self.assertTrue(self.prebuilt_runs("would fail")[0])
 
+    def engine_step(self, eng, built=None):
+        a = types.SimpleNamespace(build=False, prebuilt=setup.PREBUILT_URL, yes=True)
+        with mock.patch.object(setup, "get_prebuilt", lambda *x, **kw: eng), \
+                mock.patch.object(setup, "pip_cuda_libs", lambda tk=13: None), \
+                mock.patch.object(setup, "engine_starts", lambda e, tk=13: ("GLIBC_2.34 not found", True)), \
+                mock.patch.object(setup, "get_llama_cpp", lambda: "llama"), \
+                mock.patch.object(setup, "build_engine", lambda *x, **kw: built):
+            return quiet(setup.engine_step, a, {"arch": 89}, False, None, 13, "none")
+
     def test_setup_compiles_the_engine_when_the_ready_made_one_does_not_start(self):
         eng = self.root / "engine"
         (eng / "BUILD.json").write_text(json.dumps(self.release(self.LINK)))
@@ -300,15 +402,17 @@ class GetPrebuilt(unittest.TestCase):
         built = self.root / "built"
         built.mkdir()
         (built / "BUILD.json").write_text(json.dumps({"version": MIN, "source": "local", "lib_dirs": ["/cuda"]}))
-        a = types.SimpleNamespace(build=False, prebuilt=setup.PREBUILT_URL, yes=True)
-        with mock.patch.object(setup, "get_prebuilt", lambda *x, **kw: eng), \
-                mock.patch.object(setup, "pip_cuda_libs", lambda tk=13: None), \
-                mock.patch.object(setup, "engine_starts", lambda e, tk=13: "GLIBC_2.34 not found"), \
-                mock.patch.object(setup, "get_llama_cpp", lambda: "llama"), \
-                mock.patch.object(setup, "build_engine", lambda *x, **kw: built):
-            (llama, got, meta, lib_dirs, _, _), out = quiet(setup.engine_step, a, {"arch": 89}, False, None, 13, "none")
+        (llama, got, meta, lib_dirs, _, _), out = self.engine_step(eng, built)
         self.assertEqual((got, meta["source"], lib_dirs), (built, "local", ["/cuda"]))
         self.assertIn("does not start on this PC (GLIBC_2.34 not found)", out)
+
+    def test_setup_starts_the_engine_put_back_instead_of_compiling(self):
+        self.installed(source="release", link="0.1.44.1-link.1")
+        tag = setup.PREBUILT_TAG_URL.format(version=self.LINK)
+        eng = self.run_get([tag], self.release(self.LINK))[0]          # installed, not run yet
+        (llama, got, meta, _, _, _), out = self.engine_step(eng, built="compiled")
+        self.assertEqual((got, meta["link"]), (eng, "0.1.44.1-link.1"))
+        self.assertEqual((eng / setup.EXE).read_bytes(), b"old")
 
     def test_the_cuda12_engine_that_does_not_start_is_compiled_instead(self):
         eng = setup.engine_dir(12)
@@ -317,7 +421,7 @@ class GetPrebuilt(unittest.TestCase):
         setup.UNCHECKED_ENGINES.add(eng)
         with mock.patch.object(setup, "get_prebuilt", lambda *a, **kw: eng), \
                 mock.patch.object(setup, "pip_cuda_libs", lambda tk=13: None), \
-                mock.patch.object(setup, "engine_starts", lambda e, tk=13: "GLIBC_2.34 not found"), \
+                mock.patch.object(setup, "engine_starts", lambda e, tk=13: ("GLIBC_2.34 not found", True)), \
                 mock.patch.object(setup, "get_llama_cpp", lambda: None), \
                 mock.patch.object(setup, "build_engine", lambda *a, **kw: "compiled"):
             got, _ = quiet(setup.get_cuda12_engine, setup.PREBUILT_URL, {"arch": 70}, "none", True)
@@ -329,21 +433,24 @@ class GetPrebuilt(unittest.TestCase):
         with self.network([tag], self.release(self.LINK)) as (_, got), \
                 mock.patch.object(setup, "update_engine_gpu", lambda tk=13: {"arch": 89, "index": 0}), \
                 mock.patch.object(setup, "pip_cuda_libs", lambda tk=13: None), \
-                mock.patch.object(setup, "engine_starts", lambda e, tk=13: "GLIBC_2.34 not found"):
+                mock.patch.object(setup, "engine_starts", lambda e, tk=13: ("GLIBC_2.34 not found", True)):
             _, out = quiet(setup.update_installed_engine, setup.PREBUILT_URL, 13)
         self.assertEqual(got, [tag + setup.PREBUILT_ASSET])
         self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"old")
-        self.assertIn("could not update the engine: starting the installed 0.1.44.1-link.1", out)
+        self.assertIn("the engine it replaced (0.1.44.1-link.1) is back", out)
 
 
 class EngineStarts(unittest.TestCase):
-    """`strata --version` with the CUDA wheels' folders first on LD_LIBRARY_PATH; the loader's first line when not."""
+    """`strata --version` with the CUDA wheels' folders first on LD_LIBRARY_PATH; the loader's first line when not;
+    whether it ran at all (a timeout or an OSError says nothing lasting)."""
 
     def run_it(self, result):
         seen = {}
 
         def run(cmd, **kw):
             seen.update(cmd=cmd, env=kw["env"])
+            if isinstance(result, BaseException):
+                raise result
             return result
 
         with mock.patch.object(setup, "WIN", False), mock.patch.object(setup.subprocess, "run", run), \
@@ -352,21 +459,29 @@ class EngineStarts(unittest.TestCase):
             return setup.engine_starts(Path("/e"), 13), seen
 
     def test_it_starts(self):
-        why, seen = self.run_it(subprocess.CompletedProcess([], 0, "strata 0.1.44.1\n", ""))
-        self.assertIsNone(why)
+        (why, ran), seen = self.run_it(subprocess.CompletedProcess([], 0, "strata 0.1.44.1\n", ""))
+        self.assertEqual((why, ran), (None, True))
         self.assertEqual(seen["cmd"][1:], ["--version"])
         self.assertEqual(seen["env"]["LD_LIBRARY_PATH"], os.pathsep.join(["/v/nvidia/cu13/lib", "/usr/local/lib"]))
 
     def test_the_loader_says_why_not(self):
         err = ("/e/strata: /lib64/libc.so.6: version `GLIBC_2.34' not found (required by /e/strata)\n"
                "/e/strata: /lib64/libc.so.6: version `GLIBC_2.32' not found (required by /e/strata)\n")
-        why, _ = self.run_it(subprocess.CompletedProcess([], 1, "", err))
+        (why, ran), _ = self.run_it(subprocess.CompletedProcess([], 1, "", err))
         self.assertEqual(why, "/e/strata: /lib64/libc.so.6: version `GLIBC_2.34' not found (required by /e/strata)")
+        self.assertTrue(ran)
+
+    def test_a_timeout_or_an_oserror_did_not_run_it(self):
+        for e in (subprocess.TimeoutExpired(["strata"], 120), PermissionError(13, "Permission denied")):
+            with self.subTest(e=type(e).__name__):
+                (why, ran), _ = self.run_it(e)
+                self.assertTrue(why)
+                self.assertFalse(ran)
 
     def test_not_run_on_windows(self):
         with mock.patch.object(setup, "WIN", True), \
                 mock.patch.object(setup.subprocess, "run", side_effect=AssertionError("run")):
-            self.assertIsNone(setup.engine_starts(Path("/e"), 13))
+            self.assertEqual(setup.engine_starts(Path("/e"), 13), (None, False))
 
     @unittest.skipIf(setup.WIN, "a shell script as the engine")
     def test_a_real_program(self):
@@ -376,9 +491,11 @@ class EngineStarts(unittest.TestCase):
                            '*) echo "libcublas.so.13: cannot open shared object file" >&2; exit 127;; esac\n')
             exe.chmod(0o755)
             with mock.patch.object(setup, "cuda_lib_dirs", lambda tk=13: ["/v/cu13/lib"]):
-                self.assertIsNone(setup.engine_starts(Path(d), 13))
+                self.assertEqual(setup.engine_starts(Path(d), 13), (None, True))
             with mock.patch.object(setup, "cuda_lib_dirs", lambda tk=13: []):
-                self.assertIn("libcublas.so.13", setup.engine_starts(Path(d), 13))
+                why, ran = setup.engine_starts(Path(d), 13)
+            self.assertIn("libcublas.so.13", why)
+            self.assertTrue(ran)
 
 
 if __name__ == "__main__":

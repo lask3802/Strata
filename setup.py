@@ -2535,8 +2535,6 @@ def amd_parse_gpus(text, amd) -> list:
 # numbered as the HIP runtime numbers them (`strata-device --list-devices`): an integrated Radeon takes HIP's device 0
 # and pushes the discrete card to 1, which the display-adapter order does not show (#325).
 WIN_HIP_ASSET = "strata-windows-x64-hip.zip"
-# Strata Link builds no AMD engine (.github/workflows/release.yml): by default it comes from upstream's releases, as before
-WIN_HIP_REPO = "Niko1221/Strata"
 WIN_HIP_MIN_ENGINE = max(MIN_ENGINE, (0, 1, 33))         # the first release with a Windows HIP engine
 WIN_AMD_DRIVER = "https://www.amd.com/en/support/download/drivers.html"
 # PCI device ids (VEN_1002) of the cards the AMD backend knows; the names below cover a card whose id is not listed
@@ -3491,83 +3489,6 @@ def rollback_engine(toolkit=13) -> int:
     return 0
 
 
-# Strata Link: what get_prebuilt learned about this checkout's release (link_version()), in the engine folder, so a
-# start does not download the same ~150 MB again: "unpublished" (its tag is not out and the latest release is older:
-# only the tag is asked again, a day later) or "does not start" (prebuilt_runs: not again for this release).
-RELEASE_NOTE = ".release-check.json"
-RELEASE_RECHECK_S = 24 * 3600
-RELEASE_RECHECK = False                                # --update (update_install): ask again now, whatever the note says
-UNCHECKED_ENGINES: set = set()                         # installed by get_prebuilt in this run, not yet run (prebuilt_runs)
-
-
-def release_note(eng: Path) -> dict | None:
-    """The note an earlier run left about this checkout's release, or None (none, another release's, or --update)."""
-    try:
-        note = json.loads((eng / RELEASE_NOTE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if RELEASE_RECHECK or not isinstance(note, dict) or note.get("link") != link_version():
-        return None
-    return note
-
-
-def note_release(eng: Path, why: str, found=None, detail=None) -> None:
-    try:
-        (eng / RELEASE_NOTE).write_text(json.dumps({"link": link_version(), "why": why, "found": found,
-                                                   "detail": detail, "checked": int(time.time())}), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def engine_starts(eng: Path, toolkit=13) -> str | None:
-    """None when the engine starts on this PC (`strata --version`, which exits before it touches a GPU), with the CUDA
-    libraries pip put in (cuda_lib_dirs), else what stopped it: on Linux a C library older than the one the
-    ready-made engine is built for (Rocky Linux 8's glibc 2.28), or a missing library.  Not run on Windows, where a
-    missing DLL is a dialog box that waits for a click."""
-    if WIN:
-        return None
-    env = {**os.environ, "LD_LIBRARY_PATH": os.pathsep.join([*cuda_lib_dirs(toolkit),
-                                                             os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)}
-    try:
-        r = subprocess.run([str(eng / EXE), "--version"], capture_output=True, text=True, timeout=120, env=env)
-    except (OSError, subprocess.SubprocessError) as e:
-        return str(e)
-    if r.returncode == 0 and r.stdout.startswith("strata "):
-        return None
-    lines = (r.stderr.strip() or r.stdout.strip()).splitlines()
-    return lines[0].strip() if lines else f"exit code {r.returncode}"
-
-
-def prebuilt_runs(eng: Path, toolkit=13, updating=False) -> bool:
-    """A ready-made engine get_prebuilt installed in this run, once pip_cuda_libs put its CUDA libraries in: does it
-    start (engine_starts)?  If not, the engine it replaced (eng/.previous) is put back, or it is removed when it
-    replaced none, a note keeps the next runs from downloading it again, and False: compile instead (updating: the
-    installed engine starts).  An engine this run did not install: True, not run again."""
-    if eng not in UNCHECKED_ENGINES:
-        return True
-    UNCHECKED_ENGINES.discard(eng)
-    why = engine_starts(eng, toolkit)
-    if why is None:
-        return True
-    try:
-        link = json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("link")
-    except (OSError, ValueError):
-        link = None
-    prev = eng / PREVIOUS_ENGINE
-    for name in (EXE, VEXE, KQ_LIB, "BUILD.json"):
-        (eng / name).unlink(missing_ok=True)
-    back = prev.is_dir() and any(prev.iterdir())
-    if back:
-        for p in list(prev.iterdir()):
-            shutil.move(str(p), str(eng / p.name))
-    shutil.rmtree(prev, ignore_errors=True)
-    note_release(eng, "does not start", link, why)
-    warn(f"the ready-made engine {link or ''} does not start on this PC ({why}): "
-         + ("the engine it replaced is back" if back else "it is removed")
-         + ("" if updating else "; compiling instead"))
-    return False
-
-
 def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | None:
     """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
     updating: called to replace an installed engine, which starts instead when this fails (no compile).
@@ -3587,28 +3508,16 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             warn(f"the installed engine is built for {', '.join(str(a) for a in have)}; your GPU is "
                  f"{', '.join(str(x) for x in miss)}: compiling instead")
             return None
-        if ver >= MIN_ENGINE and not link_outdated(meta):
+        if ver >= MIN_ENGINE:
             ok("ready-made engine already installed")
             return eng
-        say(f"  Updating the ready-made engine ({meta.get('link') or meta.get('version')} -> {link_version()} or newer) ...")
+        say(f"  Updating the ready-made engine ({meta.get('version')} -> {'.'.join(map(str, MIN_ENGINE))} or newer) ...")
         info.replace(eng / "BUILD.json.prev")   # kept for the .previous copy
     if not url_base:
         return None
     eng.mkdir(exist_ok=True)
     z = eng / asset
     bases = prebuilt_bases(url_base)
-    note = release_note(eng) if len(bases) > 1 else None   # the default releases, not an explicit --prebuilt
-    if note and note.get("why") == "does not start":
-        warn(f"the ready-made engine {note.get('found') or link_version()} did not start on this PC "
-             f"({note.get('detail')})" + ("" if updating else ": compiling instead"))
-        return None
-    if note:                                           # "unpublished": the latest release was older when last asked
-        ago = time.time() - float(note.get("checked") or 0)
-        if 0 <= ago < RELEASE_RECHECK_S:
-            say(f"  Engine {link_version()} was not published yet {ago / 3600:.0f} h ago (the latest release was "
-                f"{note.get('found')}): asked again a day later, or now by {'UPDATE.bat' if WIN else './update.sh'}")
-            return None
-        bases = bases[:1]                              # a day later: its tag alone, not the older latest again
     for i, base in enumerate(bases):
         if not base.startswith(("http://", "https://")):
             break
@@ -3618,12 +3527,8 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             break
         except OSError as e:
             if i + 1 < len(bases):                     # #214: this checkout's release is not published (yet)
-                say(f"  No ready-made engine for v{link_version()} ({e}): the latest release instead")
+                say(f"  No ready-made engine for v{source_version()} ({e}): the latest release instead")
                 continue
-            if note:
-                note_release(eng, "unpublished", note.get("found"))
-                say(f"  Engine {link_version()} is still not published ({e}): asked again a day later")
-                return None
             warn(f"no ready-made engine at {base} ({e})" + ("" if updating else ": compiling instead"))
             return None
     say("  Downloading the ready-made Strata engine" + (" (CUDA 12, experimental)" if int(toolkit) == 12 else "") + " ...")
@@ -3642,17 +3547,18 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
         drop_archive(z)                                # every later run fail on it instead of downloading it again
         raise
     meta = json.loads((tmp / "BUILD.json").read_text(encoding="utf-8"))
-    if tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit()) < MIN_ENGINE or \
-            link_outdated(meta):
-        need = link_version()
-        if base == PREBUILT_URL and link_outdated(meta):   # its tag is not out, the latest is older: not again today
-            note_release(eng, "unpublished", meta.get("link") or meta.get("version"))
+    if tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit()) < MIN_ENGINE:
+        need = ".".join(map(str, MIN_ENGINE))
         if updating:                                   # these files are newer than the published release (#58)
             warn(f"engine {need} is not published yet (the release may still be uploading): run this again "
                  f"in a few minutes to update it")
         else:
-            warn(f"the ready-made engine at {base} is version {meta.get('link') or meta.get('version')}; this setup "
-                 f"needs {need}: compiling instead")
+            warn(f"the ready-made engine at {base} is version {meta.get('version')}; this setup needs "
+                 f"{need}: compiling instead")
+        shutil.rmtree(tmp, ignore_errors=True)
+        drop_archive(z)
+        return None
+    if not link_accepts(eng, meta, base, updating):   # Strata Link: LINK_REQUIRED; an update to a newer Link release
         shutil.rmtree(tmp, ignore_errors=True)
         drop_archive(z)
         return None
@@ -3668,7 +3574,6 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     install_unpacked(tmp, eng)
     shutil.rmtree(tmp, ignore_errors=True)
     drop_archive(z)
-    (eng / RELEASE_NOTE).unlink(missing_ok=True)
     UNCHECKED_ENGINES.add(eng)                         # run once its CUDA libraries are in (prebuilt_runs)
     if not (eng / EXE).exists():
         fail("the ready-made engine archive has no " + EXE)
@@ -3676,7 +3581,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
         for x in (EXE, VEXE):
             if (eng / x).exists():
                 (eng / x).chmod(0o755)
-    ok(f"ready-made engine {meta.get('link') or meta.get('version', '')} for {', '.join('sm_' + str(a) for a in archs)} (CUDA "
+    ok(f"ready-made engine {meta.get('version', '')} for {', '.join('sm_' + str(a) for a in archs)} (CUDA "
        f"{meta.get('cuda', '?')})")
     return eng
 
@@ -3794,8 +3699,8 @@ def update_installed_engine(url_base, toolkit=None) -> None:
         warn(f"could not update the engine: starting the installed {meta.get('version')}")
         return
     pip_cuda_libs(toolkit)
-    if not prebuilt_runs(new, toolkit, updating=True):  # the engine it replaced is back
-        warn(f"could not update the engine: starting the installed {meta.get('link') or meta.get('version')}")
+    if not prebuilt_runs(new, toolkit, updating=True):  # Strata Link: it does not start; the installed one does
+        warn(f"could not update the engine: starting the installed {meta.get('version')}")
 
 
 def pip_cuda_libs(toolkit=13) -> None:
@@ -4758,29 +4663,6 @@ def source_version() -> str:
     """The engine version the source tree builds (CMakeLists.txt's project version)."""
     m = re.search(r"project\(strata VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
     return m.group(1) if m else "0"
-
-
-def link_version() -> str:
-    """Strata Link's release of this checkout (the LINK_VERSION file, e.g. 0.1.44.1-link.1): the tag its ready-made
-    engine is published under, and the "link" its BUILD.json carries.  The engine's own version stays
-    CMakeLists.txt's, so every MIN_ENGINE comparison reads it as before.  When it changes: release.yml's header."""
-    try:
-        return (ROOT / "LINK_VERSION").read_text(encoding="utf-8").strip() or source_version()
-    except OSError:
-        return source_version()
-
-
-def link_key(v) -> tuple:
-    """'0.1.44.1-link.2' -> ((0, 1, 44, 1), 2), comparable; anything else (an upstream engine has no "link") is
-    ((), 0), older than every Link release."""
-    m = re.fullmatch(r"(\d+(?:\.\d+)*)-link\.(\d+)", str(v or "").strip())
-    return (tuple(int(x) for x in m.group(1).split(".")), int(m.group(2))) if m else ((), 0)
-
-
-def link_outdated(meta: dict) -> bool:
-    """A ready-made CUDA engine (BUILD.json source "release") older than this checkout's Link release, or not a Link
-    release at all (upstream's, without the remote stage): replaced like one below MIN_ENGINE."""
-    return meta.get("source") == "release" and link_key(meta.get("link")) < link_key(link_version())
 
 
 def binary_engine_version(exe) -> str | None:
@@ -6986,6 +6868,235 @@ def main() -> int:
             f"(later: {'BENCH.bat' if WIN else './bench.sh'})", ["y", "n"], "n", a.yes) == "y":
         subprocess.call([sys.executable, str(ROOT / "tools" / "strata_bench.py"), "--config", str(cfg_path), "--port", str(port)])
     return start(cfg_path, port)
+
+
+# ------------------------------------------------------------------------------------------------ Strata Link
+# The fork's own releases (.github/workflows/release.yml): the ready-made CUDA engine of this checkout's LINK_VERSION.
+# What Strata Link adds to installing it is here, so a merge from upstream meets few changed lines above:
+# get_prebuilt is upstream's (but for link_accepts and UNCHECKED_ENGINES) and wrapped at the end of this section.
+
+# The oldest Link release a downloaded engine may be: bump it only when serve or setup needs an engine change a newer
+# link.N brought.  One between it and LINK_VERSION is installed (the latest release, while LINK_VERSION's tag is not
+# out yet) and replaced once the tag is there.
+LINK_REQUIRED = "0.1.44.1-link.1"
+# Strata Link builds no AMD engine (.github/workflows/release.yml): by default it comes from upstream's releases, as before
+WIN_HIP_REPO = "Niko1221/Strata"
+# What get_prebuilt learned about this checkout's release, in the engine folder, so a start does not download the same
+# ~150 MB again: "unpublished" (its tag is not out and the latest release is older: only the tag is asked again, a
+# day later) or "does not start" (prebuilt_runs: not again for this release).
+RELEASE_NOTE = ".release-check.json"
+RELEASE_RECHECK_S = 24 * 3600
+RELEASE_RECHECK = False                                # --update (update_install): ask again now, whatever the note says
+UNCHECKED_ENGINES: set = set()                         # installed by get_prebuilt in this run, not yet run (prebuilt_runs)
+
+
+def link_version() -> str:
+    """Strata Link's release of this checkout (the LINK_VERSION file, e.g. 0.1.44.1-link.1): the tag its ready-made
+    engine is published under, and the "link" its BUILD.json carries.  The engine's own version stays
+    CMakeLists.txt's, so every MIN_ENGINE comparison reads it as before.  When it changes: release.yml's header."""
+    try:
+        return (ROOT / "LINK_VERSION").read_text(encoding="utf-8").strip() or source_version()
+    except OSError:
+        return source_version()
+
+
+def link_key(v) -> tuple:
+    """'0.1.44.1-link.2' -> ((0, 1, 44, 1), 2), comparable; anything else (an upstream engine has no "link") is
+    ((), 0), older than every Link release."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)*)-link\.(\d+)", str(v or "").strip())
+    return (tuple(int(x) for x in m.group(1).split(".")), int(m.group(2))) if m else ((), 0)
+
+
+def link_outdated(meta: dict) -> bool:
+    """A ready-made CUDA engine (BUILD.json source "release") older than this checkout's Link release, or not a Link
+    release at all (upstream's): a newer one is wanted, not needed (get_prebuilt below keeps it when there is none)."""
+    return meta.get("source") == "release" and link_key(meta.get("link")) < link_key(link_version())
+
+
+def engine_version_key(meta: dict) -> tuple:
+    return tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
+
+
+def release_note(eng: Path) -> dict | None:
+    """The note an earlier run left about this checkout's release, or None (none, another release's, a damaged one,
+    or --update)."""
+    try:
+        note = json.loads((eng / RELEASE_NOTE).read_text(encoding="utf-8"))
+        checked = float(note.get("checked"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    if RELEASE_RECHECK or note.get("link") != link_version() or note.get("why") not in ("unpublished", "does not start"):
+        return None
+    return {**note, "checked": checked}
+
+
+def note_release(eng: Path, why: str, found=None, detail=None) -> None:
+    try:
+        (eng / RELEASE_NOTE).write_text(json.dumps({"link": link_version(), "why": why, "found": found,
+                                                   "detail": detail, "checked": int(time.time())}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def engine_starts(eng: Path, toolkit=13) -> tuple:
+    """(None, True) when the engine starts on this PC (`strata --version`, which exits before it touches a GPU), with
+    the CUDA libraries pip put in (cuda_lib_dirs); (why, True) when it ran and failed - on Linux a C library older
+    than the one the ready-made engine is built for (Rocky Linux 8's glibc 2.28), or a missing library; (why, False)
+    when it could not be run at all (a timeout, an OSError), which says nothing lasting about the release.  Not run
+    on Windows, where a missing DLL is a dialog box that waits for a click: (None, False)."""
+    if WIN:
+        return None, False
+    env = {**os.environ, "LD_LIBRARY_PATH": os.pathsep.join([*cuda_lib_dirs(toolkit),
+                                                             os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)}
+    try:
+        r = subprocess.run([str(eng / EXE), "--version"], capture_output=True, text=True, timeout=120, env=env)
+    except (OSError, subprocess.SubprocessError) as e:
+        return str(e), False
+    if r.returncode == 0 and r.stdout.startswith("strata "):
+        return None, True
+    lines = (r.stderr.strip() or r.stdout.strip()).splitlines()
+    return (lines[0].strip() if lines else f"exit code {r.returncode}"), True
+
+
+def prebuilt_runs(eng: Path, toolkit=13, updating=False) -> bool:
+    """A ready-made engine get_prebuilt installed in this run, once pip_cuda_libs put its CUDA libraries in: does it
+    start (engine_starts)?  If not, the engine it replaced (eng/.previous) is put back, or it is removed when it
+    replaced none, and when it ran and failed a note keeps the next runs from downloading it again.  True: the folder
+    holds an engine to start - this one, or the ready-made one it replaced (MIN_ENGINE or newer), which is kept
+    rather than compiled; False: compile instead (updating: the installed engine starts).  An engine this run did not
+    install: True, not run again."""
+    if eng not in UNCHECKED_ENGINES:
+        return True
+    UNCHECKED_ENGINES.discard(eng)
+    why, ran = engine_starts(eng, toolkit)
+    if why is None:
+        return True
+    try:
+        link = json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("link")
+    except (OSError, ValueError):
+        link = None
+    prev = eng / PREVIOUS_ENGINE
+    for name in (EXE, VEXE, KQ_LIB, "BUILD.json"):
+        (eng / name).unlink(missing_ok=True)
+    back = prev.is_dir() and any(prev.iterdir())
+    if back:
+        for p in list(prev.iterdir()):
+            shutil.move(str(p), str(eng / p.name))
+    shutil.rmtree(prev, ignore_errors=True)
+    if ran:
+        note_release(eng, "does not start", link, why)
+    try:
+        old = json.loads((eng / "BUILD.json").read_text(encoding="utf-8")) if back else {}
+    except (OSError, ValueError):
+        old = {}
+    usable = old.get("source") == "release" and engine_version_key(old) >= MIN_ENGINE and (eng / EXE).exists()
+    warn(f"the ready-made engine {link or ''} does not start on this PC ({why}): "
+         + (f"the engine it replaced ({old.get('link') or old.get('version')}) is back" if back else "it is removed")
+         + ("" if usable or updating else "; compiling instead"))
+    return usable
+
+
+def link_accepts(eng: Path, meta: dict, base: str, updating=False) -> bool:
+    """A downloaded ready-made engine (its BUILD.json), past upstream's MIN_ENGINE check: a release this setup installs?  Not
+    below LINK_REQUIRED (upstream's zips have no "link"), and, replacing an installed one of MIN_ENGINE or newer (the
+    BUILD.json.prev get_prebuilt below moved aside), only a newer one.  One older than LINK_VERSION from the latest
+    release (its tag is not out yet) is installed, and noted: the tag is asked again a day later, not this again."""
+    if meta.get("source") != "release":              # built by hand (no release): the Link rules are not for it
+        return True
+    link = meta.get("link")
+    if link_key(link) < link_key(LINK_REQUIRED):
+        warn(f"the ready-made engine at {base} is {link or 'version ' + str(meta.get('version'))}; this setup needs "
+             f"Strata Link {LINK_REQUIRED} or newer" + ("" if updating else ": compiling instead"))
+        return False
+    if link_key(link) < link_key(link_version()):
+        if base == PREBUILT_URL:
+            note_release(eng, "unpublished", link)
+    else:
+        (eng / RELEASE_NOTE).unlink(missing_ok=True)
+    try:
+        prev = json.loads((eng / "BUILD.json.prev").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        prev = {}
+    if prev.get("source") == "release" and engine_version_key(prev) >= MIN_ENGINE and \
+            link_key(link) <= link_key(prev.get("link")):
+        say(f"  The ready-made engine at {base} is {link}, not newer than the installed one")
+        return False
+    return True
+
+
+def link_soft(eng: Path, gpu: dict) -> str | None:
+    """The installed engine's BUILD.json when only a newer Link release is wanted: a ready-made CUDA engine of
+    MIN_ENGINE or newer with code for these cards, but link_outdated.  None otherwise (upstream's get_prebuilt
+    decides: already installed, below MIN_ENGINE, compiled here, another card)."""
+    info = eng / "BUILD.json"
+    try:
+        text = info.read_text(encoding="utf-8")
+        meta = json.loads(text)
+    except (OSError, ValueError):
+        return None
+    if not (eng / EXE).exists() or meta.get("backend") == "hip" or not link_outdated(meta) or \
+            engine_version_key(meta) < MIN_ENGINE:
+        return None
+    have = [int(a) for a in meta.get("archs", [])]
+    if [int(x) for x in gpu.get("archs", [gpu["arch"]])
+            if have and int(x) not in have and not (meta.get("ptx") and int(x) > max(have))]:
+        return None
+    return text
+
+
+_upstream_get_prebuilt = get_prebuilt
+
+
+def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | None:
+    """Upstream's get_prebuilt (above) with Strata Link's releases.  An installed engine of MIN_ENGINE or newer that is
+    only link_outdated (an older Link release, or upstream's) is replaced when the newer release can be had, and kept
+    when it cannot (offline, not published yet, the notes) - never compiled for it.  A note that LINK_VERSION's
+    release does not start here: not downloaded again (compiled instead, or the installed engine kept)."""
+    eng = engine_dir(toolkit)
+    note = release_note(eng) if url_base and len(prebuilt_bases(url_base)) > 1 else None
+    soft = link_soft(eng, gpu)
+    if soft is None:
+        try:
+            current = not link_outdated(json.loads((eng / "BUILD.json").read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            current = False
+        if note and note["why"] == "does not start" and not current:
+            warn(f"the ready-made engine {note.get('found') or link_version()} did not start on this PC "
+                 f"({note.get('detail')})" + ("" if updating else ": compiling instead"))
+            return None
+        return _upstream_get_prebuilt(url_base, gpu, vision, updating, toolkit)
+    installed = json.loads(soft)
+    have = installed.get("link") or installed.get("version")
+
+    def keep(why: str) -> Path:
+        if not (eng / "BUILD.json").exists():
+            (eng / "BUILD.json").write_text(soft, encoding="utf-8")
+        (eng / "BUILD.json.prev").unlink(missing_ok=True)
+        warn(f"{why}: keeping the installed engine {have}" + ("" if installed.get("link") else
+             " (upstream's: Strata Link's own engine changes are off until it updates)"))
+        return eng
+
+    if note and note["why"] == "does not start":
+        return keep(f"the ready-made engine {note.get('found') or link_version()} did not start on this PC "
+                    f"({note.get('detail')})")
+    if note:                                           # "unpublished": the latest release was older when last asked
+        ago = time.time() - note["checked"]
+        if 0 <= ago < RELEASE_RECHECK_S:
+            return keep(f"engine {link_version()} was not published yet {ago / 3600:.0f} h ago (asked again a day "
+                        f"later, or now by {'UPDATE.bat' if WIN else './update.sh'})")
+        url_base = prebuilt_bases(url_base)[0]         # a day later: its tag alone, not the older latest again
+    say(f"  Updating the ready-made engine ({have} -> {link_version()}) ...")
+    (eng / "BUILD.json").replace(eng / "BUILD.json.prev")
+    try:
+        got = _upstream_get_prebuilt(url_base, gpu, vision, True, toolkit)
+        err = ""
+    except Exception as e:                             # a failed download: the installed engine still starts
+        got, err = None, f" ({e})"
+    if got is None:
+        if note:
+            note_release(eng, "unpublished", note.get("found"))
+        return keep(f"Strata Link's engine {link_version()} could not be had{err}")
+    return got
 
 
 if __name__ == "__main__":
