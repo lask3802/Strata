@@ -1,6 +1,6 @@
 # Strata Link's ready-made engines: the zips setup.py downloads (tools/make_release.py), built here instead of by hand.
 #
-#   a tag v<LINK_VERSION> (v0.1.44.1-link.1): build every zip, then a DRAFT release with them and SHA256.txt; the
+#   a tag v<LINK_VERSION> (v0.1.45-link.1):   build every zip, then a DRAFT release with them and SHA256.txt; the
 #                                             owner reads it over and publishes it
 #   a push to ci/**:                          build every zip, as workflow artifacts only (no release)
 #   Run workflow (workflow_dispatch):         the same as the ref it is run on
@@ -16,7 +16,9 @@
 # Every installed engine older than it is replaced (~150 MB each), so a setup or serve change alone does not bump it.
 # setup.py's LINK_REQUIRED, the oldest release setup still installs, moves only when setup or serve needs a newer
 # engine.  Publish the release before the commit that bumps LINK_VERSION reaches main: until then setup installs or
-# keeps the latest (older) release and asks for the tag again a day later.
+# keeps the latest (older) release and asks for the tag again a day later.  An upstream merge that raises setup.py's
+# MIN_ENGINE leaves no such fallback (every older release is below it: a fresh install compiles, an installed engine
+# is downloaded again on every start), so that release is tagged from the merge branch, and main moves once it is out.
 name: release
 
 on:
