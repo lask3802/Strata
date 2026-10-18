@@ -1878,17 +1878,29 @@ steps as a build without this section. Spaces around the value and its case are 
 `0 `). A value that is not `0`, `off`, `1` or `check` gets one line and is taken as `1`,
 so a typo never turns it off unnoticed. Where the split cannot run (`--peer-device`, a helper cache,
 `STRATA_VERIFY_DEVICE_PLAN=1`, below) the default is off, with one line saying so: deferring every CPU row measured KL
-0.556 on one PC and 0.176 on two (the table's setups), and `=1` still asks for it, as does
+0.370 on one PC (the table below; not measured on two PCs with 12 slices), and `=1` still asks for it, as does
 `STRATA_VERIFY_DEFER_CPU_BELOW` of 1 or more. HIP builds keep it opt-in (never built or measured on AMD). The
-trade-off, measured on the same prompts with the engine as it is otherwise (KL teacher-forced against the exact path:
-`STRATA_LOGPOS`, top 20, 4 slices of plain text, 5,257 positions, read through the verify windows with
-`--short-read 100000` so every position takes the decode path; the tail-skip column is the default
-`STRATA_ROUTE_TAIL_SKIP=7` measured the same way, for scale):
+trade-off, official IQ3_S at 262,144 context, KL teacher-forced against the exact path of the same setup
+(`STRATA_LOGPOS`, top 20, 12 slices of plain text, 15,175 positions, read through the verify windows with
+`--short-read 100000` so every position takes the decode path; mean ± sd over the slices, which differ from one
+another far more than the settings do):
 
-| setup | decode speed | KL, deferral | KL, tail skip |
-|---|---:|---:|---:|
-| 1 PC: RTX 3080, official IQ3_S, low context | +15.8% | 0.096 | 0.071 |
-| 2 PCs: RTX 3080 (layers 0-25) + RTX 2080 Ti (26-47), 10 GbE, `--pipeline-windows 2`, low context | +9.1% | 0.038 | 0.041 |
+| setup | answers, on vs `=0` | KL, the default against `=0` | for scale: `STRATA_ROUTE_TAIL_SKIP=0` against the default tail skip | placement floor: two `=0` runs with other expert-cache sizes |
+|---|---:|---:|---:|---:|
+| one PC: RTX 3080 | +15.2% (58.68 -> 67.58 tok/s) | 0.088 ± 0.132 | 0.083 ± 0.125 | 0.022 ± 0.024 |
+| two PCs: RTX 3080 + RTX 2080 Ti, 10 GbE | +12.3% (84.50 -> 94.86 tok/s) | 0.090 ± 0.125 | 0.082 ± 0.102 | 0.030 ± 0.066 |
+
+(An earlier measurement on 4 slices, 5,257 positions, is retired: a few slices carry most of the KL, and on 4 of them
+the figures moved by more than the settings did.)
+
+**With `STRATA_PCIE_BALANCE=1`** (above, opt-in) there is no deferral: the balance's GPU fit ends at a layer's wait
+for its CPU rows, which a deferred layer does not make (`src/core/verify.cpp:776-787`). It is one or the other: the
+balance measured +5.6% on an RTX A4000 (-1.6% on an RTX 3060, -1.3% on a Tesla P100), deferral +15.2% on the RTX 3080
+above. Start-up line, with `STRATA_VERIFY_DEFER_CPU` unset (the Strata Link default):
+`strata verify: STRATA_VERIFY_DEFER_CPU: off with STRATA_PCIE_BALANCE=1 (its fit times the wait for the CPU rows, which a deferred layer does not make)`;
+with it set to `1` or `check`:
+`strata verify: STRATA_VERIFY_DEFER_CPU=<value> is not taken with STRATA_PCIE_BALANCE=1 (its fit times the wait for the CPU rows, which a deferred layer does not make): no deferral`.
+A `STRATA_VERIFY_DEFER_CPU_BELOW` set then gets no line of its own.
 
 It changes the answers (teacher-forced KL against `=0`: above). Windows that run without it (one start-up
 line says why): batch windows, `--spec-split` token groups, `--remote-expert-opt`, `STRATA_PCIE_BALANCE` (its fit
