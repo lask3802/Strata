@@ -709,6 +709,37 @@ Checked without a change (the CUDA engine's code):
   hello compares the expert counts each PC read from its own file.
 - A long read giving way to a short request (#656) is the `--batch` path's, which a remote stage refuses.
 
+### After the merge of 0.1.45 (2026-10-18)
+
+Upstream v0.1.45 (477ac13c, 264 commits after 296b59d2) was merged into the fork's main (b4a50f85: the fork merges
+upstream, it does not rebase). What changed for a remote stage:
+- **`Verifier::run`** calls `remote_run_` (the worker's rows into `hand_in_`) first, then 0.1.45's lines: a window the
+  overlapped split prelaunched is not staged again, and `pre_launch_` and `refresh_ar` run otherwise
+  (`src/core/verify.cpp:2920-2928`). A remote stage is a split on one GPU, and `STRATA_SPLIT_OVERLAP` needs two
+  (`src/program/generate.cpp:8660`), so it is never prelaunched; `pre_launch_` is set on `ver` and the in-process
+  stages only.
+- **The prompt path's loan** (`lend`, moved up for the worker, as after 0.1.44.1): 0.1.45 changed it at its old place
+  (`STRATA_REFILL_PARTS`, an `exact` chunk for a planned segment read on, `seg_lend`). The moved copy took the change
+  (`src/program/generate.cpp:10939-11090`), and the worker's call passes `exact` 0, which leaves its chunk as before
+  (`src/program/generate.cpp:11479`).
+- **Checkpoint retention**: 0.1.45's `--prompt-cache-spread` went into `evict_victim`
+  (`src/program/generate.cpp:9420-9446`), so the chain the main process forecasts for the worker's `keep` and the one it
+  then keeps are picked by the same rule; `STRATA_CKPT_POOL` takes the main process's buffers back as it evicts
+  (`src/program/generate.cpp:9621`).
+- **`STRATA_PCIE_BALANCE=1`** reaches a worker only (one stage, `src/program/generate.cpp:8890`), and there it turns
+  Expert Deferral off at start-up (`src/core/verify.cpp:776-787`, #2690's refusal, with the Strata Link default's own
+  line).
+- **The prompt hand-off** keeps the in-order sends; 0.1.45's `STRATA_HANDOFF_PIPE` pieces are made for an in-process
+  next stage only (`src/prefill/prefill.cpp:1307`), so a remote send always reads a hand-off the host waited for
+  (`src/prefill/prefill.cpp:4639`).
+
+These four rest on reading the code alone: no test covers them, and no engine has run on a GPU since the merge -
+`run`'s order, the worker's `lend` with `exact` 0, `evict_victim`'s spread rule, and the balance refusal.
+
+Open: `STRATA_PRIMARY_DEVICE` other than 0 on a worker is allowed and not checked (whether a worker's own paths assume
+device 0); a checkpoint taken from `STRATA_CKPT_POOL` that the worker did not store is dropped rather than given back
+(`src/program/generate.cpp:9494-9497`); `clear_marks` (`src/program/generate.cpp:1765`) does not clear `remote_id`.
+
 ### The recovery's open points (2026-10-13)
 
 Faults injected on A + B (RTX 3080 main, RTX 2080 Ti worker, 10 GbE, RVN IQ3_S, K=26) with the branch on 0.1.43
