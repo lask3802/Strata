@@ -173,7 +173,7 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
 # With the default, the release of this checkout's own version (PREBUILT_TAG_URL, CMakeLists.txt's version) is
 # tried first and the latest release is the fallback (#214): an older checkout keeps the engine it shipped with.
 # Strata Link: the fork's own releases (.github/workflows/release.yml), tagged v<LINK_VERSION> (link_version(), e.g.
-# v0.1.44.1-link.1) instead of CMakeLists.txt's version; a renamed repository changes REPO alone.
+# v0.1.45-link.1) instead of CMakeLists.txt's version; a renamed repository changes REPO alone.
 # The repository the release assets and their SHA-256 come from; `engine_digest` reads the API here even
 # when --prebuilt points the download somewhere else, because the hash is only worth having if it comes
 # from somewhere the download does not.
@@ -7195,7 +7195,7 @@ UNCHECKED_ENGINES: set = set()                         # installed by get_prebui
 
 
 def link_version() -> str:
-    """Strata Link's release of this checkout (the LINK_VERSION file, e.g. 0.1.44.1-link.1): the tag its ready-made
+    """Strata Link's release of this checkout (the LINK_VERSION file, e.g. 0.1.45-link.1): the tag its ready-made
     engine is published under, and the "link" its BUILD.json carries.  The engine's own version stays
     CMakeLists.txt's, so every MIN_ENGINE comparison reads it as before.  When it changes: release.yml's header."""
     try:
@@ -7205,7 +7205,7 @@ def link_version() -> str:
 
 
 def link_key(v) -> tuple:
-    """'0.1.44.1-link.2' -> ((0, 1, 44, 1), 2), comparable; anything else (an upstream engine has no "link") is
+    """'0.1.45-link.2' -> ((0, 1, 45), 2), comparable; anything else (an upstream engine has no "link") is
     ((), 0), older than every Link release."""
     m = re.fullmatch(r"(\d+(?:\.\d+)*)-link\.(\d+)", str(v or "").strip())
     return (tuple(int(x) for x in m.group(1).split(".")), int(m.group(2))) if m else ((), 0)

@@ -1885,7 +1885,7 @@ trade-off, official IQ3_S at 262,144 context, KL teacher-forced against the exac
 `--short-read 100000` so every position takes the decode path; mean ± sd over the slices, which differ from one
 another far more than the settings do):
 
-| setup | answers, on vs `=0` | KL, the default against `=0` | for scale: `STRATA_ROUTE_TAIL_SKIP=0` against the default tail skip | placement floor: two `=0` runs with other expert-cache sizes |
+| setup (official IQ3_S) | answers, on vs `=0` | KL, the default against `=0` | for scale: `STRATA_ROUTE_TAIL_SKIP=0` against the default tail skip | placement floor: two `=0` runs with other expert-cache sizes |
 |---|---:|---:|---:|---:|
 | one PC: RTX 3080 | +15.2% (58.68 -> 67.58 tok/s) | 0.088 ± 0.132 | 0.083 ± 0.125 | 0.022 ± 0.024 |
 | two PCs: RTX 3080 + RTX 2080 Ti, 10 GbE | +12.3% (84.50 -> 94.86 tok/s) | 0.090 ± 0.125 | 0.082 ± 0.102 | 0.030 ± 0.066 |
@@ -1893,12 +1893,18 @@ another far more than the settings do):
 (An earlier measurement on 4 slices, 5,257 positions, is retired: a few slices carry most of the KL, and on 4 of them
 the figures moved by more than the settings did.)
 
-**With `STRATA_PCIE_BALANCE=1`** (above, opt-in) there is no deferral: the balance's GPU fit ends at a layer's wait
-for its CPU rows, which a deferred layer does not make (`src/core/verify.cpp:776-787`). It is one or the other: the
-balance measured +5.6% on an RTX A4000 (-1.6% on an RTX 3060, -1.3% on a Tesla P100), deferral +15.2% on the RTX 3080
-above. Start-up line, with `STRATA_VERIFY_DEFER_CPU` unset (the Strata Link default):
+The decode table further down (#2690's) is another model, the GSQ-RCO IQ3_S (SC117 abliterated), on the same RTX 3080:
+two models measured the same way, which is why it reads 58.69 -> 67.97 (+15.8%) where this one reads +15.2%.
+
+**Where `STRATA_PCIE_BALANCE=1` is taken** (above, opt-in: a native pack on one GPU, no `--batch`, no `--pcie-frac`,
+`src/program/generate.cpp:3492`; with `--serve` only on a verifier of one stage, `src/program/generate.cpp:8890`) there
+is no deferral: the balance's GPU fit ends at a layer's wait for its CPU rows, which a deferred layer does not make
+(`src/core/verify.cpp:776-787`). It is one or the other: the balance measured +5.6% on an RTX A4000 (-1.6% on an
+RTX 3060, -1.3% on a Tesla P100), deferral +15.2% on the RTX 3080 above (official IQ3_S). Start-up line, with
+`STRATA_VERIFY_DEFER_CPU` unset (the Strata Link default):
 `strata verify: STRATA_VERIFY_DEFER_CPU: off with STRATA_PCIE_BALANCE=1 (its fit times the wait for the CPU rows, which a deferred layer does not make)`;
-with it set to `1` or `check`:
+with it set to any value but `0` or `off` (on CUDA builds every such value turns deferral on,
+`src/core/verify.cpp:770`), the value printed as it was given, untrimmed:
 `strata verify: STRATA_VERIFY_DEFER_CPU=<value> is not taken with STRATA_PCIE_BALANCE=1 (its fit times the wait for the CPU rows, which a deferred layer does not make): no deferral`.
 A `STRATA_VERIFY_DEFER_CPU_BELOW` set then gets no line of its own.
 
@@ -1950,12 +1956,13 @@ its own layers but its last one, so nothing is deferred across the hand-off betw
 stage's own (`drive_pool_split` sets the stage's plan, partial flag included). This was checked by reading the code,
 not run on two cards.
 
-Measured by us: GSQ-RCO IQ3_S, an RTX 3080 10 GB alone (PCIe 4.0 x8) with a Ryzen 9 5900XT and DDR4-3000, Linux;
+Measured by us (#2690): the GSQ-RCO IQ3_S (SC117 abliterated, not the official IQ3_S of the table at the top of this
+section), an RTX 3080 10 GB alone (PCIe 4.0 x8) with a Ryzen 9 5900XT and DDR4-3000, Linux;
 `--serve` with the setup's config (expert cache auto, the PCIe share automatic), a fresh engine per arm. Decode is the
 median of three rounds of 12 prompts x 200 tokens (low context) and of 3 prompts of ~30K tokens read from 0, 200 tokens
 each (high context). Prompt reads are unchanged: deferral is decode only.
 
-| arm | decode, low context | high context (~30K) |
+| arm (GSQ-RCO IQ3_S) | decode, low context | high context (~30K) |
 |---|---:|---:|
 | `STRATA_VERIFY_DEFER_CPU=0` | 58.69 tok/s | 52.10 tok/s |
 | `STRATA_VERIFY_DEFER_CPU=1 STRATA_VERIFY_DEFER_CPU_BELOW=1` (every CPU row) | 67.74 (+15.4%) | 61.00 (+17.1%) |

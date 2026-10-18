@@ -584,7 +584,8 @@ after changing these settings.
     `src/program/generate.cpp:8597`), and the balance is set only on a verifier of one stage
     (`src/program/generate.cpp:8890`), which a worker is. On the worker it then turns Expert Deferral off at start-up
     (`src/core/verify.cpp:776-787`): with `STRATA_PCIE_BALANCE=1` on both PCs, the main PC's layers keep deferral and
-    the worker's run without it. As anywhere, not with `--pcie-frac` or `--batch` (`src/program/generate.cpp:3492`).
+    the worker's run without it. As anywhere, it needs a native pack on one GPU, no `--batch` and no `--pcie-frac`
+    (`src/program/generate.cpp:3492`).
   - `--prompt-cache-spread` (with `--prompt-cache N` on the main process): one rule, `evict_victim`
     (`src/program/generate.cpp:9420-9446`), picks the checkpoint the main process drops
     (`src/program/generate.cpp:9620`) and forecasts the chain it sends the worker as `keep`
