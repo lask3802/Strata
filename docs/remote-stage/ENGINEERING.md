@@ -709,36 +709,62 @@ Checked without a change (the CUDA engine's code):
   hello compares the expert counts each PC read from its own file.
 - A long read giving way to a short request (#656) is the `--batch` path's, which a remote stage refuses.
 
+### After the merge of 0.2.0-beta (2026-10-20)
+
+Upstream v0.2.0-beta (e88ee39d, engine 0.1.45.3, 789 commits after 477ac13c) was merged into the fork's line (merge
+branch `merge-020`; the fork merges upstream, it does not rebase). The conflicts were resolved as on the PR branches
+ported onto the same base (`r02/remote-stage-ckpt`, `r02/verify-defer-heavy`). What changed for a remote stage:
+- **The expert arena**: 0.2 keeps a pinned-memory reserve while the arena pins (`pin_reserve_take`); a worker's or a
+  remote main's layer range is set inside it, just before `open` (`src/program/generate.cpp:5811`).
+- **The prompt path's loan** (`lend`, moved up for the worker): 0.2's host-aware prompt chunk (`planned_chunk` with
+  `pf_plan_chunk`, #2824) went into the moved copy (`src/program/generate.cpp:11292`) and the worker's `lend_whole`
+  (`src/program/generate.cpp:11559`). The plan is made for the mapped file tier only
+  (`src/program/generate.cpp:7636`, `srcp != &src`); a remote stage's PCs run the expert arena, so their chunks do not
+  move. 0.2's pinned reserve is handed back before that block (`src/program/generate.cpp:11206`), so a worker, which
+  serves from inside it and never prints READY, gives it back too.
+- **Expert Deferral and 0.2's cold reads**: `STRATA_COLD_OVERLAP` 1, 2 or 3 computes a layer's CPU experts in batches as
+  their reads land; such a layer is not split into heavy and light rows (`src/core/expert_source.cpp:4755`, `4784`),
+  it waits for all its CPU rows. 0.2's unset default is 4 on the Linux GGUF read in place
+  (`src/core/expert_source.cpp:4389`), which reads its blobs before the pool starts (nothing pending), and 0
+  elsewhere, so the split is kept.
+- **The server**: 0.2's `lifeline.popen` ties the engine to the server (`serve/server.py:90`) in place of `contain`;
+  the stage's last `ERR` is still cleared for each new engine process (`serve/server.py:1044`).
+- The stage protocol is unchanged (7).
+
+These rest on the builds (Windows MSVC + CUDA 13.0, CT 580 Linux) and the CPU tests (`stage_link_test`,
+`stage_ckpt_store_test`, the conversation tests, `tools/test_stage_node.py`, the server's tests); no engine has run on
+a GPU since the merge.
+
 ### After the merge of 0.1.45 (2026-10-18)
 
 Upstream v0.1.45 (477ac13c, 264 commits after 296b59d2) was merged into the fork's main (b4a50f85: the fork merges
 upstream, it does not rebase). What changed for a remote stage:
 - **`Verifier::run`** calls `remote_run_` (the worker's rows into `hand_in_`) first, then 0.1.45's lines: a window the
   overlapped split prelaunched is not staged again, and `pre_launch_` and `refresh_ar` run otherwise
-  (`src/core/verify.cpp:2920-2928`). A remote stage is a split on one GPU, and `STRATA_SPLIT_OVERLAP` needs two
-  (`src/program/generate.cpp:8660`), so it is never prelaunched; `pre_launch_` is set on `ver` and the in-process
+  (`src/core/verify.cpp:2964-2972`). A remote stage is a split on one GPU, and `STRATA_SPLIT_OVERLAP` needs two
+  (`src/program/generate.cpp:8923`), so it is never prelaunched; `pre_launch_` is set on `ver` and the in-process
   stages only.
 - **The prompt path's loan** (`lend`, moved up for the worker, as after 0.1.44.1): 0.1.45 changed it at its old place
   (`STRATA_REFILL_PARTS`, an `exact` chunk for a planned segment read on, `seg_lend`). The moved copy took the change
-  (`src/program/generate.cpp:10939-11090`), and the worker's call passes `exact` 0, which leaves its chunk as before
-  (`src/program/generate.cpp:11479`).
+  (`src/program/generate.cpp:11217-11368`), and the worker's call passes `exact` 0, which leaves its chunk as before
+  (`src/program/generate.cpp:11757`).
 - **Checkpoint retention**: 0.1.45's `--prompt-cache-spread` went into `evict_victim`
-  (`src/program/generate.cpp:9420-9446`), so the chain the main process forecasts for the worker's `keep` and the one it
+  (`src/program/generate.cpp:9683-9709`), so the chain the main process forecasts for the worker's `keep` and the one it
   then keeps are picked by the same rule; `STRATA_CKPT_POOL` takes the main process's buffers back as it evicts
-  (`src/program/generate.cpp:9621`).
-- **`STRATA_PCIE_BALANCE=1`** reaches a worker only (one stage, `src/program/generate.cpp:8890`), and there it turns
-  Expert Deferral off at start-up (`src/core/verify.cpp:776-787`, #2690's refusal, with the Strata Link default's own
+  (`src/program/generate.cpp:9884`).
+- **`STRATA_PCIE_BALANCE=1`** reaches a worker only (one stage, `src/program/generate.cpp:9153`), and there it turns
+  Expert Deferral off at start-up (`src/core/verify.cpp:798-809`, #2690's refusal, with the Strata Link default's own
   line).
 - **The prompt hand-off** keeps the in-order sends; 0.1.45's `STRATA_HANDOFF_PIPE` pieces are made for an in-process
-  next stage only (`src/prefill/prefill.cpp:1307`), so a remote send always reads a hand-off the host waited for
-  (`src/prefill/prefill.cpp:4639`).
+  next stage only (`src/prefill/prefill.cpp:1424`), so a remote send always reads a hand-off the host waited for
+  (`src/prefill/prefill.cpp:4878`).
 
 These four rest on reading the code alone: no test covers them, and no engine has run on a GPU since the merge -
 `run`'s order, the worker's `lend` with `exact` 0, `evict_victim`'s spread rule, and the balance refusal.
 
 Open: `STRATA_PRIMARY_DEVICE` other than 0 on a worker is allowed and not checked (whether a worker's own paths assume
 device 0); a checkpoint taken from `STRATA_CKPT_POOL` that the worker did not store is dropped rather than given back
-(`src/program/generate.cpp:9494-9497`); `clear_marks` (`src/program/generate.cpp:1765`) does not clear `remote_id`.
+(`src/program/generate.cpp:9757-9760`); `clear_marks` (`src/program/generate.cpp:1788`) does not clear `remote_id`.
 
 ### The recovery's open points (2026-10-13)
 

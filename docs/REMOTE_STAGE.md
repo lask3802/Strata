@@ -581,28 +581,28 @@ after changing these settings.
   `STRATA_PF_FUSED=1`.
 - **What 0.1.45 adds**, as it applies to a remote stage (read from the code; none of it run with a remote stage):
   - `STRATA_PCIE_BALANCE=1` is taken by a worker only. The main process runs a split of two stages (`n_stages`,
-    `src/program/generate.cpp:8597`), and the balance is set only on a verifier of one stage
-    (`src/program/generate.cpp:8890`), which a worker is. On the worker it then turns Expert Deferral off at start-up
-    (`src/core/verify.cpp:776-787`): with `STRATA_PCIE_BALANCE=1` on both PCs, the main PC's layers keep deferral and
+    `src/program/generate.cpp:8860`), and the balance is set only on a verifier of one stage
+    (`src/program/generate.cpp:9153`), which a worker is. On the worker it then turns Expert Deferral off at start-up
+    (`src/core/verify.cpp:798-809`): with `STRATA_PCIE_BALANCE=1` on both PCs, the main PC's layers keep deferral and
     the worker's run without it. As anywhere, it needs a native pack on one GPU, no `--batch` and no `--pcie-frac`
-    (`src/program/generate.cpp:3492`).
+    (`src/program/generate.cpp:3561`).
   - `--prompt-cache-spread` (with `--prompt-cache N` on the main process): one rule, `evict_victim`
-    (`src/program/generate.cpp:9420-9446`), picks the checkpoint the main process drops
-    (`src/program/generate.cpp:9620`) and forecasts the chain it sends the worker as `keep`
-    (`src/program/generate.cpp:9476-9481`, `9490`). The worker keeps what it is told and never evicts on its own
-    (`src/program/generate.cpp:11543`, `11591`).
-  - `STRATA_CKPT_POOL=1` recycles the main process's own checkpoint buffers (`src/program/generate.cpp:9458`, `9621`).
-    A worker's parts are in its own store (`src/program/generate.cpp:11544`), which the pool does not use.
+    (`src/program/generate.cpp:9683-9709`), picks the checkpoint the main process drops
+    (`src/program/generate.cpp:9883`) and forecasts the chain it sends the worker as `keep`
+    (`src/program/generate.cpp:9739-9744`, `9753`). The worker keeps what it is told and never evicts on its own
+    (`src/program/generate.cpp:11821`, `11869`).
+  - `STRATA_CKPT_POOL=1` recycles the main process's own checkpoint buffers (`src/program/generate.cpp:9721`, `9884`).
+    A worker's parts are in its own store (`src/program/generate.cpp:11822`), which the pool does not use.
   - `STRATA_PRIMARY_DEVICE` is allowed on a worker: the refusal is for a layer split
-    (`src/program/generate.cpp:2951`), and a worker takes none (`src/program/generate.cpp:2885-2888`). Its session then
-    runs on that device (`src/program/generate.cpp:3410`, `5096`). On the main process it is refused, since
-    `--remote-stage` needs `--layer-split` (`src/program/generate.cpp:2884`).
+    (`src/program/generate.cpp:2998`), and a worker takes none (`src/program/generate.cpp:2932-2935`). Its session then
+    runs on that device (`src/program/generate.cpp:3479`, `5165`). On the main process it is refused, since
+    `--remote-stage` needs `--layer-split` (`src/program/generate.cpp:2931`).
   - No effect with a remote stage: `STRATA_SPLIT_OVERLAP` needs a split over two GPUs
-    (`src/program/generate.cpp:8660`), and the main process's is on one (`--split-device 0`,
-    `src/program/generate.cpp:2845`, `2884`), while a worker has no split (`src/program/generate.cpp:8634`).
+    (`src/program/generate.cpp:8923`), and the main process's is on one (`--split-device 0`,
+    `src/program/generate.cpp:2892`, `2931`), while a worker has no split (`src/program/generate.cpp:8897`).
     `STRATA_HANDOFF_PIPE` and `--prefill-pipe` act between a prompt path and its next stage in the same process
-    (`src/prefill/prefill.cpp:1307`, `2160`), and a remote stage's prompt path has none
-    (`src/program/generate.cpp:8391`, `8401`).
+    (`src/prefill/prefill.cpp:1424`, `2306`), and a remote stage's prompt path has none
+    (`src/program/generate.cpp:8654`, `8664`).
 
 ## Security
 

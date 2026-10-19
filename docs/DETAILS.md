@@ -1985,14 +1985,14 @@ The decode table further down (#2690's) is another model, the GSQ-RCO IQ3_S (SC1
 two models measured the same way, which is why it reads 58.69 -> 67.97 (+15.8%) where this one reads +15.2%.
 
 **Where `STRATA_PCIE_BALANCE=1` is taken** (above, opt-in: a native pack on one GPU, no `--batch`, no `--pcie-frac`,
-`src/program/generate.cpp:3492`; with `--serve` only on a verifier of one stage, `src/program/generate.cpp:8890`) there
+`src/program/generate.cpp:3561`; with `--serve` only on a verifier of one stage, `src/program/generate.cpp:9153`) there
 is no deferral: the balance's GPU fit ends at a layer's wait for its CPU rows, which a deferred layer does not make
-(`src/core/verify.cpp:776-787`). It is one or the other: the balance measured +5.6% on an RTX A4000 (-1.6% on an
+(`src/core/verify.cpp:798-809`). It is one or the other: the balance measured +5.6% on an RTX A4000 (-1.6% on an
 RTX 3060, -1.3% on a Tesla P100), deferral +15.2% on the RTX 3080 above (official IQ3_S). Start-up line, with
 `STRATA_VERIFY_DEFER_CPU` unset (the Strata Link default):
 `strata verify: STRATA_VERIFY_DEFER_CPU: off with STRATA_PCIE_BALANCE=1 (its fit times the wait for the CPU rows, which a deferred layer does not make)`;
 with it set to any value but `0` or `off` (on CUDA builds every such value turns deferral on,
-`src/core/verify.cpp:770`), the value printed as it was given, untrimmed:
+`src/core/verify.cpp:792`), the value printed as it was given, untrimmed:
 `strata verify: STRATA_VERIFY_DEFER_CPU=<value> is not taken with STRATA_PCIE_BALANCE=1 (its fit times the wait for the CPU rows, which a deferred layer does not make): no deferral`.
 A `STRATA_VERIFY_DEFER_CPU_BELOW` set then gets no line of its own.
 
