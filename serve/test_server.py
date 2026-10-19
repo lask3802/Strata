@@ -487,6 +487,17 @@ class ImageMarkers(unittest.TestCase):
                 ids, _, _ = svc.prepare(m, None, {})
             self.assertEqual(ids.count(pad), 0)
             self.assertIn("[image omitted: the image URL could not be read]", tok.decode(ids))
+            # offline (strict local mode): a tool's URL picture is a note and nothing is fetched; its data: picture
+            # beside it is still read
+            svc.offline = True
+            mixed = [{"role": "user", "content": "look"}, call,
+                     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [url, good]}]}]
+            m, _, _ = anthropic_to_messages({"messages": mixed})
+            with mock.patch.object(server.Vision, "download", return_value=b"the picture") as dl:
+                ids, _, _ = svc.prepare(m, None, {})
+            self.assertEqual((dl.call_count, ids.count(pad)), (0, 3))
+            self.assertIn("[image omitted: offline mode cannot download an image URL]", tok.decode(ids))
+            svc.embeddings.path.unlink(missing_ok=True)
             svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
             m, _, _ = anthropic_to_messages({"messages": [{"role": "user", "content": [good]}]})
             with self.assertRaises(ValueError):
