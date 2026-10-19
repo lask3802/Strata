@@ -5895,9 +5895,9 @@ class OnDemandVision(unittest.TestCase):
             events.append("start")
             return Proc(kw.get("cwd"))
 
-        p1, p2 = mock.patch.object(server, "popen", popen), mock.patch.object(server, "contain")
-        p1.start(), p2.start()
-        self.addCleanup(p1.stop), self.addCleanup(p2.stop)
+        p1 = mock.patch.object(server, "popen", popen)
+        p1.start()
+        self.addCleanup(p1.stop)
         cfg = {"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf", "on_demand": True, "gpu": gpu}
         with contextlib.redirect_stdout(io.StringIO()):
             v = server.Vision(cfg)
@@ -6111,7 +6111,7 @@ class OnDemandVision(unittest.TestCase):
             started.append(args)
             return SimpleNamespace(stdin=io.StringIO(), stdout=io.StringIO("READY 1" + chr(10)), poll=lambda: None)
         base = {"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf", "gpu": True}
-        with mock.patch.object(server, "popen", popen), mock.patch.object(server, "contain"):
+        with mock.patch.object(server, "popen", popen):
             for cfg, note in (({"vision": {**base, "on_demand": True}}, True),
                               ({"vision": {**base, "on_demand": True}, "vram_elastic": True}, False),
                               ({"vision": {**base, "on_demand": True}, "args": ["--vram-elastic"]}, False),
