@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """Prepare local web assets from the supplied Strata logo masters.
 
-Requires fontTools only while preparing the outlined wordmark. The checked-in
-exports have no font or Python dependency at app runtime. Source files stay
+Requires fontTools (the outlined wordmark) and numpy + Pillow (the Strata Link
+recolour of the PNG icons) only while preparing; they are imported before anything
+is written. The checked-in exports have no font or Python dependency at app runtime. Source files stay
 untouched; public/brand/source-manifest.json records every derivation.
 """
 
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 from pathlib import Path
 import re
 import shutil
 import xml.etree.ElementTree as ET
 
+import numpy as np
 from fontTools.pens.svgPathPen import SVGPathPen
 from fontTools.ttLib import TTFont
+from PIL import Image
 
 
 APP = Path(__file__).resolve().parent.parent
@@ -50,9 +52,6 @@ def link_png(path: Path, theme: str) -> None:
     """Move the green share of every pixel to the cyan, in place. A pixel is unmixed into tile, ink and green
     (p - tile = a*(green - tile) + b*(ink - tile)); only a*(cyan - green) is added, so edges stay smooth and
     pixels with no green keep their exact RGBA. Flat-colour icons (the favicons, no tile) are shifted directly."""
-    import numpy as np
-    from PIL import Image
-
     arr = np.array(Image.open(path).convert("RGBA"))
     rgb = arr[..., :3].astype(np.float64)
     hexa = lambda h: np.array([int(h[i:i + 2], 16) for i in (1, 3, 5)], np.float64)
@@ -103,7 +102,7 @@ def prepare_mark(entries: list[dict[str, str]], theme: str) -> None:
     master = f"logo/strata-mark-{theme}.svg"
     output = BRAND / f"strata-mark-{theme}.svg"
     text = re.sub(r"<metadata>.*?</metadata>", "", source(master).read_text(), flags=re.S)
-    output.write_text(link_svg(text.replace(' xmlns:c2pa="http://c2pa.org/manifest"', "")))
+    output.write_text(link_svg(text.replace(' xmlns:c2pa="http://c2pa.org/manifest"', "")), newline="\n")
     record(entries, master, output, f"copy of the upstream master; {link_note(theme)}; C2PA block removed (its hash covered the upstream bytes)")
 
 
@@ -181,7 +180,8 @@ def prepare_lockup(entries: list[dict[str, str]], theme: str, font: TTFont) -> N
         'viewBox="0 0 182 48" role="img">\n'
         f"{art_rectangles(master)}\n"
         f'<g fill="{INK[theme]}">{outlined_wordmark(font)}</g>\n'
-        "</svg>\n"
+        "</svg>\n",
+        newline="\n",
     )
     record(entries, master, output, f"outlined GT Walsheim Pro Bold from {FONT.relative_to(APP)}; {link_note(theme)}")
 
@@ -206,7 +206,8 @@ def prepare_favicon(entries: list[dict[str, str]]) -> None:
         '<style>@media (prefers-color-scheme: dark) {'
         f'.i {{ fill: {INK["dark"]}; }} .a {{ fill: {GREEN["dark"]}; }}'
         '}</style>\n'
-        f'{bars}\n</svg>\n'
+        f'{bars}\n</svg>\n',
+        newline="\n",
     )
     record(entries, master, output, f"explicit light fills and self-contained dark media style; {link_note('light')} (dark media style {UPSTREAM_GREEN['dark']} -> {GREEN['dark']})")
 
@@ -216,7 +217,7 @@ def prepare_manifest(entries: list[dict[str, str]]) -> None:
     manifest = json.loads(source(master).read_text())
     manifest.update({"id": "/", "start_url": "/#/chat", "scope": "/"})
     output = PUBLIC / "site.webmanifest"
-    output.write_text(json.dumps(manifest, indent=2) + "\n")
+    output.write_text(json.dumps(manifest, indent=2) + "\n", newline="\n")
     record(entries, master, output, "root-local app identity and hash-route launch")
 
 
@@ -237,7 +238,7 @@ def main() -> None:
         copy(entries, f"web/{name}", PUBLIC / name)
         theme = "light" if name.startswith("favicon-") and "dark" not in name else "dark"  # the tile icons are dark-tile art
         link_png(PUBLIC / name, theme)
-        entries[-1].update(output_sha256=digest(PUBLIC / name), method=f"copy of the upstream master; {link_note(theme)}")
+        entries[-1].update(output_sha256=digest(PUBLIC / name), method=f"copy of the upstream master; {link_note(theme)}; C2PA chunk removed (its hash covered the upstream bytes)")
     prepare_manifest(entries)
     (BRAND / "source-manifest.json").write_text(json.dumps({
         "source_root": str(MASTERS),
@@ -246,7 +247,7 @@ def main() -> None:
         "font_sha256": digest(FONT),
         "note": "Derived SVGs omit source C2PA metadata; original masters remain untouched and each source hash is recorded here. Strata Link recolours the middle bar of the mark to cyan so it is not mistaken for upstream Strata's; source hashes are the upstream masters', output hashes are of the recoloured files.",
         "files": entries,
-    }, indent=2) + "\n")
+    }, indent=2) + "\n", newline="\n")
     print(f"Prepared {len(entries)} web assets in {PUBLIC}")
 
 
