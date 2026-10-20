@@ -62,7 +62,9 @@ else stays protocol 7, so a main and a worker of different builds still work tog
 | `SessionOk` (21) | | | |
 
 A worker holds a part between these messages and lets it go before any other message and at a disconnect. A worker
-error starts with its kind (`invalid: `, `memory: `, `io: `), which the main process answers as its own.
+error starts with its kind (`invalid: `, `memory: `, `io: `), which the main process answers as its own. A Commit
+that failed before a `SessionLoad` stays pending (the load may be given up, and the session goes on) until
+`SessionEnd` puts the part in place; then it is dropped, as a `CkptRestore` drops it.
 
 ## A save
 
@@ -145,3 +147,8 @@ oversized count), `stage_link_test` section 17 (every message, both sides failin
 - Not run on GPUs yet: no save/restore time, file size or answer comparison is measured here.
 - A file restores only on the same split; moving a conversation between a split and one card is not supported.
 - Relay chains (three PCs or more) are refused.
+- Two main processes pointed at one worker take turns after `STRATA_REMOTE_TAKEOVER_S` of silence. A restore is
+  silent on the link while the main process reads its own part of the file and checks it; if another main process
+  takes the worker over then, the restore fails as `link`. Not seen, reasoned from the code.
+- The main process's `generate.cpp` glue (the order of the steps, the cross-checks, the new checkpoint id) has no
+  unit test; the GPU runs are its test.
