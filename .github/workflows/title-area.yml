@@ -13,6 +13,7 @@ permissions: {}
 
 jobs:
   title:
+    if: github.repository == 'Niko1221/Strata'   # Strata Link: upstream's tracker only
     runs-on: ubuntu-latest
     steps:
       - name: Check the title
