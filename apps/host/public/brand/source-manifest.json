@@ -3,105 +3,105 @@
   "preparation": "scripts/prepare-brand-assets.py",
   "font": "public/fonts/GTWalsheimPro-Bold.woff2",
   "font_sha256": "041cee9382bcbbc2e42bbbf5ef33c1efafd0bb4074554c5e861c9b1c7991b95d",
-  "note": "Derived SVGs omit source C2PA metadata; original masters remain untouched and each source hash is recorded here.",
+  "note": "Derived SVGs omit source C2PA metadata; original masters remain untouched and each source hash is recorded here. Strata Link recolours the middle bar of the mark to cyan so it is not mistaken for upstream Strata's; source hashes are the upstream masters', output hashes are of the recoloured files.",
   "files": [
     {
       "source": "logo/strata-mark-light.svg",
       "source_sha256": "5e8be1beff8b552b17fcb0364481d077c8628339be5caffd1375228afb47dfe7",
       "output": "brand/strata-mark-light.svg",
-      "output_sha256": "5e8be1beff8b552b17fcb0364481d077c8628339be5caffd1375228afb47dfe7",
-      "method": "unchanged copy"
+      "output_sha256": "c9d4de997c559bab1b6b31b8a1f73104e7479e518cdeea38cc7a2ac14ad2181c",
+      "method": "copy of the upstream master; recoloured for Strata Link: middle bar #10b981 -> #06b6d4; C2PA block removed (its hash covered the upstream bytes)"
     },
     {
       "source": "logo/strata-mark-dark.svg",
       "source_sha256": "1d10d244c6ea2209bd77a640b35609a644019d288fd2a83ad28bc858617d8e32",
       "output": "brand/strata-mark-dark.svg",
-      "output_sha256": "1d10d244c6ea2209bd77a640b35609a644019d288fd2a83ad28bc858617d8e32",
-      "method": "unchanged copy"
+      "output_sha256": "99cbcb6491524b4f98134d2d6e409520efef46ef01e9e6ef77af13fad96bed23",
+      "method": "copy of the upstream master; recoloured for Strata Link: middle bar #34d399 -> #22d3ee; C2PA block removed (its hash covered the upstream bytes)"
     },
     {
       "source": "logo/strata-lockup-light.svg",
       "source_sha256": "b9b077df326da8c0bdb5505ee7a6659ab3de986d481354c8d216722c673370f1",
       "output": "brand/strata-lockup-light.svg",
-      "output_sha256": "3bbe96359e7631876c0b6689ff17d8dc4382ecf294eb4936d9fdec4fd728857a",
-      "method": "outlined GT Walsheim Pro Bold from public/fonts/GTWalsheimPro-Bold.woff2"
+      "output_sha256": "997a6a8a54e089d167ff1b21be4d8a133aac1be124f324b2a0d8bc408390435a",
+      "method": "outlined GT Walsheim Pro Bold from public/fonts/GTWalsheimPro-Bold.woff2; recoloured for Strata Link: middle bar #10b981 -> #06b6d4"
     },
     {
       "source": "logo/strata-lockup-dark.svg",
       "source_sha256": "ec689b25498bf177eb8dd50f980d34ba05cd7f38403fca73c1bf9d231fde5e3b",
       "output": "brand/strata-lockup-dark.svg",
-      "output_sha256": "6ab8625610284c48b6ed7a7577f3e59d1b2b3287955d40b1f1ce65a007cae567",
-      "method": "outlined GT Walsheim Pro Bold from public/fonts/GTWalsheimPro-Bold.woff2"
+      "output_sha256": "f459f7c1a25030a826f5520da7a54264cc48c8ab1b36464021ad46cd70ab294e",
+      "method": "outlined GT Walsheim Pro Bold from public/fonts/GTWalsheimPro-Bold.woff2; recoloured for Strata Link: middle bar #34d399 -> #22d3ee"
     },
     {
       "source": "web/favicon.svg",
       "source_sha256": "5b5f45f1a93ef05337569d2ea6932ae6b0bffb7b33c66446d7135d2f59c2f640",
       "output": "favicon.svg",
-      "output_sha256": "139a9b47ddd74dd46985db7dc6dd2fbeabfa231adcd3087af9a6b66cd34d6ded",
-      "method": "explicit light fills and self-contained dark media style"
+      "output_sha256": "9b8916d85aaf7f8618f56401db8fe34b66fc9b75b016066bab23579e1a0a9460",
+      "method": "explicit light fills and self-contained dark media style; recoloured for Strata Link: middle bar #10b981 -> #06b6d4 (dark media style #34d399 -> #22d3ee)"
     },
     {
       "source": "web/favicon-16.png",
       "source_sha256": "aa6c809a8ae3f1621e8169ee45295f17078d6b7bac068611d41a23c7db253782",
       "output": "favicon-16.png",
-      "output_sha256": "aa6c809a8ae3f1621e8169ee45295f17078d6b7bac068611d41a23c7db253782",
-      "method": "unchanged copy"
+      "output_sha256": "516bf6e14d862b7ce49988d54da0ab1b3b4ca233ad74b6d8b1476ede6e265824",
+      "method": "copy of the upstream master; recoloured for Strata Link: middle bar #10b981 -> #06b6d4"
     },
     {
       "source": "web/favicon-32.png",
       "source_sha256": "cb26b9d4f6d851609293589ca1b6b765bb916a7956204f0f9dc55b3582259939",
       "output": "favicon-32.png",
-      "output_sha256": "cb26b9d4f6d851609293589ca1b6b765bb916a7956204f0f9dc55b3582259939",
-      "method": "unchanged copy"
+      "output_sha256": "27fdeb0b4a241b8056dc1ab47c4c4f6f97036af261093bdb27c5ce224394829e",
+      "method": "copy of the upstream master; recoloured for Strata Link: middle bar #10b981 -> #06b6d4"
     },
     {
       "source": "web/favicon-48.png",
       "source_sha256": "12860ea6c97260de7398cc2fb1f2ebd6fad32e4efa1124eba6afe82a0981c07f",
       "output": "favicon-48.png",
-      "output_sha256": "12860ea6c97260de7398cc2fb1f2ebd6fad32e4efa1124eba6afe82a0981c07f",
-      "method": "unchanged copy"
+      "output_sha256": "722b9d05fef2ba5d096c64fe83c36936e7a3a3797fd5995ebd406a96d5cb265e",
+      "method": "copy of the upstream master; recoloured for Strata Link: middle bar #10b981 -> #06b6d4"
     },
     {
       "source": "web/favicon-dark-16.png",
       "source_sha256": "192c35ceec5152a2517618b0669201d6ed51c09ea679ec0105dd22c96897d8bc",
       "output": "favicon-dark-16.png",
-      "output_sha256": "192c35ceec5152a2517618b0669201d6ed51c09ea679ec0105dd22c96897d8bc",
-      "method": "unchanged copy"
+      "output_sha256": "0cded1d9ee9ee3f2e87b857e044fcf590f21b92a7fd73f34f24a205c4b6da9b3",
+      "method": "copy of the upstream master; recoloured for Strata Link: middle bar #34d399 -> #22d3ee"
     },
     {
       "source": "web/favicon-dark-32.png",
       "source_sha256": "3f16a0a6444af19b3a854b594c34a5b638717213a1b93af9bf9c61b6f9e74174",
       "output": "favicon-dark-32.png",
-      "output_sha256": "3f16a0a6444af19b3a854b594c34a5b638717213a1b93af9bf9c61b6f9e74174",
-      "method": "unchanged copy"
+      "output_sha256": "bbf18b05b9fb937ee6460b03eea2092286146aef41a88b4ba3b297d3a5738275",
+      "method": "copy of the upstream master; recoloured for Strata Link: middle bar #34d399 -> #22d3ee"
     },
     {
       "source": "web/favicon-dark-48.png",
       "source_sha256": "c7c34cf1da8ef3658302ae2630f2eb651463048990d73da45d3c0d6052a45a04",
       "output": "favicon-dark-48.png",
-      "output_sha256": "c7c34cf1da8ef3658302ae2630f2eb651463048990d73da45d3c0d6052a45a04",
-      "method": "unchanged copy"
+      "output_sha256": "422a3996ce62619ebb9f99d4885560206002d36ad3f440cf8e3311253e8f0ee2",
+      "method": "copy of the upstream master; recoloured for Strata Link: middle bar #34d399 -> #22d3ee"
     },
     {
       "source": "web/apple-touch-icon.png",
       "source_sha256": "641a0bf18f44794f000ca368bd3f2ba5e5ee514f35a5ae243c77a35789f0347d",
       "output": "apple-touch-icon.png",
-      "output_sha256": "641a0bf18f44794f000ca368bd3f2ba5e5ee514f35a5ae243c77a35789f0347d",
-      "method": "unchanged copy"
+      "output_sha256": "108c3e7e1414bab7ee270f25e3cb204b14a73aeffa26b16965f0d95e827e26fd",
+      "method": "copy of the upstream master; recoloured for Strata Link: middle bar #34d399 -> #22d3ee"
     },
     {
       "source": "web/icon-192.png",
       "source_sha256": "ed154c3b1146e6a5109bcbc111e6e6fb43c82d4c0e76170655b3a6192b71b92f",
       "output": "icon-192.png",
-      "output_sha256": "ed154c3b1146e6a5109bcbc111e6e6fb43c82d4c0e76170655b3a6192b71b92f",
-      "method": "unchanged copy"
+      "output_sha256": "9a06b5a7fa4b7c81a260e52a0296704f063eb031c471142551e9159524220748",
+      "method": "copy of the upstream master; recoloured for Strata Link: middle bar #34d399 -> #22d3ee"
     },
     {
       "source": "web/icon-512.png",
       "source_sha256": "422a207febfe25727512d807d4dd5ec7894da66c0c7a1ae345f4835c1cf7f8d4",
       "output": "icon-512.png",
-      "output_sha256": "422a207febfe25727512d807d4dd5ec7894da66c0c7a1ae345f4835c1cf7f8d4",
-      "method": "unchanged copy"
+      "output_sha256": "ec63ea3385f75230fbd7654c16454bddffd53cc87307eac8fc3c64fc3d2da149",
+      "method": "copy of the upstream master; recoloured for Strata Link: middle bar #34d399 -> #22d3ee"
     },
     {
       "source": "web/site.webmanifest",

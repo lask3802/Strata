@@ -19,7 +19,7 @@ mkdirSync(out, { recursive: true });
 const { chromium } = await import(pathToFileURL(join(host, 'node_modules/playwright-core/index.mjs')).href).catch(() => import('playwright-core'));
 const CHROME = process.env.CHROME ?? ['C:/Program Files/Google/Chrome/Application/chrome.exe', '/usr/bin/google-chrome'].find(existsSync);
 
-const TILE = '#161a1d', LIGHT = '#eef1f3', GREEN = '#34d399';   // the colours of the current icon.png
+const TILE = '#161a1d', LIGHT = '#eef1f3', GREEN = '#22d3ee';   // the colours of the current icon.png; the middle bar is Strata Link's cyan, upstream Strata's is #34d399
 
 /** Integer geometry for the small sizes: bars on whole pixels, centred. Returns [{x,y,w,h,fill}]. */
 function hinted(size) {
