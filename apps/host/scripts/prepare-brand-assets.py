@@ -9,8 +9,10 @@ untouched; public/brand/source-manifest.json records every derivation.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
+import re
 import shutil
 import xml.etree.ElementTree as ET
 
@@ -25,7 +27,49 @@ BRAND = PUBLIC / "brand"
 FONT = PUBLIC / "fonts" / "GTWalsheimPro-Bold.woff2"
 SVG_NS = "http://www.w3.org/2000/svg"
 INK = {"light": "#221e1f", "dark": "#eef1f3"}
-GREEN = {"light": "#10b981", "dark": "#34d399"}
+# Strata Link: the fork's mark has a cyan middle bar so it is not mistaken for upstream Strata's. The masters still carry upstream's
+# emerald; LINK_RECOLOUR is applied to everything derived from them, and the SVG/PNG steps below record it in the manifest.
+GREEN = {"light": "#06b6d4", "dark": "#22d3ee"}
+UPSTREAM_GREEN = {"light": "#10b981", "dark": "#34d399"}
+LINK_RECOLOUR = {UPSTREAM_GREEN[theme]: GREEN[theme] for theme in GREEN}
+TILE = (0x16, 0x1A, 0x1D)
+INK_ON_TILE = (0xEE, 0xF1, 0xF3)
+
+
+def link_svg(text: str) -> str:
+    for upstream, link in LINK_RECOLOUR.items():
+        text = text.replace(upstream, link)
+    return text
+
+
+def link_note(theme: str) -> str:
+    return f"recoloured for Strata Link: middle bar {UPSTREAM_GREEN[theme]} -> {GREEN[theme]}"
+
+
+def link_png(path: Path, theme: str) -> None:
+    """Move the green share of every pixel to the cyan, in place. A pixel is unmixed into tile, ink and green
+    (p - tile = a*(green - tile) + b*(ink - tile)); only a*(cyan - green) is added, so edges stay smooth and
+    pixels with no green keep their exact RGBA. Flat-colour icons (the favicons, no tile) are shifted directly."""
+    import numpy as np
+    from PIL import Image
+
+    arr = np.array(Image.open(path).convert("RGBA"))
+    rgb = arr[..., :3].astype(np.float64)
+    hexa = lambda h: np.array([int(h[i:i + 2], 16) for i in (1, 3, 5)], np.float64)
+    green, cyan = hexa(UPSTREAM_GREEN[theme]), hexa(GREEN[theme])
+    if (arr[..., :3] == TILE).all(-1).mean() > 0.25:
+        tile, ink = np.array(TILE, np.float64), np.array(INK_ON_TILE, np.float64)
+        u, v, d = green - tile, ink - tile, rgb - tile
+        uu, vv, uv = u @ u, v @ v, u @ v
+        a = ((d @ u) * vv - (d @ v) * uv) / (uu * vv - uv * uv)
+        b = ((d @ v) * uu - (d @ u) * uv) / (uu * vv - uv * uv)
+        residual = np.linalg.norm(d - a[..., None] * u - b[..., None] * v, axis=-1)
+        hit = (arr[..., 3] > 0) & (a >= 0.02) & (a <= 1.35) & (b >= -0.12) & (residual <= 6.0)
+    else:
+        a = np.ones(arr.shape[:2])
+        hit = (arr[..., 3] > 0) & (rgb[..., 1] - rgb[..., 0] > 50)
+    arr[..., :3] = np.where(hit[..., None], np.clip(np.rint(rgb + a[..., None] * (cyan - green)), 0, 255), rgb).astype(np.uint8)
+    Image.fromarray(arr, "RGBA").save(path, "PNG")
 
 
 def digest(path: Path) -> str:
@@ -55,6 +99,14 @@ def copy(entries: list[dict[str, str]], master: str, output: Path) -> None:
     record(entries, master, output, "unchanged copy")
 
 
+def prepare_mark(entries: list[dict[str, str]], theme: str) -> None:
+    master = f"logo/strata-mark-{theme}.svg"
+    output = BRAND / f"strata-mark-{theme}.svg"
+    text = re.sub(r"<metadata>.*?</metadata>", "", source(master).read_text(), flags=re.S)
+    output.write_text(link_svg(text.replace(' xmlns:c2pa="http://c2pa.org/manifest"', "")))
+    record(entries, master, output, f"copy of the upstream master; {link_note(theme)}; C2PA block removed (its hash covered the upstream bytes)")
+
+
 def art_rectangles(master: str) -> str:
     root = ET.parse(source(master)).getroot()
     rects = root.findall(f"{{{SVG_NS}}}rect")
@@ -63,7 +115,7 @@ def art_rectangles(master: str) -> str:
     return "\n".join(
         f'<rect x="{r.attrib["x"]}" y="{r.attrib["y"]}" '
         f'width="{r.attrib["width"]}" height="{r.attrib["height"]}" '
-        f'rx="{r.attrib["rx"]}" fill="{r.attrib["fill"]}" />'
+        f'rx="{r.attrib["rx"]}" fill="{link_svg(r.attrib["fill"])}" />'
         for r in rects
     )
 
@@ -131,7 +183,7 @@ def prepare_lockup(entries: list[dict[str, str]], theme: str, font: TTFont) -> N
         f'<g fill="{INK[theme]}">{outlined_wordmark(font)}</g>\n'
         "</svg>\n"
     )
-    record(entries, master, output, f"outlined GT Walsheim Pro Bold from {FONT.relative_to(APP)}")
+    record(entries, master, output, f"outlined GT Walsheim Pro Bold from {FONT.relative_to(APP)}; {link_note(theme)}")
 
 
 def prepare_favicon(entries: list[dict[str, str]]) -> None:
@@ -156,7 +208,7 @@ def prepare_favicon(entries: list[dict[str, str]]) -> None:
         '}</style>\n'
         f'{bars}\n</svg>\n'
     )
-    record(entries, master, output, "explicit light fills and self-contained dark media style")
+    record(entries, master, output, f"explicit light fills and self-contained dark media style; {link_note('light')} (dark media style {UPSTREAM_GREEN['dark']} -> {GREEN['dark']})")
 
 
 def prepare_manifest(entries: list[dict[str, str]]) -> None:
@@ -172,7 +224,7 @@ def main() -> None:
     BRAND.mkdir(parents=True, exist_ok=True)
     entries: list[dict[str, str]] = []
     for theme in ("light", "dark"):
-        copy(entries, f"logo/strata-mark-{theme}.svg", BRAND / f"strata-mark-{theme}.svg")
+        prepare_mark(entries, theme)
     font = TTFont(FONT)
     for theme in ("light", "dark"):
         prepare_lockup(entries, theme, font)
@@ -183,13 +235,16 @@ def main() -> None:
         "apple-touch-icon.png", "icon-192.png", "icon-512.png",
     ):
         copy(entries, f"web/{name}", PUBLIC / name)
+        theme = "light" if name.startswith("favicon-") and "dark" not in name else "dark"  # the tile icons are dark-tile art
+        link_png(PUBLIC / name, theme)
+        entries[-1].update(output_sha256=digest(PUBLIC / name), method=f"copy of the upstream master; {link_note(theme)}")
     prepare_manifest(entries)
     (BRAND / "source-manifest.json").write_text(json.dumps({
         "source_root": str(MASTERS),
         "preparation": "scripts/prepare-brand-assets.py",
         "font": str(FONT.relative_to(APP)),
         "font_sha256": digest(FONT),
-        "note": "Derived SVGs omit source C2PA metadata; original masters remain untouched and each source hash is recorded here.",
+        "note": "Derived SVGs omit source C2PA metadata; original masters remain untouched and each source hash is recorded here. Strata Link recolours the middle bar of the mark to cyan so it is not mistaken for upstream Strata's; source hashes are the upstream masters', output hashes are of the recoloured files.",
         "files": entries,
     }, indent=2) + "\n")
     print(f"Prepared {len(entries)} web assets in {PUBLIC}")

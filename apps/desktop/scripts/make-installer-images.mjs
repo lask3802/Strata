@@ -26,13 +26,13 @@ const fontMedium = pathToFileURL(join(host, 'public/fonts/GTWalsheimPro-Medium.w
 const lockup = readFileSync(join(host, 'public/brand/strata-lockup-light.svg'), 'utf8');
 const mark = readFileSync(join(host, 'public/brand/strata-mark-light.svg'), 'utf8');
 
-// the app's light tokens
-const SURFACE = '#f9fafb', INK = '#171b1e', MUTED = '#5b646b', ACCENT = '#10b981', LINE = '#e3e8ea';
+// the app's light tokens; Strata Link's accent for the brand art here is the mark's cyan (upstream: ACCENT #10b981, gradient end #eef6f2)
+const SURFACE = '#f9fafb', INK = '#171b1e', MUTED = '#5b646b', ACCENT = '#06b6d4', LINE = '#e3e8ea';
 const css = `@font-face{font-family:GT;font-weight:700;src:url(${font})}@font-face{font-family:GT;font-weight:500;src:url(${fontMedium})}
 *{box-sizing:border-box}body{margin:0;font-family:GT,'Segoe UI',sans-serif;color:${INK};background:${SURFACE}}`;
 
 const pages = {
-  sidebar: { w: 164, h: 314, html: `<div style="width:164px;height:314px;padding:22px 18px;display:flex;flex-direction:column;background:linear-gradient(180deg,#f9fafb 0%,#eef6f2 100%);border-right:1px solid ${LINE}">
+  sidebar: { w: 164, h: 314, html: `<div style="width:164px;height:314px;padding:22px 18px;display:flex;flex-direction:column;background:linear-gradient(180deg,#f9fafb 0%,#eaf6f9 100%);border-right:1px solid ${LINE}">
     <div style="height:26px">${lockup.replace('<svg', '<svg style="height:26px;width:auto;display:block"')}</div>
     <div style="margin-top:auto">
       <div style="font-weight:700;font-size:22px;line-height:1.12;letter-spacing:-.01em">State of<br>the art.<br>At home.</div>
