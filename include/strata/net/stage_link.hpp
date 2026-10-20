@@ -329,8 +329,10 @@ struct StageHandlers {
     /// it was), -1 an error.  ckpt_restore: an id it does not hold is an error starting with kStageCkptMissing.
     std::function<int(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> ckpt_save;
     std::function<bool(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> ckpt_restore;
-    /// Session files (optional, all five or none; without them the Session messages get an error).  serve_stage has
-    /// checked a save's position and reported a failed Commit.  session_save: capture this worker's part at
+    /// Session files (optional, all five or none; without them the Session messages get an error).  An error's text
+    /// starts with its kind ("invalid: ", "memory: ", "io: "), which the main process answers as it answers its own
+    /// (the server's 400, 503, 500).  serve_stage has checked a save's position and reported a failed Commit.
+    /// session_save: capture this worker's part at
     /// ids.size() tokens (with checkpoint `ckpt_id`'s, 0: none) and hold it; `part_bytes` its size.
     std::function<bool(const std::vector<int32_t>& ids, int64_t ckpt_id, int64_t ckpt_tokens, uint64_t& part_bytes,
                        std::string& err)> session_save;

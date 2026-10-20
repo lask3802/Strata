@@ -357,7 +357,9 @@ class Slots(unittest.TestCase):
         cases = [("storage", "No space left on device", 507), ("storage", "espace insuffisant", 507),
                  ("memory", "out of memory for the write buffer", 503), ("invalid", "not enough disk space", 400),
                  ("invalid", "saved with another model", 400), ("io", "Permission denied", 500),
-                 ("io", "RAM", 500)]
+                 ("io", "RAM", 500),
+                 ("link", "the link to the remote stage's worker was lost (remote stage: the peer closed the "
+                          "connection): its part of the session is gone; the next request connects again", 503)]
         for kind, msg, code in cases:
             self.engine.script = [f"SERR {kind} 0 {msg}\n"]
             s, b = self.post("/slots/0?action=save", {"filename": "k.bin"})

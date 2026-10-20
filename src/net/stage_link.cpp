@@ -2045,7 +2045,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 bool lost = false;
                 const auto send = [&](const void* p, size_t n, std::string& why) -> bool {
                     if (n < 1 || n > kStageSessionBlock || n > held_bytes - sent) {
-                        why = "io: the part is not the " + std::to_string(held_bytes) + " bytes it was announced as";
+                        why = "the part is not the " + std::to_string(held_bytes) + " bytes it was announced as";
                         return false;
                     }
                     StageHeader d;
@@ -2106,14 +2106,14 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 size_t at = 0;   // how far d's block is read
                 auto take = [&](Inbox& x, std::string& why) -> bool {
                     if (!next_data(x)) { lost = true; why = err = "the worker is stopping"; return false; }
-                    if (x.closed) { lost = true; err = x.err; why = "io: the link ended in the middle of the part"; return false; }
+                    if (x.closed) { lost = true; err = x.err; why = "the link ended in the middle of the part"; return false; }
                     stats.bytes_in += sizeof x.h + x.h.bytes;
                     if ((StageMsg) x.h.type != StageMsg::SessionData || !x.bad.empty() || x.data.size() > left) {
                         lost = true;
                         why = err = "a message other than the session part's next block (the link is out of step)";
                         return false;
                     }
-                    if (x.h.c == 1) { gave_up = true; why = "io: the main process gave the part up"; return false; }
+                    if (x.h.c == 1) { gave_up = true; why = "the main process gave the part up"; return false; }
                     left -= x.data.size();
                     return true;
                 };
@@ -2122,7 +2122,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     while (n > 0) {
                         if (at == d.data.size()) {
                             if (lost || gave_up) return false;
-                            if (left == 0) { why = "io: read past the part's end"; return false; }
+                            if (left == 0) { why = "read past the part's end"; return false; }
                             d = Inbox();
                             at = 0;
                             if (!take(d, why)) return false;
