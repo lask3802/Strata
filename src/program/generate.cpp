@@ -12036,8 +12036,9 @@ int main(int argc, char** argv) {
                                 "restores (" + std::to_string(max) + " bytes: its layers at its context, one checkpoint)";
                             return false;
                         }
+                        // (the parse's peak, and the link's blocks on the way: two queued besides the one being read)
                         std::string why;
-                        if (!wk_ram(strata::core::session_read_peak_bytes(bytes), why)) {
+                        if (!wk_ram(strata::core::session_read_peak_bytes(bytes) + 2 * strata::net::kStageSessionBlock, why)) {
                             e = "memory: " + why;
                             return false;
                         }
@@ -13168,9 +13169,10 @@ int main(int argc, char** argv) {
                 // link (format v2), so the worker must take them (its hello's kStageCapSession: not a relay, nor an
                 // earlier build) and be there.  A link its end closed while this process was idle is made again for a
                 // RESTORE, which replaces the session anyway; a SAVE is refused (the worker's part of it is gone).
-                // A worker's error starts with its kind; a lost link is `link` (503: the next request connects again).
-                auto remote_kind = [](const std::string& e) {
-                    if (strata::net::stage_link_lost(e)) return strata::core::SessionError::link;
+                // A worker's error starts with its kind; a lost link is `link` (503: the next request connects again),
+                // and so is one the client ended itself (a reply out of step).
+                auto remote_kind = [&](const std::string& e) {
+                    if (strata::net::stage_link_lost(e) || !remote_link.connected()) return strata::core::SessionError::link;
                     static const std::string w = "remote stage (worker): ";
                     if (e.compare(0, w.size(), w) == 0) {
                         if (e.compare(w.size(), 9, "invalid: ") == 0) return strata::core::SessionError::invalid;

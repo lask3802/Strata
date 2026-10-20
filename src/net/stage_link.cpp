@@ -2076,14 +2076,9 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 break;
             }
             case StageMsg::SessionLoad: {
-                // the session will be replaced: a Commit that failed before no longer matters (logged), as at a
-                // CkptRestore; a failed position table stays for the request it belongs to
+                // (a Commit that failed before stays pending: the load may be given up, and the session it was in goes
+                // on; SessionEnd drops it once the part replaced that session)
                 std::string e;
-                if (!pending_err.empty()) {
-                    std::fprintf(stderr, "strata stage worker: a commit failed before a session load: %s\n",
-                                 pending_err.c_str());
-                    pending_err.clear();
-                }
                 if (!replies_out()) { keep = false; break; }
                 const uint64_t bytes = (uint64_t) in.h.a;
                 if (!h.session_load_begin || !h.session_load || !h.session_end) e = "invalid: this worker takes no session files";
@@ -2167,13 +2162,23 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 const bool apply = in.h.a == 1;
                 bool ok = true;
                 if (apply && held != Held::loaded) {
+                    drop_held();   // (a saved part, if any: let go, as for any other message)
                     ok = false;
                     e = "invalid: no session part is loaded here (a session load first)";
                 } else if (h.session_end) {
                     ok = h.session_end(apply, in.h.b, e);
                 }
-                // in place: the session is at the part's end; a failed transfer leaves it unknown until a reset
-                if (apply && held == Held::loaded) pos = ok ? held_tokens : -1;
+                if (apply && held == Held::loaded) {
+                    // in place: the session is at the part's end, and a Commit that failed before it no longer
+                    // matters (logged), as at a CkptRestore - a failed position table stays for the request it belongs
+                    // to; a failed transfer leaves the session unknown until a reset
+                    pos = ok ? held_tokens : -1;
+                    if (!pending_err.empty()) {
+                        std::fprintf(stderr, "strata stage worker: a commit failed before a session restore: %s\n",
+                                     pending_err.c_str());
+                        pending_err.clear();
+                    }
+                }
                 held = Held::none;
                 if (!ok) { keep = reply_error(e); break; }
                 StageHeader r;

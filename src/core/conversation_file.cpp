@@ -1105,7 +1105,8 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     put_payload(sizing, image, sources);
     const SessionStageOut& stage = opt.stage;   // format v2: the worker's part in front of the payload
     if (stage.bytes && !stage.stream) { error = "session file: a worker's part without its stream"; return false; }
-    if (sizing.overflow || stage.bytes > UINT64_MAX - kHeader - kTrailer - sizing.n ||
+    if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
+        stage.bytes > UINT64_MAX - kHeader - kTrailer - sizing.n ||
         sizing.n + stage.bytes + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
         return false;

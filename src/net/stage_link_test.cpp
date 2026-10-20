@@ -1482,6 +1482,7 @@ int main() {
             int64_t held_ckpt = 0, applied_id = -1;
             int ends = 0, drops = 0;
             size_t pull_block = 1000, pad = 50000, load_piece = 777;
+            int load_delay_ms = 0;   // before a load's handler reads its first byte
             uint64_t load_max = (uint64_t) 1 << 30;
             bool fail_pull = false, fail_parse = false;
         } s;
@@ -1535,11 +1536,14 @@ int main() {
                               int64_t& tokens, int64_t& ckpt_tokens, std::string& e) {
             size_t piece = 0;
             bool fail = false;
+            int delay = 0;
             {
                 std::lock_guard<std::mutex> lk(s.mu);
                 piece = s.load_piece;
                 fail = s.fail_parse;
+                delay = s.load_delay_ms;
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
             std::vector<unsigned char> p((size_t) bytes);
             for (size_t at = 0; at < p.size(); at += piece) {
                 if (fail && at >= 1000) {
@@ -1717,6 +1721,53 @@ int main() {
             check(cl.session_load(want.size(), from(want, at), tokens, ckpt_tokens, failed, err) &&
                       cl.session_end(false, 0, err) && !cl.session_end(true, 30, err),
                   "end without apply: the loaded part let go");
+            // at most two blocks wait in the worker's reader: a handler that reads nothing yet holds the main process's
+            // sends back.  128 MiB in 16 MiB blocks, the handler 1 s late: the last block leaves after it starts.
+            {
+                {
+                    std::lock_guard<std::mutex> lk(s.mu);
+                    s.pad = (size_t) 128 << 20;
+                    s.load_piece = (size_t) 1 << 20;
+                    s.load_delay_ms = 1000;
+                }
+                const std::vector<unsigned char> big = make_part(ids8, 0);
+                size_t bat = 0;
+                double last_ms = 0;
+                const auto t0 = SteadyClock::now();
+                const auto timed = [&](void* p, size_t n, std::string& why) {
+                    if (n > big.size() - bat) { why = "past the end (test)"; return false; }
+                    std::memcpy(p, big.data() + bat, n);
+                    bat += n;
+                    last_ms = ms_between(t0, SteadyClock::now());
+                    return true;
+                };
+                const bool loaded = cl.session_load(big.size(), timed, tokens, ckpt_tokens, failed, err) &&
+                                    tokens == kChunk && bat == big.size();
+                check(loaded && last_ms >= 800 && cl.session_end(false, 0, err),
+                      "a load's blocks wait for the worker's reader: two at most in its queue");
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.pad = 50000;
+                s.load_piece = 777;
+                s.load_delay_ms = 0;
+            }
+            // a Commit that failed before a load the worker refused stays pending: the session it was in goes on
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.load_max = 1;
+            }
+            fail_commit = true;
+            at = 0;
+            const bool pending = prompt() &&
+                                 cl.run(1, wtok.data(), kChunk, win.data(), (size_t) kHbf, wout.data(), (size_t) kHbf, err) &&
+                                 cl.commit(1, err) &&
+                                 !cl.session_load(want.size(), from(want, at), tokens, ckpt_tokens, failed, err);
+            fail_commit = false;
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.load_max = (uint64_t) 1 << 30;
+            }
+            check(pending && !cl.ckpt_save(31, kChunk + 1, {31}, stored, err) && contains(err, "a commit failed (test)"),
+                  "a failed Commit before a refused load still comes back on the next CkptSave");
             // a disconnect with a part held lets it go
             at = 0;
             d0 = drops();
