@@ -46,7 +46,12 @@ namespace {
 constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
 constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersionStage = 2;   // a remote stage's file: a worker's part in front of the payload
 constexpr size_t kHeader = 64, kTrailer = 16;
+// a worker's part (format v2): magic[8] version:u32 header_size:u32 model:u64 config:u64, then a v1 payload
+constexpr char kPartMagic[8] = {'S', 'T', 'R', 'S', 'P', 'R', 'T', '\x01'};
+constexpr uint32_t kPartVersion = 1;
+constexpr size_t kPartHeader = 32;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
 // - the last, partial block included - so a small file reports too, and each report follows real movement.
@@ -525,18 +530,13 @@ bool free_space(const std::string& path, uint64_t& out) {
 }
 #endif
 
-class FileSink {
+// Where the serialization walk (Out) puts its bytes: a block it fills in place (span, then commit) or copies into.
+class BlockSink {
 public:
-    explicit FileSink(RawFile& f) : buf_(aligned_block()), f_(f) {}
-    bool ok() const { return buf_ != nullptr; }
-    std::string error() const {
-        if (!buf_) return "out of memory for the write buffer";
-        return fault_ ? fault_msg_ : f_.error();
-    }
-    SessionError kind() const { return buf_ ? (fault_ ? fault_kind_ : f_.kind()) : SessionError::memory; }
+    virtual ~BlockSink() = default;
     // room in the block for in-place production (avoids a staging copy)
-    uint8_t* span(size_t& room) { room = kBlock - used_; return buf_.get() + used_; }
-    bool commit(size_t n) { used_ += n; total_ += n; return used_ < kBlock || drain(); }
+    virtual uint8_t* span(size_t& room) = 0;
+    virtual bool commit(size_t n) = 0;
     bool write(const void* p, size_t n) {
         const uint8_t* s = static_cast<const uint8_t*>(p);
         while (n) {
@@ -549,6 +549,19 @@ public:
         }
         return true;
     }
+};
+
+class FileSink : public BlockSink {
+public:
+    explicit FileSink(RawFile& f) : buf_(aligned_block()), f_(f) {}
+    bool ok() const { return buf_ != nullptr; }
+    std::string error() const {
+        if (!buf_) return "out of memory for the write buffer";
+        return fault_ ? fault_msg_ : f_.error();
+    }
+    SessionError kind() const { return buf_ ? (fault_ ? fault_kind_ : f_.kind()) : SessionError::memory; }
+    uint8_t* span(size_t& room) override { room = kBlock - used_; return buf_.get() + used_; }
+    bool commit(size_t n) override { used_ += n; total_ += n; return used_ < kBlock || drain(); }
     // last block padded to the alignment for direct I/O, then the file cut back to its exact size and flushed
     bool finish(bool durable) {
         if (!f_.is_open()) return false;
@@ -586,13 +599,51 @@ private:
     uint64_t total_ = 0;
 };
 
-class FileSource {
+// A worker's part (format v2) on its way out: the same 16 MiB blocks, each handed to `send` when full or at the end.
+class StreamSink : public BlockSink {
+public:
+    explicit StreamSink(const std::function<bool(const void*, size_t, std::string&)>& send)
+        : buf_(aligned_block()), send_(send) {}
+    bool ok() const { return buf_ != nullptr; }
+    const std::string& error() const { return error_; }
+    uint8_t* span(size_t& room) override { room = kBlock - used_; return buf_.get() + used_; }
+    bool commit(size_t n) override { used_ += n; total_ += n; return used_ < kBlock || drain(); }
+    bool finish() { return used_ == 0 || drain(); }
+    SessionProgress progress;
+    uint64_t expected = 0;
+private:
+    bool drain() {
+        if (!send_(buf_.get(), used_, error_)) {
+            if (error_.empty()) error_ = "the part's stream failed";
+            return false;
+        }
+        used_ = 0;
+        if (progress) progress(total_, expected);
+        return true;
+    }
+    Aligned buf_;
+    const std::function<bool(const void*, size_t, std::string&)>& send_;
+    std::string error_;
+    size_t used_ = 0;
+    uint64_t total_ = 0;
+};
+
+// What the parse (In) reads from: the file, or a worker's part as it comes over the link.
+class ByteSource {
+public:
+    virtual ~ByteSource() = default;
+    virtual bool read(void* p, size_t n) = 0;
+    virtual std::string error() const = 0;
+    virtual SessionError kind() const = 0;
+};
+
+class FileSource : public ByteSource {
 public:
     explicit FileSource(RawFile& f) : buf_(aligned_block()), f_(f) {}
     bool ok() const { return buf_ != nullptr; }
-    std::string error() const { return buf_ ? f_.error() : std::string("out of memory for the read buffer"); }
-    SessionError kind() const { return buf_ ? f_.kind() : SessionError::memory; }
-    bool read(void* p, size_t n) {
+    std::string error() const override { return buf_ ? f_.error() : std::string("out of memory for the read buffer"); }
+    SessionError kind() const override { return buf_ ? f_.kind() : SessionError::memory; }
+    bool read(void* p, size_t n) override {
         uint8_t* d = static_cast<uint8_t*>(p);
         while (n) {
             if (at_ == have_ && !fill()) return false;
@@ -625,9 +676,25 @@ private:
     uint64_t total_ = 0;
 };
 
+// A worker's part as it comes in: `read` gives the next bytes (its own pieces), its failure the stream's reason.
+class StreamSource : public ByteSource {
+public:
+    explicit StreamSource(const std::function<bool(void*, size_t, std::string&)>& read) : read_(read) {}
+    bool read(void* p, size_t n) override {
+        if (read_(p, n, error_)) return true;
+        if (error_.empty()) error_ = "the part's stream failed";
+        return false;
+    }
+    std::string error() const override { return error_; }
+    SessionError kind() const override { return SessionError::io; }
+private:
+    const std::function<bool(void*, size_t, std::string&)>& read_;
+    std::string error_;
+};
+
 // ---- serialization: the same walk counts (f == nullptr) and writes
 struct Out {
-    FileSink* f = nullptr;
+    BlockSink* f = nullptr;
     SessionHasher* hash = nullptr;
     uint64_t n = 0;
     bool ok = true, overflow = false;
@@ -709,7 +776,7 @@ void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKv
 
 // ---- parsing: every count is checked against the bytes left and the caller's limits before anything is allocated
 struct In {
-    FileSource* f;
+    ByteSource* f;
     SessionHasher hash;
     uint64_t left;
     std::string& error;
@@ -802,16 +869,18 @@ bool has_stage_parts(const SavedConversation& s) {
 }
 
 // header v1, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
-// header_hash:u64 (session_hash64 of bytes 0..55, seed 0)
-void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
+// header_hash:u64 (session_hash64 of bytes 0..55, seed 0).  v2 (a remote stage's file, `stage` > 0): the same with
+// version 2 and the worker's part's size in the first reserved field (the payload length counts it).
+void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload, uint64_t stage = 0) {
     std::memset(h, 0, kHeader);
     std::memcpy(h, kMagic, 8);
-    const uint32_t version = kVersion, size = kHeader;
+    const uint32_t version = stage ? kVersionStage : kVersion, size = kHeader;
     std::memcpy(h + 8, &version, 4);
     std::memcpy(h + 12, &size, 4);
     std::memcpy(h + 16, &id.model, 8);
     std::memcpy(h + 24, &id.config, 8);
     std::memcpy(h + 32, &payload, 8);
+    std::memcpy(h + 40, &stage, 8);
     const uint64_t hh = session_hash64(h, 56, 0);
     std::memcpy(h + 56, &hh, 8);
 }
@@ -906,6 +975,7 @@ const char* session_error_name(SessionError e) {
         case SessionError::storage: return "storage";
         case SessionError::memory: return "memory";
         case SessionError::io: return "io";
+        case SessionError::link: return "link";
     }
     return "io";
 }
@@ -1033,12 +1103,14 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
     Out sizing;
     put_payload(sizing, image, sources);
-    if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
-        sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
+    const SessionStageOut& stage = opt.stage;   // format v2: the worker's part in front of the payload
+    if (stage.bytes && !stage.stream) { error = "session file: a worker's part without its stream"; return false; }
+    if (sizing.overflow || stage.bytes > UINT64_MAX - kHeader - kTrailer - sizing.n ||
+        sizing.n + stage.bytes + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
         return false;
     }
-    const uint64_t payload = sizing.n, total = kHeader + payload + kTrailer;
+    const uint64_t payload = stage.bytes + sizing.n, total = kHeader + payload + kTrailer;
     st.error = SessionError::io;
     if (opt.min_free_bytes) {
         uint64_t avail = 0;
@@ -1069,12 +1141,35 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     f.write_fault = injected(fault, "write");
     f.flush_fault = injected(fault, "file_flush");
     uint8_t h[kHeader];
-    header_bytes(h, id, payload);
+    header_bytes(h, id, payload, stage.bytes);
     bool ok = f.write(h, kHeader);
     SessionHasher hash(0);
     Out out;
     out.f = &f;
     out.hash = &hash;
+    // the worker's part first, as it comes (counted and hashed like the rest); a write that failed is the file's, a
+    // stream that failed on its own is the part's (stage_why)
+    bool stage_failed = false;
+    std::string stage_why;
+    SessionError stage_kind = SessionError::io;
+    if (ok && stage.bytes) {
+        bool file_failed = false, too_long = false;
+        const std::function<bool(const void*, size_t)> write = [&](const void* p, size_t n) {
+            if (n > stage.bytes - out.n) { too_long = true; return false; }   // (out.n <= stage.bytes here)
+            out.raw(p, n);
+            if (!out.ok) file_failed = true;
+            return out.ok;
+        };
+        const bool streamed = stage.stream(write, stage_why, stage_kind);
+        if (!streamed || out.n != stage.bytes) {
+            ok = false;
+            stage_failed = !file_failed;
+            if (stage_failed && (streamed || too_long || stage_why.empty())) {
+                stage_why = "the worker's part is not the " + std::to_string(stage.bytes) + " bytes it was announced as";
+                stage_kind = SessionError::io;
+            }
+        }
+    }
     if (ok) put_payload(out, image, sources);
     ok = ok && out.ok && out.n == payload;
     if (ok) {
@@ -1084,9 +1179,14 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     ok = f.finish(opt.durable) && ok;
     std::string why;
     if (!ok) {
-        why = out.read_failed ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
-                              : f.error();
-        st.error = out.read_failed ? SessionError::io : f.kind();
+        if (stage_failed) {
+            why = stage_why;
+            st.error = stage_kind == SessionError::none ? SessionError::io : stage_kind;
+        } else {
+            why = out.read_failed ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
+                                  : f.error();
+            st.error = out.read_failed ? SessionError::io : f.kind();
+        }
     } else {
         if (opt.phase) opt.phase("publish", total);
         if (pub.publish(why, opt.durable, st, fault)) {
@@ -1184,7 +1284,9 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
         return false;
     }
     if (size < kHeader + kTrailer) { error = "session file: size " + std::to_string(size) + " is below the minimum"; return false; }
-    const uint64_t max_size = session_read_max_file_bytes(limits);
+    // (format v2: the worker's part on top, at most max_stage_bytes - its own size is checked once the header says it)
+    const uint64_t own_max = session_read_max_file_bytes(limits);
+    const uint64_t max_size = limits.stage ? sat_add(own_max, limits.max_stage_bytes) : own_max;
     if (size > max_size || size > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: size " + std::to_string(size) + " exceeds this engine's limit" +
                 (max_size == UINT64_MAX ? std::string() : " of " + std::to_string(max_size));
@@ -1204,8 +1306,27 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
     if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
-    if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
-    if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
+    if (version != kVersion && version != kVersionStage) {
+        error = "session file: unsupported version " + std::to_string(version);
+        return false;
+    }
+    // a remote stage's file holds the worker's layers too, a file of one process all of them: neither restores into
+    // the other (the layer ranges differ, and no proof that two layouts hold the same bytes is attempted)
+    if (version == kVersionStage && !limits.stage) {
+        error = "session file: saved with a remote stage (its worker's layers are in it): restore it on a main process "
+                "of the same split (--remote-stage)";
+        return false;
+    }
+    if (version == kVersion && limits.stage) {
+        error = "session file: saved by one process holding every layer, not with a remote stage: restore it on an "
+                "engine started that way";
+        return false;
+    }
+    const uint64_t stage = r0;
+    if (hsize != kHeader || r1 || (version == kVersion) != (stage == 0)) {
+        error = "session file: invalid header fields";
+        return false;
+    }
     if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
     if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
     if (payload > size || size - kHeader - kTrailer != payload) {
@@ -1213,9 +1334,14 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
                 std::to_string(kHeader + payload + kTrailer) + ")";
         return false;
     }
+    if (stage > payload || stage > limits.max_stage_bytes || size - stage > own_max) {
+        error = "session file: the worker's part (" + std::to_string(stage) + " bytes) or this process's (" +
+                std::to_string(size - std::min(size, stage)) + " bytes) exceeds this engine's limit";
+        return false;
+    }
     if (limits.admit) {
         std::string why;
-        if (!limits.admit(session_read_peak_bytes(size), why)) {
+        if (!limits.admit(session_read_peak_bytes(size - stage), why)) {   // (the part only passes through)
             st.error = SessionError::memory;
             error = "session file: " + why;
             return false;
@@ -1223,6 +1349,27 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     SavedConversation parsed;
     In in{&f, SessionHasher(0), payload, error, limits};
+    if (stage) {
+        // the worker's part, handed over as it is read (hashed with the rest of the payload: the trailer's check below
+        // covers it); a read that failed is the file's, any other failure the part's
+        bool read_failed = false;
+        const std::function<bool(void*, size_t)> read = [&](void* p, size_t n) {
+            if (n > in.left - (payload - stage) || !in.raw(p, n)) { read_failed = true; return false; }
+            return true;
+        };
+        std::string why;
+        SessionError kind = SessionError::io;
+        if (!limits.stage(stage, read, why, kind) || in.left != payload - stage) {
+            if (read_failed && !error.empty()) {
+                st.error = in.kind;
+            } else {
+                error = "session file: the worker's part: " +
+                        (why.empty() ? std::string("not read whole") : why);
+                st.error = why.empty() || kind == SessionError::none ? SessionError::io : kind;
+            }
+            return false;
+        }
+    }
     if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
@@ -1246,6 +1393,123 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
         ok = read_impl(path, id, image, bytes, error, limits, st);
     } catch (const std::bad_alloc&) {
         error = "session file: out of memory while reading " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+// ---- a remote stage worker's part (format v2)
+bool session_part_bytes(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                        const SessionFileIdentity&, uint64_t& bytes, std::string& error) {
+    if (has_stage_parts(meta) || !meta.stage_images.empty()) {
+        error = "session part: layer-split state cannot be saved";
+        return false;
+    }
+    if (!meta.kv.empty()) { error = "session part: K/V given both in the image and as sources"; return false; }
+    Out sizing;
+    put_payload(sizing, meta, &kv);
+    if (sizing.overflow || sizing.n > UINT64_MAX - kPartHeader) {
+        error = "session part: the state is too large for this build";
+        return false;
+    }
+    bytes = kPartHeader + sizing.n;
+    return true;
+}
+
+bool session_part_write(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                        const SessionFileIdentity& id,
+                        const std::function<bool(const void* data, size_t n, std::string& why)>& send,
+                        uint64_t& bytes, std::string& error, const SessionProgress& progress) {
+    try {
+        uint64_t total = 0;
+        if (!session_part_bytes(meta, kv, id, total, error)) return false;
+        StreamSink s(send);
+        if (!s.ok()) { error = "session part: out of memory for the send buffer"; return false; }
+        s.progress = progress;
+        s.expected = total;
+        uint8_t h[kPartHeader] = {};
+        const uint32_t version = kPartVersion, size = kPartHeader;
+        std::memcpy(h, kPartMagic, 8);
+        std::memcpy(h + 8, &version, 4);
+        std::memcpy(h + 12, &size, 4);
+        std::memcpy(h + 16, &id.model, 8);
+        std::memcpy(h + 24, &id.config, 8);
+        Out out;
+        out.f = &s;
+        out.raw(h, kPartHeader);
+        if (out.ok) put_payload(out, meta, &kv);
+        if (!out.ok || out.n != total || !s.finish()) {
+            error = "session part: " + (out.read_failed ? "K/V source read" +
+                                                              (out.read_error.empty() ? std::string() : ": " + out.read_error)
+                                                        : s.error().empty() ? std::string("its stream failed") : s.error());
+            return false;
+        }
+        bytes = total;
+        return true;
+    } catch (const std::bad_alloc&) {
+        error = "session part: out of memory while sending it";
+        return false;
+    }
+}
+
+uint64_t session_part_max_bytes(const SessionReadLimits& limits) {
+    const uint64_t file = session_read_max_file_bytes(limits);
+    if (file == UINT64_MAX) return file;
+    return file < kHeader + kTrailer ? kPartHeader : file - kHeader - kTrailer + kPartHeader;
+}
+
+bool session_part_read(uint64_t bytes, const std::function<bool(void* data, size_t n, std::string& why)>& read,
+                       const SessionFileIdentity& id, SavedConversation& image, std::string& error,
+                       const SessionReadLimits& limits, SessionStatus* status) {
+    SessionStatus st;
+    st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
+    error.clear();
+    bool ok = false;
+    try {
+        [&] {
+            const uint64_t max = session_part_max_bytes(limits);
+            if (bytes < kPartHeader || bytes > max || bytes > (uint64_t) std::numeric_limits<size_t>::max()) {
+                error = "session part: size " + std::to_string(bytes) + (bytes < kPartHeader ? " is below the minimum"
+                        : " exceeds this engine's limit" + (max == UINT64_MAX ? std::string() : " of " + std::to_string(max)));
+                return;
+            }
+            StreamSource src(read);
+            uint8_t h[kPartHeader];
+            if (!src.read(h, kPartHeader)) { st.error = src.kind(); error = "session part: " + src.error(); return; }
+            uint32_t version = 0, hsize = 0;
+            uint64_t model = 0, config = 0;
+            std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
+            std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8);
+            if (std::memcmp(h, kPartMagic, 8) != 0) { error = "session part: not a worker's part (magic)"; return; }
+            if (version != kPartVersion || hsize != kPartHeader) {
+                error = "session part: unsupported version " + std::to_string(version);
+                return;
+            }
+            if (model != id.model) { error = "session part: saved with another model on the worker (model fingerprint differs)"; return; }
+            if (config != id.config) {
+                error = "session part: saved with another engine configuration on the worker (config fingerprint differs)";
+                return;
+            }
+            if (limits.admit) {
+                std::string why;
+                if (!limits.admit(session_read_peak_bytes(bytes), why)) {
+                    st.error = SessionError::memory;
+                    error = "session part: " + why;
+                    return;
+                }
+            }
+            SavedConversation parsed;
+            In in{&src, SessionHasher(0), bytes - kPartHeader, error, limits};
+            if (!get_payload(in, parsed)) { st.error = in.kind; return; }
+            if (in.left) { error = "session part: " + std::to_string(in.left) + " unparsed bytes"; return; }
+            image = std::move(parsed);
+            st.error = SessionError::none;
+            ok = true;
+        }();
+    } catch (const std::bad_alloc&) {
+        error = "session part: out of memory while reading it";
         st.error = SessionError::memory;
         ok = false;
     }
