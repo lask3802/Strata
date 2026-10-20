@@ -1483,6 +1483,7 @@ int main() {
             int ends = 0, drops = 0;
             size_t pull_block = 1000, pad = 50000, load_piece = 777;
             int load_delay_ms = 0;   // before a load's handler reads its first byte
+            std::chrono::steady_clock::time_point read_from;   // when it started reading
             uint64_t load_max = (uint64_t) 1 << 30;
             bool fail_pull = false, fail_parse = false;
         } s;
@@ -1544,6 +1545,10 @@ int main() {
                 delay = s.load_delay_ms;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.read_from = std::chrono::steady_clock::now();
+            }
             std::vector<unsigned char> p((size_t) bytes);
             for (size_t at = 0; at < p.size(); at += piece) {
                 if (fail && at >= 1000) {
@@ -1722,28 +1727,35 @@ int main() {
                       cl.session_end(false, 0, err) && !cl.session_end(true, 30, err),
                   "end without apply: the loaded part let go");
             // at most two blocks wait in the worker's reader: a handler that reads nothing yet holds the main process's
-            // sends back.  128 MiB in 16 MiB blocks, the handler 1 s late: the last block leaves after it starts.
+            // sends back.  128 MiB in 16 MiB blocks, the handler 2 s late: the last block is taken from the source after
+            // the handler started reading (without the limit the reader takes all of it meanwhile, and the source is done
+            // before)
             {
                 {
                     std::lock_guard<std::mutex> lk(s.mu);
                     s.pad = (size_t) 128 << 20;
                     s.load_piece = (size_t) 1 << 20;
-                    s.load_delay_ms = 1000;
+                    s.load_delay_ms = 2000;
                 }
                 const std::vector<unsigned char> big = make_part(ids8, 0);
                 size_t bat = 0;
-                double last_ms = 0;
-                const auto t0 = SteadyClock::now();
+                SteadyClock::time_point last_block;
                 const auto timed = [&](void* p, size_t n, std::string& why) {
                     if (n > big.size() - bat) { why = "past the end (test)"; return false; }
                     std::memcpy(p, big.data() + bat, n);
                     bat += n;
-                    last_ms = ms_between(t0, SteadyClock::now());
+                    last_block = SteadyClock::now();
                     return true;
                 };
                 const bool loaded = cl.session_load(big.size(), timed, tokens, ckpt_tokens, failed, err) &&
                                     tokens == kChunk && bat == big.size();
-                check(loaded && last_ms >= 800 && cl.session_end(false, 0, err),
+                double after_ms = 0;   // the last block's take, after the handler's start
+                {
+                    std::lock_guard<std::mutex> lk(s.mu);
+                    after_ms = ms_between(s.read_from, last_block);
+                }
+                std::printf("  (the last block taken %.0f ms after the handler started reading)\n", after_ms);
+                check(loaded && after_ms > 0 && cl.session_end(false, 0, err),
                       "a load's blocks wait for the worker's reader: two at most in its queue");
                 std::lock_guard<std::mutex> lk(s.mu);
                 s.pad = 50000;
