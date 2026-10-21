@@ -1,6 +1,7 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/warm_policy.hpp"
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
@@ -406,6 +407,7 @@ struct HandWorker {
     std::thread th;
     HandWorker() {
         th = std::thread([this] {
+            strata::platform::name_this_thread("strata-hand");
             strata::aux_cpus::pin_current_thread();
             for (;;) {
                 std::packaged_task<bool()> job;
@@ -490,7 +492,16 @@ inline bool cvec_fuse() {
 inline bool pf_pad() {
     static const bool v = [] {
         const char* p = std::getenv("STRATA_PF_PAD"); const char* g = std::getenv("STRATA_PF_GEMM");
-        return p && p[0] == '1' && g && g[0] == '1';
+        if (!(p && p[0] == '1' && g && g[0] == '1')) return false;
+        // The padded stride pays only for strata_pf_gemm_f16_ld, which is built for the gfx11 matrix cores.  On another
+        // card nothing takes a padded X (it used to end the engine: "a padded X ... needs STRATA_PF_PAD's path", #1237):
+        // do not pad, and say so once.
+        if (!strata_pf_padded_gemm_available()) {
+            std::fprintf(stderr, "prefill gemm: STRATA_PF_PAD needs the padded gfx11 product, which this card does not run; "
+                                 "not padding\n");
+            return false;
+        }
+        return true;
     }();
     return v;
 }
@@ -592,6 +603,7 @@ struct Stager {
             threads.emplace_back([this] {
                 // --aux-cpus: the copy threads go to the spare CPUs with the other helpers; STRATA_AUX_STAGER=0 leaves them where
                 // they were created (a small spare set would then hold all of them: it limits the copy rate of a long read)
+                strata::platform::name_this_thread("strata-stage");
                 static const bool keep = [] { const char* v = std::getenv("STRATA_AUX_STAGER"); return v != nullptr && std::atoi(v) == 0; }();
                 if (keep) strata::aux_cpus::note_owned_thread();
                 else strata::aux_cpus::pin_current_thread();
@@ -1317,6 +1329,24 @@ void warm_gemm_libraries(int device) {
     static const bool off = [] { const char* e = std::getenv("STRATA_PREFILL_WARM"); return e != nullptr && e[0] == '0'; }();
     if (off) return;
 #if defined(STRATA_USE_HIP)
+    // #3204: not when the process sees cards of more than one architecture (gfx1151 + gfx1201: prompts -25%); see
+    // warm_policy.hpp.  STRATA_PREFILL_WARM=1 asks for it anyway.
+    static const bool arch_ok = [] {
+        std::vector<std::string> archs;
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess) { (void) cudaGetLastError(); return true; }
+        for (int i = 0; i < n && i < 32; ++i) {
+            cudaDeviceProp p{};
+            if (cudaGetDeviceProperties(&p, i) == cudaSuccess) archs.emplace_back(p.gcnArchName);
+            else (void) cudaGetLastError();
+        }
+        const bool wanted = warm_gemm_wanted(archs, std::getenv("STRATA_PREFILL_WARM"));
+        if (!wanted)
+            std::fprintf(stderr, "strata prefill: no hipBLAS warm-up: the cards are of more than one architecture "
+                                 "(it slows prompts there, #3204); the first prompt loads the libraries (STRATA_PREFILL_WARM=1 asks for it)\n");
+        return wanted;
+    }();
+    if (!arch_ok) return;
     static std::mutex mu;
     static unsigned done_mask = 0;   // per device: each card loads its own code objects
     if (device < 0 || device >= 32) return;
@@ -3022,6 +3052,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const bool threaded_issue = stream_all && issuer_on;
         if (threaded_issue) {
             issuer = std::thread([&] {
+                strata::platform::name_this_thread("strata-issue");
                 strata::aux_cpus::pin_current_thread();
                 const core::OnDevice od(m.device);
                 for (size_t idx = 0; idx < seq.size(); ++idx) {

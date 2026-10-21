@@ -295,10 +295,12 @@ class WhatARefusalDoesToTheCaller(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         (Path(self.tmp.name) / "engine").mkdir(parents=True, exist_ok=True)
-        # the release is published (get_prebuilt's HEAD), without asking GitHub: a fork's has no release yet
-        patcher = mock.patch.object(setup.urllib.request, "urlopen", lambda req, timeout=None: io.BytesIO())
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # get_prebuilt looks for the release with a HEAD request before it downloads (0.2.0), and keeps the engine in
+        # an engine folder of its own: no network, and never this checkout's engine folder.  A published release answers the probe.
+        for patcher in (mock.patch.object(setup, "engine_dir", lambda toolkit=13: Path(self.tmp.name) / "engine"),
+                        mock.patch.object(setup, "_urlopen", lambda req, timeout=None: mock.MagicMock())):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def fake_download(self, url, dst, what=None):
         with zipfile.ZipFile(dst, "w") as z:
