@@ -4962,10 +4962,8 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             if i + 1 < len(bases):                     # #214: this checkout's release is not published (yet)
                 say(f"  No ready-made engine for v{source_version()} ({e}): the latest release instead")
                 continue
-            if int(toolkit) != 12:                     # 0.2 releases: the signed feed has it (#3469)
-                got = engine_from_feed(eng, updating)
-                if got is not None:
-                    return got
+            # (upstream's 0.2 releases fall back to its signed feed here (#3469); Strata Link does not: that engine is
+            # upstream's, without Link's engine changes, and the fork's releases carry the flat zips)
             warn(f"no ready-made engine at {base} ({e})" + ("" if updating else ": compiling instead"))
             return None
     say("  Downloading the ready-made Strata engine" + (" (CUDA 12, experimental)" if int(toolkit) == 12 else "") + " ...")
