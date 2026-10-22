@@ -83,6 +83,22 @@ class Procs(unittest.TestCase):
         self.assertIsNone(child.poll(), "a stranger with the recorded PID must be left alone")
         self.assertEqual(procs.records(), [], "the stale record is dropped")
 
+    def test_the_ps_token_is_the_start_time_alone(self):
+        # the fallback without psutil (neither Linux nor Windows): ps's stat changes while the process runs (S, then
+        # Sl once it starts a thread), and in the token a live process read as another one
+        from types import SimpleNamespace
+        start = "Thu Oct 22 15:02:59 2026"
+
+        def token(stat):
+            with mock.patch.object(procs.sys, "platform", "darwin"), mock.patch.object(procs, "WINDOWS", False), \
+                    mock.patch.object(procs, "psutil", None), \
+                    mock.patch.object(procs.subprocess, "run", return_value=SimpleNamespace(stdout=f"{start} {stat}\n")):
+                return procs.start_token(4242)
+
+        self.assertEqual({token(stat) for stat in ("R", "S", "Ss+", "Sl", "Rl")}, {"s:" + start})
+        for stat in ("Z", "Zs", "Z+"):
+            self.assertIsNone(token(stat))
+
     def test_the_same_start_time_with_another_command_line_is_not_ended(self):
         starter, child = self.recorded_pair()
         path = procs.procs_dir() / f"{child.pid}.json"

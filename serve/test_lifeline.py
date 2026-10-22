@@ -117,9 +117,11 @@ class Lifeline(unittest.TestCase):
             with mock.patch.object(lifeline.subprocess, "run", return_value=SimpleNamespace(stdout=f"{start} {stat}\n")):
                 tokens.add(lifeline._start_token(4242))
         self.assertEqual(tokens, {"s:" + start})
-        with mock.patch.object(lifeline.subprocess, "run", return_value=SimpleNamespace(stdout=f"{start} Z\n")):
-            self.assertEqual(lifeline._start_token(4242), "")
-        self.assertIn('"s:" + out.rsplit(None, 1)[0]', lifeline._WATCHER)   # the watcher reads it the same way
+        for stat in ("Z", "Zs", "Z+"):
+            with mock.patch.object(lifeline.subprocess, "run", return_value=SimpleNamespace(stdout=f"{start} {stat}\n")):
+                self.assertEqual(lifeline._start_token(4242), "")
+        for part in ('out.split()[-1].startswith("Z")', '"s:" + out.rsplit(None, 1)[0]'):   # the watcher reads it the same way
+            self.assertIn(part, lifeline._WATCHER)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG is Linux")
     def test_a_child_started_on_a_request_thread_outlives_that_thread_but_not_the_server(self):

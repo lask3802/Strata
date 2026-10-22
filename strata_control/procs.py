@@ -75,7 +75,8 @@ def start_token(pid: int) -> str | None:
                              timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
-    return None if not out or out.endswith("Z") else "s:" + out
+    # the start time alone: stat (R, S, Sl, ...) changes while the process runs, so it is only used to tell a zombie
+    return None if not out or out.split()[-1].startswith("Z") else "s:" + out.rsplit(None, 1)[0]
 
 
 def command_line(pid: int) -> list[str] | None:
