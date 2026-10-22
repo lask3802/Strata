@@ -290,6 +290,27 @@ class NoLeakedSampler(unittest.TestCase):
             time.sleep(0.1)
         self.assertEqual(sum(1 for t in threading.enumerate() if t.name.endswith("(_loop)")), before)
 
+    def test_close_waits_for_the_sample_in_progress(self):
+        # a sampler told to stop in the middle of a sample used to be still alive when close() returned: the next
+        # test counted it as running, and it ended during that test's count (1 != 2 above, on a busy CI runner)
+        import threading
+        from unittest import mock
+        from serve import telemetry
+        sampling = threading.Event()
+
+        def slow(_self):
+            sampling.set()
+            threading.Event().wait(0.3)
+            return {}
+
+        before = set(threading.enumerate())
+        with mock.patch.object(telemetry.Telemetry, "sample", slow):
+            tel = telemetry.Telemetry()
+            self.assertTrue(sampling.wait(5))
+            tel.close()
+        mine = [t for t in set(threading.enumerate()) - before if t.name.endswith("(_loop)")]
+        self.assertEqual(mine, [])
+
 
 # ------------------------------------------------------------------------------------------------ over HTTP
 class Server(unittest.TestCase):

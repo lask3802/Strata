@@ -103,7 +103,7 @@ def start_of(p):
         out = subprocess.run(["ps", "-o", "lstart=,stat=", "-p", str(p)], capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:
         return None
-    return None if not out or out.endswith("Z") else "s:" + out
+    return None if not out or out.endswith("Z") else "s:" + out.rsplit(None, 1)[0]   # the start time: stat changes
 os.set_blocking(0, True)
 data = b""
 while True:
@@ -134,12 +134,14 @@ _watchers_lock = threading.Lock()
 
 
 def _start_token(pid: int) -> str:
+    """The child's start time, as the watcher reads it again.  stat (here only to tell a zombie) is not part of it: a
+    child still starting up is R here and S once it waits, and the watcher then took it for another process."""
     try:
         out = subprocess.run(["ps", "-o", "lstart=,stat=", "-p", str(pid)], capture_output=True, text=True,
                              timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
-    return "" if not out or out.endswith("Z") else "s:" + out
+    return "" if not out or out.endswith("Z") else "s:" + out.rsplit(None, 1)[0]
 
 
 def _watch(child: subprocess.Popen) -> None:

@@ -105,6 +105,22 @@ class Lifeline(unittest.TestCase):
     def test_the_portable_watcher_ends_the_child_when_the_server_is_killed(self):
         self.assertEqual(self._killed_parent_takes_the_child(STRATA_LIFELINE="watcher"), "watcher")
 
+    def test_the_watchers_token_is_the_start_time_alone(self):
+        # ps's stat column is R while the child starts up and S once it sleeps: in the token, the watcher took the
+        # same child for another process and left it running (the test above: on CI now and then, in WSL every time)
+        from types import SimpleNamespace
+        from unittest import mock
+        from serve import lifeline
+        start = "Thu Oct 22 15:02:59 2026"
+        tokens = set()
+        for stat in ("R", "S", "Ss+", "Sl"):
+            with mock.patch.object(lifeline.subprocess, "run", return_value=SimpleNamespace(stdout=f"{start} {stat}\n")):
+                tokens.add(lifeline._start_token(4242))
+        self.assertEqual(tokens, {"s:" + start})
+        with mock.patch.object(lifeline.subprocess, "run", return_value=SimpleNamespace(stdout=f"{start} Z\n")):
+            self.assertEqual(lifeline._start_token(4242), "")
+        self.assertIn('"s:" + out.rsplit(None, 1)[0]', lifeline._WATCHER)   # the watcher reads it the same way
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG is Linux")
     def test_a_child_started_on_a_request_thread_outlives_that_thread_but_not_the_server(self):
         proc, info = self.launch("thread")
