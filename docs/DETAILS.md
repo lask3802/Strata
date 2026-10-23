@@ -2036,8 +2036,9 @@ A `STRATA_VERIFY_DEFER_CPU_BELOW` set then gets no line of its own.
 
 It changes the answers (teacher-forced KL against `=0`: above). Windows that run without it (one start-up
 line says why): batch windows, `--spec-split` token groups, `--remote-expert-opt`, `STRATA_PCIE_BALANCE` (its fit
-times the wait for the CPU rows), the all-resident graph (no CPU rows), a stage with no layer to defer, a control
-vector on the stage. Start-up lines when on:
+times the wait for the CPU rows), the DFlash2 taps (`--draft dflash2`, `STRATA_TAP_FILE`: a tap copies layer l's
+output before a deferred layer's CPU rows join it), the all-resident graph (no CPU rows), a stage with no layer to
+defer, a control vector on the stage. Start-up lines when on:
 `STRATA_VERIFY_DEFER_CPU=1 (the Strata Link default; STRATA_VERIFY_DEFER_CPU=0 turns it off) (changes the output)`
 (without the default's part when it is set), then the split's (below)
 `STRATA_VERIFY_DEFER_CPU_BELOW=0.1 (the default): a deferred layer waits for its CPU rows of routing weight >= 0.1 ...`
