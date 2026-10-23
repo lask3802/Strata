@@ -1,7 +1,9 @@
 // On-disk persistence of a conversation's state (SavedConversation): one file holding the running state, the
 // checkpoints the caller passes (the engine passes only the deepest one), every QSA layer's authoritative K/V and
 // the draft layer's K/V.  Pure host code: no CUDA.  Format v1 and the fail-closed read order are in
-// docs/DETAILS.md (Session files).
+// docs/DETAILS.md (Session files).  Format v2 is a remote stage's file: v1's header and payload with a worker's part
+// (its layers, docs/remote-stage/SESSIONS.md) in front of the payload, handed through as a stream, never parsed by
+// the process that writes or reads the file.
 //
 // Format v1 is little-endian, with fixed-width integers and IEEE-754 floats; a big-endian build is refused at
 // compile time.  The hashes detect accidental corruption; they do not authenticate a file: restore trusted files only.
@@ -115,7 +117,8 @@ std::vector<SessionModelFile> session_model_inputs(const SessionInputs& inputs);
 //   storage   no room on the disk: the free-space preflight, or ENOSPC / EDQUOT / EFBIG (507)
 //   memory    the RAM preflight refused it, or an allocation failed (503)
 //   io        any other failure: permissions, read/write/flush/rename errors, a missing folder (500)
-enum class SessionError { none, invalid, storage, memory, io };
+//   link      a remote stage's link to its worker failed in the middle of it (503; the next request connects again)
+enum class SessionError { none, invalid, storage, memory, io, link };
 const char* session_error_name(SessionError e);
 struct SessionStatus {
     SessionError error = SessionError::none;
@@ -140,6 +143,16 @@ using SessionPhase = std::function<void(const char* phase, uint64_t bytes)>;
 // 4 MiB (a slow disk or network folder at 4 MiB/s), at most an hour.  1.2 GB: 345 s.
 int64_t session_phase_limit_s(uint64_t bytes);
 
+// Format v2 (a remote stage): the worker's part of the file, `bytes` long, written in front of this process's payload.
+// `stream` hands it over in order through `write` (pieces of any size, exactly `bytes` in all); a false `write` is
+// the file's own failure (the stream then returns false without a reason of its own), a false stream with `why` and
+// `kind` is the part's.  bytes 0: no part, format v1 (byte for byte as without this).
+struct SessionStageOut {
+    uint64_t bytes = 0;
+    std::function<bool(const std::function<bool(const void* data, size_t n)>& write, std::string& why,
+                       SessionError& kind)> stream;
+};
+
 // Optional knobs of a write.
 struct SessionWriteOptions {
     // the free-space PREFLIGHT: refused when the disk has less than the new file plus this many bytes free before the
@@ -151,6 +164,8 @@ struct SessionWriteOptions {
     SessionPhase phase;
     // tests: return an errno value to make a step fail ("write", "file_flush", "rename", "dir_flush"), 0 to go on
     std::function<int(const char* step)> fault;
+    // format v2: the worker's part (SessionStageOut).  It counts toward the free-space preflight.
+    SessionStageOut stage;
 };
 
 // Writes a temporary file beside `path` (a unique hidden name, created exclusively: never an existing file or link;
@@ -222,6 +237,14 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // Format v2 (a remote stage): the worker's part, handed over as the file is read and before this process's payload
+    // is parsed.  `read` gives its next n bytes (false: the file failed; the read reports why); `stage` must read
+    // exactly `bytes` or fail with `why` and `kind`.  Set: only a v2 file is read (a v1 one is refused); unset: only
+    // v1 (a v2 one is refused).  The limits above, the size limit and the RAM preflight then cover this process's
+    // payload; `max_stage_bytes` bounds the part, from the header, before anything else is read.
+    std::function<bool(uint64_t bytes, const std::function<bool(void* data, size_t n)>& read, std::string& why,
+                       SessionError& kind)> stage;
+    uint64_t max_stage_bytes = UINT64_MAX;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
@@ -234,6 +257,30 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes);
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
+
+// ---- A remote stage worker's part of a v2 file (docs/remote-stage/SESSIONS.md).  The worker writes and reads it as a
+// stream over the link, never a file: magic "STRSPRT\x01", version u32 (1), header size u32 (32), the worker's own
+// model and config fingerprints (u64 each), then format v1's payload for its layers (geometry, layer range, cvec flag,
+// the live state, its checkpoints, its K/V layers - no draft layer).  No hash of its own: the file's payload hash
+// covers it, and the main process checks that before the worker puts the part in place.
+// `kv` as for session_file_write; `bytes`: the part's size (no state read).
+bool session_part_bytes(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                        const SessionFileIdentity& id, uint64_t& bytes, std::string& error);
+// The part through `send`, in blocks of at most 16 MiB (the K/V read straight into them), exactly session_part_bytes
+// in all; `progress` after each block.  A false `send` ends it (`error` its reason).
+bool session_part_write(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                        const SessionFileIdentity& id,
+                        const std::function<bool(const void* data, size_t n, std::string& why)>& send,
+                        uint64_t& bytes, std::string& error, const SessionProgress& progress = {});
+// The largest part these limits admit (UINT64_MAX when one of them is open), as session_read_max_file_bytes.
+uint64_t session_part_max_bytes(const SessionReadLimits& limits);
+// Reads a part of `bytes` through `read` (pieces of any size; false: the stream failed, `why` its reason), checking
+// what session_file_read checks of a payload: the size against the limits first, the magic, the identity before the
+// payload, every count before its allocation, and every byte consumed.  `limits.admit`, when set, is asked for
+// session_read_peak_bytes(bytes) before the payload; `limits.stage` is not used.  On failure `image` is unchanged.
+bool session_part_read(uint64_t bytes, const std::function<bool(void* data, size_t n, std::string& why)>& read,
+                       const SessionFileIdentity& id, SavedConversation& image, std::string& error,
+                       const SessionReadLimits& limits = {}, SessionStatus* status = nullptr);
 
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC

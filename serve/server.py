@@ -442,10 +442,11 @@ class RemoteStageLost(ValueError):
 
 class SessionRefused(ValueError):
     """Disk sessions: the engine refused or failed a SAVE / RESTORE and is still in step (`SERR <kind> <published>
-    <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500); `published`:
-    a save whose new file already replaced the old one before a later step (the folder flush) failed."""
+    <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500), link (503: a
+    remote stage's link to its worker failed in the middle of it; the next request connects again); `published`: a
+    save whose new file already replaced the old one before a later step (the folder flush) failed."""
 
-    STATUS = {"invalid": 400, "storage": 507, "memory": 503, "io": 500}
+    STATUS = {"invalid": 400, "storage": 507, "memory": 503, "io": 500, "link": 503}
 
     def __init__(self, kind: str, message: str, published: bool = False):
         super().__init__(message)

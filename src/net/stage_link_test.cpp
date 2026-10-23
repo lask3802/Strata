@@ -51,6 +51,13 @@
 //      window's and a chunk's rows back rounded to bf16, in half the bytes, one listing fp32 only gets them exact; the
 //      worker's sizes follow the agreed format (an fp32-sized window or chunk on a bf16 link is malformed), and a
 //      second hello on a connection agrees again; a chunk larger than one conversion slice comes back whole.
+//  17. session files (docs/remote-stage/SESSIONS.md): a SessionSave only where the session is and of a checkpoint the
+//      worker holds; the part comes back whole in the handler's blocks and is let go after its pull, at another
+//      message or at a disconnect; a sink that fails is given nothing more and a worker that fails part-way answers in
+//      place of a block, the link in step both times; a load the worker cannot take is refused before a byte is sent,
+//      one it refuses part-way is drained there, one the main process gives up ends at once; SessionEnd puts the part
+//      in place (the session at its tokens, its checkpoint under the new id); a malformed SessionSave is answered, a
+//      block out of place or over 16 MiB ends the connection; a worker without the handlers answers an error.
 // The handlers run on the worker's serving thread: what they share with the test is behind a mutex or atomic.
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/net/stage_ckpt_store.hpp"
@@ -1463,6 +1470,402 @@ int main() {
             check(greet16(0, 1), "... the same one served");
             worker_kv_type = 0;
             wk16.stop();
+        }
+    }
+
+    // 17. session files: the worker's part across the link (SessionSave / SessionPull / SessionLoad / SessionEnd)
+    {
+        // the worker's part here: its token count, the ids, the checkpoint's tokens, then filler to `pad` bytes
+        struct Sess {
+            std::mutex mu;
+            std::vector<unsigned char> held, applied;
+            int64_t held_ckpt = 0, applied_id = -1;
+            int ends = 0, drops = 0;
+            size_t pull_block = 1000, pad = 50000, load_piece = 777;
+            int load_delay_ms = 0;   // before a load's handler reads its first byte
+            std::chrono::steady_clock::time_point read_from;   // when it started reading
+            uint64_t load_max = (uint64_t) 1 << 30;
+            bool fail_pull = false, fail_parse = false;
+        } s;
+        auto make_part = [&](const std::vector<int32_t>& ids, int64_t ckpt_tokens) {
+            std::vector<unsigned char> p(s.pad, 0);
+            const int64_t n = (int64_t) ids.size();
+            std::memcpy(p.data(), &n, 8);
+            std::memcpy(p.data() + 8, &ckpt_tokens, 8);
+            std::memcpy(p.data() + 16, ids.data(), ids.size() * 4);
+            for (size_t i = 16 + ids.size() * 4; i < p.size(); ++i) p[i] = (unsigned char) (i * 13);
+            return p;
+        };
+        StageHandlers hs = h;
+        hs.session_save = [&](const std::vector<int32_t>& ids, int64_t ckpt_id, int64_t ckpt_tokens, uint64_t& bytes,
+                              std::string& e) {
+            std::lock_guard<std::mutex> lk(s.mu);
+            if (ckpt_id != 0 && w.store.find(ckpt_id) == nullptr) {
+                e = "io: checkpoint " + std::to_string(ckpt_id) + " not held (test)";
+                return false;
+            }
+            s.held = make_part(ids, ckpt_tokens);
+            bytes = s.held.size();
+            return true;
+        };
+        hs.session_pull = [&](const std::function<bool(const void*, size_t, std::string&)>& send, std::string& e) {
+            std::vector<unsigned char> part;
+            size_t block = 0;
+            bool fail = false;
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                part.swap(s.held);
+                block = s.pull_block;
+                fail = s.fail_pull;
+            }
+            for (size_t at = 0, n = 0; at < part.size(); at += block, ++n) {
+                if (fail && n == 2) {
+                    e = "io: the device copy failed (test)";
+                    return false;
+                }
+                if (!send(part.data() + at, std::min(block, part.size() - at), e)) return false;
+            }
+            return true;
+        };
+        hs.session_load_begin = [&](uint64_t bytes, std::string& e) {
+            std::lock_guard<std::mutex> lk(s.mu);
+            if (bytes <= s.load_max) return true;
+            e = "memory: no RAM for a part of " + std::to_string(bytes) + " bytes (test)";
+            return false;
+        };
+        hs.session_load = [&](uint64_t bytes, const std::function<bool(void*, size_t, std::string&)>& read,
+                              int64_t& tokens, int64_t& ckpt_tokens, std::string& e) {
+            size_t piece = 0;
+            bool fail = false;
+            int delay = 0;
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                piece = s.load_piece;
+                fail = s.fail_parse;
+                delay = s.load_delay_ms;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.read_from = std::chrono::steady_clock::now();
+            }
+            std::vector<unsigned char> p((size_t) bytes);
+            for (size_t at = 0; at < p.size(); at += piece) {
+                if (fail && at >= 1000) {
+                    e = "invalid: a bad part (test)";
+                    return false;
+                }
+                if (!read(p.data() + at, std::min(piece, p.size() - at), e)) return false;
+            }
+            std::memcpy(&tokens, p.data(), 8);
+            std::memcpy(&ckpt_tokens, p.data() + 8, 8);
+            std::lock_guard<std::mutex> lk(s.mu);
+            s.held.swap(p);
+            s.held_ckpt = ckpt_tokens;
+            return true;
+        };
+        hs.session_end = [&](bool apply, int64_t ckpt_id, std::string&) {
+            std::lock_guard<std::mutex> lk(s.mu);
+            ++s.ends;
+            if (!apply) {
+                ++s.drops;
+                s.held.clear();
+                return true;
+            }
+            s.applied.swap(s.held);
+            s.held.clear();
+            s.applied_id = ckpt_id;
+            std::lock_guard<std::mutex> lw(w.mu);
+            w.store.clear();
+            if (ckpt_id != 0 && s.held_ckpt > 0) {
+                StageCkptStore::Part p;
+                p.L = s.held_ckpt;
+                w.store.put(ckpt_id, std::move(p), {ckpt_id});
+            }
+            return true;
+        };
+        auto drops = [&] {
+            std::lock_guard<std::mutex> lk(s.mu);
+            return s.drops;
+        };
+        Worker wk17;
+        if (!wk17.start(hs, buf)) {
+            check(false, "a worker for session files");
+        } else {
+            StageClient cl;
+            std::string err;
+            StageHello peer;
+            bool stored = false, failed = false;
+            int64_t tokens = -1, ckpt_tokens = -1;
+            uint64_t bytes = 0;
+            std::vector<int32_t> ids8(8);
+            for (size_t i = 0; i < ids8.size(); ++i) ids8[i] = (int32_t) (100 + i);
+            std::vector<unsigned char> got;
+            size_t blocks = 0;
+            const auto collect = [&](const void* p, size_t n, std::string&) {
+                ++blocks;
+                got.insert(got.end(), (const unsigned char*) p, (const unsigned char*) p + n);
+                return true;
+            };
+            auto prompt = [&] {   // a reset and a chunk: the session at kChunk
+                std::fill(back.begin(), back.end(), 0.0f);
+                return cl.reset({}, err) && cl.prefill_send(tok.data(), kChunk, 0, 0, rows.data(), (size_t) kD, 0, err) &&
+                       cl.prefill_recv(back.data(), (size_t) kD, kChunk, 0, err) && back == rows;
+            };
+            check(cl.connect(wk17.where, hello_of(), peer, err) && prompt() &&
+                      cl.ckpt_save(11, kChunk, {11}, stored, err) && stored,
+                  "a session at 8 tokens with a checkpoint (11) there");
+            check(!cl.session_save(std::vector<int32_t>(5, 1), 0, 0, bytes, err) && contains(err, "io: ") &&
+                      contains(err, "the worker's session is at 8") && cl.connected(),
+                  "a save where the session is not: an io error, the link stays");
+            check(!cl.session_save(ids8, 12, 8, bytes, err) && contains(err, "checkpoint 12 not held") && cl.connected(),
+                  "a save of a checkpoint the worker does not hold: its error, the link stays");
+            check(!cl.session_save(ids8, 11, 9, bytes, err) && contains(err, "bad checkpoint"),
+                  "a checkpoint past the session's end: refused");
+            const std::vector<unsigned char> want = make_part(ids8, kChunk);
+            check(cl.session_save(ids8, 11, kChunk, bytes, err) && bytes == want.size() &&
+                      cl.session_pull(bytes, collect, failed, err) && !failed && got == want && blocks == 50,
+                  "save, then pull: the part whole, in the handler's 1000-byte blocks, ids and checkpoint as sent");
+            check(!cl.session_pull(bytes, collect, failed, err) && contains(err, "no session part is held") &&
+                      cl.reset({}, err),
+                  "a second pull: nothing held (let go after the first), the link in step");
+            int d0 = drops();
+            check(prompt() && cl.session_save(ids8, 0, 0, bytes, err) && cl.reset({}, err) && drops() == d0 + 1 &&
+                      !cl.session_pull(bytes, collect, failed, err) && contains(err, "no session part is held"),
+                  "another message after a save lets the held part go");
+            size_t calls = 0;
+            const auto sink_fails = [&](const void*, size_t, std::string& why) {
+                if (++calls < 2) return true;
+                why = "the disk is full (test)";
+                return false;
+            };
+            check(prompt() && cl.session_save(ids8, 0, 0, bytes, err) &&
+                      !cl.session_pull(bytes, sink_fails, failed, err) && failed && calls == 2 &&
+                      contains(err, "the disk is full (test)") && cl.connected() && cl.reset({}, err),
+                  "a sink that fails: given nothing more, its reason, the rest read (the link in step)");
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.fail_pull = true;
+            }
+            got.clear();
+            check(prompt() && cl.session_save(ids8, 0, 0, bytes, err) && !cl.session_pull(bytes, collect, failed, err) &&
+                      !failed && contains(err, "device copy failed (test)") && got.size() == 2000 && cl.connected() &&
+                      cl.reset({}, err),
+                  "the worker failing part-way: its error in place of a block, the link in step");
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.fail_pull = false;
+                s.load_max = 1000;
+            }
+            size_t reads = 0;
+            const auto from = [&](const std::vector<unsigned char>& src, size_t& at) {
+                return [&src, &at, &reads](void* p, size_t n, std::string& why) {
+                    ++reads;
+                    if (n > src.size() - at) { why = "past the end (test)"; return false; }
+                    std::memcpy(p, src.data() + at, n);
+                    at += n;
+                    return true;
+                };
+            };
+            size_t at = 0;
+            check(!cl.session_load(want.size(), from(want, at), tokens, ckpt_tokens, failed, err) && !failed &&
+                      reads == 0 && contains(err, "memory: ") && cl.connected() && cl.reset({}, err),
+                  "a load the worker cannot take: refused before a byte is sent");
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.load_max = (uint64_t) 1 << 30;
+            }
+            // the part back into a session somewhere else (0 after the reset): in place, the session is at its end
+            at = 0;
+            check(cl.reset({}, err) && cl.session_load(want.size(), from(want, at), tokens, ckpt_tokens, failed, err, 4096) &&
+                      tokens == kChunk && ckpt_tokens == kChunk && at == want.size() && reads == 13,
+                  "load in 4 KiB blocks: read whole, its tokens and checkpoint's");
+            check(cl.session_end(true, 21, err) && w.has(21) && !w.has(11) && w.size() == 1,
+                  "end with apply: in place, its checkpoint kept under the new id, nothing else");
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                check(s.applied == want && s.applied_id == 21, "... the part the handler put in place");
+            }
+            check(cl.ckpt_save(22, kChunk, {21, 22}, stored, err) && stored &&
+                      !cl.ckpt_save(23, 3, {21, 22, 23}, stored, err) && contains(err, "session is at 8"),
+                  "after it the worker's session is at the part's tokens (a checkpoint there is stored)");
+            check(!cl.session_end(true, 30, err) && contains(err, "no session part is loaded") && cl.connected(),
+                  "end with apply and nothing loaded: refused, the link stays");
+            size_t given = 0;
+            const auto gives_up = [&](void* p, size_t n, std::string& why) {
+                if (++given < 3) {
+                    std::memset(p, 0, n);
+                    return true;
+                }
+                why = "the file failed (test)";
+                return false;
+            };
+            d0 = drops();
+            check(!cl.session_load(want.size(), gives_up, tokens, ckpt_tokens, failed, err, 1000) && failed &&
+                      contains(err, "the file failed (test)") && cl.connected() && cl.reset({}, err),
+                  "a source that fails: the part given up, its reason, the link in step");
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.fail_parse = true;
+            }
+            at = 0;
+            check(!cl.session_load(want.size(), from(want, at), tokens, ckpt_tokens, failed, err, 1000) && !failed &&
+                      contains(err, "invalid: a bad part (test)") && at == want.size() && cl.connected() &&
+                      cl.reset({}, err),
+                  "a part the worker refuses part-way: sent whole, the rest drained there, its error, the link in step");
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.fail_parse = false;
+            }
+            at = 0;
+            check(cl.session_load(want.size(), from(want, at), tokens, ckpt_tokens, failed, err) &&
+                      cl.reset({}, err) && drops() > d0 && !cl.session_end(true, 30, err) &&
+                      contains(err, "no session part is loaded"),
+                  "a loaded part another message comes before: let go");
+            at = 0;
+            check(cl.session_load(want.size(), from(want, at), tokens, ckpt_tokens, failed, err) &&
+                      cl.session_end(false, 0, err) && !cl.session_end(true, 30, err),
+                  "end without apply: the loaded part let go");
+            // at most two blocks wait in the worker's reader: a handler that reads nothing yet holds the main process's
+            // sends back.  128 MiB in 16 MiB blocks, the handler 2 s late: the last block is taken from the source after
+            // the handler started reading (without the limit the reader takes all of it meanwhile, and the source is done
+            // before)
+            {
+                {
+                    std::lock_guard<std::mutex> lk(s.mu);
+                    s.pad = (size_t) 128 << 20;
+                    s.load_piece = (size_t) 1 << 20;
+                    s.load_delay_ms = 2000;
+                }
+                const std::vector<unsigned char> big = make_part(ids8, 0);
+                size_t bat = 0;
+                SteadyClock::time_point last_block;
+                const auto timed = [&](void* p, size_t n, std::string& why) {
+                    if (n > big.size() - bat) { why = "past the end (test)"; return false; }
+                    std::memcpy(p, big.data() + bat, n);
+                    bat += n;
+                    last_block = SteadyClock::now();
+                    return true;
+                };
+                const bool loaded = cl.session_load(big.size(), timed, tokens, ckpt_tokens, failed, err) &&
+                                    tokens == kChunk && bat == big.size();
+                double after_ms = 0;   // the last block's take, after the handler's start
+                {
+                    std::lock_guard<std::mutex> lk(s.mu);
+                    after_ms = ms_between(s.read_from, last_block);
+                }
+                std::printf("  (the last block taken %.0f ms after the handler started reading)\n", after_ms);
+                check(loaded && after_ms > 0 && cl.session_end(false, 0, err),
+                      "a load's blocks wait for the worker's reader: two at most in its queue");
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.pad = 50000;
+                s.load_piece = 777;
+                s.load_delay_ms = 0;
+            }
+            // a Commit that failed before a load the worker refused stays pending: the session it was in goes on
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.load_max = 1;
+            }
+            fail_commit = true;
+            at = 0;
+            const bool pending = prompt() &&
+                                 cl.run(1, wtok.data(), kChunk, win.data(), (size_t) kHbf, wout.data(), (size_t) kHbf, err) &&
+                                 cl.commit(1, err) &&
+                                 !cl.session_load(want.size(), from(want, at), tokens, ckpt_tokens, failed, err);
+            fail_commit = false;
+            {
+                std::lock_guard<std::mutex> lk(s.mu);
+                s.load_max = (uint64_t) 1 << 30;
+            }
+            check(pending && !cl.ckpt_save(31, kChunk + 1, {31}, stored, err) && contains(err, "a commit failed (test)"),
+                  "a failed Commit before a refused load still comes back on the next CkptSave");
+            // a disconnect with a part held lets it go
+            at = 0;
+            d0 = drops();
+            check(cl.session_load(want.size(), from(want, at), tokens, ckpt_tokens, failed, err), "a part held ...");
+            cl.close();
+            for (int i = 0; i < 200 && drops() == d0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            check(drops() == d0 + 1, "... let go at a disconnect");
+            // by hand: a SessionSave of 2^62 tokens and a SessionData outside a load
+            std::vector<char> hello_raw(sizeof(StageHeader) + sizeof(StageHello));
+            {
+                StageHeader hh;
+                hh.type = (uint32_t) StageMsg::Hello;
+                hh.bytes = sizeof(StageHello);
+                const StageHello hl = hello_of();
+                std::memcpy(hello_raw.data(), &hh, sizeof hh);
+                std::memcpy(hello_raw.data() + sizeof hh, &hl, sizeof hl);
+            }
+            {
+                Raw p;
+                bool ok = p.open(wk17.where);
+                p.send(hello_raw.data(), hello_raw.size());
+                StageHeader r;
+                std::string m;
+                ok = ok && p.reply(r, m) && r.type == (uint32_t) StageMsg::HelloOk;
+                p.header(StageMsg::SessionSave, (int64_t) 1 << 62, 0);
+                ok = ok && p.reply(r, m) && r.type == (uint32_t) StageMsg::Error && contains(m, "bad session save");
+                p.header(StageMsg::SessionSave, 2, 12);   // the ids of 2 tokens are 8 bytes
+                p.send(std::string(12, '\0').data(), 12);
+                ok = ok && p.reply(r, m) && r.type == (uint32_t) StageMsg::Error && contains(m, "bad session save");
+                p.header(StageMsg::SessionPull, 0, 0);
+                ok = ok && p.reply(r, m) && r.type == (uint32_t) StageMsg::Error && contains(m, "no session part");
+                check(ok, "a SessionSave whose size is wrong or wraps: malformed, answered, the link in step");
+                p.header(StageMsg::SessionData, 0, 16);
+                p.send(std::string(16, 'x').data(), 16);
+                check(p.closed_by_worker(), "a SessionData outside a load: the connection ends");
+            }
+            {
+                Raw p;
+                bool ok = p.open(wk17.where);
+                p.send(hello_raw.data(), hello_raw.size());
+                StageHeader r;
+                std::string m;
+                ok = ok && p.reply(r, m) && r.type == (uint32_t) StageMsg::HelloOk;
+                p.header(StageMsg::SessionLoad, 100, 0);
+                ok = ok && p.reply(r, m) && r.type == (uint32_t) StageMsg::SessionOk;
+                p.header(StageMsg::SessionData, 0, kStageSessionBlock + 1);
+                check(ok && p.closed_by_worker(), "a block larger than 16 MiB in a load: the connection ends, unread");
+            }
+            {
+                Raw p;
+                bool ok = p.open(wk17.where);
+                p.send(hello_raw.data(), hello_raw.size());
+                StageHeader r;
+                std::string m;
+                ok = ok && p.reply(r, m) && r.type == (uint32_t) StageMsg::HelloOk;
+                p.header(StageMsg::SessionLoad, 100, 0);
+                ok = ok && p.reply(r, m) && r.type == (uint32_t) StageMsg::SessionOk;
+                p.header(StageMsg::Reset, 0, 0);
+                check(ok && p.closed_by_worker(), "another message in place of a load's block: the connection ends");
+            }
+            check(cl.connect(wk17.where, hello_of(), peer, err) && cl.reset({}, err), "... and the worker serves on");
+            cl.close();
+            wk17.stop();
+        }
+        // a worker without the handlers (a main process asks none: it has no kStageCapSession; this one answers)
+        Worker wk17b;
+        if (!wk17b.start(h, buf)) {
+            check(false, "a worker without session handlers");
+        } else {
+            StageClient cl;
+            std::string err;
+            StageHello peer;
+            uint64_t bytes = 0;
+            int64_t tokens = 0, ckpt_tokens = 0;
+            bool failed = false;
+            std::vector<int32_t> ids8(8, 1);
+            const bool saved = cl.connect(wk17b.where, hello_of(), peer, err) && cl.reset({}, err) &&
+                               cl.prefill_send(tok.data(), kChunk, 0, 0, rows.data(), (size_t) kD, 0, err) &&
+                               cl.prefill_recv(back.data(), (size_t) kD, kChunk, 0, err) &&
+                               !cl.session_save(ids8, 0, 0, bytes, err) && contains(err, "takes no session files");
+            check(saved && !cl.session_load(10, [](void*, size_t, std::string&) { return true; }, tokens, ckpt_tokens,
+                                            failed, err) &&
+                      contains(err, "takes no session files") && cl.reset({}, err),
+                  "a worker without session handlers: an error, the link in step");
+            cl.close();
+            wk17b.stop();
         }
     }
 

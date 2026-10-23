@@ -237,7 +237,8 @@ strata --serve --stage-worker 7841 --stage-begin 24 --stage-end 40 --stage-next 
 ```
 
 Measured with three PCs (the tables above). A relay carries every prompt chunk and every window twice, so give it the
-fastest link: on 1 GbE the relay's link was the limit.
+fastest link: on 1 GbE the relay's link was the limit. A relay does not forward session files
+([below](#session-files-save-and-restore-a-conversation)).
 
 ## Images (`--vision`)
 
@@ -254,6 +255,23 @@ first text request after a picture sends "plain positions again" (no table); oth
 
 The hello checks it: a worker without `--vision` refuses a main process with it. A worker with `--vision` serves a
 main process without it.
+
+## Session files (save and restore a conversation)
+
+The slot API's save and restore (`POST /slots/0?action=save|restore`, the server started with `--slot-save-path`,
+[DETAILS.md](DETAILS.md)) work on a split of two PCs, with `--prompt-cache N` on the main process as on one card. One
+file on the main PC holds the whole conversation: the main process's layers and the worker's. The worker's part
+crosses the link during the save and the restore; the worker never writes or reads a file, and needs no folder.
+
+- A file restores on a main process of the **same split**: the same K, the same model files and settings on both PCs
+  (each side checks its own). The worker may have been started again, or be another PC with the same setup.
+- A file saved on one card does not restore on a split, and a split's file does not restore on one card.
+- A **relay worker** (more than two PCs) does not forward session files: the main process refuses them, with a line
+  that says so. So does a worker of an earlier build.
+- If the link fails during a save or a restore, that request fails (`503`, `error.kind: link`) and the main engine
+  stays; the next request connects again and reads its prompt from token 0.
+
+Design, protocol and every check: [remote-stage/SESSIONS.md](remote-stage/SESSIONS.md).
 
 ## Options
 

@@ -1385,8 +1385,10 @@ this session's limits; the session is as it was); `404` for a restore of a missi
 loaded, when the RAM to read the file is not there or an allocation failed; `507` when the disk has no room (the
 free-space reserve, or the OS reports no space or quota); `500` for any other I/O failure (permissions, read, write,
 flush, rename) and when the engine ended (a restore transfer failure, below, an engine that said nothing for
-`engine_silence_s`, or one that answered out of protocol) - the next request starts it again. The status follows the
-engine's category (`error.kind`: `invalid`, `memory`, `storage`, `io`), never the words of the message. A save that
+`engine_silence_s`, or one that answered out of protocol) - the next request starts it again; with a remote stage,
+`503` also when the link to the worker failed during the save or restore (the engine stays, the next request
+connects again). The status follows the engine's category (`error.kind`: `invalid`, `memory`, `storage`, `io`,
+`link`), never the words of the message. A save that
 failed after its new file had replaced the old one says so with `error.published: true` (below). A save or restore waits for the running request
 (the same queue), shows in `/status` and counts as activity for the idle unload. A later request whose messages
 continue the restored conversation reuses the restored state or its checkpoint; a short tail may be read again (35
@@ -1397,7 +1399,7 @@ export. Underneath, `strata --serve` takes `SAVE <path>` and `RESTORE <path>` on
 the engine and the session as they were) or `FATAL <reason>` (then exits). On the way, `SESSION <done> <total>` follows
 every block of the file that moved (at most 16 MiB, the last partial block and a small file included), and
 `SWAIT <phase> <seconds>` comes before a step that blocks in one call (`fingerprint`, `capture`, `flush`, `publish`,
-`validate`, `transfer`): that step is allowed those seconds - 60 plus one per 4 MiB it concerns, at most 3600 - by the
+`validate`, `transfer`, and `remote` for the worker's step with a remote stage): that step is allowed those seconds - 60 plus one per 4 MiB it concerns, at most 3600 - by the
 engine's watchdog and by the server, then it counts as stuck. The next line clears the allowance. The server checks
 every line: a malformed or unknown one, counts that are negative or go back, an allowance outside 1..3600 or a time
 that is not a finite number end the engine as out of step.
@@ -1442,7 +1444,13 @@ and then the usual snapshot validation - all before any device write, and a refu
 was. A transfer failure after the device writes began ends the engine (`FATAL`) rather than decode from a partial
 state; the server reports `500` and starts it again. A restore does not park the outgoing session. Not supported with
 `--layer-split`, `--peer-device`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
-`--prompt-cache 0` (the RAM conversation cache need not be on). On Linux the file
+`--prompt-cache 0` (the RAM conversation cache need not be on). With a remote stage (`--remote-stage` on the main
+PC, `--stage-worker` on the other), one file on the main PC holds the whole conversation: the main process's layers
+and the worker's, which cross the link during the save and the restore. The worker never writes or reads a file.
+Such a file is format v2 and restores only on a main process of the same split; a one-process file does not restore
+there, and a v2 file does not restore on one process. A relay worker (`--stage-next`) does not forward session
+files, so the main process refuses them. How it works, and what it refuses:
+[docs/remote-stage/SESSIONS.md](remote-stage/SESSIONS.md). On Linux the file
 moves with `O_DIRECT` in 16 MiB blocks when the filesystem takes it (buffered I/O otherwise, or with
 `STRATA_SESSION_BUFFERED=1`); on Windows with buffered I/O. The engine has been run on Linux/CUDA only. An earlier
 revision's CPU file-I/O test passed as a 32-bit Windows executable under Wine; the current code has not been built

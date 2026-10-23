@@ -3,6 +3,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <new>
 #include <utility>
@@ -116,6 +118,23 @@ bool same(const SavedConversation& a, const SavedConversation& b) {
             !(x.pooled == y.pooled)) return false;
     }
     return true;
+}
+
+// the image's K/V as streamed sources (read in place, no copy), as the engine hands them to a write
+std::vector<SessionKvSource> sources_of(const SavedConversation& s) {
+    std::vector<SessionKvSource> sources;
+    for (const auto& k : s.kv) {
+        SessionKvSource src;
+        src.format = k.format; src.cells = k.cells; src.heads = k.heads; src.head_dim = k.head_dim;
+        src.page_size = k.page_size; src.pooled_rows = k.pooled_rows; src.idx_dim = k.idx_dim;
+        const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+        for (size_t i = 0; i < 5; ++i) src.sizes[i] = parts[i]->size();
+        src.read = [parts](size_t part, size_t offset, void* dst, size_t n) {
+            return parts[part]->read(dst, offset, n);
+        };
+        sources.push_back(std::move(src));
+    }
+    return sources;
 }
 
 std::vector<char> slurp(const fs::path& p) {
@@ -241,10 +260,11 @@ int main() {
     // other model or other configuration
     check(rejects(good, {id.model ^ 1, id.config}, "model"), "different model fingerprint rejected");
     check(rejects(good, {id.model, id.config ^ 1}, "config"), "different configuration rejected");
-    // wrong version: header field patched and header hash recomputed so only the version differs
+    // wrong version: header field patched and header hash recomputed so only the version differs (2 is a remote
+    // stage's: below)
     {
         auto d = image;
-        uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
+        uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);
         const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
         const fs::path p = dir / "ver.bin"; spit(p, d);
         check(rejects(p, id, "version"), "unknown version rejected");
@@ -334,18 +354,7 @@ int main() {
     {
         SavedConversation meta = original;
         meta.kv.clear();
-        std::vector<SessionKvSource> sources;
-        for (const auto& k : original.kv) {
-            SessionKvSource s;
-            s.format = k.format; s.cells = k.cells; s.heads = k.heads; s.head_dim = k.head_dim;
-            s.page_size = k.page_size; s.pooled_rows = k.pooled_rows; s.idx_dim = k.idx_dim;
-            const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
-            for (size_t i = 0; i < 5; ++i) s.sizes[i] = parts[i]->size();
-            s.read = [parts](size_t part, size_t offset, void* dst, size_t n) {
-                return parts[part]->read(dst, offset, n);
-            };
-            sources.push_back(std::move(s));
-        }
+        const std::vector<SessionKvSource> sources = sources_of(original);
         const fs::path p = dir / "streamed.bin";
         check(session_file_write(p.string(), meta, sources, id, written, error), "streamed write succeeds");
         check(slurp(p) == image, "streamed write equals the captured-image write");
@@ -358,6 +367,231 @@ int main() {
         // K/V in the image and as sources at once is ambiguous: refused
         check(!session_file_write((dir / "both.bin").string(), original, sources, id, written, error),
               "image K/V plus sources refused");
+    }
+
+    // ---- a remote stage worker's part (format v2's), as the worker writes it to the link and reads it back
+    const SessionFileIdentity wid{0x0123456789abcdefull, 0x0fedcba987654321ull};   // the worker's own identity
+    SavedConversation worker = sample();   // its layers: another range, fewer K/V layers (no draft)
+    worker.layer_lo = 26;
+    worker.kv.pop_back();
+    SavedConversation wmeta = worker;
+    wmeta.kv.clear();
+    const std::vector<SessionKvSource> wsrc = sources_of(worker);
+    std::vector<uint8_t> part;
+    {
+        uint64_t announced = 0, sent = 0;
+        size_t blocks = 0;
+        bool small = true;
+        const std::function<bool(const void*, size_t, std::string&)> collect = [&](const void* p, size_t n, std::string&) {
+            ++blocks;
+            small = small && n >= 1 && n <= (16u << 20);
+            part.insert(part.end(), (const uint8_t*) p, (const uint8_t*) p + n);
+            return true;
+        };
+        check(session_part_bytes(wmeta, wsrc, wid, announced, error), "part: its size, no state read");
+        check(session_part_write(wmeta, wsrc, wid, collect, sent, error) && sent == announced && part.size() == announced,
+              "part: written whole, the size it announced");
+        check(blocks >= 2 && small, "part: in blocks of 1 byte to 16 MiB");
+        check(std::memcmp(part.data(), "STRSPRT\x01", 8) == 0, "part: magic");
+        const fs::path p = dir / "worker-v1.bin";
+        check(session_file_write(p.string(), worker, wid, written, error), "part: the same image as a v1 file");
+        const std::vector<char> v1 = slurp(p);
+        check(part.size() - 32 == v1.size() - 64 - 16 && std::memcmp(part.data() + 32, v1.data() + 64, part.size() - 32) == 0,
+              "part: after its 32-byte header, format v1's payload byte for byte");
+        size_t calls = 0;
+        const std::function<bool(const void*, size_t, std::string&)> failing = [&](const void*, size_t, std::string& why) {
+            if (++calls < 2) return true;
+            why = "the link went (test)";
+            return false;
+        };
+        check(!session_part_write(wmeta, wsrc, wid, failing, sent, error) && error.find("the link went (test)") != std::string::npos,
+              "part: a send that fails part-way ends the write with its reason");
+    }
+    // a reader over bytes in hand, as the link hands a block at a time
+    struct Bytes {
+        const std::vector<uint8_t>& d;
+        size_t at = 0, calls = 0;
+        std::function<bool(void*, size_t, std::string&)> fn() {
+            return [this](void* p, size_t n, std::string& why) {
+                ++calls;
+                if (n > d.size() - at) { why = "the stream ran out (test)"; return false; }
+                std::memcpy(p, d.data() + at, n);
+                at += n;
+                return true;
+            };
+        }
+    };
+    {
+        SavedConversation back;
+        Bytes r{part};
+        check(session_part_read(part.size(), r.fn(), wid, back, error) && same(worker, back) && r.at == part.size(),
+              "part: read back whole, identical");
+        SavedConversation keep = original;
+        Bytes r1{part}, r2{part};
+        check(!session_part_read(part.size(), r1.fn(), {wid.model ^ 1, wid.config}, keep, error) &&
+                  error.find("another model on the worker") != std::string::npos && same(keep, original),
+              "part: another model on the worker refused, the destination untouched");
+        check(!session_part_read(part.size(), r2.fn(), {wid.model, wid.config ^ 1}, keep, error) &&
+                  error.find("configuration on the worker") != std::string::npos,
+              "part: another configuration on the worker refused");
+        const std::vector<uint8_t> cut(part.begin(), part.begin() + (std::ptrdiff_t) (part.size() / 2));
+        Bytes r3{cut};
+        SessionStatus st;
+        check(!session_part_read(part.size(), r3.fn(), wid, keep, error, {}, &st) && st.error == SessionError::io &&
+                  error.find("ran out") != std::string::npos,
+              "part: a stream that ends early fails as I/O, with its reason");
+        std::vector<uint8_t> longer = part;
+        longer.push_back(0);
+        Bytes r4{longer};
+        check(!session_part_read(longer.size(), r4.fn(), wid, keep, error) && error.find("unparsed") != std::string::npos,
+              "part: a byte past its payload refused");
+        SessionReadLimits tight;   // every limit closed: the largest part they admit is small
+        tight.max_tokens = 4; tight.max_checkpoints = 0; tight.max_kv_layers = 0;
+        tight.max_state_bytes = {0, 0, 0, 0, 0};
+        Bytes r5{part};
+        check(session_part_max_bytes(tight) < part.size() &&
+                  !session_part_read(part.size(), r5.fn(), wid, keep, error, tight) && r5.calls == 0 &&
+                  error.find("limit") != std::string::npos,
+              "part: larger than the limits admit, refused before a byte is read");
+        SessionReadLimits poor;
+        poor.admit = [](uint64_t, std::string& why) { why = "no RAM (test)"; return false; };
+        Bytes r6{part};
+        check(!session_part_read(part.size(), r6.fn(), wid, keep, error, poor, &st) && st.error == SessionError::memory &&
+                  r6.at == 32,
+              "part: the RAM preflight after its header, before its payload");
+        std::vector<uint8_t> bad = part;
+        const uint64_t huge = 0x0fffffffffffffffull;   // live.ids' count: after geometry, the range and cvec
+        std::memcpy(bad.data() + 32 + 21 * 8, &huge, 8);
+        Bytes r7{bad};
+        check(!session_part_read(bad.size(), r7.fn(), wid, keep, error) && error.find("count") != std::string::npos,
+              "part: an oversized count refused before allocation");
+    }
+
+    // ---- format v2 (a remote stage's file): the worker's part in front of this process's payload, streamed through
+    {
+        SavedConversation meta = original;
+        meta.kv.clear();
+        const std::vector<SessionKvSource> sources = sources_of(original);
+        const size_t piece = (3u << 20) + 7;
+        SessionWriteOptions wo;
+        wo.stage.bytes = part.size();
+        wo.stage.stream = [&](const std::function<bool(const void*, size_t)>& write, std::string&, SessionError&) {
+            for (size_t at = 0; at < part.size(); at += piece)
+                if (!write(part.data() + at, std::min(piece, part.size() - at))) return false;
+            return true;
+        };
+        const fs::path v2 = dir / "remote.bin";
+        check(session_file_write(v2.string(), meta, sources, id, written, error, wo), "v2: a write with a worker's part");
+        const std::vector<char> f2 = slurp(v2);
+        auto u32 = [&](size_t o) { uint32_t v = 0; std::memcpy(&v, f2.data() + o, 4); return v; };
+        auto u64 = [&](size_t o) { uint64_t v = 0; std::memcpy(&v, f2.data() + o, 8); return v; };
+        check(written == f2.size() && u32(8) == 2 && u64(40) == part.size() && u64(48) == 0 &&
+                  u64(32) == f2.size() - 64 - 16,
+              "v2: version 2, the part's size in the first reserved field, the payload counts it");
+        check(std::memcmp(f2.data() + 64, part.data(), part.size()) == 0 &&
+                  f2.size() - part.size() == image.size() &&
+                  std::memcmp(f2.data() + 64 + part.size(), image.data() + 64, image.size() - 64 - 16) == 0,
+              "v2: the part, then this process's payload as v1 has it");
+        SessionReadLimits lim;
+        std::vector<uint8_t> got;
+        bool handed = false;
+        lim.stage = [&](uint64_t bytes, const std::function<bool(void*, size_t)>& read, std::string&, SessionError&) {
+            handed = true;
+            got.assign((size_t) bytes, 0);
+            for (size_t at = 0; at < bytes; at += piece)
+                if (!read(got.data() + at, std::min<size_t>(piece, (size_t) bytes - at))) return false;
+            return true;
+        };
+        SavedConversation back;
+        size_t rb = 0;
+        check(session_file_read(v2.string(), id, back, rb, error, lim) && same(original, back) && got == part &&
+                  rb == f2.size(),
+              "v2: read back, the part handed over whole and this process's payload parsed after it");
+        // the part through the worker's own reader, as it comes off the link
+        SavedConversation wback;
+        SessionReadLimits through;
+        through.stage = [&](uint64_t bytes, const std::function<bool(void*, size_t)>& read, std::string& why,
+                            SessionError& kind) {
+            const std::function<bool(void*, size_t, std::string&)> r = [&](void* p, size_t n, std::string&) {
+                return read(p, n);
+            };
+            SessionStatus pst;
+            if (session_part_read(bytes, r, wid, wback, why, {}, &pst)) return true;
+            kind = pst.error;
+            return false;
+        };
+        check(session_file_read(v2.string(), id, back, rb, error, through) && same(original, back) && same(worker, wback),
+              "v2: the worker's part read back by the worker's reader");
+        // which engine reads which
+        check(rejects(v2, id, "with a remote stage"), "v2: refused by an engine without a remote stage");
+        check(rejects(good, id, "one process holding every layer", lim), "v1: refused by an engine with a remote stage");
+        handed = false;
+        SessionReadLimits small = lim;
+        small.max_stage_bytes = part.size() - 1;
+        check(rejects(v2, id, "limit", small) && !handed, "v2: a part over its limit refused from the header, unread");
+        SessionReadLimits failing;
+        failing.stage = [&](uint64_t, const std::function<bool(void*, size_t)>& read, std::string& why, SessionError& kind) {
+            std::vector<uint8_t> b(100);
+            (void) read(b.data(), b.size());
+            why = "the link went (test)";
+            kind = SessionError::link;
+            return false;
+        };
+        SavedConversation keep = original;
+        SessionStatus st;
+        check(!session_file_read(v2.string(), id, keep, rb, error, failing, &st) && st.error == SessionError::link &&
+                  error.find("the link went (test)") != std::string::npos && same(keep, original),
+              "v2: a part that fails: its kind and reason, the destination untouched");
+        SessionReadLimits partial;
+        partial.stage = [&](uint64_t, const std::function<bool(void*, size_t)>& read, std::string&, SessionError&) {
+            std::vector<uint8_t> b(100);
+            return read(b.data(), b.size());
+        };
+        check(rejects(v2, id, "not read whole", partial), "v2: a part not read whole refused");
+        std::vector<char> flipped = f2;
+        flipped[64 + part.size() / 2] ^= 0x10;
+        const fs::path fp = dir / "remote-flip.bin";
+        spit(fp, flipped);
+        handed = false;
+        check(rejects(fp, id, "checksum", lim) && handed,
+              "v2: a flipped byte in the part: handed over, then the payload hash refuses the file");
+        // the stream failing on its own, short or long: no file, no temporary
+        const fs::path q = dir / "remote-fail.bin";
+        SessionWriteOptions bad = wo;
+        bad.stage.stream = [&](const std::function<bool(const void*, size_t)>& write, std::string& why, SessionError& kind) {
+            (void) write(part.data(), 1000);
+            why = "the worker went (test)";
+            kind = SessionError::link;
+            return false;
+        };
+        check(!session_file_write(q.string(), meta, sources, id, written, error, bad, &st) &&
+                  st.error == SessionError::link && error.find("the worker went (test)") != std::string::npos &&
+                  !fs::exists(q) && no_temp(dir),
+              "v2: a part's stream that fails: its kind, no file");
+        bad.stage.stream = [&](const std::function<bool(const void*, size_t)>& write, std::string&, SessionError&) {
+            return write(part.data(), part.size() - 1);
+        };
+        check(!session_file_write(q.string(), meta, sources, id, written, error, bad, &st) && st.error == SessionError::io &&
+                  error.find("announced") != std::string::npos && !fs::exists(q) && no_temp(dir),
+              "v2: a part shorter than announced refused");
+        bad.stage.stream = [&](const std::function<bool(const void*, size_t)>& write, std::string&, SessionError&) {
+            return write(part.data(), part.size()) && write(part.data(), 1);
+        };
+        check(!session_file_write(q.string(), meta, sources, id, written, error, bad, &st) &&
+                  error.find("announced") != std::string::npos && !fs::exists(q) && no_temp(dir),
+              "v2: a part longer than announced refused");
+        bad = wo;
+        bad.fault = [](const char* step) { return std::strcmp(step, "write") == 0 ? ENOSPC : 0; };
+        bool told = false;
+        bad.stage.stream = [&](const std::function<bool(const void*, size_t)>& write, std::string&, SessionError&) {
+            for (size_t at = 0; at < part.size(); at += piece)
+                if (!write(part.data() + at, std::min(piece, part.size() - at))) { told = true; return false; }
+            return true;
+        };
+        check(!session_file_write(q.string(), meta, sources, id, written, error, bad, &st) &&
+                  st.error == SessionError::storage && told && !fs::exists(q) && no_temp(dir),
+              "v2: the disk failing under the part: the file's own kind, the stream told");
+        check(std::string(session_error_name(SessionError::link)) == "link", "the link kind's name");
     }
 
     // the configuration fingerprint: every field counts, doubles by their exact bits

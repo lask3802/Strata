@@ -61,8 +61,8 @@ Out (forced off or refused in remote mode, each with a stderr line):
 - Parking (`--conversation-cache-mib`): ignored on a remote main (forced 0, stderr line), with or without
   checkpoints, as #1748 does, so a config with both still starts. A later step: the worker would keep its K/V images
   under a park id.
-- Session files: refused with a remote stage (the existing guard checks `stages`/`multi_gpu`, which a remote main has
-  neither of).
+- Session files: supported since, with the worker's part carried across the link ([SESSIONS.md](SESSIONS.md)). A
+  restored file's checkpoint is the store's only part, under a new id.
 
 ## Protocol (kStageProtocol 5 -> 6)
 

@@ -15,8 +15,10 @@
 // worker reads chunk c (the worker receives on its own thread into two buffers), and takes the replies in order on
 // another thread.  Images (--vision on both sides): a request with a picture rotates its tokens by M-RoPE positions
 // that are not the cell index, so the main process sends its position table before the request (and a reset to the
-// identity before the next text request); the worker's layers read their own copy.  POSIX sockets on Linux, Winsock on
-// Windows.
+// identity before the next text request); the worker's layers read their own copy.  Session files (a worker whose
+// hello carries kStageCapSession): between requests the worker's part of the conversation streams to the main
+// process, which writes it into its file, or back from it (SessionSave / SessionPull / SessionLoad / SessionEnd,
+// docs/remote-stage/SESSIONS.md); the worker never touches a file.  POSIX sockets on Linux, Winsock on Windows.
 #pragma once
 
 #include <atomic>
@@ -40,6 +42,10 @@ inline constexpr int32_t kStageCkptMax = 64;
 /// the start of the worker's CkptRestore error for an id it does not hold - the one restore error the main process
 /// recovers from (it reads the prompt from token 0); every other error means the worker's session is lost
 inline constexpr char kStageCkptMissing[] = "checkpoint not held: ";
+/// Session files: the most bytes one SessionData message carries (the session file's own block)
+inline constexpr uint64_t kStageSessionBlock = (uint64_t) 16 << 20;
+/// Session files: the most token ids a SessionSave carries (as many cells as a position table's)
+inline constexpr int64_t kStageSessionMaxTokens = (int64_t) 1 << 22;
 
 // (rows[n * w]: n rows of w floats in the link's row format, StageRows)
 enum class StageMsg : uint32_t {
@@ -61,6 +67,19 @@ enum class StageMsg : uint32_t {
     CkptSaveOk = 13,     // a = 1 stored, 0 not stored (the worker's store is as it was)
     CkptRestore = 14,    // a = id, b = L; payload: int64 keep[]
     CkptRestoreOk = 15,
+    // session files (a worker with kStageCapSession; docs/remote-stage/SESSIONS.md), between requests:
+    SessionSave = 16,    // a = tokens (the worker must be there), b = a checkpoint id (0: none), c = its tokens;
+                         // payload: int32 ids[a].  Reply SessionOk (a = the part's bytes): the worker holds its part
+    SessionPull = 17,    // reply: the part as SessionData messages, then SessionOk (a = its bytes) - or an Error in
+                         // place of any of them
+    SessionLoad = 18,    // a = the part's bytes.  Reply SessionOk (it fits here); then the main process sends the part
+                         // as SessionData messages, and the reply after the last is SessionOk (a = its tokens, b = its
+                         // checkpoint's, 0: none): the worker holds it, not yet in place
+    SessionEnd = 19,     // a = 1: the loaded part in place of the session (its checkpoint kept under id b, 0: none);
+                         // a = 0: drop what a SessionSave or SessionLoad left held.  Reply SessionOk
+    SessionData = 20,    // payload: the part's next bytes (1..kStageSessionBlock); c = 1, no payload: the main process
+                         // gives a SessionLoad up (its file failed)
+    SessionOk = 21,
 };
 
 #pragma pack(push, 1)
@@ -121,6 +140,11 @@ void stage_rows_decode(StageRows f, const void* src, size_t rows, size_t width, 
 /// which still compares kv_type itself): no K/V type is compared here, and each side logs a line (--kv must
 /// match by hand); two without it: kv_type compared, as earlier builds do.
 inline constexpr uint32_t kStageCapKvElem = 1u << 31;
+/// Bit 30 (kStageCapSession): this side takes session files across the link (the Session messages).  A main process
+/// sends them only to a worker whose hello has it; a relay worker does not set it (it does not forward them), nor
+/// does an earlier build, so neither is asked - the main process refuses the file itself.  No protocol change: the
+/// two sides still talk protocol 7 for everything else.
+inline constexpr uint32_t kStageCapSession = 1u << 30;
 /// the row_formats bits for a K/V element type as --kv names it (fp16, int8, q4_0, k8v4); 0 for another name
 uint32_t stage_kv_elem_bits(const std::string& kv);
 /// both hellos carry their K/V element type
@@ -207,6 +231,27 @@ public:
     /// hold `id` and nothing changed there.  Any other error: the worker's session is lost.
     bool ckpt_restore(int64_t id, int64_t L, const std::vector<int64_t>& keep, bool& missing, std::string& err);
 
+    /// Session files (between requests; the worker's hello has kStageCapSession).  The worker captures its part of
+    /// the session at `ids.size()` tokens (with its part of checkpoint `ckpt_id`, saved at ckpt_tokens; 0: none) and
+    /// holds it: `part_bytes`, its size.  Then session_pull, or session_end(false) to let it go.
+    bool session_save(const std::vector<int32_t>& ids, int64_t ckpt_id, int64_t ckpt_tokens, uint64_t& part_bytes,
+                      std::string& err);
+    /// The held part, exactly part_bytes, through `sink` (pieces of at most kStageSessionBlock, in order).  A sink that
+    /// fails is given nothing more while the rest is read (the link stays in step): false, `sink_failed`, and `err`
+    /// what the sink said.  An error from the worker in place of a piece: false, the link in step.
+    bool session_pull(uint64_t part_bytes, const std::function<bool(const void* data, size_t n, std::string& why)>& sink,
+                      bool& sink_failed, std::string& err);
+    /// A part of part_bytes to the worker, from `source` (pieces of at most `block`), which it reads and checks but
+    /// does not put in place: `tokens` and `ckpt_tokens` (0: no checkpoint) say what it holds.  The worker first says
+    /// whether it can take that many bytes (else false before anything is sent).  A source that fails: the worker is
+    /// told the part is given up, false, `source_failed`, `err` what the source said.  Then session_end.
+    bool session_load(uint64_t part_bytes, const std::function<bool(void* data, size_t n, std::string& why)>& source,
+                      int64_t& tokens, int64_t& ckpt_tokens, bool& source_failed, std::string& err,
+                      uint64_t block = kStageSessionBlock);
+    /// apply: the loaded part in place of the worker's session, its checkpoint (if any) kept under `ckpt_id` and every
+    /// other part dropped; an error then means the worker's session is lost.  !apply: whatever is held, dropped.
+    bool session_end(bool apply, int64_t ckpt_id, std::string& err);
+
     const StageStats& stats() const { return stats_; }
     std::string peer_name() const { return peer_; }
     /// the row format the connection agreed on (connect)
@@ -216,7 +261,7 @@ private:
     /// `rows` > 0: the payload is that many rows of `width` floats in the link's format, read into `reply` (floats),
     /// their conversion's time added to *conv_ms
     bool read_reply_(StageMsg want, void* reply, size_t reply_bytes, int64_t& worker_us, std::string& err,
-                     size_t rows = 0, size_t width = 0, double* conv_ms = nullptr);
+                     size_t rows = 0, size_t width = 0, double* conv_ms = nullptr, int64_t* reply_b = nullptr);
     /// a synchronous message with a keep[] payload (Reset, CkptSave, CkptRestore); `reply_a`: the reply's `a`
     bool keep_call_(StageMsg type, StageMsg want, int64_t a, int64_t b, const std::vector<int64_t>& keep,
                     int64_t& reply_a, std::string& err);
@@ -284,6 +329,25 @@ struct StageHandlers {
     /// it was), -1 an error.  ckpt_restore: an id it does not hold is an error starting with kStageCkptMissing.
     std::function<int(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> ckpt_save;
     std::function<bool(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> ckpt_restore;
+    /// Session files (optional, all five or none; without them the Session messages get an error).  An error's text
+    /// starts with its kind ("invalid: ", "memory: ", "io: "), which the main process answers as it answers its own
+    /// (the server's 400, 503, 500).  serve_stage has checked a save's position and reported a failed Commit.
+    /// session_save: capture this worker's part at
+    /// ids.size() tokens (with checkpoint `ckpt_id`'s, 0: none) and hold it; `part_bytes` its size.
+    std::function<bool(const std::vector<int32_t>& ids, int64_t ckpt_id, int64_t ckpt_tokens, uint64_t& part_bytes,
+                       std::string& err)> session_save;
+    /// the held part through `send` (blocks of 1..kStageSessionBlock, exactly part_bytes in all), then let go
+    std::function<bool(const std::function<bool(const void* data, size_t n, std::string& why)>& send,
+                       std::string& err)> session_pull;
+    /// whether a part of `bytes` can be loaded here (its size, the RAM to hold it): before any of it is sent
+    std::function<bool(uint64_t bytes, std::string& err)> session_load_begin;
+    /// read the part through `read` (exactly `bytes` in all, pieces of any size), check it and hold it: `tokens` and
+    /// `ckpt_tokens` (0: none) what it holds.  serve_stage drains whatever it leaves unread.
+    std::function<bool(uint64_t bytes, const std::function<bool(void* data, size_t n, std::string& why)>& read,
+                       int64_t& tokens, int64_t& ckpt_tokens, std::string& err)> session_load;
+    /// apply: the held part in place of the session (its checkpoint kept under ckpt_id, the store's other parts
+    /// dropped); !apply: let whatever is held go (also before any other message, and at a disconnect)
+    std::function<bool(bool apply, int64_t ckpt_id, std::string& err)> session_end;
     std::function<void()> disconnected;   ///< the main process went away (the session is stale)
     /// optional (a relay worker): about once a second while the served main process is idle (no message read or being
     /// read, no reply going out), on the serving thread.  False ends that connection with `err`, as a closed one ends:

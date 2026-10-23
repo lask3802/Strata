@@ -801,7 +801,7 @@ bool StageClient::alive(std::string& err) {
 
 // the next reply: `want` with exactly reply_bytes of payload, or the worker's error (the connection then stays)
 bool StageClient::read_reply_(StageMsg want, void* reply, size_t reply_bytes, int64_t& worker_us, std::string& err,
-                              size_t rows, size_t width, double* conv_ms) {
+                              size_t rows, size_t width, double* conv_ms, int64_t* reply_b) {
     StageHeader r;
     if (broken_) { err = "remote stage: the link failed earlier"; return false; }
     if (!recv_header(S(fd_), r, err)) { break_(); return false; }
@@ -834,6 +834,7 @@ bool StageClient::read_reply_(StageMsg want, void* reply, size_t reply_bytes, in
     }
     if (conv_ms != nullptr) *conv_ms += conv;
     worker_us = r.a;
+    if (reply_b != nullptr) *reply_b = r.b;
     stats_.bytes_in += sizeof r + reply_bytes;
     return true;
 }
@@ -1021,6 +1022,158 @@ bool StageClient::positions(const int32_t* table, int64_t cells, std::string& er
     return true;
 }
 
+// ---- session files (docs/remote-stage/SESSIONS.md): one request at a time between requests, each whole before the
+// next; the part's bytes go a block per message in order, and a side that fails part-way still reads (or is told) the
+// rest, so the link stays in step
+
+bool StageClient::session_save(const std::vector<int32_t>& ids, int64_t ckpt_id, int64_t ckpt_tokens,
+                               uint64_t& part_bytes, std::string& err) {
+    std::lock_guard<std::mutex> ls(send_mu_);
+    std::lock_guard<std::mutex> lr(recv_mu_);
+    if (!connected()) { err = "remote stage: not connected"; return false; }
+    if (ids.empty() || (int64_t) ids.size() > kStageSessionMaxTokens) {
+        err = "a session of " + std::to_string(ids.size()) + " tokens cannot be saved across the link (1.." +
+              std::to_string(kStageSessionMaxTokens) + ")";
+        return false;
+    }
+    StageHeader h;
+    h.type = (uint32_t) StageMsg::SessionSave;
+    h.a = (int64_t) ids.size();
+    h.b = ckpt_id;
+    h.c = ckpt_tokens;
+    h.bytes = ids.size() * sizeof(int32_t);
+    if (!send_msg(S(fd_), h, ids.data(), (size_t) h.bytes, nullptr, 0, err)) { break_(); return false; }
+    stats_.bytes_out += sizeof h + h.bytes;
+    int64_t a = 0;
+    if (!read_reply_(StageMsg::SessionOk, nullptr, 0, a, err)) return false;
+    if (a < 1) {
+        err = "remote stage: receive failed: a session part of " + std::to_string(a) + " bytes (the link is out of step)";
+        break_();
+        return false;
+    }
+    part_bytes = (uint64_t) a;
+    return true;
+}
+
+bool StageClient::session_pull(uint64_t part_bytes,
+                               const std::function<bool(const void* data, size_t n, std::string& why)>& sink,
+                               bool& sink_failed, std::string& err) {
+    std::lock_guard<std::mutex> ls(send_mu_);
+    std::lock_guard<std::mutex> lr(recv_mu_);
+    sink_failed = false;
+    if (!connected()) { err = "remote stage: not connected"; return false; }
+    StageHeader h;
+    h.type = (uint32_t) StageMsg::SessionPull;
+    if (!send_msg(S(fd_), h, nullptr, 0, nullptr, 0, err)) { break_(); return false; }
+    stats_.bytes_out += sizeof h;
+    std::vector<unsigned char> block;
+    std::string why;
+    for (uint64_t left = part_bytes; left > 0;) {
+        StageHeader r;
+        if (!recv_header(S(fd_), r, err)) { break_(); return false; }
+        if (r.type == (uint32_t) StageMsg::Error && r.bytes <= kMaxErrorBytes) {   // in place of a block: in step
+            std::string m((size_t) r.bytes, '\0');
+            std::string e2;
+            (void) recv_all(S(fd_), m.data(), m.size(), e2);
+            err = "remote stage (worker): " + m;
+            return false;
+        }
+        // the size bounded before anything is allocated: a block, no more than is left
+        if (r.type != (uint32_t) StageMsg::SessionData || r.c != 0 || r.bytes < 1 || r.bytes > kStageSessionBlock ||
+            r.bytes > left) {
+            char buf[200];
+            std::snprintf(buf, sizeof buf, "remote stage: receive failed: unexpected session data (type %u, %llu bytes, "
+                          "%llu left; the link is out of step)", r.type, (unsigned long long) r.bytes,
+                          (unsigned long long) left);
+            err = buf;
+            break_();
+            return false;
+        }
+        block.resize((size_t) r.bytes);
+        if (!recv_all(S(fd_), block.data(), block.size(), err)) { break_(); return false; }
+        stats_.bytes_in += sizeof r + r.bytes;
+        if (!sink_failed && !sink(block.data(), block.size(), why)) sink_failed = true;   // (the rest still read)
+        left -= r.bytes;
+    }
+    int64_t a = 0;
+    if (!read_reply_(StageMsg::SessionOk, nullptr, 0, a, err)) return false;
+    if ((uint64_t) a != part_bytes) {
+        err = "remote stage: receive failed: the worker sent " + std::to_string(a) + " session bytes, not " +
+              std::to_string(part_bytes) + " (the link is out of step)";
+        break_();
+        return false;
+    }
+    if (sink_failed) {
+        err = why.empty() ? std::string("the session part's destination failed") : why;
+        return false;
+    }
+    return true;
+}
+
+bool StageClient::session_load(uint64_t part_bytes,
+                               const std::function<bool(void* data, size_t n, std::string& why)>& source,
+                               int64_t& tokens, int64_t& ckpt_tokens, bool& source_failed, std::string& err,
+                               uint64_t block) {
+    std::lock_guard<std::mutex> ls(send_mu_);
+    std::lock_guard<std::mutex> lr(recv_mu_);
+    source_failed = false;
+    if (!connected()) { err = "remote stage: not connected"; return false; }
+    if (part_bytes < 1 || part_bytes > (uint64_t) INT64_MAX) {
+        err = "a session part of " + std::to_string(part_bytes) + " bytes cannot cross the link";
+        return false;
+    }
+    block = std::clamp<uint64_t>(block, 1, kStageSessionBlock);
+    StageHeader h;
+    h.type = (uint32_t) StageMsg::SessionLoad;
+    h.a = (int64_t) part_bytes;
+    if (!send_msg(S(fd_), h, nullptr, 0, nullptr, 0, err)) { break_(); return false; }
+    stats_.bytes_out += sizeof h;
+    int64_t a = 0, b = 0;
+    if (!read_reply_(StageMsg::SessionOk, nullptr, 0, a, err)) return false;   // refused before any byte moved
+    std::vector<unsigned char> buf((size_t) std::min(block, part_bytes));
+    std::string why;
+    for (uint64_t left = part_bytes; left > 0;) {
+        const size_t n = (size_t) std::min(block, left);
+        StageHeader d;
+        d.type = (uint32_t) StageMsg::SessionData;
+        if (!source(buf.data(), n, why)) {   // the part is given up: the worker stops reading and answers
+            source_failed = true;
+            d.c = 1;
+            if (!send_msg(S(fd_), d, nullptr, 0, nullptr, 0, err)) { break_(); return false; }
+            stats_.bytes_out += sizeof d;
+            break;
+        }
+        d.bytes = n;
+        if (!send_msg(S(fd_), d, buf.data(), n, nullptr, 0, err)) { break_(); return false; }
+        stats_.bytes_out += sizeof d + n;
+        left -= n;
+    }
+    std::string reply_err;
+    const bool ok = read_reply_(StageMsg::SessionOk, nullptr, 0, a, reply_err, 0, 0, nullptr, &b);
+    if (source_failed) {   // (the worker's answer to a part given up says nothing more)
+        err = why.empty() ? std::string("the session part's source failed") : why;
+        return false;
+    }
+    if (!ok) { err = reply_err; return false; }
+    tokens = a;
+    ckpt_tokens = b;
+    return true;
+}
+
+bool StageClient::session_end(bool apply, int64_t ckpt_id, std::string& err) {
+    std::lock_guard<std::mutex> ls(send_mu_);
+    std::lock_guard<std::mutex> lr(recv_mu_);
+    if (!connected()) { err = "remote stage: not connected"; return false; }
+    StageHeader h;
+    h.type = (uint32_t) StageMsg::SessionEnd;
+    h.a = apply ? 1 : 0;
+    h.b = ckpt_id;
+    if (!send_msg(S(fd_), h, nullptr, 0, nullptr, 0, err)) { break_(); return false; }
+    stats_.bytes_out += sizeof h;
+    int64_t a = 0;
+    return read_reply_(StageMsg::SessionOk, nullptr, 0, a, err);
+}
+
 // ------------------------------------------------------------------------------------------------ serve_stage
 
 namespace {
@@ -1033,6 +1186,7 @@ struct Inbox {
     std::vector<float> rows;    ///< a window's rows, fp32 (copied to run_in by the serving thread)
     double decode_ms = 0;       ///< the rows' conversion from the link's format (the receiving thread's)
     std::vector<int64_t> keep;  ///< Reset / CkptSave / CkptRestore: the checkpoint ids the main process holds
+    std::vector<unsigned char> data;   ///< SessionData: a block of a session part (counted in data_queued)
     StageHello hello;
     int slot = -1;
     std::string bad;            ///< the message was malformed: reply this error
@@ -1223,6 +1377,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         if (have_first) q.push_back(std::move(first));   // (read with its connection: the reader starts after it)
         first = Inbox();
         bool slot_busy[2] = {false, false};
+        int data_queued = 0;   // (under mu) SessionData blocks read and not yet taken: the reader waits at two
         std::atomic<bool> quit{false};
         std::atomic<bool> reading{false};   // a message's header is in, the rest not yet queued
         bool admitted = false;              // (under mu) the serving thread took this connection's hello: read on
@@ -1345,6 +1500,40 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                             in.keep.resize((size_t) (in.h.bytes / 8));
                             if (!recv_all(fd, in.keep.data(), (size_t) in.h.bytes, in.err)) in.closed = true;
                         }
+                    } else if (type == StageMsg::SessionSave) {
+                        const int64_t n = in.h.a;   // (bounded before its product, as a window's T)
+                        if (n < 1 || n > kStageSessionMaxTokens || in.h.bytes != (uint64_t) n * 4) {
+                            in.bad = "bad session save";
+                            if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                        } else {
+                            in.tok32.resize((size_t) n);
+                            if (!recv_all(fd, in.tok32.data(), (size_t) n * 4, in.err)) in.closed = true;
+                        }
+                    } else if (type == StageMsg::SessionPull || type == StageMsg::SessionLoad ||
+                               type == StageMsg::SessionEnd) {
+                        if (in.h.bytes != 0) {
+                            in.bad = "bad session message";
+                            if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                        }
+                    } else if (type == StageMsg::SessionData) {
+                        // a block of 1..kStageSessionBlock bytes, or the main process giving the part up (c = 1, none);
+                        // at most two blocks wait here (a part is as large as the session, gigabytes).  A malformed one
+                        // ends the connection unread: nothing after it is in step, and its size is not taken on trust.
+                        const bool give_up = in.h.c == 1;
+                        if (give_up ? in.h.bytes != 0
+                                    : in.h.c != 0 || in.h.bytes < 1 || in.h.bytes > kStageSessionBlock) {
+                            in.err = "bad session data (the link is out of step)";
+                            in.closed = true;
+                        } else if (!give_up) {
+                            {
+                                std::unique_lock<std::mutex> lk(mu);
+                                cv.wait(lk, [&] { return data_queued < 2 || quit.load(); });
+                                if (quit.load()) break;
+                                ++data_queued;
+                            }
+                            in.data.resize((size_t) in.h.bytes);
+                            if (!recv_all(fd, in.data.data(), in.data.size(), in.err)) in.closed = true;
+                        }
                     } else if (type != StageMsg::Commit) {
                         in.bad = "unknown message type " + std::to_string(in.h.type);
                         if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
@@ -1381,6 +1570,30 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         // the position the session holds (a checkpoint is saved only there): a chunk's end, a window's first
         // position plus its accepted count, 0 after a reset, L after a checkpoint restore
         int64_t pos = 0, run_pos0 = 0;
+        // session files: what this worker holds between the Session messages - a part SessionSave captured (for its
+        // SessionPull) or SessionLoad read (for its SessionEnd); any other message lets it go first, as a disconnect does
+        enum class Held { none, saved, loaded } held = Held::none;
+        uint64_t held_bytes = 0;   // a captured part's size
+        int64_t held_tokens = 0;   // a loaded part's tokens (the session's position once it is in place)
+        auto drop_held = [&] {
+            if (held == Held::none) return;
+            std::string e;
+            if (h.session_end && !h.session_end(false, 0, e))
+                std::fprintf(stderr, "strata stage worker: letting a session part go failed: %s\n", e.c_str());
+            held = Held::none;
+        };
+        // a SessionLoad's next block, in its turn (false: the worker is stopping)
+        auto next_data = [&](Inbox& d) -> bool {
+            std::unique_lock<std::mutex> lk(mu);
+            while (!cv.wait_for(lk, std::chrono::milliseconds(250), [&] { return !q.empty(); }))
+                if (stop != nullptr && stop->load()) return false;
+            d = std::move(q.front());
+            q.pop_front();
+            if (!d.data.empty()) --data_queued;
+            lk.unlock();
+            cv.notify_all();
+            return true;
+        };
         // a slice of the replies' rows in another format than fp32: a window's (this thread's), a prompt chunk's (its
         // reply thread's: one is out at a time), and that one's conversion time (stats has it once the reply is out)
         std::vector<unsigned char> run_tx, pf_tx;
@@ -1466,7 +1679,9 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     if (cv.wait_for(lk, std::chrono::milliseconds(cand != kNoSock ? 20 : 250), [&] { return !q.empty(); })) {
                         in = std::move(q.front());
                         q.pop_front();
+                        if (!in.data.empty()) --data_queued;   // (a session block out of turn: its room again)
                         lk.unlock();
+                        cv.notify_all();
                         if (cand != kNoSock && !in.closed) drop_cand();   // (a closed one: the held one is served next)
                         return true;
                     }
@@ -1546,6 +1761,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 break;
             }
             stats.bytes_in += sizeof in.h + in.h.bytes;
+            if (held != Held::none && type != StageMsg::SessionPull && type != StageMsg::SessionEnd) drop_held();
             if (!in.bad.empty()) {
                 release();
                 // a one-way message gets no reply of its own: a malformed table is the next reply's error, as its
@@ -1781,6 +1997,199 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
                 break;
             }
+            // ---- session files (docs/remote-stage/SESSIONS.md).  An error's text starts with its kind ("invalid: ",
+            // "memory: ", "io: "), as the handlers' do: the main process answers it as it answers its own.
+            case StageMsg::SessionSave: {
+                // after every reply and window before it (as a CkptSave): the session must be where the main process
+                // says, with no failed Commit pending
+                std::string e;
+                if (!replies_out()) { keep = false; break; }
+                uint64_t bytes = 0;
+                if (!pending_err.empty() || !pos_err.empty()) {
+                    e = "io: " + take_pending();
+                } else if (in.h.a != pos) {
+                    e = "io: a session save at " + std::to_string(in.h.a) + " tokens, the worker's session is at " +
+                        std::to_string(pos);
+                } else if (!h.session_save || !h.session_pull || !h.session_end) {
+                    e = "invalid: this worker takes no session files";
+                } else if (in.h.b < 0 || in.h.c < 0 || in.h.c > in.h.a || (in.h.b == 0) != (in.h.c == 0)) {
+                    e = "invalid: a session save with a bad checkpoint (id " + std::to_string(in.h.b) + " at " +
+                        std::to_string(in.h.c) + " tokens)";
+                } else if (h.session_save(in.tok32, in.h.b, in.h.c, bytes, e)) {
+                    held = Held::saved;   // (the device state must not change until it is pulled)
+                    held_bytes = bytes;
+                    if (bytes < 1 || bytes > (uint64_t) INT64_MAX) {
+                        drop_held();
+                        e = "io: a session part of " + std::to_string(bytes) + " bytes";
+                    } else {
+                        StageHeader r;
+                        r.type = (uint32_t) StageMsg::SessionOk;
+                        r.a = (int64_t) bytes;
+                        if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                        break;
+                    }
+                }
+                keep = reply_error(e);
+                break;
+            }
+            case StageMsg::SessionPull: {
+                std::string e;
+                if (!replies_out()) { keep = false; break; }
+                if (held != Held::saved) {
+                    drop_held();
+                    keep = reply_error("invalid: no session part is held here (a session save first)");
+                    break;
+                }
+                // its blocks as they come, never more than it was announced as; an error in place of the next one
+                uint64_t sent = 0;
+                bool lost = false;
+                const auto send = [&](const void* p, size_t n, std::string& why) -> bool {
+                    if (n < 1 || n > kStageSessionBlock || n > held_bytes - sent) {
+                        why = "the part is not the " + std::to_string(held_bytes) + " bytes it was announced as";
+                        return false;
+                    }
+                    StageHeader d;
+                    d.type = (uint32_t) StageMsg::SessionData;
+                    d.bytes = n;
+                    if (!send_msg(fd, d, p, n, nullptr, 0, err)) {
+                        lost = true;
+                        why = err;
+                        return false;
+                    }
+                    stats.bytes_out += sizeof d + n;
+                    sent += n;
+                    return true;
+                };
+                bool ok = h.session_pull(send, e);
+                held = Held::none;   // (the handler let it go)
+                if (lost) { keep = false; break; }
+                if (ok && sent != held_bytes) {
+                    ok = false;
+                    e = "io: the part is " + std::to_string(sent) + " bytes, not the " + std::to_string(held_bytes) +
+                        " it was announced as";
+                }
+                if (!ok) { keep = reply_error(e); break; }
+                StageHeader r;
+                r.type = (uint32_t) StageMsg::SessionOk;
+                r.a = (int64_t) sent;
+                if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                break;
+            }
+            case StageMsg::SessionLoad: {
+                // (a Commit that failed before stays pending: the load may be given up, and the session it was in goes
+                // on; SessionEnd drops it once the part replaced that session)
+                std::string e;
+                if (!replies_out()) { keep = false; break; }
+                const uint64_t bytes = (uint64_t) in.h.a;
+                if (!h.session_load_begin || !h.session_load || !h.session_end) e = "invalid: this worker takes no session files";
+                else if (in.h.a < 1) e = "invalid: a session part of no bytes";
+                if (!e.empty() || !h.session_load_begin(bytes, e)) {   // refused: the main process sends nothing
+                    keep = reply_error(e);
+                    break;
+                }
+                {
+                    StageHeader r;
+                    r.type = (uint32_t) StageMsg::SessionOk;
+                    if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) { keep = false; break; }
+                }
+                // the part as it comes, a block at a time; whatever the reader leaves is read and dropped after it, so
+                // the next message is in step.  Another message in its place, a malformed or an oversized block, or
+                // the link's end: the connection ends.
+                uint64_t left = bytes;
+                bool lost = false, gave_up = false;
+                Inbox d;
+                size_t at = 0;   // how far d's block is read
+                auto take = [&](Inbox& x, std::string& why) -> bool {
+                    if (!next_data(x)) { lost = true; why = err = "the worker is stopping"; return false; }
+                    if (x.closed) { lost = true; err = x.err; why = "the link ended in the middle of the part"; return false; }
+                    stats.bytes_in += sizeof x.h + x.h.bytes;
+                    if ((StageMsg) x.h.type != StageMsg::SessionData || !x.bad.empty() || x.data.size() > left) {
+                        lost = true;
+                        why = err = "a message other than the session part's next block (the link is out of step)";
+                        return false;
+                    }
+                    if (x.h.c == 1) { gave_up = true; why = "the main process gave the part up"; return false; }
+                    left -= x.data.size();
+                    return true;
+                };
+                const auto read = [&](void* p, size_t n, std::string& why) -> bool {
+                    unsigned char* dst = (unsigned char*) p;
+                    while (n > 0) {
+                        if (at == d.data.size()) {
+                            if (lost || gave_up) return false;
+                            if (left == 0) { why = "read past the part's end"; return false; }
+                            d = Inbox();
+                            at = 0;
+                            if (!take(d, why)) return false;
+                        }
+                        const size_t c = std::min(n, d.data.size() - at);
+                        std::memcpy(dst, d.data.data() + at, c);
+                        at += c;
+                        dst += c;
+                        n -= c;
+                    }
+                    return true;
+                };
+                int64_t tokens = 0, ckpt_tokens = 0;
+                bool ok = h.session_load(bytes, read, tokens, ckpt_tokens, e);
+                held = ok ? Held::loaded : Held::none;
+                if (ok && (left > 0 || at < d.data.size())) {
+                    ok = false;
+                    e = "invalid: the part has bytes its reader did not take";
+                }
+                while (!lost && !gave_up && left > 0) {
+                    Inbox x;
+                    std::string why;
+                    if (!take(x, why)) break;
+                }
+                if (lost) { drop_held(); keep = false; break; }
+                if (!ok) {
+                    drop_held();
+                    keep = reply_error(e.empty() ? std::string("io: the part could not be read") : e);
+                    break;
+                }
+                held_tokens = tokens;
+                StageHeader r;
+                r.type = (uint32_t) StageMsg::SessionOk;
+                r.a = tokens;
+                r.b = ckpt_tokens;
+                if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                break;
+            }
+            case StageMsg::SessionEnd: {
+                std::string e;
+                if (!replies_out()) { keep = false; break; }
+                const bool apply = in.h.a == 1;
+                bool ok = true;
+                if (apply && held != Held::loaded) {
+                    drop_held();   // (a saved part, if any: let go, as for any other message)
+                    ok = false;
+                    e = "invalid: no session part is loaded here (a session load first)";
+                } else if (h.session_end) {
+                    ok = h.session_end(apply, in.h.b, e);
+                }
+                if (apply && held == Held::loaded) {
+                    // in place: the session is at the part's end, and a Commit that failed before it no longer
+                    // matters (logged), as at a CkptRestore - a failed position table stays for the request it belongs
+                    // to; a failed transfer leaves the session unknown until a reset
+                    pos = ok ? held_tokens : -1;
+                    if (!pending_err.empty()) {
+                        std::fprintf(stderr, "strata stage worker: a commit failed before a session restore: %s\n",
+                                     pending_err.c_str());
+                        pending_err.clear();
+                    }
+                }
+                held = Held::none;
+                if (!ok) { keep = reply_error(e); break; }
+                StageHeader r;
+                r.type = (uint32_t) StageMsg::SessionOk;
+                if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                break;
+            }
+            case StageMsg::SessionData:   // (outside a SessionLoad: nobody reads it in step)
+                err = "a session block outside a session load (the link is out of step)";
+                keep = false;
+                break;
             default:
                 keep = reply_error("unknown message type " + std::to_string(in.h.type));
                 break;
@@ -1789,6 +2198,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
             if (!keep) break;
         }
         (void) replies_out();   // a reply still going out ends first (or fails on the closed socket)
+        drop_held();            // a session part held for this main process goes with it
         // end the receiving thread: quit ends its polls and its waits on cv (it is set under mu, so a wait that checked
         // it just before cannot miss the notify), and shutting the socket down wakes a blocked recv on Linux.  On
         // Windows it does not: there only the rest of a message from an admitted peer (a header's rest, a body, or
