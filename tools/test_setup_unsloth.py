@@ -191,6 +191,7 @@ class Base(unittest.TestCase):
             mock.patch.object(shutil, "disk_usage", lambda p: shutil._ntuple_diskusage(int(max(free, 1000) * 1e9), int(max(free, 1000) * 1e9 - free * 1e9), int(free * 1e9))),
             mock.patch.object(setup, "rotational_disk", lambda p: None),   # #605: not the test PC's disk
             mock.patch.object(setup, "is_wsl", lambda: False),            # #974: the tests are not run inside WSL
+            mock.patch.object(setup, "card_speeds", lambda: {}),         # not the test PC's cards: two identical cards, speeds unknown
             mock.patch.object(setup, "pip_install", lambda *a, **k: None),
             mock.patch.object(setup, "get_llama_cpp", lambda: self.t / "llama.cpp"),
             mock.patch.object(setup, "get_prebuilt", lambda *a, **k: eng),
@@ -352,7 +353,7 @@ class Main(Base):
         """#967: images are allowed with UD-Q4_K_XL (tested end to end since MODEL-UPDATE)."""
         code, out, cfg = self.main(["--context", "8192", "--vision", "yes", "--low-ram", "on"], n_gpus=2)
         self.assertEqual(code, 0, out)
-        self.assertIn("(NVIDIA GeForce RTX 5070, 12 GB) only (--gpus 1,0 shares it across", out)
+        self.assertIn("(NVIDIA GeForce RTX 5070, 12 GB) only (--gpus 0,1 shares it across", out)
         self.assertNotIn("images are not available", out)
         self.assertIn("images: on", out)
         self.assertNotIn("are untested", out)                      # MODEL-UPDATE: run end to end (CUDA, HIP)
@@ -433,14 +434,14 @@ class Main(Base):
             self.assertIn("--resident-budget-gib", cfg["args"])
             code, out, cfg = self.main(["--context", "8192"], n_gpus=2, answers={"which GPUs?": "2"})
             self.assertEqual(code, 0, out)
-            self.assertEqual(cfg["gpu"], [1, 0])
+            self.assertEqual(cfg["gpu"], [0, 1])
             self.assertIn("--resident-budget-gib", cfg["args"])
 
     @budget_mode()
     def test_yes_alone_keeps_one_gpu(self):
         code, out, cfg = self.main(["--context", "8192"], n_gpus=2, ram=165.0)
         self.assertEqual(code, 0, out)
-        self.assertIn("Main: GPU 1", out)                                       # the roles are shown; the model keeps to one card
+        self.assertIn("Main: GPU 2", out)                                       # the roles are shown; the model keeps to one card
         self.assertNotIn("layer_split", cfg)
         self.assertIn("--resident-budget-gib", cfg["args"])
 
@@ -806,7 +807,7 @@ class Resident(Base):
         """Where the experts fit, two cards are the GGUF models' layer split (no budget question, no #498 note)."""
         code, out, cfg = self.main(["--context", "8192"], n_gpus=2, ram=127.8, answers={"Use these roles?": "y"})     # the recommended roles
         self.assertEqual(code, 0, out)
-        self.assertEqual(cfg["gpu"], [1, 0])
+        self.assertEqual(cfg["gpu"], [0, 1])
         self.assertEqual(cfg["layer_split"], "auto")
         self.assertNotIn("--resident-budget-gib", cfg["args"])
         self.assertNotIn("which GPUs?", out)
