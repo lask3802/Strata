@@ -5033,6 +5033,8 @@ class Service:
                     try:
                         self._vision_up()         # an elastic encoder is not running until a picture needs it
                         self.vision.encode(src)
+                    except GpuBusy:     # an on-demand encoder that did not start: a 503, not the picture's fault
+                        raise
                     except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
                         why[(id(c), n)] = str(e)
         for c, n, _ in found:

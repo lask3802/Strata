@@ -6392,6 +6392,30 @@ class OnDemandVision(unittest.TestCase):
         self.assertEqual(events, ["lend", "start", "encode", "encode", "stop", "give back"])
         svc.drop_embeddings()
 
+    def test_a_failed_start_for_tool_pictures_is_a_503_once(self):
+        # upstream's elastic path leaves a tool picture out when its encoder does not start (RuntimeError); an
+        # on-demand encoder's GpuBusy stays a 503, and the other pictures do not lend and start it again
+        from serve.frontend import anthropic_to_messages
+        v, events = self.make(ready=False)
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                      vision=v)
+        v.lend = lambda on: events.append("lend" if on else "give back")
+
+        def pic(b):
+            return {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                "data": base64.b64encode(self.PNG + b).decode()}}
+        call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}
+        msgs = [{"role": "user", "content": "look"}, call,
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1",
+                                              "content": [pic(b"a"), pic(b"b"), pic(b"c")]}]}]
+        m, _, _ = anthropic_to_messages({"messages": msgs})
+        with self.assertRaises(GpuBusy):
+            self.quiet(svc.prepare, m, None, {})
+        self.assertEqual(events.count("lend"), 1)
+        self.assertEqual(events.count("start"), 1)
+        self.assertEqual(events[-1], "give back")
+
 
 class VisionShutdown(unittest.TestCase):
     """#914: ending the server removes the encoder's scratch directory; unloading keeps it."""
