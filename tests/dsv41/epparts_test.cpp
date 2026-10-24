@@ -300,6 +300,23 @@ std::string slurp(const std::string& f) {
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 void spit(const std::string& f, const std::string& body) { std::ofstream(f, std::ios::binary | std::ios::trunc) << body; }
+// an index edited on purpose, with its stamp made right and the part files' headers following it (so it still opens)
+void spit_index(const std::string& dir, const std::string& text) {
+    const std::string idx = restamp(text);
+    spit(dir + "/ep-parts.txt", idx);
+    uint8_t le[8];
+    for (int i = 0; i < 8; ++i) le[i] = (uint8_t) (index_stamp(idx) >> (8 * i));
+    std::istringstream in(idx);
+    for (std::string line; std::getline(in, line);) {
+        std::istringstream s(line);
+        std::string tag, i, name;
+        s >> tag >> i >> name;
+        if (tag != "file") continue;
+        std::fstream f(dir + "/" + name, std::ios::binary | std::ios::in | std::ios::out);
+        f.seekp(8);
+        f.write((const char*) le, 8);
+    }
+}
 
 // the index text with token `idx` of its last part line replaced (the stamp made right again, so only that field is wrong)
 std::string edit_last_part(const std::string& text, std::vector<std::pair<size_t, std::string>> edits, const std::string& append = "") {
@@ -356,8 +373,9 @@ void refusal_tests(const fs::path& root) {
     CHECK(refused(edit_last_part(good, {{10, "4097"}}), "not aligned"));
     CHECK(refused(edit_last_part(good, {{10, "0"}}), "header page"));
     CHECK(refused(edit_last_part(good, {{11, "1"}}), "disagrees"));                      // bytes != rows x row_bytes
-    CHECK(refused(edit_last_part(good, {{9, "199"}}) , "disagrees"));                    // down: row_bytes not a multiple of (b - a)
-    CHECK(refused(edit_last_part(good, {{1, "5"}}), "out of range"));                    // an expert the geometry lacks
+    CHECK(refused(edit_last_part(good, {{9, "199"}, {11, "101888"}}), "disagrees"));    // down: row_bytes not a multiple of (b - a), the rest right
+    CHECK(refused(edit_last_part(good, {{1, "5"}}), "out of range"));                    // a layer the geometry lacks
+    CHECK(refused(edit_last_part(good, {{2, "5"}}), "out of range"));                    // an expert it lacks
     CHECK(refused(edit_last_part(good, {{0, "part"}}, " extra"), "bad part line"));      // a token too many
     CHECK(refused(good + "heat 0 0 1 2\n", "bad heat line"));
     {   // a part of a layer the covered line leaves out
@@ -431,15 +449,19 @@ void layout_tests(const fs::path& root) {
     CHECK(p.open(dir, err) && p.whole(0, 0) && p.whole(0, 1) == false);
     p.close();
     const std::string good = slurp(dir + "/ep-parts.txt");
-    spit(dir + "/ep-parts.txt", edit_last_part(good, {{4, "16"}}));   // the pool's down part now says IQ2_XXS (16); layer 0's down is IQ2_XS... or the same
-    CHECK(p.open(dir, err));
-    const bool same = std::string("16") == std::to_string(kTypes[g.ty[0][2]].id);
-    CHECK(p.whole(0, 0) == same);                                  // a different type: the parts do not join
     uint8_t buf[8];
-    CHECK(same || !p.assemble(0, 0, ep::kDown, buf));
+    // the pool's down part says IQ2_XS (17), the worker's says IQ2_XXS (16): the index opens, the parts do not join
+    spit_index(dir, edit_last_part(good, {{4, "17"}}));
+    CHECK(p.open(dir, err) || (std::printf("  open: %s\n", err.c_str()), false));
+    CHECK(!p.whole(0, 0) && !p.assemble(0, 0, ep::kDown, buf) && p.whole(0, 1) == false);
+    ep::View v0;
+    CHECK(p.view(0, 0, ep::kDown, 2, v0) && v0.type == 17 && p.view(0, 0, ep::kDown, 7, v0) && v0.type == 16);
     p.close();
-    spit(dir + "/ep-parts.txt", edit_last_part(good, {{9, "199"}}));
-    CHECK(!p.open(dir, err));
+    // ... and a part whose bytes a unit are not the other's (row_bytes 390 = 6 x 65, the worker's 3 x 66)
+    spit_index(dir, edit_last_part(good, {{9, "390"}, {11, "199680"}}));
+    CHECK(p.open(dir, err) || (std::printf("  open: %s\n", err.c_str()), false));
+    CHECK(!p.whole(0, 0));
+    p.close();
     // a parts pack of one layer: the others have no view, no whole, no assemble
     const std::string one = (root / "onelayer").string();
     std::vector<std::pair<int, int>> l1;
