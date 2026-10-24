@@ -21,6 +21,7 @@
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
+#include "ds4_rx.hpp"
 #include "ds4_stage.hpp"
 #include "ds4_store.hpp"
 #include "ds4_vision.cuh"
@@ -1062,6 +1063,16 @@ struct Model::Impl {
     std::atomic<int> layer_of[kRing];
     std::thread service;
     std::atomic<bool> quit{false};
+    // remote experts (--remote-experts, ds4_rx.hpp): the link (the service thread's after the load), the experts the
+    // server holds ([layer][n_exp]), the per-request times (ms) for the percentiles
+    std::unique_ptr<rx::Main> rx_link;
+    std::vector<uint8_t> rx_has;
+    bool rx_on = false;
+    double rx_timeout_ms = 20.0;
+    int rx_late_run = 0;
+    std::vector<rx::ReqRow> rx_rows;
+    mutable std::mutex rx_mu;
+    std::vector<float> rx_rtt, rx_wait;
     bool sync_decode = std::getenv("DS4_SYNC") != nullptr;
     // a window of one through moe_gate_up / moe_down (DS4_MOE_TOKEN=0: win_experts, whose down rows run
     // before the wait for the CPU lane - the same bits, no faster)
@@ -2945,6 +2956,7 @@ struct Model::Impl {
                 }
             }
         }
+        rx_setup();   // (--remote-experts: the expert server's blobs, before the service thread takes the link)
         {
             void* m = nullptr;
             if (cudaHostAlloc(&m, sizeof(Req) * kRing, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
@@ -6493,6 +6505,293 @@ struct Model::Impl {
         pf_cv.notify_one();
     }
 
+    // ---- remote experts (--remote-experts, ds4_rx.hpp): an expert server's GPU holds some of the CPU lane's experts
+    // the load: wait for the server, send it the geometry and the hottest CPU-lane experts by the profile that fit its
+    // room (none came, or the link failed: the lane computes all of them, as without the option)
+    void rx_setup() {
+        if (o.remote_experts.empty()) return;
+        if (const char* v = std::getenv("DS4_RX_TIMEOUT_MS"); v != nullptr && *v != '\0') rx_timeout_ms = std::max(0.05, std::atof(v));
+        const char* wv = std::getenv("DS4_RX_WAIT_S");
+        const int wait_s = wv != nullptr && *wv != '\0' ? std::max(1, std::atoi(wv)) : 120;
+        const char* mv_ = std::getenv("DS4_RX_MAX");   // (tests: at most this many experts)
+        const int64_t max_n = mv_ != nullptr && *mv_ != '\0' ? std::atoll(mv_) : INT64_MAX;
+        const char* tv = std::getenv("STRATA_STAGE_TOKEN");
+        const std::string token = tv != nullptr ? tv : "";
+        std::fprintf(stderr, "ds4: remote experts: waiting up to %d s for an expert server on %s%s\n", wait_s,
+                     o.remote_experts.c_str(), token.empty() ? " (WARNING: no STRATA_STAGE_TOKEN)" : "");
+        auto link = std::make_unique<rx::Main>();
+        std::string e;
+        if (!link->accept(o.remote_experts, token, wait_s, e)) {
+            std::fprintf(stderr, "ds4: remote experts: %s - the CPU lane computes all its experts\n", e.c_str());
+            return;
+        }
+        const int NL = std::min(g.nl, (int) L.size());
+        rx::GeoMsg gm;
+        gm.n_embd = g.dim;
+        gm.n_ff = g.ff;
+        gm.n_layers = NL;
+        gm.limit = g.lim;
+        std::vector<rx::GeoLayer> gl((size_t) NL);
+        for (int li = 0; li < NL; ++li) {   // (the layers here whose experts the device kernels take: the others none)
+            const Layer& l = L[(size_t) li];
+            if (l.mtp || elsewhere(l) || l.cpu_only || l.lay.fmt != gg::kFmtMXFP4 || l.n_exp != g.n_exp ||
+                (int) l.slot.size() < l.n_exp)
+                continue;
+            size_t off = 0;
+            for (int r = 0; r < 3; ++r) {
+                gl[(size_t) li].K[r] = gg::expert_type(l.lay, r);
+                gl[(size_t) li].off[r] = off;
+                off += align256(mx_part_bytes(l, r));
+            }
+            gl[(size_t) li].blob = off;
+        }
+        struct Cand {
+            uint32_t n;
+            int li, e;
+        };
+        std::vector<Cand> cand;   // the CPU lane's experts (not in VRAM here), the most routed first
+        double all_n = 0;
+        for (int li = 0; li < NL; ++li) {
+            if (gl[(size_t) li].blob == 0) continue;
+            const Layer& l = L[(size_t) li];
+            for (int x = 0; x < l.n_exp; ++x)
+                if (l.slot[(size_t) x] < 0) {
+                    cand.push_back({prof[(size_t) li * g.n_exp + x], li, x});
+                    all_n += (double) cand.back().n;
+                }
+        }
+        std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.n > b.n; });
+        const uint64_t room = link->room();
+        uint64_t used = 0;
+        double sent_n = 0;
+        std::vector<Cand> pick;
+        for (const Cand& c : cand) {
+            if ((int64_t) pick.size() >= max_n) break;
+            const uint64_t b = gl[(size_t) c.li].blob;
+            if (used + b > room) continue;
+            pick.push_back(c);
+            used += b;
+            sent_n += (double) c.n;
+        }
+        std::fprintf(stderr, "ds4: remote experts: server %s (%s, %.2f GB of VRAM for experts): sending %zu of the CPU "
+                             "lane's %zu experts (%.2f GB, %.1f%% of their routings in the profile)\n",
+                     link->peer().c_str(), link->name().c_str(), (double) room / 1e9, pick.size(), cand.size(),
+                     (double) used / 1e9, all_n > 0 ? 100.0 * sent_n / all_n : 0.0);
+        const double t0 = now_ms();
+        if (!link->send_geo(gm, gl, e)) {
+            std::fprintf(stderr, "ds4: remote experts: %s - the CPU lane computes all its experts\n", e.c_str());
+            return;
+        }
+        std::vector<uint8_t> blob;
+        for (size_t i = 0; i < pick.size(); ++i) {
+            const Layer& l = L[(size_t) pick[i].li];
+            const rx::GeoLayer& G = gl[(size_t) pick[i].li];
+            blob.assign((size_t) G.blob, 0);
+            for (int r = 0; r < 3; ++r) {   // (each matrix whole: its NH parts in order, from wherever they are)
+                const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
+                for (int X = 0; X < NH; ++X)
+                    std::memcpy(blob.data() + G.off[r] + (size_t) X * nb, mx_part_ptr(l, pick[i].e, r, X), nb);
+            }
+            if (!link->send_blob(pick[i].li, pick[i].e, blob.data(), blob.size(), e)) {
+                std::fprintf(stderr, "ds4: remote experts: %s - the CPU lane computes all its experts\n", e.c_str());
+                return;
+            }
+        }
+        std::vector<uint8_t> ok;
+        if (!link->end_blobs((int) pick.size(), ok, 120000.0, e)) {
+            std::fprintf(stderr, "ds4: remote experts: %s - the CPU lane computes all its experts\n", e.c_str());
+            return;
+        }
+        rx_has.assign((size_t) NL * g.n_exp, 0);
+        int64_t held = 0;
+        uint64_t held_b = 0;
+        for (size_t i = 0; i < pick.size(); ++i)
+            if (ok[i]) {
+                rx_has[(size_t) pick[i].li * g.n_exp + pick[i].e] = 1;
+                ++held;
+                held_b += gl[(size_t) pick[i].li].blob;
+            }
+        st.rx_held = held;
+        st.rx_upload_bytes = (int64_t) held_b;
+        st.rx_upload_ms = now_ms() - t0;
+        std::fprintf(stderr, "ds4: remote experts: %lld experts (%.2f GB) in the server's VRAM, uploaded in %.1f s (%.0f MB/s); "
+                             "a reply later than %.2f ms after its request: its picks computed here\n",
+                     (long long) held, (double) held_b / 1e9, st.rx_upload_ms / 1000.0,
+                     st.rx_upload_ms > 0 ? (double) held_b / 1e3 / st.rx_upload_ms : 0.0, rx_timeout_ms);
+        st.rx_bytes_out = (int64_t) link->bytes_out();   // (the per-token bytes count from here)
+        st.rx_bytes_in = (int64_t) link->bytes_in();
+        rx_link = std::move(link);
+        rx_on = held > 0;
+        rx_rtt.reserve(1 << 20);
+        rx_wait.reserve(1 << 20);
+    }
+    // the link given up: the lane computes every pick from now on (said once)
+    void rx_lost(const std::string& why) {
+        if (!rx_on) return;
+        rx_on = false;
+        if (rx_link) rx_link->close();
+        std::fprintf(stderr, "ds4: remote experts: %s - the CPU lane computes all its experts from now on\n", why.c_str());
+    }
+    // request seq's picks the server holds ((expert, t * kPicks + i), in token order) as rows of r's tokens
+    bool rx_send(unsigned seq, int li, int T, const Req& r, const std::vector<std::pair<int, int>>& rpk) {
+        rx_rows.clear();
+        const float* xs[kWin];
+        int row_of[kWin];
+        for (int t = 0; t < kWin; ++t) row_of[t] = -1;
+        for (const auto& q : rpk) {
+            const int t = q.second / kPicks, i = q.second % kPicks;
+            if (t >= T) continue;
+            if (row_of[t] < 0) {
+                row_of[t] = (int) rx_rows.size();
+                rx_rows.emplace_back();
+                rx_rows.back().t = (uint8_t) t;
+                xs[row_of[t]] = r.x[t];
+            }
+            rx::ReqRow& w = rx_rows[(size_t) row_of[t]];
+            w.e[w.n] = (int16_t) q.first;
+            w.w[w.n] = r.w[t][i];
+            ++w.n;
+        }
+        std::string e;
+        if (!rx_link->send_req(seq, li, (int) rx_rows.size(), rx_rows.data(), xs, e)) {
+            rx_lost("a request did not go out (" + e + ")");
+            return false;
+        }
+        ++st.rx_reqs;
+        return true;
+    }
+    // picks (expert, t * kPicks + i) of request r computed on the lane and added to rp's parts
+    void lane_add(const Layer& l, const Req& r, Resp& rp, int T, std::vector<std::pair<int, int>> pk2) {
+        std::sort(pk2.begin(), pk2.end());
+        std::vector<Ent> ents;
+        float wv[kWin * kPicks];
+        int tok_of[kWin * kPicks];
+        int nslots = 0;
+        for (size_t a = 0; a < pk2.size();) {
+            Ent en;
+            en.e = pk2[a].first;
+            en.slot0 = nslots;
+            while (a < pk2.size() && pk2[a].first == en.e && en.n < ent_cap(l)) {
+                const int t = pk2[a].second / kPicks, i = pk2[a].second % kPicks;
+                en.tok[en.n++] = t;
+                tok_of[nslots] = t;
+                wv[nslots] = r.w[t][i];
+                ++nslots;
+                ++a;
+            }
+            ents.push_back(en);
+        }
+        cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim);
+        const int D = g.dim;
+        for (int t = 0; t < T; ++t)
+            for (int sl = 0; sl < nslots; ++sl) {
+                if (tok_of[sl] != t) continue;
+                float* o = rp.part[t];
+                if (!rp.cpu[t]) {
+                    for (int c = 0; c < D; ++c) o[c] = 0.0f;
+                    rp.cpu[t] = 1;
+                }
+                const float* y = c_yd.data() + (size_t) sl * D;
+                for (int c = 0; c < D; ++c) o[c] += wv[sl] * y[c];
+            }
+        st.cpu_experts += nslots;
+    }
+    // the reply to request seq (sent at t0) into rp's parts; late or no link: those picks computed here
+    void rx_finish(const Layer& l, const Req& r, Resp& rp, int T, unsigned seq, double t0,
+                   const std::vector<std::pair<int, int>>& rpk) {
+        const double tw = rx::now_ms();
+        const uint16_t* y = nullptr;
+        int srv_us = 0;
+        std::string e;
+        const int got = rx_on ? rx_link->wait_resp(seq, (int) rx_rows.size(), t0 + rx_timeout_ms, &y, srv_us, e) : -1;
+        const double t1 = rx::now_ms();
+        st.rx_wait_ms += t1 - tw;
+        st.rx_bytes_out = (int64_t) rx_link->bytes_out();
+        st.rx_bytes_in = (int64_t) rx_link->bytes_in();
+        {
+            std::lock_guard<std::mutex> lk(rx_mu);
+            rx_rtt.push_back(got == 1 ? (float) (t1 - t0) : -1.0f);
+            rx_wait.push_back((float) (t1 - tw));
+        }
+        if (got == 1) {
+            const int D = g.dim;
+            for (size_t j = 0; j < rx_rows.size(); ++j) {
+                const int t = rx_rows[j].t;
+                float* o = rp.part[t];
+                const uint16_t* yj = y + j * (size_t) D;
+                if (rp.cpu[t]) {
+                    for (int c = 0; c < D; ++c) o[c] += rx::bf2f(yj[c]);
+                } else {
+                    for (int c = 0; c < D; ++c) o[c] = rx::bf2f(yj[c]);
+                    rp.cpu[t] = 1;
+                }
+            }
+            st.rx_picks += (int64_t) rpk.size();
+            st.rx_rtt_ms += t1 - t0;
+            st.rx_srv_ms += srv_us / 1000.0;
+            rx_late_run = 0;
+            return;
+        }
+        if (got == 0) {
+            if (++st.rx_late == 1)
+                std::fprintf(stderr, "ds4: remote experts: a reply later than %.2f ms (layer %d): its %zu picks computed "
+                                     "here (said once; the count is in the stats)\n", rx_timeout_ms, l.il, rpk.size());
+            if (++rx_late_run >= 8) rx_lost("8 replies in a row later than DS4_RX_TIMEOUT_MS");
+        } else {
+            rx_lost(e.empty() ? "the link failed" : e);
+        }
+        const double tf = rx::now_ms();
+        lane_add(l, r, rp, T, rpk);
+        st.rx_fallback += (int64_t) rpk.size();
+        st.rx_fallback_ms += rx::now_ms() - tf;
+    }
+    std::string rx_lines(const Stats& s0, double nt) const {
+        if (st.rx_held == 0) return "";
+        std::vector<float> rt, wt;
+        {
+            std::lock_guard<std::mutex> lk(rx_mu);
+            for (size_t i = (size_t) std::max<int64_t>(0, s0.rx_reqs); i < rx_rtt.size(); ++i) {
+                if (rx_rtt[i] >= 0) rt.push_back(rx_rtt[i]);
+                wt.push_back(rx_wait[i]);
+            }
+        }
+        auto pct = [](std::vector<float>& v, std::string& out) {
+            char b[96];
+            if (v.empty()) {
+                out = "-";
+                return;
+            }
+            std::sort(v.begin(), v.end());
+            double sum = 0;
+            for (float x : v) sum += x;
+            std::snprintf(b, sizeof b, "mean %.3f p50 %.3f p99 %.3f", sum / (double) v.size(), v[v.size() / 2],
+                          v[std::min(v.size() - 1, (size_t) ((double) v.size() * 0.99))]);
+            out = b;
+        };
+        std::string rts, wts;
+        pct(rt, rts);
+        pct(wt, wts);
+        const double req = (double) (st.rx_reqs - s0.rx_reqs), served = (double) (st.rx_picks - s0.rx_picks);
+        const double local = (double) (st.cpu_experts - s0.cpu_experts);
+        char b[1024];
+        std::snprintf(b, sizeof b,
+                      "remote experts: %.1f%% of the CPU lane's picks served by the expert server (%.2f a token of %.2f), "
+                      "%.2f a token computed here after all (%lld late replies%s); %.2f requests a token\n"
+                      "remote experts per request: round trip %s ms (the server's own %.3f ms), the lane's wait after its "
+                      "part %s ms\n"
+                      "remote experts per token: the lane's own part %.2f ms + its wait %.2f ms + the late ones %.2f ms; the "
+                      "link %.1f KB out, %.1f KB in; the upload %lld experts, %.2f GB in %.1f s\n",
+                      local + served > 0 ? 100.0 * served / (local + served) : 0.0, served / nt, (local + served) / nt,
+                      (double) (st.rx_fallback - s0.rx_fallback) / nt, (long long) (st.rx_late - s0.rx_late),
+                      rx_on ? "" : ", the link given up", req / nt, rts.c_str(),
+                      (st.rx_srv_ms - s0.rx_srv_ms) / std::max<double>(1.0, (double) rt.size()), wts.c_str(),
+                      (st.cpu_ms - s0.cpu_ms) / nt, (st.rx_wait_ms - s0.rx_wait_ms) / nt,
+                      (st.rx_fallback_ms - s0.rx_fallback_ms) / nt,
+                      (double) (st.rx_bytes_out - s0.rx_bytes_out) / 1e3 / nt, (double) (st.rx_bytes_in - s0.rx_bytes_in) / 1e3 / nt,
+                      (long long) st.rx_held, (double) st.rx_upload_bytes / 1e9, st.rx_upload_ms / 1000.0);
+        return b;
+    }
+
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
     // part, then the answer's seq.  Spins while requests come (a token's 40 layers), naps after 2 ms without one.
     void serve_lane() {
@@ -6525,6 +6824,9 @@ struct Model::Impl {
                 int tok_of[kWin * kPicks];
                 int nslots = 0;
                 std::vector<std::pair<int, int>> picks;   // (expert, t * kPicks + i), CPU-lane only
+                // (--remote-experts) the CPU-lane picks the expert server holds: sent before the lane computes the rest
+                std::vector<std::pair<int, int>> rpicks;
+                const bool rxl = rx_on && !l.mtp && li < g.nl && li < (int) (rx_has.size() / (size_t) g.n_exp);
                 if (trace_f != nullptr && !l.mtp) {   // DS4_TRACE=file: one record a route request: u8 layer, u8 T, T x k int16 expert ids
                     // DS4_TRACE_AHEAD=1: T has bit 7 set and the guesses follow: u8 na1, u8 na2, T x (na1 + na2) int16 (the
                     // next layer's likely picks by rank, then the one after's), as the lookahead made them for THIS layer's
@@ -6570,6 +6872,10 @@ struct Model::Impl {
                             st.ahead_hit2 += (fl[e] >> 2) & 1;
                         }
                         if (l.slot[(size_t) e] < 0) {
+                            if (rxl && rx_has[(size_t) li * g.n_exp + e]) {   // (the expert server's: not a swap candidate)
+                                rpicks.push_back({e, t * kPicks + i});
+                                continue;
+                            }
                             l.cpu_hits.push_back(e);
                             if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
                                 store->touch(li, e);
@@ -6600,6 +6906,15 @@ struct Model::Impl {
                     }
                 }
                 if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
+                double rx_t0 = 0.0;
+                if (!rpicks.empty()) {
+                    rx_t0 = rx::now_ms();
+                    if (!rx_send(next, li, T, r, rpicks)) {   // (no link: the lane computes them as it did before)
+                        picks.insert(picks.end(), rpicks.begin(), rpicks.end());
+                        st.rx_fallback += (int64_t) rpicks.size();
+                        rpicks.clear();
+                    }
+                }
                 std::sort(picks.begin(), picks.end());
                 for (size_t a = 0; a < picks.size();) {
                     Ent en;
@@ -6652,6 +6967,7 @@ struct Model::Impl {
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
                 }
+                if (!rpicks.empty()) rx_finish(l, r, rp, T, next, rx_t0, rpicks);
             }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;
@@ -9952,6 +10268,7 @@ const Stats& Model::stats() const {
     return st;
 }
 std::string Model::describe() const { return p_->describe(); }
+std::string Model::rx_lines(const Stats& s0, double nt) const { return p_->rx_lines(s0, nt); }
 std::vector<std::string> Model::info_lines() const { return p_->info_lines(); }
 
 }  // namespace strata::ds4

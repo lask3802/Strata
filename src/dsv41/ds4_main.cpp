@@ -11,6 +11,10 @@
 //                                                                     the main process below, on PORT (no head)
 //   maya-ds4 --pack ... --remote-stage HOST:PORT --stage-end K ...    layers 0 to K - 1 and the head here, the rest on
 //                                                                     the worker (docs/REMOTE_STAGE.md; any mode above)
+//   maya-ds4 --pack ... --remote-experts [BIND:]PORT ...              (a proof of concept, ds4_rx.hpp) some of the CPU
+//                                                                     lane's experts on an expert server's GPU
+//   maya-ds4 --expert-server-connect HOST:PORT [--expert-server-reserve-mib N] [--expert-server-once] [--gpus I]
+//                                                                     that server: no pack, it dials the main process
 //
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
 // `GEN <max_new> [key=value ...] <id,id,...>` answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
@@ -32,6 +36,7 @@
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
 #include "ds4_partstore.hpp"
+#include "ds4_rx.hpp"
 #include "ds4_slotmeta.hpp"
 #include "ds4_stage.hpp"
 
@@ -101,11 +106,12 @@ void usage() {
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto] [--stage-begin K] [--stage-end E]\n"
-                 "           [--remote-stage HOST:PORT --stage-end K]\n"
+                 "           [--remote-stage HOST:PORT --stage-end K] [--remote-experts [BIND:]PORT]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
                  "           | --stage-worker PORT [--stage-bind ADDR] --stage-begin K\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
-                 "           | --pack-info)\n");
+                 "           | --pack-info)\n"
+                 "maya-ds4 --expert-server-connect HOST:PORT [--expert-server-reserve-mib N] [--expert-server-once] [--gpus I]\n");
 }
 
 // stdin lines on a thread, so a request can see STOP while it decodes
@@ -1572,6 +1578,9 @@ int main(int argc, char** argv) {
     std::string remote_at, stage_bind;   // (a remote stage: the worker's HOST:PORT; a worker's address to listen on)
     int worker_port = 0;
     bool worker_mode = false;
+    std::string rx_at;          // (--expert-server-connect: the main process's HOST:PORT)
+    int64_t rx_reserve = 1024;  // (its VRAM left free, MiB)
+    bool rx_once = false;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1647,6 +1656,10 @@ int main(int argc, char** argv) {
             worker_port = std::atoi(val("--stage-worker").c_str());
         }
         else if (a == "--stage-bind") stage_bind = val("--stage-bind");
+        else if (a == "--remote-experts") o.remote_experts = val("--remote-experts");
+        else if (a == "--expert-server-connect") rx_at = val("--expert-server-connect");
+        else if (a == "--expert-server-reserve-mib") rx_reserve = std::atoll(val("--expert-server-reserve-mib").c_str());
+        else if (a == "--expert-server-once") rx_once = true;
         else if (a == "--help" || a == "-h") {
             usage();
             return 0;
@@ -1655,6 +1668,11 @@ int main(int argc, char** argv) {
             usage();
             return 2;
         }
+    }
+    if (!rx_at.empty()) {   // the expert server (ds4_rx.hpp): no pack, the main process sends what it computes
+        std::string token;
+        if (!stage_token(token)) return 1;
+        return strata::ds4::rx::serve(rx_at, token, rx_reserve, o.gpus.empty() ? 0 : o.gpus[0], rx_once);
     }
     if (pack_info_mode) {   // the pack's description only: no device, no weights, no lock
         if (o.pack.empty()) {
@@ -1919,6 +1937,7 @@ int main(int argc, char** argv) {
                          "head wait %.2f, Engram reads %.2f\n",
                  (s.layer_ms - s0.layer_ms) / nt, (s.gpu_wait_ms - s0.gpu_wait_ms) / nt, (s.cpu_ms - s0.cpu_ms) / nt,
                  (s.head_ms - s0.head_ms) / nt, (s.engram_ms - s0.engram_ms) / nt);
+    std::fprintf(stderr, "%s", m.rx_lines(s0, nt).c_str());   // (--remote-experts)
     if (s.eg_rows > s0.eg_rows) {   // the Engram rows: how many the row cache served, the reads' time behind the layers
         const double rows = (double) (s.eg_rows - s0.eg_rows);
         std::fprintf(stderr, "Engram per token: %.0f rows, %.1f%% without a read (the row cache holds %lld of %lld), "

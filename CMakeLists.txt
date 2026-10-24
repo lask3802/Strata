@@ -812,7 +812,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(strata-dsv41 src/dsv41/ds4_main.cpp src/dsv41/ds4_model.cu src/dsv41/ds4_kernels.cu src/dsv41/ds4_vision.cu
                    src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
                    src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp
-                   src/net/stage_link.cpp)
+                   src/net/stage_link.cpp src/dsv41/ds4_rx.cpp src/dsv41/ds4_rx_server.cu)
     if(WIN32)
       target_link_libraries(strata-dsv41 PRIVATE ws2_32)   # the remote stage's sockets (src/net/stage_link.cpp)
     endif()
@@ -890,6 +890,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_compile_definitions(ds4_iq_test PRIVATE STRATA_DSV41_TQ_CPU=1)
       if(STRATA_ENABLE_HIP)
         target_compile_options(ds4_iq_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
+      endif()
+      # the remote experts (ds4_rx.hpp): this is the main process's end, an expert server (strata-dsv41
+      # --expert-server-connect, a GPU) the other; its replies against the CPU lane's sums of the same random experts
+      set_source_files_properties(tests/dsv41/rx_test.cpp PROPERTIES LANGUAGE ${_ds4_test_lang})
+      add_executable(ds4_rx_test tests/dsv41/rx_test.cpp src/dsv41/ds4_rx.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
+                     src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp)
+      target_include_directories(ds4_rx_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
+      target_link_libraries(ds4_rx_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} Threads::Threads)
+      target_compile_definitions(ds4_rx_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+      if(WIN32)
+        target_link_libraries(ds4_rx_test PRIVATE ws2_32)
       endif()
       # the kept conversations' .meta file and prefix matching (ds4_slotmeta.hpp): no GPU, no model
       add_executable(ds4_slot_test tests/dsv41/slot_test.cpp)

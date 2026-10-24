@@ -82,6 +82,9 @@ struct Options {
     // set_stage_ckpt): each is taken on the worker too, under the main process's id, and used only where both hold it.
     // Off: no checkpoints, every request that does not continue the conversation in place starts from token 0
     bool stage_ckpt = false;
+    // remote VRAM experts (ds4_rx.hpp, a proof of concept): [BIND:]PORT this process listens on at its load for an
+    // expert server (strata-dsv41 --expert-server-connect), which then computes the CPU lane's picks it holds; empty: off
+    std::string remote_experts;
 };
 
 /// A picture in the prompt: its span's rows (every position of the span carries the image token), BF16 [span][dim]
@@ -120,6 +123,15 @@ struct Stats {
     // per draft position (the 1st .. 8th of a round): verified with all the drafts before it accepted, and accepted
     int64_t draft_reached[8] = {}, draft_kept[8] = {};
     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
+    // remote experts (--remote-experts): requests sent, the CPU lane's picks served remotely, and the server's picks
+    // computed here after all (late replies, a lost link: in cpu_experts too), late replies; the lane's wait for the
+    // replies after its own part, the round trips (send to reply read), the server's own time and the fallbacks'
+    // compute, ms in all; the link's bytes; the load's upload (experts held, bytes, ms)
+    int64_t rx_reqs = 0, rx_picks = 0, rx_fallback = 0, rx_late = 0;
+    double rx_wait_ms = 0.0, rx_rtt_ms = 0.0, rx_srv_ms = 0.0, rx_fallback_ms = 0.0;
+    int64_t rx_bytes_out = 0, rx_bytes_in = 0;
+    int64_t rx_held = 0, rx_upload_bytes = 0;
+    double rx_upload_ms = 0.0;
 };
 
 class Model {
@@ -306,6 +318,9 @@ public:
 
     void save_profile() const;
     const Stats& stats() const;
+    /// (--remote-experts) the remote experts' lines since s0 (per token of nt): picks served there, the round trips
+    /// and the lane's waits (mean, p50, p99), bytes; "" without an expert server
+    std::string rx_lines(const Stats& s0, double nt) const;
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.
     std::vector<std::string> info_lines() const;
