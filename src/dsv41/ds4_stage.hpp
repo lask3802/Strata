@@ -318,6 +318,11 @@ public:
     /// `g`'s rows, compact on the link when `compact` (the hellos' kRowsBf16Cap), else as they are
     ChunkLink(net::StageClient& link, const RowGeo& g, bool compact)
         : link_(link), relay_(link), row_(compact ? g.compact() : g.full()), g_(g), compact_(compact) {}
+    /// (the send out reads wire_: waited for here, before the slots go)
+    ~ChunkLink() {
+        std::string e;
+        (void) relay_.wait(e);
+    }
     /// chunk rows `rows` (T, block by block) of tokens at p0 to the worker; `skip`: the rows its reply leaves out
     bool send(const int32_t* tokens, int T, int64_t p0, int flags, const float* rows, int skip, std::string& err) {
         tok_.assign(tokens, tokens + (T > 0 ? T : 0));

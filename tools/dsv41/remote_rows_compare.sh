@@ -44,6 +44,7 @@ thr=${CPU_THREADS:-$(( $(nproc) / 2 > 0 ? $(nproc) / 2 : 1 ))}
 eg_mb=${ENGRAM_MB:-64}
 py=${PYTHON:-python3}
 arms=${ARMS:-"bf16 bf16b"}
+[ -n "${arms// /}" ] || { echo "ARMS: no arm (bf16, bf16b)"; exit 2; }
 for a in $arms; do
     case $a in
         bf16 | bf16b) ;;
@@ -166,7 +167,7 @@ res = {a: cmp("KL(single || split-%s)" % a, single, logits[a]) for a in arms}
 if "bf16" in logits and "bf16b" in logits:
     cmp("KL(split-bf16 || split-bf16b)", logits["bf16"], logits["bf16b"])
 kl, top = res[arms[0]]
-if kl > kl_max or top < top_min * len(single):
+if not kl <= kl_max or top < top_min * len(single):   # (a NaN KL fails)
     print("FAIL: split-%s is further from one process than KL_MAX %g / TOP1_MIN %g allow" % (arms[0], kl_max, top_min))
     sys.exit(1)
 PYEOF
