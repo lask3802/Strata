@@ -191,9 +191,10 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
                                                   "host: the sync's wait", "host: bf16 and send", "host: the whole request",
                                                   "GPU: plan in", "GPU: x in", "GPU: gate_up (q8 + dots)",
                                                   "GPU: down (q8 + dots + combine)", "GPU: y out", "GPU: first copy to last"};
-    std::vector<float> parts[kParts];
+    std::vector<float> parts[3][kParts];   // (by the request's rows: T = 1, T = 4, any other T)
+    int bucket = 0;
     auto keep = [&](int k, double ms) {
-        if (parts[k].size() < (size_t(1) << 20)) parts[k].push_back((float) (ms * 1000.0));
+        if (parts[bucket][k].size() < (size_t(1) << 20)) parts[bucket][k].push_back((float) (ms * 1000.0));
     };
     std::vector<uint16_t> yb((size_t) kMaxRows * D);
     int rc = 0;
@@ -208,16 +209,18 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
                          c.peer().c_str(), err.c_str(), (long long) served, busy * 1000.0 / n, prep * 1000.0 / n,
                          gpu * 1000.0 / n, (busy - prep - gpu) * 1000.0 / n);
             if (pings > 0) std::fprintf(stderr, "expert server: %lld pings answered\n", (long long) pings);
-            for (int k = 0; diag && k < kParts; ++k) {
-                std::vector<float>& v = parts[k];
-                if (v.empty()) continue;
-                std::sort(v.begin(), v.end());
-                double s = 0;
-                for (float x : v) s += x;
-                std::fprintf(stderr, "expert server: part %-36s mean %7.1f p50 %7.1f p99 %7.1f us (%zu)\n", part_name[k],
-                             s / (double) v.size(), (double) v[v.size() / 2], (double) v[(size_t) ((double) v.size() * 0.99)],
-                             v.size());
-            }
+            static const char* const bucket_name[3] = {"T=1", "T=4", "T=other"};
+            for (int bk = 0; diag && bk < 3; ++bk)
+                for (int k = 0; k < kParts; ++k) {
+                    std::vector<float>& v = parts[bk][k];
+                    if (v.empty()) continue;
+                    std::sort(v.begin(), v.end());
+                    double s = 0;
+                    for (float x : v) s += x;
+                    std::fprintf(stderr, "expert server: part %-7s %-36s mean %7.1f p50 %7.1f p99 %7.1f us (%zu)\n",
+                                 bucket_name[bk], part_name[k], s / (double) v.size(), (double) v[v.size() / 2],
+                                 (double) v[(size_t) ((double) v.size() * 0.99)], v.size());
+                }
             break;
         }
         if (h.type == Ping) {
@@ -228,6 +231,7 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         if (h.type != Req) continue;
         const double tr = now_ms();
         const int li = h.a, nr = h.b;
+        bucket = nr == 1 ? 0 : nr == 4 ? 1 : 2;
         const size_t per = sizeof(ReqRow) + (size_t) D * 2;
         std::string why;
         if (li < 0 || li >= g.n_layers || nr < 1 || nr > kMaxRows || p.size() != (size_t) nr * per) why = "a malformed request";
