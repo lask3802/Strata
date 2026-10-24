@@ -3,6 +3,7 @@
 //   DS4_U9=0                         all of them off: the 747981ba path
 //   DS4_U9_OFF=quant,hc,...          these off (names below)
 // DS4_ATTN_SPLIT (ds4_kernels.cu, other bits in the last place) keeps its own env; unset, it follows defaults() below.
+// So DS4_U9_OFF naming all six still leaves the split on - not DS4_U9=0's bits; add DS4_ATTN_SPLIT=0 for those.
 // Header-only: the test targets link ds4_gguf.cu / ds4_iq.cu without the model.
 #pragma once
 #include <cstdio>

@@ -1906,8 +1906,8 @@ namespace {
 
 // ---- the split-KV attention's scratch: a device allocation a (device, stream), made on first use and kept
 constexpr int kSplitG = 4, kSplitR = 40, kSplitCap = 24, kSplitMaxT = 5;
-bool split_enabled() {
-    static const bool on = [] {
+bool& split_flag() {   // (a test sets it: both kernels in one process)
+    static bool on = [] {
         // unset: on with the U9 defaults (the 2080 Ti's attention 15.9 -> 15.0 ms a token), off with DS4_U9=0 and on HIP
         // (no gain measured on 4x R9700: 21.8 vs 21.9 tok/s)
         const char* e = std::getenv("DS4_ATTN_SPLIT");
@@ -1939,6 +1939,8 @@ attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
     return sc;
 }
 }  // namespace
+
+bool& attn_split() { return split_flag(); }
 
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
@@ -2175,8 +2177,8 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     }
     // a decode step / short verify window of packed rows: the split-KV kernel (Strata's CUDA lab, ds4_attn_split.cuh; 2.9x at
     // one query on an A4000).  The same inputs; the merge sums the chunks in another order, so the bits differ in the last
-    // place (4e-7 against a double reference).  DS4_ATTN_SPLIT=0 / =1 turns it off / on (split_enabled: the default follows DS4_U9).
-    if (ckv_fmt == kKvFp4 && a.gen == 0 && T >= 1 && T <= kSplitMaxT && heads % kSplitG == 0 && split_enabled()) {
+    // place (4e-7 against a double reference).  DS4_ATTN_SPLIT=0 / =1 turns it off / on (split_flag: the default follows DS4_U9).
+    if (ckv_fmt == kKvFp4 && a.gen == 0 && T >= 1 && T <= kSplitMaxT && heads % kSplitG == 0 && split_flag()) {
         int total_max = 0;
         for (int t = 0; t < T; ++t) total_max = std::max(total_max, a.nwin[t] + a.nsel[t]);
         if (total_max > 0 && total_max <= kSplitCap * kSplitR) {
@@ -2288,7 +2290,7 @@ void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaSt
 }
 void win_submit(cudaStream_t s) {
 #if defined(_WIN32)
-    static const bool on = [] {
+    static bool on = [] {
         const char* v = std::getenv("DS4_WIN_SUBMIT");
         return v == nullptr || std::atoi(v) != 0;
     }();

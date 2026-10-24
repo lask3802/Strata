@@ -464,9 +464,6 @@ struct Dev {
     // U9 hc: a sublayer's hc_mix / hc_split beside st (forked after the residual is final, joined before its hc_post)
     cudaStream_t st2 = nullptr;
     cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
-    // U9 route: the bytes the F32 router copies would have taken beyond the BF16 rows, still charged to the experts'
-    // VRAM budget (the same placement as the F32 path: the A/B compares the kernels, not a different expert split)
-    size_t u9_held = 0;
     size_t free0 = 0, total = 0, weights = 0, experts = 0, caches = 0, scratch = 0;
     std::vector<void*> allocs;
     // a window's scratch, rows of up to kWin tokens (the routed experts' rows: kWin * kPicks)
@@ -1235,7 +1232,8 @@ struct Model::Impl {
     std::mutex dump_mu;
     // DS4_PROF: the GPU's time a decoded token by stage - events in stream order at a layer's start, after its
     // attention, after the routing and the shared expert, after the experts' gate / up, after the wait for the CPU
-    // lane, after the down pass and the post - read after the token's sync, each the time since the mark before it
+    // lane, after the down pass and the post - read after the token's sync, each the time since the mark before it.
+    // (U9 tail moves the device experts' down into the gate / up stage: compare such runs by their totals, not by stage)
     bool prof_on = std::getenv("DS4_PROF") != nullptr;
     // DS4_PRED_DUMP=file (predictor data, the chunked prompt path): per layer and chunk u8 layer, u16 T, T x 384 fp16 router
     // logits, T x 256 fp16 projection of the router input.  DS4_XIN_DUMP=file (expert similarity inputs): u8 layer, u16 T,
@@ -1691,8 +1689,9 @@ struct Model::Impl {
             err = name + ": read failed";
             return false;
         }
-        if (!dalloc(d, l.gate_bf, want, err, acct)) return false;
-        d.u9_held += align256(want * 4) - align256(want * 2);
+        // (allocated at the F32 copy's size: the same cudaMalloc sizes as the F32 path, so the same VRAM is left for the
+        // experts - the driver's granules make a smaller buffer free more than its bytes; the second half stays unused)
+        if (!dalloc(d, l.gate_bf, want * 2, err, acct)) return false;
         cudaSetDevice(d.id);
         CK(cudaMemcpy(l.gate_bf, raw.data(), t->bytes, cudaMemcpyHostToDevice));
         return true;
@@ -2047,22 +2046,24 @@ struct Model::Impl {
         if (ids.empty())
             for (int i = 0; i < ndev; ++i) ids.push_back(i);
         devs.resize(ids.size());
+        u9::mask();       // (both print their state at load)
+        attn_split();
         for (size_t i = 0; i < ids.size(); ++i) {
             Dev& d = devs[i];
             d.id = ids[i];
             CK(cudaSetDevice(d.id));
             CK(cudaStreamCreateWithFlags(&d.st, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming));
-            if (u9::on(u9::kHc)) {
-                CK(cudaStreamCreateWithFlags(&d.st2, cudaStreamNonBlocking));
-                CK(cudaEventCreateWithFlags(&d.ev_fork, cudaEventDisableTiming));
-                CK(cudaEventCreateWithFlags(&d.ev_join, cudaEventDisableTiming));
-            }
             if (!x3::prepare(d.st) || (pk.gguf && !gg::prepare(d.st))) {
                 err = "exl3 scratch on CUDA" + std::to_string(d.id);
                 return false;
             }
             CK(cudaMemGetInfo(&d.free0, &d.total));
+            if (u9::on(u9::kHc)) {   // (after free0: the plan's free VRAM is the old path's)
+                CK(cudaStreamCreateWithFlags(&d.st2, cudaStreamNonBlocking));
+                CK(cudaEventCreateWithFlags(&d.ev_fork, cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&d.ev_join, cudaEventDisableTiming));
+            }
         }
         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
@@ -2873,7 +2874,6 @@ struct Model::Impl {
                 cudaSetDevice(d.id);
                 size_t fr = 0, tot = 0;
                 CK(cudaMemGetInfo(&fr, &tot));
-                fr -= std::min(fr, d.u9_held);   // (U9 route: the F32 path's room)
                 room += std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
             }
             for (const Layer& l : L) all += (double) l.blob * l.n_exp;
@@ -4090,7 +4090,6 @@ struct Model::Impl {
                 cudaSetDevice(devs[(size_t) m].id);
                 size_t fr = 0, tot = 0;
                 CK(cudaMemGetInfo(&fr, &tot));
-                fr -= std::min(fr, devs[(size_t) m].u9_held);
                 budget = std::min(budget, std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20))) *
                                               o.vram_experts);
                 charged = charged || commit_charged(devs[(size_t) m]);
