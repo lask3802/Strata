@@ -24,8 +24,9 @@ namespace strata::ds4::stage {
 
 /// row_formats' capability bit both sides of a DeepSeek link set (hello_matches compares neither it nor the other
 /// bits 24-30): the worker's reply is reply_tap_at's layout.  An earlier build's worker sent its last layer's streams
-/// and pre back, which a main process of this one would read as the normed rows - each side refuses a peer without it
-inline constexpr uint32_t kRowsNormed = 1u << 30;
+/// and pre back, which a main process of this one would read as the normed rows - each side refuses a peer without it.
+/// (Bit 30 is the compact rows' capability on dsv41-u4-rows.)
+inline constexpr uint32_t kRowsNormed = 1u << 29;
 
 inline uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
     const unsigned char* p = (const unsigned char*) data;
@@ -103,17 +104,17 @@ inline bool main_accepts(const net::StageHello& peer, std::string& err) {
     return true;
 }
 
-/// The worker's reply to a window of T rows, in the T x handoff_floats floats the link sends back (the request's
-/// size), block by block: its last layer's rows through the final norm (T x dim: what the head reads), then the
-/// drafter's taps - the streams' mean entering each target layer, T rows of nt x dim, target after target in a row
-/// (the main process's h_taps layout).  The rest of the reply is not read.  A target the worker does not hold leaves
-/// its slot unwritten.
+/// The worker's reply to a window of T rows, inside the streams block of the request's layout (its first T x hc x dim
+/// floats, the part every row format carries as floats), block by block: its last layer's rows through the final norm
+/// (T x dim: what the head reads), then the drafter's taps - the streams' mean entering each target layer, T rows of
+/// nt x dim, target after target in a row (the main process's h_taps layout).  The rest of the reply is not read.  A
+/// target the worker does not hold leaves its slot unwritten.
 inline size_t reply_tap_at(int T, int dim, int nt, int t, int j) {
     return (size_t) T * (size_t) dim + ((size_t) t * (size_t) nt + (size_t) j) * (size_t) dim;
 }
-/// whether a reply with nt targets' taps fits a row of handoff_floats
-inline bool reply_fits(int dim, int nt, int64_t handoff_floats) {
-    return (int64_t) dim * (1 + (int64_t) nt) <= handoff_floats;
+/// whether a reply with nt targets' taps fits a row's streams (hc x dim floats)
+inline bool reply_fits(int dim, int nt, int64_t streams) {
+    return (int64_t) dim * (1 + (int64_t) nt) <= streams;
 }
 /// (the main process) the taps of the targets from layer `end` on - the worker's - from a reply of T rows into taps
 /// (T rows of targets.size() x dim); the others' slots stay as this process's own layers wrote them

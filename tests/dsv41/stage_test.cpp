@@ -42,9 +42,10 @@ static void put(const fs::path& p, const std::string& s) {
 
 // the reply's layout: the real geometry fits, a target the main process holds keeps its own slot
 static void replies() {
-    const int64_t ds41 = 4 * 5120 + 8 + 512 + 2048;   // (hc x dim + pre + topk_stride + cand_stride: ds4.txt's)
+    const int64_t ds41 = 4 * 5120;   // (a row's streams, hc x dim: ds4.txt's)
     CHECK(st::reply_fits(5120, 3, ds41));
     CHECK(!st::reply_fits(5120, 4, ds41));
+    CHECK(!st::reply_fits(5120, 3, ds41 - 1));
     CHECK(st::reply_fits(5120, 0, 5120) && !st::reply_fits(5120, 1, 2 * 5120 - 1));
     const int T = 5, dim = 4, nt = 3;
     const std::vector<int> targets = {37, 38, 39};

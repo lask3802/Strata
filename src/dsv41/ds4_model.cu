@@ -1923,7 +1923,7 @@ struct Model::Impl {
         if (ranged) {   // (a slot, the drafter, a picture or the prompt path's chunks would need the other layers)
             // (a remote stage's main process keeps the drafter: the worker's reply carries the taps of its layers)
             const bool d_here = o.remote_stage && o.dspark &&
-                                stage::reply_fits(g.dim, (int) g.d_targets.size(), handoff_floats());
+                                stage::reply_fits(g.dim, (int) g.d_targets.size(), (int64_t) g.hc * g.dim);
             std::fprintf(stderr, "ds4: layers [%d, %d) of %d here%s: prompts in windows of %d, %s, no pictures, no "
                                  "slots%s\n", lo, hi, g.nl,
                          o.remote_stage ? " (the rest: the remote stage's worker)" : o.stage_worker ? " (a remote stage's worker)" : "",
@@ -8389,7 +8389,7 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         hc_mean(d.h, T, g.hc, D, d.tap, D, d.st);
         if (o.stage_worker) {
-            if (!stage::reply_fits(D, (int) nt, handoff_floats())) return true;   // (load said so: no DSpark there)
+            if (!stage::reply_fits(D, (int) nt, (int64_t) g.hc * D)) return true;   // (load said so: no DSpark there)
             CK(cudaMemcpy2DAsync(link_tx + stage::reply_tap_at(T, D, (int) nt, 0, (int) j), nt * D * 4, d.tap,
                                  (size_t) D * 4, (size_t) D * 4, (size_t) T, cudaMemcpyDeviceToHost, d.st));
             return true;
