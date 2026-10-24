@@ -629,9 +629,9 @@ after changing these settings.
 | Images (`--vision` on the main PC and every worker) | **measured** on two PCs (RVN IQ3_S, the encoder on the main PC's CPU); through a relay worker not run |
 | A pack with `experts.bin`, or `--shared-expert-arena` | refused at start (the layer range needs the GGUF loader) |
 | Linux, NVIDIA (CUDA 13.0) | measured: Ubuntu 24.04 in an LXC container (main), a Linux host with kernel 6.14 (worker) |
-| Windows 11 native, NVIDIA (MSVC 2022, CUDA 13.0) | measured as a worker (and its node agent); as the main PC not tested |
+| Windows 11 native, NVIDIA (MSVC 2022, CUDA 13.0) | measured as a worker (and its node agent); as the main PC not tested here (a user ran one: see the AMD row) |
 | WSL2 (Windows 11, mirrored networking) | measured as a worker |
-| AMD (HIP) | builds (ROCm 7.0, gfx1100, in a container); not run: no AMD card was available |
+| AMD (HIP) | builds (ROCm 7.0, gfx1100, in a container); not run here: no AMD card was available. A user ran a Radeon 8060S (gfx1151, Windows) as the worker of an RTX 5070 main PC over USB4, on 0.1.45.3-link.1 ([report](https://github.com/Niko1221/Strata/pull/1748#issuecomment-6332714185)) |
 | Intel (SYCL) | the SYCL port builds (oneAPI 2026.1.1, in a container) but has no remote stage: it keeps its own copies of the engine files this feature changes |
 | Apple (Metal, 0.1.44) | refused at start: the Metal backend runs each verify window itself, past the remote stage's hooks. Its build compiles the link's code so the binary links (not built here: no Mac) |
 | Links | measured on 1 GbE and on 10 GbE (limited to ~400 MB/s by its slot) |

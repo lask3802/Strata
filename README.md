@@ -37,6 +37,47 @@ agents. Your chats and files stay on your PC.
 
 Version 0.2.3 · engine 0.1.48
 
+## Strata Link: one model on two or more PCs
+
+Strata Link's main addition to Strata: it can split the model across PCs on your network. This helps when the model
+does not fit one PC well, but you have a second PC with a graphics card.
+
+- **Each PC loads only its own layers' experts into RAM**, so no PC needs RAM for the whole model. Every PC still needs
+  the model's files; `tools/stage_ship.py` sends a worker only its layers.
+- **Every card adds memory for the expert cache.** More of the experts are on a GPU, so fewer come from RAM.
+- **Decoding can get faster, or slower.** Below, two PCs decode 16.8% faster than the 2080 Ti alone. A slow worker or
+  link can make it slower: a 3080 with a 3070 under WSL2 over 1 GbE decoded short prompts at 36.2 tok/s, against 39.9
+  for the 3080 alone ([measurements](docs/REMOTE_STAGE.md#when-it-helps-measured)).
+- **The split is opt-in.** It runs only if you start it with `--remote-stage` on the main PC and `--stage-worker` on
+  the others. One Link change applies on one PC too: on NVIDIA, a layer's CPU experts join one layer later (+15.2%
+  decode on an RTX 3080, the answers differ slightly; `STRATA_VERIFY_DEFER_CPU=0` turns it off,
+  [details](docs/DETAILS.md)).
+
+Measured on 2026-10-23 with this release's engine: an RTX 2080 Ti 11 GB, plus an RTX 3080 10 GB in a second PC over
+10 GbE (about 400 MB/s, limited by its slot). These are PCs A and B of
+[docs/REMOTE_STAGE.md](docs/REMOTE_STAGE.md#when-it-helps-measured) with their cards swapped. The model is SC117's
+GSQ-RCO abliterated IQ3_S of Qwen3.8-Flash-Next; on two PCs, layers 0-19 run on the 2080 Ti. Settings as served:
+262,144 context, `--kv int8`, `--spec 4` with the draft layer, `--prefill auto` alone and 5,888 on two PCs. Each number is the median of three
+rounds in one session (12 short prompts a round; three prompts of 29,000-29,800 tokens). A second two-PC session gave
+70.28 and 1,382 / 63.0.
+
+| | 2080 Ti alone | 2080 Ti + 3080 (two PCs) |
+| --- | ---: | ---: |
+| short prompts, decode tok/s | 60.31 | 70.42 (+16.8%) |
+| ~30K prompt, prefill / decode tok/s | 833 / 49.4 | 1,291 / 63.7 |
+
+What has been run, and what has not:
+
+| | |
+| --- | --- |
+| **Measured by us** | NVIDIA cards only (RTX 2080 Ti, 3080, 3070), on two and three PCs; a Linux main PC; Linux, Windows 11 and WSL2 workers; 1 GbE and 10 GbE links; the Qwen3.8-Flash-Next family only |
+| **Reported by a user** | An RTX 5070 main PC with a Radeon 8060S worker (AMD, HIP), both on Windows, over USB4; SC117's IQ3_XXS; on 0.1.45.3-link.1 ([report](https://github.com/Niko1221/Strata/pull/1748#issuecomment-6332714185)) |
+| **Not run by us** | An AMD main PC, a Windows main PC (one user report above), other models |
+| **Not supported** | Intel cards (the SYCL engine has no remote stage), a Mac (the Metal engine refuses it at start) |
+
+Setup, the earlier measurements and the limits: [docs/REMOTE_STAGE.md](docs/REMOTE_STAGE.md). Link's own releases:
+[lask3802/Strata](https://github.com/lask3802/Strata/releases).
+
 ## What you need
 
 **You need at least 32 GB of RAM and graphics memory (VRAM) together.** On a Mac or a Ryzen AI Max, that is the unified
@@ -60,8 +101,8 @@ Also needed:
 - Windows 10 / 11, Linux or macOS
 - a current graphics driver
 
-Two or three cards of the same make can share a model ([multi-GPU](docs/MULTI_GPU.md)). Strata never splits a model across
-NVIDIA and AMD cards. Full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
+Two or three cards of the same make in one PC can share a model ([multi-GPU](docs/MULTI_GPU.md)). In one PC, Strata never
+splits a model across NVIDIA and AMD cards; across PCs, see [Strata Link](#strata-link-one-model-on-two-or-more-pcs). Full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
 
 ## Install
 
