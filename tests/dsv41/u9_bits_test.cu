@@ -8,10 +8,13 @@
 
 #include <cuda_fp16.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <random>
 #include <string>
 #include <vector>
@@ -328,6 +331,159 @@ void test_route(cudaStream_t s) {
     }
 }
 
+// ---- the split-KV decode attention (DS4_ATTN_SPLIT, on with the U9 defaults): its merge sums in another order, so it
+// is checked against a double reference (with the old kernel beside it), at its edges: a partial last chunk, a verify
+// window's queries each with its own rows, a short window, no selected rows, the 960-row cap; and where it must fall
+// back to the old kernel (above the cap, its scratch not allocated) the old kernel's bytes
+float e4m3_val(uint8_t q) {
+    const int e = (q >> 3) & 15, m = q & 7;
+    const float v = e == 0 ? m * (1.f / 512.f) : std::ldexp(1.f + m / 8.f, e - 7);
+    return (q & 0x80) ? -v : v;
+}
+float e2m1_val(int c) {
+    static const float v[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    return (c & 8) ? -v[c & 7] : v[c & 7];
+}
+struct SplitCase {
+    const char* name;
+    int heads, T, nwin[5], nsel[5];
+    bool fallback;   // (above the cap: the old kernel's bytes)
+};
+const SplitCase kSplitCases[] = {
+    {"T 1, win 128 + sel 512 (16 chunks)", 64, 1, {128}, {512}, false},
+    {"T 1, win 128 + sel 301 (a partial last chunk)", 64, 1, {128}, {301}, false},
+    {"T 1, win 37, no sel", 64, 1, {37}, {0}, false},
+    {"T 4, win 5..128, sel 0..832 (960: the cap)", 64, 4, {5, 60, 128, 128}, {0, 77, 512, 832}, false},
+    {"T 5, the first tokens (win 1..5, no sel)", 64, 5, {1, 2, 3, 4, 5}, {0, 0, 0, 0, 0}, false},
+    {"T 2, 16 heads (TP 4), win 128 + sel 200 / 512", 16, 2, {128, 128}, {200, 512}, false},
+    {"T 3, sel to 833 (961: above the cap)", 64, 3, {128, 128, 128}, {100, 400, 833}, true},
+};
+void test_split(cudaStream_t s) {
+    const int d = 512, ncache = 2048, stride = 1024;
+    const size_t rb = sd::kv_row_bytes(sd::kKvFp4, d);
+    const float scale = 1.f / std::sqrt((float) d);
+    std::normal_distribution<float> nrand(0.f, 1.f);
+    std::vector<uint8_t> ckv((size_t) ncache * rb, 0);
+    std::vector<float> cdec((size_t) ncache * d);
+    for (int p = 0; p < ncache; ++p) {
+        uint8_t* r = &ckv[(size_t) p * rb];
+        for (int j = 0; j < d / 2; ++j) r[j] = (uint8_t) (rng() & 0xff);
+        for (int g = 0; g < d / 16; ++g) r[d / 2 + g] = (uint8_t) ((7 << 3) | (rng() & 7)) - (uint8_t) (rng() % 3 * 8);
+        for (int e = 0; e < d; ++e)
+            cdec[(size_t) p * d + e] = e2m1_val((r[e / 2] >> (4 * (e & 1))) & 15) * e4m3_val(r[d / 2 + e / 16]);
+    }
+    uint8_t* dck = dev(ckv);
+    sd::AttnScratch scr;
+    CU(cudaMalloc((void**) &scr.rows, (size_t) sd::kAttnScratchT * stride * d * 2));
+    scr.max_t = sd::kAttnScratchT;
+    scr.cap = stride;
+    const bool keep = sd::attn_split();
+    for (int ci = 0; ci <= (int) (sizeof(kSplitCases) / sizeof(kSplitCases[0])); ++ci) {
+        // (the last round: the first case on a new stream with the device's memory taken, so the scratch fails)
+        const bool starve = ci == (int) (sizeof(kSplitCases) / sizeof(kSplitCases[0]));
+        const SplitCase& c = kSplitCases[starve ? 0 : ci];
+        const int T = c.T, heads = c.heads;
+        sd::AttnRows ar = {};
+        int wrows = 0;
+        for (int t = 0; t < T; ++t) {
+            ar.win0[t] = t;
+            ar.nwin[t] = c.nwin[t];
+            ar.nsel[t] = c.nsel[t];
+            wrows = std::max(wrows, t + c.nwin[t]);
+        }
+        std::vector<uint16_t> win((size_t) wrows * d);
+        std::vector<float> wdec(win.size());
+        for (size_t i = 0; i < win.size(); ++i) {
+            const float f = nrand(rng);
+            uint32_t u;
+            std::memcpy(&u, &f, 4);
+            win[i] = (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+            const uint32_t b = (uint32_t) win[i] << 16;
+            std::memcpy(&wdec[i], &b, 4);
+        }
+        std::vector<float> q((size_t) T * heads * d), sink(heads);
+        for (auto& v : q) v = nrand(rng);
+        for (auto& v : sink) v = frand();
+        std::vector<int> sel((size_t) T * stride, 0);
+        for (int t = 0; t < T; ++t)
+            for (int i = 0; i < c.nsel[t]; ++i) sel[(size_t) t * stride + i] = (int) (rng() % ncache);
+        uint16_t* dwin = dev(win);
+        float *dq = dev(q), *dsink = dev(sink);
+        int* dsel = dev(sel);
+        Outs out;
+        float* o = (float*) out.add((size_t) T * heads * d * 4);
+        cudaStream_t st = s;
+        if (starve) CU(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+        std::vector<uint8_t> r[2];
+        void* hog = nullptr;
+        for (int on = 0; on < 2; ++on) {
+            if (starve && on == 1) {   // (all but a few MiB taken: the split's ~16 MB scratch cannot be made)
+                size_t fr = 0, tot = 0;
+                CU(cudaMemGetInfo(&fr, &tot));
+                for (size_t keep_mib = 4; hog == nullptr && keep_mib < 64 && fr > (keep_mib << 20); keep_mib += 4)
+                    if (cudaMalloc(&hog, fr - (keep_mib << 20)) != cudaSuccess) {
+                        cudaGetLastError();
+                        hog = nullptr;
+                    }
+            }
+            sd::attn_split() = on == 1;
+            out.clear();
+            sd::sparse_attn(dq, dwin, dck, dsel, stride, ar, dsink, heads, d, T, scale, o, st, sd::kKvFp4, 0, &scr);
+            CU(cudaStreamSynchronize(st));
+            CU(cudaGetLastError());
+            r[on] = out.get();
+        }
+        if (hog != nullptr) CU(cudaFree(hog));
+        sd::attn_split() = keep;
+        // the reference: every query, every 5th head, in double
+        double err[2] = {0, 0}, mx = 0;
+        for (int t = 0; t < T; ++t)
+            for (int h = 0; h < heads; h += 5) {
+                std::vector<const float*> rows;
+                for (int j = 0; j < c.nwin[t]; ++j) rows.push_back(&wdec[(size_t) (ar.win0[t] + j) * d]);
+                for (int i = 0; i < c.nsel[t]; ++i) rows.push_back(&cdec[(size_t) sel[(size_t) t * stride + i] * d]);
+                const float* qh = &q[((size_t) t * heads + h) * d];
+                std::vector<double> sc(rows.size());
+                double m = sink[h];
+                for (size_t j = 0; j < rows.size(); ++j) {
+                    double a = 0;
+                    for (int e = 0; e < d; ++e) a += (double) qh[e] * rows[j][e];
+                    sc[j] = a * scale;
+                    m = std::max(m, sc[j]);
+                }
+                double den = std::exp(sink[h] - m);
+                for (double v : sc) den += std::exp(v - m);
+                std::vector<double> acc(d, 0.0);
+                for (size_t j = 0; j < rows.size(); ++j) {
+                    const double p = std::exp(sc[j] - m) / den;
+                    for (int e = 0; e < d; ++e) acc[e] += p * rows[j][e];
+                }
+                for (int e = 0; e < d; ++e) {
+                    mx = std::max(mx, std::fabs(acc[e]));
+                    for (int on = 0; on < 2; ++on) {
+                        float g;
+                        std::memcpy(&g, &r[on][(((size_t) t * heads + h) * d + e) * 4], 4);
+                        err[on] = std::max(err[on], std::fabs(g - acc[e]));
+                    }
+                }
+            }
+        for (double& e : err) e /= mx + 1e-30;
+        size_t diff = 0;
+        for (size_t i = 0; i < r[0].size(); ++i) diff += r[0][i] != r[1][i];
+        const bool same = c.fallback || starve;
+        const bool ok = err[0] < 1e-4 && err[1] < 1e-4 && (!same || diff == 0) && (hog != nullptr) == starve;
+        ++g_cases;
+        if (!ok) ++g_fail;
+        std::printf("%-4s split: %s%s   rel err old %.1e split %.1e, %zu bytes differ%s\n", ok ? "ok" : "FAIL", c.name,
+                    starve ? " - no scratch" : "", err[0], err[1], diff, same ? " (must be 0: the old kernel)" : "");
+        if (starve) CU(cudaStreamDestroy(st));
+        for (void* p : std::initializer_list<void*>{dwin, dq, dsink, dsel}) CU(cudaFree(p));
+        for (auto& b : out.b) CU(cudaFree(b.first));
+    }
+    CU(cudaFree(scr.rows));
+    CU(cudaFree(dck));
+}
+
 // ---- item q5k: the staged Q5_K GEMV (the decode's dense shapes: wq_b, wo_a's slices, wo_b, the shared expert, the engram's
 // wkv (layers 1 and 14), the head)
 struct Shape {
@@ -399,6 +555,7 @@ int main(int argc, char** argv) {
     if (!gg::prepare(s)) return 1;
     if (!bench) test_quant(s);
     if (!bench) test_route(s);
+    if (!bench) test_split(s);
     test_q5k(s, bench);
     std::printf("%d of %d cases failed\n", g_fail, g_cases);
     return g_fail ? 1 : 0;
