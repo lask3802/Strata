@@ -621,9 +621,11 @@ struct Layer {
     x3::ExpertLayout hlay;
     size_t hblob = 0;
     int ff0 = 0, ffn = 0;     // this member's FFN columns [ff0, ff0 + ffn) (split128 of n_ff; the whole one alone)
-    // expert parallelism: the routed experts' n_ff slice [ep_ff0, ep_ff0 + ep_ffn) this process's CPU lane computes (the
-    // GGUF i-quant experts, cpu_experts_iq: a partial sum of each expert's output) - the whole n_ff unless EP sets it
-    int ep_ff0 = 0, ep_ffn = 0;
+    // expert parallelism: the routed experts' n_ff slice [ep_ff0, ep_ff0 + ep_ffn) this process's decode CPU lane computes
+    // (serve_lane -> the GGUF i-quant experts' cpu_experts_iq: a partial sum of each expert's output; the prompt path and
+    // calibrate_paths compute them whole) - ep_ffn -1: the whole n_ff (resolved at load, ep_resolve); a slice on a layer
+    // whose experts another path computes is refused there (ep_slices_ok)
+    int ep_ff0 = 0, ep_ffn = -1;
     // this member's heads [ah0, ah0 + ahn) and wo_a groups [og0, og0 + ogn) - all of them alone; in a group of more
     // members than the heads split among evenly (head_members: 9, 7 or 6 over 64 heads), the first ones none: their
     // attention adds nothing to the sum
@@ -1840,6 +1842,18 @@ struct Model::Impl {
         const int ffh = g.ff / l.nm;
         mx_slice_to_blob(l, src, m * ffh, ffh, l.hlay.trellis, blob);
     }
+    // expert parallelism's n_ff slices: every layer with one must have its experts on the i-quant CPU lane alone (no VRAM
+    // tier, no GPU-visible store slots) - false (err) otherwise.  At load, and again by whatever sets a slice later
+    bool ep_slices_ok(std::string& err) const {
+        for (const Layer& l : L)
+            if (const char* why = ep_slice_refusal(l.ep_ff0, l.ep_ffn, g.ff, l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay),
+                                                   l.n_slots > 0, !l.zc.empty())) {
+                err = "expert parallelism: layer " + std::to_string(l.il) + "'s n_ff slice [" + std::to_string(l.ep_ff0) + ", " +
+                      std::to_string(l.ep_ff0 + l.ep_ffn) + "): " + why;
+                return false;
+            }
+        return true;
+    }
     // the same for any slice [ff0, ff0 + ffn) of n_ff in whole blocks of the experts' types (ds4_ffslice.hpp), the slice's
     // matrices at so[3]: a tensor parallel member's even share, an expert parallel side's part of n_ff
     FfSlice mx_slice(const Layer& l, int ff0, int ffn) const {
@@ -2361,8 +2375,7 @@ struct Model::Impl {
         for (Layer& l : L) {
             l.ff0 = 0;
             l.ffn = g.ff;
-            l.ep_ff0 = 0;
-            l.ep_ffn = g.ff;
+            ep_resolve(l.ep_ff0, l.ep_ffn, g.ff);
             l.ah0 = l.og0 = 0;
             l.ahn = g.heads;
             l.ogn = g.o_groups;
@@ -3014,6 +3027,7 @@ struct Model::Impl {
         calibrate_paths();
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
+        if (!ep_slices_ok(err)) return false;
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         reset();
         return true;
@@ -5767,8 +5781,12 @@ struct Model::Impl {
     // them, exact integer sums a block; every CPU tier the same bits): each token's input quantized once, whatever
     // number of entries take it, and each job its band of h straight into the down's int8 input.
     // (ord: the order the entries are computed in - their slots, so the sums, stay the same; null: as they are)
-    void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
-        if (!gg::mx_experts(l.lay)) return cpu_experts_iq(l, x, ents, ldx, ord);
+    void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, bool ep = false) {
+        if (!gg::mx_experts(l.lay)) {   // (ep: the decode lane, the layer's EP slice; every other caller the whole n_ff)
+            int ff0, ffn;
+            ep_range(ep, l.ep_ff0, l.ep_ffn, g.ff, ff0, ffn);
+            return cpu_experts_iq(l, x, ents, ldx, ord, ff0, ffn);
+        }
         constexpr int RB = 64;   // rows a job (whole blocks of h: RB % 32 == 0)
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
         const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
@@ -5856,12 +5874,13 @@ struct Model::Impl {
     }
     // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
     // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same.
-    // With an n_ff slice (l.ep_ff0 / ep_ffn, expert parallelism): the gate / up rows of the slice, and the down over the
-    // slice's values in place (gg::iq_cpu_slice) - each entry's yd then its part of the expert's output
-    void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
+    // Over the n_ff slice [ff0, ff0 + ffn) (expert parallelism's decode lane: the layer's ep_ff0 / ep_ffn; the whole n_ff
+    // otherwise): the gate / up rows of the slice, and the down over the slice's values in place (gg::iq_cpu_slice) -
+    // each entry's yd then its part of the expert's output
+    void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, int ff0,
+                        int ffn) {
         constexpr int RB = 64;   // rows a job
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
-        const int ff0 = l.ep_ff0, ffn = l.ep_ffn;
         const bool sliced = ff0 != 0 || ffn != FF;
         int glo[4], ghi[4], gmax = 0;   // node X's gate / up rows: its part's [X FFh, ..) within the slice
         for (int X = 0; X < NH; ++X) {
@@ -5969,11 +5988,11 @@ struct Model::Impl {
         }
     };
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
-                     const int* ord = nullptr) {
+                     const int* ord = nullptr, bool ep = false) {
         if (ldx == 0) ldx = (size_t) g.dim;
         if (l.lay.fmt == gg::kFmtMXFP4) {
             StoreHold hold(this, l, ents);
-            return cpu_experts_mx(l, x, ents, ldx, ord);
+            return cpu_experts_mx(l, x, ents, ldx, ord, ep);
         }
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, GQ = E / 256, DQ = FF / 128;
         const int GB = FFh / 128, DB = Eh / 128, EB = E / 128, FB = FF / 128;
@@ -6663,7 +6682,7 @@ struct Model::Impl {
                 }
                 if (!ents.empty()) {
                     const double tc = now_ms();
-                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
+                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, true);   // (the decode lane: the layer's EP slice)
                     const int D = g.dim;
                     for (int t = 0; t < T; ++t) {
                         bool any = false;

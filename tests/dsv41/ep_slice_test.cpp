@@ -6,7 +6,7 @@
 // slice copied out to a blob of its own (packed rows: what a device or a parts file would hold); then the sum of the
 // slices against the whole, bounded by the products' L1 norm (ggml's decode of the weights, the quantized h); and the
 // blob -> slices -> blob round trip byte for byte.  Random legal blocks (any bit pattern with a sane F16 scale), and real
-// experts read from a pack (read only) when one is given.  No GPU.
+// experts read from a pack (read only) when one is given; and the setup side (ep_resolve, ep_range, ep_slice_refusal).  No GPU.
 //   ep_slice_test [--type 29,16,17] [--tokens 1,2,3,6,8] [--pack DIR --layers 3,7,17,23 --experts 0,7]
 #include "../../src/dsv41/ds4_ffslice.hpp"
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
@@ -331,6 +331,38 @@ int main(int argc, char** argv) {
         std::printf("iq_cpu_slice: %d of 6 bad slices refused, the whole one the whole format %s  %s\n", refused, whole ? "yes" : "NO",
                     refused == 6 && whole ? "ok" : "FAIL");
         fails += !(refused == 6 && whole);
+    }
+    {   // the setup side: ep_ffn -1 resolves to the whole n_ff, only the decode lane's calls take the slice, and which layers
+        // a slice is refused on (ds4_ffslice.hpp)
+        int a0 = 512, an = -1, b0 = 512, bn = 1536, c0 = 0, cn = FF;
+        strata::ds4::ep_resolve(a0, an, FF);
+        strata::ds4::ep_resolve(b0, bn, FF);
+        strata::ds4::ep_resolve(c0, cn, FF);
+        bool res = a0 == 0 && an == FF && b0 == 512 && bn == 1536 && c0 == 0 && cn == FF;
+        {   // ep_range: the decode lane (ep) takes the layer's slice; the prompt path and calibrate_paths (!ep) the whole n_ff
+            int f0, fn;
+            strata::ds4::ep_range(false, 1536, 768, FF, f0, fn);  res = res && f0 == 0 && fn == FF;
+            strata::ds4::ep_range(false, 0, 1536, FF, f0, fn);    res = res && f0 == 0 && fn == FF;
+            strata::ds4::ep_range(true, 1536, 768, FF, f0, fn);   res = res && f0 == 1536 && fn == 768;
+            strata::ds4::ep_range(true, 0, -1, FF, f0, fn);       res = res && f0 == 0 && fn == FF;
+        }
+        using strata::ds4::ep_slice_refusal;
+        struct Case { int ff0, ffn; bool iq, vram, zc, refused; };
+        const Case cs[] = {
+            {0, FF, false, true, true, false},       // no slice: every path takes it, whatever it is
+            {0, 1536, true, false, false, false},    // the main's [0, 6) on the i-quant CPU lane alone
+            {1536, 768, true, false, false, false},  // the worker's [6, 9)
+            {0, 1536, false, false, false, true},    // MXFP4 / EXL3 CPU lane: computes whole
+            {0, 1536, true, true, false, true},      // a VRAM tier: computes whole
+            {0, 1536, true, false, true, true},      // GPU-visible store slots: computed whole
+            {128, 1536, true, false, false, true},   // not whole blocks
+            {2048, 512, true, false, false, true},   // past n_ff
+        };
+        int bad = 0;
+        for (const Case& c : cs) bad += (ep_slice_refusal(c.ff0, c.ffn, FF, c.iq, c.vram, c.zc) != nullptr) != c.refused;
+        std::printf("ep_resolve / ep_range %s; ep_slice_refusal: %d of %zu cases as expected  %s\n", res ? "ok" : "WRONG",
+                    (int) (sizeof cs / sizeof cs[0]) - bad, sizeof cs / sizeof cs[0], res && bad == 0 ? "ok" : "FAIL");
+        fails += !(res && bad == 0);
     }
     for (const Expert& x : xs)
         for (const auto& c : cuts) round_trip(x, c);

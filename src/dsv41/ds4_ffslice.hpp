@@ -35,4 +35,34 @@ inline void ff_slice_to_blob(const FfSlice& s, const uint8_t* src, const size_t 
         std::memcpy(blob + dst[2] + row * s.dr + s.d_off, src + srco[2] + row * s.ds, s.ds);
 }
 
+/// Layer::ep_ff0 / ep_ffn as the load leaves them: ep_ffn -1 (the default) is the whole n_ff
+inline void ep_resolve(int& ff0, int& ffn, int n_ff) {
+    if (ffn < 0) {
+        ff0 = 0;
+        ffn = n_ff;
+    }
+}
+/// The n_ff range a call of the CPU lane computes: the layer's EP slice on the decode lane (ep), the whole n_ff on every
+/// other path (the prompt path, calibrate_paths: one PC's until prompts split too), whatever the layer's fields say
+inline void ep_range(bool ep, int ep_ff0, int ep_ffn, int n_ff, int& ff0, int& ffn) {
+    ff0 = 0;
+    ffn = n_ff;
+    if (!ep) return;
+    ff0 = ep_ff0;
+    ffn = ep_ffn;
+    ep_resolve(ff0, ffn, n_ff);   // (a layer the load did not see: whole)
+}
+/// Why a layer cannot take the n_ff slice [ff0, ff0 + ffn) of its routed experts (nullptr: it can, or it has none).  Only
+/// the GGUF i-quant CPU lane (cpu_experts_iq) computes a slice; any other path computes an expert whole, which the other
+/// PC's part would then add a second time - so a layer with one of them is refused at setup until it takes slices too.
+inline const char* ep_slice_refusal(int ff0, int ffn, int n_ff, bool iq_cpu_lane, bool vram_tier, bool store_zc) {
+    if (ff0 == 0 && ffn == n_ff) return nullptr;
+    if (n_ff % 256 != 0 || ff0 < 0 || ffn <= 0 || ff0 % 256 != 0 || ffn % 256 != 0 || ff0 + ffn > n_ff)
+        return "not whole 256-value blocks inside n_ff";
+    if (!iq_cpu_lane) return "its CPU lane computes these experts whole (MXFP4 / EXL3: only the GGUF i-quants take slices)";
+    if (vram_tier) return "its VRAM tier computes experts whole (--vram-experts 0 for the layers that take slices)";
+    if (store_zc) return "the RAM store's GPU-visible slots are computed whole on the device";
+    return nullptr;
+}
+
 }  // namespace strata::ds4
