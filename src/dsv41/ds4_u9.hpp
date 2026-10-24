@@ -2,6 +2,7 @@
 // gpu-part.md): each change gives the same bits as before and is on by default until measured.
 //   DS4_U9=0                         all of them off: the 747981ba path
 //   DS4_U9_OFF=quant,hc,...          these off (names below)
+// DS4_ATTN_SPLIT (ds4_kernels.cu, other bits in the last place) keeps its own env; unset, it follows defaults() below.
 // Header-only: the test targets link ds4_gguf.cu / ds4_iq.cu without the model.
 #pragma once
 #include <cstdio>
@@ -19,6 +20,15 @@ enum : unsigned {
     kIxfast = 1u << 5,   // the indexer's short-context path
 };
 
+inline bool defaults() {   // false: DS4_U9=0 (and HIP without DS4_U9=1) - the switches' defaults are the old path
+    const char* all = std::getenv("DS4_U9");
+#if defined(STRATA_USE_HIP)
+    return all != nullptr && std::atoi(all) == 1;   // (measured on CUDA only: HIP keeps the old path unless DS4_U9=1)
+#else
+    return all == nullptr || std::atoi(all) != 0;
+#endif
+}
+
 inline unsigned& mask() {   // (a test sets it to compare both paths in one process)
     static unsigned m = [] {
         static const struct {
@@ -27,11 +37,7 @@ inline unsigned& mask() {   // (a test sets it to compare both paths in one proc
         } items[] = {{"quant", kQuant}, {"hc", kHc}, {"route", kRoute}, {"tail", kTail}, {"q5k", kQ5k}, {"ixfast", kIxfast}};
         unsigned v = 0;
         for (const auto& it : items) v |= it.bit;
-        const char* all = std::getenv("DS4_U9");
-        if (all != nullptr && std::atoi(all) == 0) v = 0;
-#if defined(STRATA_USE_HIP)
-        if (all == nullptr || std::atoi(all) != 1) v = 0;   // (measured on CUDA only: HIP keeps the old path unless DS4_U9=1)
-#endif
+        if (!defaults()) v = 0;
         const char* off = std::getenv("DS4_U9_OFF");
         for (const char* p = off; p != nullptr && *p != '\0';) {
             const char* e = std::strchr(p, ',');
