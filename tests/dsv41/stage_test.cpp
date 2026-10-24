@@ -573,9 +573,10 @@ static void chunks_over_a_link() {
             net::StageClient c;   // (windows only: any worker)
             CHECK(c.connect(s.at, hello_of(0), peer, e) && peer.chunk == 64);
         }
-        net::StageClient c;
-        net::StageHello mine = hello_of(64);
-        CHECK(c.connect(s.at, mine, peer, e) && peer.chunk == 64 && st::main_accepts(peer, mine, e));
+        net::StageClient c;   // (a main process of 128-row chunks: what it sends below is the worker's 64 at most)
+        net::StageHello mine = hello_of(128);
+        CHECK(c.connect(s.at, mine, peer, e) && peer.chunk == 64 && st::main_accepts(peer, mine, e) &&
+              st::chunk_sent(mine.chunk, peer.chunk) == 64);
         CHECK(c.reset({}, e));
         st::ChunkLink link(c, kW);
         std::vector<float> a((size_t) 64 * kW), b((size_t) 64 * kW), rx((size_t) 100 * kW, 0.0f);
@@ -818,15 +819,17 @@ struct LinkTest {
             std::lock_guard<std::mutex> lk(mu);
             st::worker_disconnected(model, parts);
         };
-        h.ckpt_save = [this](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) -> int {
+        // (ds4_main.cpp's handlers, each under mu here: the test reads the stand-in from its own thread)
+        st::worker_ckpt_handlers(model, parts, last_t, h, nullptr);
+        const auto save = h.ckpt_save;
+        const auto restore = h.ckpt_restore;
+        h.ckpt_save = [this, save](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) -> int {
             std::lock_guard<std::mutex> lk(mu);
-            std::string note;
-            return st::worker_ck_save(model, parts, id, L, keep, e, note);
+            return save(id, L, keep, e);
         };
-        h.ckpt_restore = [this](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) {
+        h.ckpt_restore = [this, restore](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) {
             std::lock_guard<std::mutex> lk(mu);
-            std::string note;
-            return st::worker_restore(model, parts, id, L, keep, last_t, e, note);
+            return restore(id, L, keep, e);
         };
         pf_mem.resize((size_t) 4 * (size_t) std::max(chunk, 1) * 4);
         float* const pf[4] = {pf_mem.data(), pf_mem.data() + pf_mem.size() / 4, pf_mem.data() + pf_mem.size() / 2,
@@ -1156,7 +1159,15 @@ static void test_restore_chunks(const fs::path& root) {
     CHECK(chunk_at(8, 8));                       // pos 12, a chunk at p0 8 > 0
     CHECK(t.save(st::kCkRole0 + 0, 12, {}));
     CHECK(t.feed(12, 4, 12));                    // pos 16
+    {
+        std::lock_guard<std::mutex> lk(t.mu);
+        t.last_t = 3;   // (as after a draft's check of 3 rows whose Commit has not come)
+    }
     CHECK(t.restore(st::kCkAt, 8, {}) == 1);     // back to 8, then the prompt's rest in a chunk from there
+    {
+        std::lock_guard<std::mutex> lk(t.mu);
+        CHECK(t.last_t == 0);                    // (the handler ds4_main.cpp has: the window forgotten)
+    }
     CHECK(chunk_at(8, 50));
     {
         const FakeModel w = t.snap();

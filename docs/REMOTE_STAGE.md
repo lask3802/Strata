@@ -498,8 +498,8 @@ asked. What its remote stage does (the code is `src/dsv41/ds4_stage.hpp`; on two
   candidate blocks, 92,192 bytes a token. The worker's reply is its last layer's rows through the final norm.
 - **Prompt chunks** (the chunked prompt path on both PCs, chunks of 2048 unless `--prefill-chunk N` says otherwise):
   the main process runs chunk c + 1 through its layers while the worker runs chunk c. Chunks cross as fp32 rows only.
-  Both sides go chunk after chunk, which is what overlaps; `DS4_LAYER_MAJOR=1` lets a side take its layers one after
-  another over all the chunks instead. A worker that takes smaller chunks than the main process's gets chunks of its
+  Both sides go chunk after chunk, which is what overlaps; `DS4_LAYER_MAJOR=1` on the main process lets it take its
+  layers one after another over all the chunks instead (the worker reads one chunk at a time either way). A worker that takes smaller chunks than the main process's gets chunks of its
   size (the main process says so); only a worker with no chunks (`--prefill-chunk 0`) is refused by a main process
   that sends them.
 - **DSpark across the split** with `--dspark on` on the main process: the drafter runs there, the worker's reply
@@ -515,8 +515,8 @@ asked. What its remote stage does (the code is `src/dsv41/ds4_stage.hpp`; on two
 - **Slots and conversation checkpoints** with `STRATA_DS4_SLOT_KEEP=1` on the main process (serve): each side keeps
   its own layers' part, the worker under the main process's ids (its bounds `STRATA_DS4_SLOT_CAP` / `_GB` / `_DIR`
   set on the worker), and a conversation is taken back only when both sides hold it - one the worker does not hold
-  is read from token 0. The parts end with the link, so they do not survive a restart of either side
-  ([DEEPSEEK41.md](DEEPSEEK41.md)). Without the switch every request that does not continue the conversation in
+  goes on from the model's own checkpoint (the shared start), or token 0. The main process keeps 32 such slots at
+  most. The parts end with the link, so they do not survive a restart of either side ([DEEPSEEK41.md](DEEPSEEK41.md)). Without the switch every request that does not continue the conversation in
   place is read from token 0 on both PCs.
 - `STRATA_REMOTE_TIMING=1`: the timing lines, every 64 windows, as the Qwen engine's.
 - **Not yet**: relays, images, `--tp` above 1 at either end of the link.

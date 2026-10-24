@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <new>
 #include <string>
@@ -492,6 +493,24 @@ bool worker_restore(M& m, PartStore& parts, int64_t id, int64_t L, const std::ve
                     std::string& e, std::string& note) {
     last_t = 0;
     return worker_ck_restore(m, parts, id, L, keep, e, note);
+}
+/// The worker's CkptSave / CkptRestore handlers (ds4_main.cpp's; the tests' over a stand-in): worker_ck_save and
+/// worker_restore over `m` and `parts` - `last_t` the Run / Commit handlers' (a restore zeroes it) - each note to `log`
+template <class M>
+void worker_ckpt_handlers(M& m, PartStore& parts, int& last_t, net::StageHandlers& hs,
+                          std::function<void(const std::string&)> log) {
+    hs.ckpt_save = [&m, &parts, log](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) -> int {
+        std::string note;
+        const int r = worker_ck_save(m, parts, id, L, keep, e, note);
+        if (!note.empty() && log) log(note);
+        return r;
+    };
+    hs.ckpt_restore = [&m, &parts, &last_t, log](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) {
+        std::string note;
+        const bool ok = worker_restore(m, parts, id, L, keep, last_t, e, note);
+        if (!note.empty() && log) log(note);
+        return ok;
+    };
 }
 
 }  // namespace strata::ds4::stage

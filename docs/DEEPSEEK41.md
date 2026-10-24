@@ -89,7 +89,8 @@ The server speaks to the engine as it does for the other models, so `/v1/chat/co
   With a remote stage (`--remote-stage`) the switch works across the split: the worker keeps its part of each set-aside conversation under the
   main process's slot id (in RAM up to `STRATA_DS4_SLOT_CAP` parts, 4 by default, then in `STRATA_DS4_SLOT_DIR` or `<pack>/slots-stage` up to
   `STRATA_DS4_SLOT_GB`, 16 by default) and a conversation is taken back only when both processes hold it; when the worker does not (it was
-  restarted, or its cap let the part go) the prompt is read from the start. The worker's parts end with its link to the main process, so slots
+  restarted, or its cap let the part go) the prompt goes on from the model's own checkpoint (the shared start) or from the start; the
+  main process keeps 32 such slots at most. The worker's parts end with its link to the main process, so slots
   do not survive a restart of either side. Both processes must run this version.
 
 Not in this version: several requests at once (`--parallel` is ignored with a warning) and pictures (`--vision` is ignored with a warning).

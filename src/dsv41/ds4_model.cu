@@ -20,7 +20,6 @@
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
-#include "ds4_stage.hpp"
 #include "ds4_pool.hpp"
 #include "ds4_stage.hpp"
 #include "ds4_store.hpp"
@@ -866,8 +865,8 @@ struct Model::Impl {
     // a remote stage's prompt chunks (the chunked path, chunk > 0; fp32 rows only, full_floats a row): the main
     // process's sends (Model::StageChunks) from two slots of chunk rows taken in turn (link_cx); the worker's four
     // buffers the link lends (link_pf: two in, two out), and the chunk it runs - its rows in (stage_in, block by block)
-    // and out (stage_out, its rows from stage_skip on, row by row).  All pageable, committed as written (link_maps:
-    // freed at the end)
+    // and out (stage_out, its rows from stage_skip on, row by row).  All pageable, committed as written on Linux (at
+    // the allocation on Windows; link_maps: freed at the end)
     Model::StageChunks stage_chunks;
     float* link_cx[2] = {nullptr, nullptr};
     float* link_pf[4] = {nullptr, nullptr, nullptr, nullptr};
@@ -2778,19 +2777,36 @@ struct Model::Impl {
             if (chunk > 0 && aerr.empty()) err.clear();
         }
         // a remote stage's prompt chunks: the main process's two slots of rows out, the worker's four the link lends -
-        // pageable (a chunk's rows cross the network at its pace; a page is committed once a chunk reaches it)
+        // pageable (a chunk's rows cross the network at its pace; on Linux a page is committed once a chunk reaches
+        // it, on Windows at the allocation).  Memory short: chunks half as large, as the prompt path's buffers above
         if (linked() && chunk > 0) {
-            const size_t b = (size_t) chunk * (size_t) full_floats() * 4;
             float** bufs = o.remote_stage ? link_cx : link_pf;
-            for (int i = 0; i < (o.remote_stage ? 2 : 4); ++i) {
-                void* m = os::anon_alloc(b, -1, 1);
-                if (m == nullptr) {
-                    err = "remote stage: " + std::to_string(b >> 20) + " MiB of memory for a prompt chunk's rows "
-                          "(--prefill-chunk N for smaller chunks)";
+            const int nb = o.remote_stage ? 2 : 4;
+            for (;;) {
+                const size_t b = (size_t) chunk * (size_t) full_floats() * 4;
+                int got = 0;
+                for (; got < nb; ++got) {
+                    void* m = os::anon_alloc(b, -1, 1);
+                    if (m == nullptr) break;
+                    link_maps.push_back({m, b});
+                    bufs[got] = (float*) m;
+                }
+                if (got == nb) break;
+                for (; got > 0; --got) {
+                    os::anon_free(link_maps.back().first, link_maps.back().second);
+                    link_maps.pop_back();
+                    bufs[got - 1] = nullptr;
+                }
+                if (chunk <= 256) {
+                    err = "remote stage: " + std::to_string((b >> 20) * (size_t) nb) + " MiB of memory for prompt "
+                          "chunks' rows (--prefill-chunk 0 for windows)";
                     return false;
                 }
-                link_maps.push_back({m, b});
-                bufs[i] = (float*) m;
+                const int was = chunk;
+                chunk = chunk / 2 / 16 * 16;
+                eg_cap = (size_t) chunk;
+                std::fprintf(stderr, "ds4: remote stage: %zu MiB of memory for chunks of %d rows' hand-off rows: not "
+                                     "had - trying %d\n", (b >> 20) * (size_t) nb, was, chunk);
             }
         }
         // the CPU lane's experts read in place (decided above): how much of them the load reads ahead, from what VRAM
@@ -9864,7 +9880,7 @@ void Model::set_stage_chunk(int n) {
     Impl& p = *p_;
     if (!p.o.remote_stage) return;
     if (p.chunk_own < 0) p.chunk_own = p.chunk;   // (the first link: what the load left - the buffers' rows)
-    p.chunk = std::min(p.chunk_own, std::max(0, n));   // (each link again: its worker's, never more than the load's)
+    p.chunk = (int) stage::chunk_sent(p.chunk_own, n);   // (each link again: its worker's, never more than the load's)
 }
 float* Model::stage_chunk_rows(int i) { return i >= 0 && i < 4 ? p_->link_pf[i] : nullptr; }
 bool Model::stage_prefill(const int64_t* tokens, int T, int64_t p0, bool last, int skip, const float* in, float* out,

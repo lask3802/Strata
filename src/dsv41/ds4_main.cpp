@@ -599,19 +599,10 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
         last_t = 0;
     };
     // the main process's checkpoints and slots (CkptSave / CkptRestore, ids as ds4_stage.hpp has them).  serve_stage has
-    // checked the position of a save and tracks it across a restore
-    hs.ckpt_save = [&](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) -> int {
-        std::string note;
-        const int r = strata::ds4::stage::worker_ck_save(m, parts, id, L, keep, e, note);
-        if (!note.empty()) std::fprintf(stderr, "maya ds4: remote stage worker: %s\n", note.c_str());
-        return r;
-    };
-    hs.ckpt_restore = [&](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) {
-        std::string note;
-        const bool ok = strata::ds4::stage::worker_restore(m, parts, id, L, keep, last_t, e, note);
-        if (!note.empty()) std::fprintf(stderr, "maya ds4: remote stage worker: %s\n", note.c_str());
-        return ok;
-    };
+    // checked the position of a save and tracks it across a restore; a restore forgets the last window (last_t)
+    strata::ds4::stage::worker_ckpt_handlers(m, parts, last_t, hs, [](const std::string& note) {
+        std::fprintf(stderr, "maya ds4: remote stage worker: %s\n", note.c_str());
+    });
     float* const pf[4] = {m.stage_chunk_rows(0), m.stage_chunk_rows(1), m.stage_chunk_rows(2), m.stage_chunk_rows(3)};
     const strata::net::StageBuffers bufs = strata::ds4::stage::worker_buffers(m.stage_rows_in(), m.stage_rows_out(), sg.max_t,
                                                                              pf, sg.chunk, sg.handoff_floats, sg.full_floats);
