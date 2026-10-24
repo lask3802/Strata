@@ -494,10 +494,13 @@ PC C's RVN workers in the measurements above ran from these sparse files (PC B's
 (`--stage-worker PORT --stage-begin K`, layers K to 39 of the model's 40, no relay), so the agent starts it only when
 asked. What its remote stage does (the code is `src/dsv41/ds4_stage.hpp`; on two PCs none of it is measured yet):
 
-- **Windows** of up to 16 rows each way, the hand-off rows fp32: the streams, pre and the indexer's int32 picks and
-  candidate blocks, 92,192 bytes a token. The worker's reply is its last layer's rows through the final norm.
+- **bf16 rows**, always: each hand-off row carries the streams, pre and the indexer's int32 picks and candidate
+  blocks; the streams cross as bf16, pre and the picks exactly, 51,232 bytes a token (fp32 would be 92,192). The
+  engine packs the rows itself, a window's and a prompt chunk's: the link's own bf16 would round the picks.
+  `STRATA_REMOTE_ROWS=fp32` on both PCs sends the fp32 rows, for debugging only; a mismatch is refused at the hello.
+- **Windows** of up to 16 rows each way. The worker's reply is its last layer's rows through the final norm.
 - **Prompt chunks** (the chunked prompt path on both PCs, chunks of 2048 unless `--prefill-chunk N` says otherwise):
-  the main process runs chunk c + 1 through its layers while the worker runs chunk c. Chunks cross as fp32 rows only.
+  the main process runs chunk c + 1 through its layers while the worker runs chunk c. Chunks cross as bf16 rows too.
   Both sides go chunk after chunk, which is what overlaps; `DS4_LAYER_MAJOR=1` on the main process lets it take its
   layers one after another over all the chunks instead (the worker reads one chunk at a time either way). A worker that takes smaller chunks than the main process's gets chunks of its
   size (the main process says so); only a worker with no chunks (`--prefill-chunk 0`) is refused by a main process
@@ -507,11 +510,7 @@ asked. What its remote stage does (the code is `src/dsv41/ds4_stage.hpp`; on two
   main process rejected are undone there, as one process undoes them). With the drafter loaded the main process
   sends its prompts in windows, not chunks: a chunk's reply carries no taps. `--dspark auto` judges by this PC's GPU
   as on one PC (the routed experts against what the GPU holds: off on a 2080 Ti), so drafts across the split take
-  `--dspark on`. bf16 rows and drafts go together (the taps come back bf16).
-- **bf16 rows** (`STRATA_REMOTE_ROWS=bf16` on both PCs; a mismatch is refused at the hello): the streams cross as
-  bf16, pre and the picks exactly, 51,232 bytes a token. The engine packs the rows itself: the link's own bf16 would
-  round the picks. With bf16 rows there are no prompt chunks (prompts in windows), since a chunk's rows would be
-  converted whole.
+  `--dspark on`. The taps come back bf16, as the rows do.
 - **Slots and conversation checkpoints** with `STRATA_DS4_SLOT_KEEP=1` on the main process (serve): each side keeps
   its own layers' part, the worker under the main process's ids (its bounds `STRATA_DS4_SLOT_CAP` / `_GB` / `_DIR`
   set on the worker), and a conversation is taken back only when both sides hold it - one the worker does not hold
@@ -543,9 +542,10 @@ curl -H "X-Stage-Token: $T" -d '{"engine":"dsv41","begin":20,"model":{"dir":"<mo
   config's `args`, or the Qwen spelling (`--layer-split K --split-device 0 --remote-stage HOST:PORT`) that the server turns
   into it for DeepSeek. Put `STRATA_STAGE_TOKEN` in the config's `env`. The Workers card reads K from `--stage-end` (it
   wins over a `--layer-split`, which the engine ignores). Not yet measured on two PCs.
-- `STRATA_REMOTE_ROWS` (`fp32` or `bf16`) has to be the same in the main process's environment and the worker's. The
-  worker's comes from the `/start` request, `"env": {"STRATA_REMOTE_ROWS": "bf16"}` (the one variable an agent takes
-  from it, and either engine); the agent's own environment is not passed on, so a request without it is fp32.
+- `STRATA_REMOTE_ROWS` has to be the same in the main process's environment and the worker's. The worker's comes from
+  the `/start` request, `"env": {"STRATA_REMOTE_ROWS": "fp32"}` (the one variable an agent takes from it, and either
+  engine); the agent's own environment is not passed on, so a DeepSeek request without it is bf16, the engine's
+  default (a Qwen one fp32).
 - A ranged process saves its learned expert profile by reading the file, replacing its own layers' rows and writing it
   back, so a main process and a worker must not share one file. The agent starts a DeepSeek worker with `--expert-profile
   <pack>/expert-profile.from-K.bin`, copied from the pack's `expert-profile.bin` the first time; the shipped file is
@@ -686,7 +686,7 @@ after changing these settings.
 | | status |
 |---|---|
 | Model family | Qwen3.8-Flash-Next only (48 layers, 512 experts top-10, 4 hyper-connection streams, n_embd 2560). The hello checks the geometry. A Qwen3.6-35B-A3B file (0.1.44 runs it from the same binary, on its own engine path) is refused at start |
-| DeepSeek V4.1-Flash (`strata-dsv41`, its own engine) | two PCs, 40 layers (0-39) cut at K: the main process `--remote-stage HOST:PORT --stage-end K` (layers 0 to K - 1, Engram, the head), the worker `--stage-worker PORT --stage-begin K` (K to 39). Windows of 16; prompt chunks (fp32 rows only); DSpark across the split with `--dspark on`; bf16 rows (`STRATA_REMOTE_ROWS=bf16` on both); slots and checkpoints with `STRATA_DS4_SLOT_KEEP=1` (each side its part). Not yet: relays, images, `--tp` above 1 at either end of the link. More under [Tools](#tools) (DeepSeek-V4.1). Windows with fp32 rows checked on one PC over the loopback (`tools/dsv41/remote_loopback.sh`); the chunks, DSpark across the split, bf16 rows and the slots not yet run on a GPU; not measured on two PCs |
+| DeepSeek V4.1-Flash (`strata-dsv41`, its own engine) | two PCs, 40 layers (0-39) cut at K: the main process `--remote-stage HOST:PORT --stage-end K` (layers 0 to K - 1, Engram, the head), the worker `--stage-worker PORT --stage-begin K` (K to 39). Windows of 16 and prompt chunks, bf16 rows (the picks exact); DSpark across the split with `--dspark on`; slots and checkpoints with `STRATA_DS4_SLOT_KEEP=1` (each side its part). Not yet: relays, images, `--tp` above 1 at either end of the link. More under [Tools](#tools) (DeepSeek-V4.1). Checked on one PC over the loopback (`tools/dsv41/remote_loopback.sh`) by the build before bf16 rows became the default: windows and chunks with fp32 rows, DSpark across the split, bf16 rows in windows; bf16 chunks and the slots not yet run on a GPU; not measured on two PCs |
 | RVN IQ3_S, native pack read from its GGUF | **measured** (two and three PCs) |
 | Huihui UD-Q4_K_XL (Unsloth UD layout), native pack read from its GGUF | **measured** (one, two and three PCs) |
 | Other quantizations and models of the family (the official IQ3_S, IQ3_XXS, IQ2_XS, Coder, Swift 1.5, UD-IQ4_XS) | not tested. The hand-off is fp32 rows whatever the quantization, the arena range is cut by layer from the pack's expert table and the shipper works by tensor name |

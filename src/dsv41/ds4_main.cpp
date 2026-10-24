@@ -608,8 +608,9 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
                                                                              pf, sg.chunk, sg.handoff_floats);
     strata::net::StageStats wst;
     std::fprintf(stderr, "maya ds4: remote stage worker: layers %d-%d, no head, windows of %d, prompt chunks of %d at most%s, "
-                 "port %d\n", sg.layer_begin, sg.layer_end - 1, sg.max_t, sg.chunk, sg.chunk > 0 ? "" : " (none: windows only)",
-                 port);
+                 "rows %s, port %d\n", sg.layer_begin, sg.layer_end - 1, sg.max_t, sg.chunk,
+                 sg.chunk > 0 ? "" : " (none: windows only)",
+                 sg.rows_bf16 ? "bf16 (the streams; the picks exact)" : "fp32 (STRATA_REMOTE_ROWS=fp32)", port);
     std::fflush(stderr);
     return strata::net::serve_stage(bind, port, token, hs, bufs, wst, nullptr);
 }

@@ -59,7 +59,8 @@ only the tuner and the main process drive this PC.  Endpoints (JSON in and out):
                                from the pack's expert-profile.bin the first time), never the shipped one
                                "env": {"STRATA_REMOTE_ROWS": "fp32"|"bf16"} (either engine): the rows' precision on the
                                link.  The main process's value goes here (the hello refuses a pair that differs);
-                               without it the worker reads fp32, whatever this agent's own environment says
+                               without it the Qwen worker reads fp32 and the DeepSeek one bf16 (the engine's default;
+                               fp32 there is for debugging), whatever this agent's own environment says
     POST /stop                 {"port": 7841} (no port: every worker) - and no start again
     GET  /log?port=P&lines=N   a worker's log tail (&prev=1: the last run that listened before this one,
                                stage-worker-P.prev.log)
@@ -486,6 +487,8 @@ class Workers:
         env["STRATA_STAGE_TOKEN"] = c["_token"]
         env["STRATA_REMOTE_TIMING"] = "1"
         env.pop("STRATA_REMOTE_ROWS", None)   # (the rows' precision is the main process's: only /start says it)
+        if dsv41:
+            env["STRATA_REMOTE_ROWS"] = "bf16"   # (DeepSeek's rows are bf16 unless /start says fp32: debugging)
         env.update({k: str(v) for k, v in req.get("env", {}).items()})
         libs = os.pathsep.join(c.get("lib_dirs", []))
         if libs:

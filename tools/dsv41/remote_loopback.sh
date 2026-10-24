@@ -36,18 +36,19 @@
 # dense weights and the KV caches.  The worker listens on 127.0.0.1 only and the link carries a token made here
 # (STRATA_STAGE_TOKEN, unless one is set).
 #
-# The split's logits are not expected to be the same bits as one process's: each process places its own experts
-# (which ones VRAM holds follows the VRAM free at its load), and a window's sum of experts in another place is another
-# order of additions.  The check prints the top-1 agreement and the KL of the split's distribution from the single
-# process's, and whether the greedy tokens agree.
+# The split's logits are not expected to be the same bits as one process's: the rows cross the link as the engine's
+# compact ones (its default: the streams bf16, the picks exact), and each process places its own experts (which ones
+# VRAM holds follows the VRAM free at its load) - a window's sum of experts in another place is another order of
+# additions.  The check prints the top-1 agreement and the KL of the split's distribution from the single process's,
+# and whether the greedy tokens agree.
 #
-# The speculative check's token ids are expected IDENTICAL with VRAM_EXPERTS=0: then neither process puts an expert
-# in VRAM (the drafter's included), both read every expert on the CPU lane with CPU_THREADS threads, the drafter runs
-# on the main process in both, the prompt goes in windows of 16 in both (a main process with the drafter sends no
-# prompt chunks: their replies carry no taps), and each window - a draft's check too - is the same rows on the same
-# GPU kernels, the worker undoing a check's rejected rows as one process does.  With experts in VRAM the two
-# placements differ (the worker loads first), so the drafts and the trunk's sums can differ by rounding; then a greedy
-# run may part at a near tie, and the speculative check says where.
+# The speculative check: with VRAM_EXPERTS=0 neither process puts an expert in VRAM (the drafter's included), both read
+# every expert on the CPU lane with CPU_THREADS threads, the drafter runs on the main process in both, the prompt goes
+# in windows of 16 in both (a main process with the drafter sends no prompt chunks: their replies carry no taps), and
+# each window - a draft's check too - runs on the same GPU kernels, the worker undoing a check's rejected rows as one
+# process does; the rows' bf16 streams are what still differs, so a greedy run may part from one process's at a near
+# tie, and the check says where (a fail only with STRATA_REMOTE_ROWS=fp32 on both sides - debugging - where the ids are
+# expected IDENTICAL).  With experts in VRAM the two placements differ as well (the worker loads first).
 #
 # The chunks' check (LONG): the prompt as one feed through the chunked prompt path on both sides, in chunks of CHUNK
 # rows - the main process's layers on chunk c + 1 while the worker reads chunk c - and through one process with the
@@ -61,11 +62,11 @@
 # DS4_LAYER_MAJOR=1: then the main process may take its layers one after another over all the chunks (the worker
 # reads one chunk at a time either way), which overlaps little; the
 # single process decides by its own gate, DS4_LAYER_MAJOR=0 never).
-# STRATA_REMOTE_ROWS=bf16 passes through as well, and turns the chunks off on both sides of the split (windows of 16;
-# the single process reads no such variable, so with IDS and CHUNK > 0 it is chunks against windows then).
+# The rows on the link are the engine's default, bf16, a window's and a chunk's alike; STRATA_REMOTE_ROWS=fp32 passes
+# through to both split processes (debugging only - nothing here sets it).
 set -u
 if [ $# -lt 3 ]; then
-    sed -n '2,65p' "$0"
+    sed -n '2,66p' "$0"
     exit 2
 fi
 exe=$1
@@ -283,7 +284,8 @@ if [ -n "${SPEC_IDS:-}" ]; then
                             <(grep -h '^[0-9]' "$out/spec-single.out" | head -1 | tr ',' '\n') |
                 awk '$1 != $2 { print NR - 1; exit }')
         echo "  speculative token ids: DIFFER (split $a tokens, single $b; first different at token ${first:-?})"
-        [ "$vram" = 0 ] && rc=1   # (experts in VRAM: the placements differ, a near tie may part them - said above)
+        # (bf16 rows, or experts in VRAM: a near tie may part them - said above)
+        [ "$vram" = 0 ] && [ "${STRATA_REMOTE_ROWS:-bf16}" = fp32 ] && rc=1
     fi
 fi
 if [ -n "${IDS:-}" ]; then

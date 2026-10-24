@@ -361,13 +361,14 @@ class StartTest(unittest.TestCase):
         self.assertEqual(self.argv[-1][self.argv[-1].index("--expert-profile") + 1], str(packd / "expert-profile.from-30.bin"))
 
     def test_the_rows_precision_is_the_start_requests_and_nothing_else(self):
-        """STRATA_REMOTE_ROWS has to be the main process's on the worker too (the hello refuses a pair that differs)."""
+        """STRATA_REMOTE_ROWS has to be the main process's on the worker too (the hello refuses a pair that differs);
+        a DeepSeek worker's default is bf16, the engine's own."""
         req = {"engine": "dsv41", "begin": 20, "port": self.PORT, "model": {"dir": "ds-model", "pack": "ds-pack"}}
-        with mock.patch.dict(os.environ, {"STRATA_REMOTE_ROWS": "bf16"}):     # (the agent's own environment)
+        with mock.patch.dict(os.environ, {"STRATA_REMOTE_ROWS": "fp32"}):     # (the agent's own environment)
             self.assertTrue(self.w.start(req)["ok"])
-            self.assertIn("rows: None", self.log())                            # not inherited
+            self.assertIn("rows: bf16", self.log())                            # the default, not inherited
             self.assertTrue(self.w.start({**req, "env": {"STRATA_REMOTE_ROWS": "fp32"}})["ok"])
-            self.assertIn("rows: fp32", self.log())
+            self.assertIn("rows: fp32", self.log())                            # (debugging: asked for)
         self.assertTrue(self.w.start({**req, "env": {"STRATA_REMOTE_ROWS": "bf16"}})["ok"])
         self.assertIn("rows: bf16", self.log())
         n = len(self.argv)
@@ -376,10 +377,14 @@ class StartTest(unittest.TestCase):
             self.assertFalse(r["ok"], env)
             self.assertIn("env: STRATA_REMOTE_ROWS is fp32 or bf16", r["error"], env)
         self.assertEqual(len(self.argv), n)                                    # none of them started anything
-        # the Qwen worker takes it too
+        # the Qwen worker takes it too, and has no default of its own here
         self.w.stop(self.PORT)
         self.assertTrue(self.w.start({"begin": 24, "port": self.PORT, "env": {"STRATA_REMOTE_ROWS": "bf16"}})["ok"])
         self.assertIn("rows: bf16", self.log())
+        self.w.stop(self.PORT)
+        with mock.patch.dict(os.environ, {"STRATA_REMOTE_ROWS": "bf16"}):
+            self.assertTrue(self.w.start({"begin": 24, "port": self.PORT})["ok"])
+            self.assertIn("rows: None", self.log())
 
     def test_nodes_own_pack_is_left_alone(self):
         own = self.d / "own-pack"
