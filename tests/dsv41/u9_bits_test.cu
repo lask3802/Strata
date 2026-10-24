@@ -328,13 +328,15 @@ void test_route(cudaStream_t s) {
     }
 }
 
-// ---- item q5k: the staged Q5_K GEMV (the decode's dense shapes: wq_b, wo_a's slices, wo_b, the shared expert, the head)
+// ---- item q5k: the staged Q5_K GEMV (the decode's dense shapes: wq_b, wo_a's slices, wo_b, the shared expert, the engram's
+// wkv (layers 1 and 14), the head)
 struct Shape {
     const char* name;
     int n, k, jobs;
 };
 const Shape kQ5Shapes[] = {{"wq_b", 32768, 1280, 1}, {"wo_a x 8", 1024, 4096, 8}, {"wo_b", 5120, 8192, 1},
-                           {"s1 + s3", 2304, 5120, 2}, {"s2", 5120, 2304, 1}, {"odd rows", 1003, 768, 3}};
+                           {"s1 + s3", 2304, 5120, 2}, {"s2", 5120, 2304, 1}, {"engram wkv", 25600, 6144, 1},
+                           {"head", 129280, 5120, 1}, {"odd rows", 1003, 768, 3}};
 void test_q5k(cudaStream_t s, bool bench) {
     for (const Shape& sh : kQ5Shapes)
         for (int T : {1, 3, 16}) {
