@@ -420,7 +420,7 @@ struct RemoteMain {
     bool reset(std::string& e) {
         if (link.connected() && link.reset({}, e)) return true;
         if (link.connected() && !strata::net::stage_link_lost(e)) return false;   // (the worker's own error)
-        const std::string lost = e.empty() ? "the link is down" : e;
+        const std::string lost = e.empty() ? "remote stage: the link is down" : e;
         if (!connect(e)) {
             e = lost + "; connecting again: " + e;
             return false;
@@ -1016,11 +1016,17 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         if (!ok) {
             std::fprintf(stderr, "ds4: %s\n", err.c_str());
+            if (g_remote != nullptr) {   // (a remote stage: the worker again within the request - its wait's heartbeat
+                m.reset();               // and its STOP are this request's)
+                held.clear();
+            }
             std::printf("ERR %s\n", err.c_str());
             std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
             std::fflush(stdout);
-            m.reset();
-            held.clear();
+            if (g_remote == nullptr) {
+                m.reset();
+                held.clear();
+            }
             continue;
         }
         held = std::move(pics);
@@ -1395,6 +1401,7 @@ int main(int argc, char** argv) {
     std::string score_ids, score_out, prof_ids, spec_ids;
     std::string remote_at, stage_bind;   // (a remote stage: the worker's HOST:PORT; a worker's address to listen on)
     int worker_port = 0;
+    bool worker_mode = false;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1465,7 +1472,10 @@ int main(int argc, char** argv) {
         else if (a == "--stage-begin") o.stage_begin = std::atoi(val("--stage-begin").c_str());
         else if (a == "--stage-end") o.stage_end = std::atoi(val("--stage-end").c_str());
         else if (a == "--remote-stage") remote_at = val("--remote-stage");
-        else if (a == "--stage-worker") worker_port = std::atoi(val("--stage-worker").c_str());
+        else if (a == "--stage-worker") {
+            worker_mode = true;
+            worker_port = std::atoi(val("--stage-worker").c_str());
+        }
         else if (a == "--stage-bind") stage_bind = val("--stage-bind");
         else if (a == "--help" || a == "-h") {
             usage();
@@ -1485,7 +1495,6 @@ int main(int argc, char** argv) {
     }
     // a remote stage (ds4_stage.hpp): the worker (--stage-worker PORT --stage-begin K) serves its main process instead
     // of a mode of its own; the main process (--remote-stage HOST:PORT --stage-end K) runs any mode
-    const bool worker_mode = worker_port != 0;
     {
         std::string why;
         if (worker_mode && !remote_at.empty()) why = "--stage-worker or --remote-stage, not both";

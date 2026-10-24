@@ -2253,7 +2253,7 @@ struct Model::Impl {
             const size_t first = groups[(size_t) L[(size_t) lo].grp].mem.size(), last = groups[(size_t) devs[(size_t) head_dev].grp].mem.size();
             if ((o.stage_worker && first > 1) || (o.remote_stage && last > 1)) {
                 err = "remote stage: the GPUs at this end of the link are a tensor-parallel group of " +
-                      std::to_string(std::max(first, last)) + ": v1 hands one GPU's rows over (--tp 1)";
+                      std::to_string(o.stage_worker ? first : last) + ": v1 hands one GPU's rows over (--tp 1)";
                 return false;
             }
         }
@@ -8399,7 +8399,7 @@ struct Model::Impl {
             }
         if (stage_lost && pos == 0 && stage_reset && stage_reset(stage_err)) stage_lost = false;   // (the worker back)
         if (stage_lost) {   // (the worker's layers hold another state, or none: only a conversation from 0 goes on)
-            err = "remote stage: " + stage_err + " - the conversation starts again from its first token";
+            err = stage_err + " - the conversation starts again from its first token";   // (the link's: "remote stage ...")
             return false;
         }
         const int64_t p0 = pos;

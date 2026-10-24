@@ -11,7 +11,9 @@
 #        1024); VRAM_EXPERTS (0.3: each process's share of the VRAM free when it loads - the worker loads first, the
 #        main process takes its share of what is left); CPU_THREADS (half the CPUs each); ENGRAM_MB (64, each
 #        process's Engram row cache); IDS (a file of prompt ids, comma separated: also the logits check - 64 greedy
-#        tokens after it through the split, then through one process with the same flags, compared); PYTHON (python3)
+#        tokens after it through the split, then through one process with the same flags, compared); KL_MAX (0.02)
+#        and TOP1_MIN (0.9): the comparison fails (exit 1) when the mean KL is above KL_MAX or the top-1 tokens agree
+#        at fewer than TOP1_MIN of the positions; PYTHON (python3)
 #
 # Both processes read the experts in place (--mmap-experts on: the files' page cache, shared by both, no copies in
 # RAM), with no SSD store, a fixed placement (--no-expert-cache --expert-profile none) and Engram row caches of
@@ -24,7 +26,7 @@
 # process's, and whether the greedy tokens agree.
 set -u
 if [ $# -lt 3 ]; then
-    sed -n '2,24p' "$0"
+    sed -n '2,26p' "$0"
     exit 2
 fi
 exe=$1
@@ -85,12 +87,12 @@ if [ -n "${IDS:-}" ]; then
     echo "== logits: the split, then one process"
     "$main" --max-context "$ctx" --dspark none --n 64 --ids "$ids" --dump-logits "$out/split.f32" \
         > "$out/split.out" 2> "$out/split.err"
-    echo "split rc=$?"
+    s=$?; echo "split rc=$s"; [ $s -eq 0 ] || rc=1
     kill $wpid 2> /dev/null
     wait $wpid 2> /dev/null
     DS4_CHUNK_MIN=100000 "$exe" "${common[@]}" --max-context "$ctx" --prefill-chunk 0 --dspark none --n 64 --ids "$ids" \
         --dump-logits "$out/single.f32" > "$out/single.out" 2> "$out/single.err"
-    echo "single rc=$?"
+    s=$?; echo "single rc=$s"; [ $s -eq 0 ] || rc=1
     for b in split single; do
         echo "  $b: $(grep -h 'in VRAM' "$out/$b.err" | head -1 | sed 's/.*experts/experts/')"
     done
@@ -107,6 +109,10 @@ for x, y in zip(b[:n], a[:n]):
     kl.append(float(np.sum(px * (np.log(px + 1e-30) - np.log(py + 1e-30)))))
     top += int(x.argmax() == y.argmax())
 print("  %d positions: top-1 agrees at %d, KL(single || split) mean %.3e max %.3e" % (n, top, np.mean(kl), np.max(kl)))
-' "$out/split.f32" "$out/single.f32" || rc=1
+kl_max, top_min = float(sys.argv[3]), float(sys.argv[4])
+if n == 0 or np.mean(kl) > kl_max or top < top_min * n:
+    print("  FAIL: the split is further from one process than KL_MAX %g / TOP1_MIN %g allow" % (kl_max, top_min))
+    sys.exit(1)
+' "$out/split.f32" "$out/single.f32" "${KL_MAX:-0.02}" "${TOP1_MIN:-0.9}" || rc=1
 fi
 exit $rc
