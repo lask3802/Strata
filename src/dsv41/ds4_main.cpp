@@ -395,7 +395,9 @@ struct RemoteMain {
             link.close();
             const int left = wait_s > 0 ? std::min(strata::net::io_timeout_s(), std::max(1, (int) std::ceil(wait_s - spent()))) : 0;
             if (link.connect(at, me, peer, e, left, stop)) {
-                ok = strata::ds4::stage::main_accepts(peer, e) && link.reset({}, e);
+                ok = strata::ds4::stage::main_accepts(peer, e);
+                if (!ok) link.close();   // (refused: no link a later reset could take as up)
+                ok = ok && link.reset({}, e);
                 break;
             }
             const bool cancelled = strata::net::stage_wait_cancelled(e) || (stop != nullptr && stop->load());
@@ -461,17 +463,9 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
         return strata::ds4::stage::worker_accepts(theirs, me, m.max_context(), e);
     };
     hs.run = [&](int T, const int32_t* tokens, int64_t p0, std::string& e) {
-        last_t = 0;
-        if (!m.stage_run(tokens, T, p0, e)) return false;
-        last_t = T;
-        return true;
+        return strata::ds4::stage::worker_run(m, tokens, T, p0, last_t, e);
     };
-    hs.commit = [&](int n_keep, std::string& e) {
-        const strata::ds4::stage::Keep k = strata::ds4::stage::commit_kind(n_keep, last_t, e);
-        last_t = 0;
-        if (k == strata::ds4::stage::Keep::Part) return m.stage_rollback(n_keep, e);
-        return k == strata::ds4::stage::Keep::All;
-    };
+    hs.commit = [&](int n_keep, std::string& e) { return strata::ds4::stage::worker_commit(m, n_keep, last_t, e); };
     hs.prefill = [](const int64_t*, int64_t, int64_t, int64_t, int64_t, const float*, float*, std::string& e) {
         e = "a prompt chunk: this worker reads windows only";
         return false;

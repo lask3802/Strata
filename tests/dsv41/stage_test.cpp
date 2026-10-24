@@ -2,8 +2,9 @@
 // (the same model on two PCs whose model_dir differs; any other line of ds4.txt or tensors.txt changes it), every
 // main-process hello a worker refuses and the worker's hello a main process refuses, the reply's layout (the normed
 // rows, then the drafter's taps: which ones the main process takes), what a Commit keeps - and, over the loopback
-// through src/net/stage_link.cpp, a main process's draft checks committed in part on a worker that keeps a history
-// and undoes the rest as ds4_main.cpp's worker does (each reply must be what the kept tokens alone give).
+// through src/net/stage_link.cpp, a main process's draft checks committed in part on a worker that runs ds4_main.cpp's
+// Run and Commit (worker_run, worker_commit) over a stand-in model keeping a history, undone past what a Commit keeps
+// (each reply must be what the kept tokens alone give).
 //   ds4_stage_test            exit 0: all passed
 #include "ds4_stage.hpp"
 
@@ -80,10 +81,11 @@ static void commits() {
     CHECK(st::commit_kind(1, 0, e) == st::Keep::Bad && e.find("no window") != std::string::npos);   // (twice)
 }
 
-// A main process and a worker over the loopback: the worker keeps the tokens it ran (a stand-in for its layers'
-// state), every window of 2 or more rows undoable; its reply's normed rows and taps are a function of everything it
-// holds up to each row.  The main process runs windows kept whole (a prompt, a plain step) and draft checks kept in
-// part, committing as ds4_model.cu does; every reply must be what the tokens it kept give, as one process's would.
+// A main process and a worker over the loopback: the worker's stand-in model keeps the tokens it ran (for its layers'
+// state), every window of 2 or more rows undoable as Model::stage_rollback undoes one; its reply's normed rows and
+// taps are a function of everything it holds up to each row.  The main process runs windows kept whole (a prompt, a
+// plain step) and draft checks kept in part, committing as ds4_model.cu does; every reply must be what the tokens it
+// kept give, as one process's would.
 namespace {
 constexpr int kDim = 8, kHc = 4, kNt = 3;
 constexpr int64_t kHand = (int64_t) kHc * kDim + 8 + 32 + 32;   // (topk_stride / cand_stride 32 at least)
@@ -93,6 +95,38 @@ float sum_of(const std::vector<int32_t>& h, size_t n) {   // (a row's value: the
     for (size_t i = 0; i < n; ++i) s += (double) h[i] * (double) (i + 1);
     return (float) std::fmod(s, 65521.0);
 }
+
+// Model's stage_run / stage_rollback over a history, writing the reply into out
+struct Held {
+    std::vector<int32_t> held;
+    std::vector<float>* out = nullptr;
+    int stage_t = 0;
+    bool stage_run(const int32_t* tokens, int T, int64_t p0, std::string& e) {
+        stage_t = 0;
+        if (p0 != (int64_t) held.size()) {
+            e = "out of step: at " + std::to_string(held.size()) + ", the window at " + std::to_string(p0);
+            return false;
+        }
+        for (int t = 0; t < T; ++t) held.push_back(tokens[t]);
+        for (int t = 0; t < T; ++t) {   // the reply: normed rows, then each target's tap
+            float* o = out->data();
+            o[(size_t) t * kDim] = sum_of(held, (size_t) (p0 + t + 1));
+            for (int j = 0; j < kNt; ++j) o[st::reply_tap_at(T, kDim, kNt, t, j)] = (float) (j + 1) * o[(size_t) t * kDim];
+        }
+        if (T > 1) stage_t = T;
+        return true;
+    }
+    bool stage_rollback(int n_keep, std::string& e) {
+        const int T = stage_t;
+        stage_t = 0;
+        if (T < 2 || n_keep < 1 || n_keep >= T) {
+            e = "no window to keep " + std::to_string(n_keep) + " rows of";
+            return false;
+        }
+        held.resize(held.size() - (size_t) (T - n_keep));
+        return true;
+    }
+};
 
 net::StageHello hello_of(int layer_begin) {
     net::StageHello h;
@@ -112,10 +146,10 @@ net::StageHello hello_of(int layer_begin) {
 }  // namespace
 
 static void link_drafts() {
-    std::vector<int32_t> held;     // the worker's: the tokens its layers hold
-    int last_t = 0;                // (as ds4_main.cpp's worker)
-    int64_t last_p0 = 0;
     std::vector<float> in((size_t) 16 * kHand), out((size_t) 16 * kHand);
+    Held model;   // the worker's: the tokens its layers hold
+    model.out = &out;
+    int last_t = 0;
     net::StageHandlers hs;
     const net::StageHello me = hello_of(20);
     hs.hello = [&](const net::StageHello& theirs, net::StageHello& mine, std::string& e) {
@@ -123,32 +157,15 @@ static void link_drafts() {
         return st::worker_accepts(theirs, me, 4096, e);
     };
     hs.run = [&](int T, const int32_t* tokens, int64_t p0, std::string& e) {
-        last_t = 0;
-        if (p0 != (int64_t) held.size()) {
-            e = "out of step: at " + std::to_string(held.size()) + ", the window at " + std::to_string(p0);
-            return false;
-        }
-        for (int t = 0; t < T; ++t) held.push_back(tokens[t]);
-        for (int t = 0; t < T; ++t) {   // the reply: normed rows, then each target's tap
-            out[(size_t) t * kDim] = sum_of(held, (size_t) (p0 + t + 1));
-            for (int j = 0; j < kNt; ++j) out[st::reply_tap_at(T, kDim, kNt, t, j)] = (float) (j + 1) * out[(size_t) t * kDim];
-        }
-        last_t = T;
-        last_p0 = p0;
-        return true;
+        return st::worker_run(model, tokens, T, p0, last_t, e);
     };
-    hs.commit = [&](int n_keep, std::string& e) {
-        const st::Keep k = st::commit_kind(n_keep, last_t, e);
-        last_t = 0;
-        if (k == st::Keep::Part) held.resize((size_t) (last_p0 + n_keep));   // (stage_rollback)
-        return k != st::Keep::Bad;
-    };
+    hs.commit = [&](int n_keep, std::string& e) { return st::worker_commit(model, n_keep, last_t, e); };
     hs.prefill = [](const int64_t*, int64_t, int64_t, int64_t, int64_t, const float*, float*, std::string& e) {
         e = "no chunks";
         return false;
     };
     hs.reset = [&](const std::vector<int64_t>&, std::string&) {
-        held.clear();
+        model.held.clear();
         last_t = 0;
         return true;
     };
@@ -239,7 +256,7 @@ static void link_drafts() {
     c.close();
     stop = true;
     th.join();
-    CHECK(held.size() >= kept.size() && std::equal(kept.begin(), kept.end(), held.begin()));
+    CHECK(model.held.size() >= kept.size() && std::equal(kept.begin(), kept.end(), model.held.begin()));
 }
 
 int main() {

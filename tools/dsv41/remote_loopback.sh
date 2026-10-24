@@ -98,7 +98,8 @@ if [ -n "${SPEC_IDS:-}" ]; then   # (the split's run first: the worker stops bef
     [ "$vram" = 0 ] || echo "(VRAM_EXPERTS=$vram: the two placements differ - token ids may part at a near tie)"
     echo "== speculative decoding through the split (${spec[*]})"
     "$main" --max-context "$ctx" "${spec[@]}" --ids "@$SPEC_IDS" > "$out/spec-split.out" 2> "$out/spec-split.err"
-    echo "spec split rc=$?"
+    ss=$?
+    echo "spec split rc=$ss"
 fi
 if [ -n "${IDS:-}" ]; then
     ids=$(cat "$IDS")
@@ -113,7 +114,8 @@ if [ -n "${SPEC_IDS:-}" ]; then
     echo "== speculative decoding through one process"
     DS4_CHUNK_MIN=100000 "$exe" "${common[@]}" --max-context "$ctx" --prefill-chunk 0 "${spec[@]}" --ids "@$SPEC_IDS" \
         > "$out/spec-single.out" 2> "$out/spec-single.err"
-    echo "spec single rc=$?"
+    s1=$?
+    echo "spec single rc=$s1"
     for b in spec-split spec-single; do
         echo "  $b: $(grep -h '^decode:' "$out/$b.err" | head -1 | cut -c1-60)"
         echo "    $(grep -h '^dspark:' "$out/$b.err" | head -1 | cut -c1-120)"
@@ -121,14 +123,17 @@ if [ -n "${SPEC_IDS:-}" ]; then
     done
     a=$(grep -h '^[0-9]' "$out/spec-split.out" | head -1 | tr ',' '\n' | grep -c .)
     b=$(grep -h '^[0-9]' "$out/spec-single.out" | head -1 | tr ',' '\n' | grep -c .)
-    if [ "$a" -gt 0 ] && cmp -s <(grep -h '^[0-9]' "$out/spec-split.out") <(grep -h '^[0-9]' "$out/spec-single.out"); then
+    if [ $ss -ne 0 ] || [ $s1 -ne 0 ]; then
+        echo "  speculative token ids: not compared - a run failed (its .err: $out/spec-split.err, $out/spec-single.err)"
+        rc=1
+    elif [ "$a" -gt 0 ] && cmp -s <(grep -h '^[0-9]' "$out/spec-split.out") <(grep -h '^[0-9]' "$out/spec-single.out"); then
         echo "  speculative token ids: IDENTICAL ($a tokens)"
     else
         first=$(paste -d' ' <(grep -h '^[0-9]' "$out/spec-split.out" | head -1 | tr ',' '\n') \
                             <(grep -h '^[0-9]' "$out/spec-single.out" | head -1 | tr ',' '\n') |
                 awk '$1 != $2 { print NR - 1; exit }')
         echo "  speculative token ids: DIFFER (split $a tokens, single $b; first different at token ${first:-?})"
-        rc=1
+        [ "$vram" = 0 ] && rc=1   # (experts in VRAM: the placements differ, a near tie may part them - said above)
     fi
 fi
 if [ -n "${IDS:-}" ]; then

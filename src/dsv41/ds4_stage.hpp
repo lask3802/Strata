@@ -141,4 +141,21 @@ inline Keep commit_kind(int n_keep, int last_t, std::string& err) {
     return Keep::Bad;
 }
 
+/// The worker's Run and Commit (ds4_main.cpp's handlers; M: Model, or a test's stand-in with its stage_run and
+/// stage_rollback).  `last_t`: the last window's rows until its Commit (0: none).
+template <class M>
+bool worker_run(M& m, const int32_t* tokens, int T, int64_t p0, int& last_t, std::string& err) {
+    last_t = 0;
+    if (!m.stage_run(tokens, T, p0, err)) return false;
+    last_t = T;
+    return true;
+}
+template <class M>
+bool worker_commit(M& m, int n_keep, int& last_t, std::string& err) {
+    const Keep k = commit_kind(n_keep, last_t, err);
+    last_t = 0;
+    if (k == Keep::Part) return m.stage_rollback(n_keep, err);
+    return k == Keep::All;
+}
+
 }  // namespace strata::ds4::stage

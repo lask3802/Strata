@@ -1927,7 +1927,7 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: layers [%d, %d) of %d here%s: prompts in windows of %d, %s, no pictures, no "
                                  "slots%s\n", lo, hi, g.nl,
                          o.remote_stage ? " (the rest: the remote stage's worker)" : o.stage_worker ? " (a remote stage's worker)" : "",
-                         kWin, d_here ? "DSpark as asked (the worker's taps come back with its rows)" : "no DSpark",
+                         kWin, d_here ? "DSpark as --dspark says (the worker's taps come back with its rows)" : "no DSpark",
                          linked() ? ", no checkpoints" : "");
             if (!d_here) o.dspark = false;
             o.vision = false;
