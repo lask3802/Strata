@@ -69,7 +69,7 @@ struct Options {
     // (stage_run), its last layer's go back; no embedding table, no head.  Either: no conversation checkpoints
     bool remote_stage = false;
     bool stage_worker = false;
-    // (either side) the link's rows compact: the streams and pre as bf16, the indexer's picks exact (ds4_stage.hpp
+    // (either side) the link's rows compact: the streams as bf16, pre and the indexer's picks exact (ds4_stage.hpp
     // rows_pack; STRATA_REMOTE_ROWS=bf16 on both sides)
     bool stage_bf16 = false;
 };
@@ -204,7 +204,7 @@ public:
     /// floats, then T x 8, then T x topk_stride, then T x cand_stride (T x handoff_floats in all).  The worker's reply
     /// has the same layout; the main process reads its streams and pre.  With stage_bf16 the rows on the link are the
     /// compact ones (ds4_stage.hpp RowGeo::compact(): handoff_floats words a row; full_floats the fp32 row) and the
-    /// layout is: the first block as bf16, the picks and candidates as they are.
+    /// layout is: the streams as bf16, pre, the picks and candidates as they are.
     struct StageGeo {
         int dim = 0, hc = 0, n_layers = 0, n_expert = 0, layer_begin = 0, layer_end = 0, max_t = 0;
         int64_t handoff_floats = 0;
@@ -226,9 +226,14 @@ public:
     float* stage_rows_in();
     float* stage_rows_out();
     bool stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err);
-    /// The compact rows' conversions so far, milliseconds (stage_bf16): rows in = fp32 rows from the link's, rows out =
-    /// to the link's (the main process: its window's rows out, the reply's back in; the worker: the reverse).
-    void stage_conv_ms(double& rows_in, double& rows_out) const;
+    /// The compact rows' conversions so far (stage_bf16): the time and the windows converted, rows in = fp32 rows from the
+    /// link's, rows out = to the link's (the main process: its window's rows out, the reply's back in; the worker: the
+    /// reverse).  Each count is of its own conversions, so a mean divides by its own.
+    struct StageConv {
+        double in_ms = 0, out_ms = 0;
+        int64_t in_n = 0, out_n = 0;
+    };
+    StageConv stage_conv() const;
 
     void save_profile() const;
     const Stats& stats() const;

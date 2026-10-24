@@ -384,7 +384,8 @@ struct RemoteMain {
     const std::atomic<bool>* stop = nullptr;   // (serve: its STOP flag - a request's wait ends on it)
     const strata::ds4::Model* model = nullptr;   // (the timing lines: the compact rows' conversions)
     // (remote_timing) this process's share of a window: from one window's rows coming back to the next one's send
-    double last_end = 0, gap_ms = 0, conv_in0 = 0, conv_out0 = 0;
+    double last_end = 0, gap_ms = 0;
+    strata::ds4::Model::StageConv conv0;   // (the conversions at the last line)
     int64_t gaps = 0;
 
     bool connect(std::string& e) {
@@ -457,13 +458,15 @@ struct RemoteMain {
                 std::fprintf(stderr, "strata remote: main process between windows %.2f ms each (64 windows: head, "
                                      "layers 0-K)\n", gap_ms / 64);
                 if (model != nullptr && model->stage_geo().rows_bf16) {
-                    double ci = 0, co = 0;
-                    model->stage_conv_ms(ci, co);
-                    std::fprintf(stderr, "strata remote: rows bf16: %lld bytes a row each way; pack %.3f + unpack %.3f ms a "
-                                         "window (64 windows; part of the time between windows)\n",
-                                 (long long) (me.handoff_floats * 4), (co - conv_out0) / 64, (ci - conv_in0) / 64);
-                    conv_in0 = ci;
-                    conv_out0 = co;
+                    // (each mean over the windows it converted since the last line: a window's pack and its reply's
+                    // unpack are not the same count at a line, and a prompt's first window has no gap)
+                    const strata::ds4::Model::StageConv c = model->stage_conv();
+                    const int64_t no = std::max<int64_t>(1, c.out_n - conv0.out_n), ni = std::max<int64_t>(1, c.in_n - conv0.in_n);
+                    std::fprintf(stderr, "strata remote: rows bf16: %lld bytes a row each way; pack %.3f ms (%lld windows) + "
+                                         "unpack %.3f ms (%lld windows) a window (part of the time between windows)\n",
+                                 (long long) (me.handoff_floats * 4), (c.out_ms - conv0.out_ms) / (double) no, (long long) no,
+                                 (c.in_ms - conv0.in_ms) / (double) ni, (long long) ni);
+                    conv0 = c;
                 }
                 gap_ms = 0;
             }
@@ -493,7 +496,8 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
     };
     // (remote_timing) every 64 windows: this worker's own time for a window - its rows unpacked, its layers, its rows
     // packed - and the conversions' share of it
-    double own_ms = 0, conv_in0 = 0, conv_out0 = 0;
+    double own_ms = 0;
+    strata::ds4::Model::StageConv conv0;   // (the conversions at the last line)
     int64_t windows = 0;
     hs.run = [&](int T, const int32_t* tokens, int64_t p0, std::string& e) {
         last_t = 0;
@@ -503,13 +507,13 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
         if (remote_timing()) {
             own_ms += now_ms() - t0;
             if (++windows % 64 == 0) {
-                double ci = 0, co = 0;
-                m.stage_conv_ms(ci, co);
+                const strata::ds4::Model::StageConv c = m.stage_conv();
+                const int64_t no = std::max<int64_t>(1, c.out_n - conv0.out_n), ni = std::max<int64_t>(1, c.in_n - conv0.in_n);
                 std::fprintf(stderr, "strata stage worker: windows: own layers %.2f ms each (64 windows; rows in %.2f, "
-                                     "rows out %.2f)\n", own_ms / 64, (ci - conv_in0) / 64, (co - conv_out0) / 64);
+                                     "rows out %.2f)\n", own_ms / 64, (c.in_ms - conv0.in_ms) / (double) ni,
+                             (c.out_ms - conv0.out_ms) / (double) no);
                 own_ms = 0;
-                conv_in0 = ci;
-                conv_out0 = co;
+                conv0 = c;
             }
         }
         return true;

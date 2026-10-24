@@ -831,12 +831,14 @@ struct Model::Impl {
     // (stage_bf16) the same rows as the link carries them, compact: wire_tx / wire_rx, kWin rows of handoff_floats()
     // words, packed from link_tx after a window's last sync and unpacked into link_rx before its first copy
     float *wire_tx = nullptr, *wire_rx = nullptr;
-    double conv_in_ms = 0, conv_out_ms = 0;   // (stage_conv_ms)
+    double conv_in_ms = 0, conv_out_ms = 0;   // (stage_conv)
+    int64_t conv_in_n = 0, conv_out_n = 0;
     bool linked() const { return o.remote_stage || o.stage_worker; }
     bool bf16_rows() const { return o.stage_bf16 && linked(); }
     stage::RowGeo row_geo() const {
         stage::RowGeo r;
-        r.floats = (int64_t) g.hc * g.dim + 8;
+        r.h = (int64_t) g.hc * g.dim;
+        r.pre = 8;
         r.topk = (int64_t) topk_stride();
         r.cand = (int64_t) cand_stride();
         return r;
@@ -1929,7 +1931,7 @@ struct Model::Impl {
             return false;
         }
         if (bf16_rows() && !row_geo().compact_ok()) {
-            err = "bf16 rows: a row's streams and pre (" + std::to_string(row_geo().floats) + " floats) are not a whole number of words";
+            err = "bf16 rows: a row's streams (" + std::to_string(row_geo().h) + " floats) are not a whole number of words";
             return false;
         }
         ranged = lo > 0 || hi < g.nl || linked();
@@ -8553,6 +8555,7 @@ struct Model::Impl {
             const double t0 = now_ms();
             stage::rows_pack(row_geo(), T, link_tx, wire_tx);
             conv_out_ms += now_ms() - t0;
+            ++conv_out_n;
         }
         if (!stage_hop || !stage_hop(T, toks.data() + p0, p0, bf ? wire_tx : link_tx, bf ? wire_rx : link_rx, err)) {
             if (!stage_hop) err = "remote stage: no link";
@@ -8564,6 +8567,7 @@ struct Model::Impl {
             const double t0 = now_ms();
             stage::rows_unpack(row_geo(), T, wire_rx, link_rx, false);
             conv_in_ms += now_ms() - t0;
+            ++conv_in_n;
         }
         return link_rows(link_rx, d, T, false, 2, err);
     }
@@ -9350,9 +9354,13 @@ void Model::set_stage_link(StageRun run, std::function<bool(std::string& err)> r
 }
 float* Model::stage_rows_in() { return p_->bf16_rows() ? p_->wire_rx : p_->link_rx; }
 float* Model::stage_rows_out() { return p_->bf16_rows() ? p_->wire_tx : p_->link_tx; }
-void Model::stage_conv_ms(double& rows_in, double& rows_out) const {
-    rows_in = p_->conv_in_ms;
-    rows_out = p_->conv_out_ms;
+Model::StageConv Model::stage_conv() const {
+    StageConv c;
+    c.in_ms = p_->conv_in_ms;
+    c.out_ms = p_->conv_out_ms;
+    c.in_n = p_->conv_in_n;
+    c.out_n = p_->conv_out_n;
+    return c;
 }
 bool Model::stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err) {
     Impl& p = *p_;
@@ -9365,18 +9373,24 @@ bool Model::stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err
               std::to_string(p0);
         return false;
     }
-    std::vector<int> tk(tokens, tokens + std::max(0, T));
+    if (T < 1 || T > kWin) {   // (before the rows are read: the link's bound, here too)
+        err = "a window of " + std::to_string(T) + " tokens";
+        return false;
+    }
+    std::vector<int> tk(tokens, tokens + T);
     const bool bf = p.bf16_rows();
     if (bf) {   // (the main process's compact rows into the layout the first layer's copy reads)
         const double t0 = now_ms();
         stage::rows_unpack(p.row_geo(), T, p.wire_rx, p.link_rx);
         p.conv_in_ms += now_ms() - t0;
+        ++p.conv_in_n;
     }
     if (!p.forward(tk.data(), T, 0, err)) return false;
     if (bf) {   // (forward ended with its last stream synchronized: the rows for the reply are in link_tx)
         const double t0 = now_ms();
         stage::rows_pack(p.row_geo(), T, p.link_tx, p.wire_tx);
         p.conv_out_ms += now_ms() - t0;
+        ++p.conv_out_n;
     }
     return true;
 }

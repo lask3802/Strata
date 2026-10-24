@@ -58,7 +58,7 @@ static float bf16_round(float f) {
 // candidates as int32 words that include every bit pattern a float conversion would change
 static std::vector<float> make_rows(const st::RowGeo& g, int T, std::mt19937& rng) {
     std::vector<float> r((size_t) T * (size_t) g.full());
-    const size_t nf = (size_t) T * (size_t) g.floats, ni = (size_t) T * (size_t) (g.topk + g.cand);
+    const size_t nf = (size_t) T * (size_t) (g.h + g.pre), ni = (size_t) T * (size_t) (g.topk + g.cand);
     std::normal_distribution<float> nd(0.f, 3.f);
     for (size_t i = 0; i < nf; ++i) r[i] = i % 7 == 0 ? nd(rng) * 1e-6f : i % 11 == 0 ? nd(rng) * 1e4f : nd(rng);
     const uint32_t special[] = {0u, 1u, 2u, 16777217u, 123457u, 0x7fffffffu, 0x80000000u, 0xffffffffu,
@@ -106,7 +106,7 @@ struct Loop {
             return st::worker_accepts(theirs, me, 8192, e);
         };
         hs.run = [this](int T, const int32_t*, int64_t, std::string&) {
-            const size_t nf = (size_t) T * (size_t) g.floats;
+            const size_t nf = (size_t) T * (size_t) (g.h + g.pre);
             std::vector<float> full((size_t) T * (size_t) g.full());
             if (worker_bf16) st::rows_unpack(g, T, in.data(), full.data());
             else std::memcpy(full.data(), in.data(), full.size() * 4);
@@ -259,48 +259,54 @@ int main() {
         CHECK(!st::worker_accepts(t, w, 8192, e) && e.find("fp32") != std::string::npos);
     }
 
-    // the compact rows: the picks exact, the streams as the link's bf16 rounds them
+    // the compact rows: the streams as the link's bf16 rounds them; pre and the picks exact
     {
         std::mt19937 rng(7);
         st::RowGeo g;
-        g.floats = 4 * 64 + 8;
+        g.h = 4 * 64;
         g.topk = 40;
         g.cand = 70;
-        CHECK(g.compact_ok() && g.full() == 264 + 110 && g.compact() == 132 + 110);
+        CHECK(g.compact_ok() && g.full() == 256 + 8 + 110 && g.compact() == 128 + 8 + 110);
         st::RowGeo odd = g;
-        odd.floats = 263;
+        odd.h = 255;
         CHECK(!odd.compact_ok());
         st::RowGeo real;   // the real geometry: hidden 5120, hc 4, index_topk 512, candidate_topk_blocks 2048
-        real.floats = 4 * 5120 + 8;
+        real.h = 4 * 5120;
         real.topk = 512;
         real.cand = 2048;
-        CHECK(real.full() * 4 == 92192 && real.compact() * 4 == 51216);
+        CHECK(real.full() * 4 == 92192 && real.compact() * 4 == 51232);
         for (const int T : {1, 3, 16}) {
             const std::vector<float> rows = make_rows(g, T, rng);
-            const size_t nf = (size_t) T * (size_t) g.floats, ni = (size_t) T * (size_t) (g.topk + g.cand);
+            const size_t nh = (size_t) T * (size_t) g.h, np = (size_t) T * (size_t) g.pre, nf = nh + np,
+                         ni = (size_t) T * (size_t) (g.topk + g.cand);
             std::vector<float> wire((size_t) T * (size_t) g.compact(), 0.f), back(rows.size(), 0.f);
             st::rows_pack(g, T, rows.data(), wire.data());
             st::rows_unpack(g, T, wire.data(), back.data());
-            bool floats_ok = true, close = true;
-            for (size_t i = 0; i < nf; ++i) {
+            bool floats_ok = true, close = true, changed = false;
+            for (size_t i = 0; i < nh; ++i) {
                 floats_ok = floats_ok && bits_of(back[i]) == bits_of(bf16_round(rows[i]));
                 close = close && std::fabs(back[i] - rows[i]) <= std::fabs(rows[i]) * 0.00391f;   // (2^-8)
+                changed = changed || bits_of(back[i]) != bits_of(rows[i]);
             }
             CHECK(floats_ok);
             CHECK(close);
+            CHECK(changed);   // (the streams do lose bits: the check above is not trivially true)
+            CHECK(std::memcmp(back.data() + nh, rows.data() + nh, np * 4) == 0);        // pre, bit for bit
             CHECK(std::memcmp(back.data() + nf, rows.data() + nf, ni * 4) == 0);        // the picks, bit for bit
-            CHECK(std::memcmp(wire.data() + nf / 2, rows.data() + nf, ni * 4) == 0);    // ... on the wire too
-            // a reply's unpack (no ints) leaves the picks where they were
+            CHECK(std::memcmp(wire.data() + nh / 2, rows.data() + nh, (np + ni) * 4) == 0);   // ... on the wire too
+            // a reply's unpack (no ints) brings pre and leaves the picks' place alone
             const std::vector<float> marker(rows.size(), float_of(0xdeadbeefu));
             std::vector<float> keep = marker;
             st::rows_unpack(g, T, wire.data(), keep.data(), false);
+            CHECK(std::memcmp(keep.data() + nh, rows.data() + nh, np * 4) == 0);
             CHECK(std::memcmp(keep.data() + nf, marker.data() + nf, ni * 4) == 0);
-            // the picks through the link's own bf16 would not survive: why the engine packs the rows itself
-            std::vector<unsigned char> lossy(ni * 2);
-            std::vector<float> lossy_back(ni);
-            net::stage_rows_encode(net::StageRows::BF16, rows.data() + nf, 1, ni, lossy.data());
-            net::stage_rows_decode(net::StageRows::BF16, lossy.data(), 1, ni, lossy_back.data());
-            CHECK(std::memcmp(lossy_back.data(), rows.data() + nf, ni * 4) != 0);
+            // pre and the picks through the link's own bf16 would not survive: why the engine packs the rows itself
+            std::vector<unsigned char> lossy((np + ni) * 2);
+            std::vector<float> lossy_back(np + ni);
+            net::stage_rows_encode(net::StageRows::BF16, rows.data() + nh, 1, np + ni, lossy.data());
+            net::stage_rows_decode(net::StageRows::BF16, lossy.data(), 1, np + ni, lossy_back.data());
+            CHECK(std::memcmp(lossy_back.data(), rows.data() + nh, np * 4) != 0);
+            CHECK(std::memcmp(lossy_back.data() + np, rows.data() + nf, ni * 4) != 0);
         }
     }
 
@@ -308,12 +314,13 @@ int main() {
     {
         std::mt19937 rng(11);
         Loop w;
-        w.g.floats = 4 * 64 + 8;
+        w.g.h = 4 * 64;
         w.g.topk = 40;
         w.g.cand = 70;
         const int T = 16;
         const std::vector<float> rows = make_rows(w.g, T, rng);
-        const size_t nf = (size_t) T * (size_t) w.g.floats, ni = (size_t) T * (size_t) (w.g.topk + w.g.cand);
+        const size_t nh = (size_t) T * (size_t) w.g.h, nf = nh + (size_t) T * (size_t) w.g.pre,
+                     ni = (size_t) T * (size_t) (w.g.topk + w.g.cand);
         for (const bool bf : {true, false}) {
             CHECK(w.start(bf));
             std::vector<float> back;
@@ -321,9 +328,9 @@ int main() {
             CHECK(link_window(w, bf, T, rows, back, err));
             if (!err.empty()) std::printf("  %s link: %s\n", bf ? "bf16" : "fp32", err.c_str());
             bool floats_ok = back.size() == rows.size();
-            for (size_t i = 0; floats_ok && i < nf; ++i)   // (the worker's layers added 1)
-                floats_ok = bf ? bits_of(back[i]) == bits_of(bf16_round(bf16_round(rows[i]) + 1.f))
-                               : bits_of(back[i]) == bits_of(rows[i] + 1.f);
+            for (size_t i = 0; floats_ok && i < nf; ++i)   // (the worker's layers added 1; only the streams are rounded)
+                floats_ok = bf && i < nh ? bits_of(back[i]) == bits_of(bf16_round(bf16_round(rows[i]) + 1.f))
+                                         : bits_of(back[i]) == bits_of(rows[i] + 1.f);
             CHECK(floats_ok);
             CHECK(back.size() == rows.size() && std::memcmp(back.data() + nf, rows.data() + nf, ni * 4) == 0);
             // the other format against this worker: refused at the hello, with the way out
