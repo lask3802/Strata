@@ -19,6 +19,8 @@ geometry and the files before the parts):
   stamp <16 hex>            fnv1a of every other line of this index; also in each file's header page: an index and
                             files from different runs (a re-cut with another profile, a run that stopped half way)
                             do not open together
+  nonce <16 hex>            random, one per run: it is a line of the index, so the stamp differs even when a re-cut
+                            changes only the weights' bytes (same tensors.txt and ds4.txt, same heat, same layout)
   geometry <dim> <n_ff> <layers> <experts> <unit> <align>
   covered <layer>...        the layers that have parts (a subset of the pack's: other layers have no view)
   file <i> <name> <a> <b> <bytes>
@@ -34,7 +36,9 @@ expert is its parts in both (ds4_epparts.hpp assembles it back, byte for byte). 
   ep_parts.py PACK OUT --verify             re-read the index and the pack: every part, every whole expert, byte-exact
 """
 import argparse
+import glob
 import os
+import secrets
 import sys
 import time
 
@@ -308,8 +312,14 @@ def choose_pool(pack, order, a, b, n_experts=None, gb=None):
 
 def check_complementary(tail, pool, nb):
     """The two sets of one parts pack tile [0, nb): the pool [0, k) and the worker's [k, nb).  Anything else leaves an
-    expert that can never be whole (or a double part), so the writer refuses it."""
-    if tail is None or pool is None:
+    expert that can never be whole (or a double part), so the writer refuses it.  With no worker set the pool alone
+    has to be [0, nb)."""
+    if pool is None:
+        return
+    if tail is None:
+        if pool != (0, nb):
+            raise ValueError("with no worker set the pool %d:%d is all there is, and no expert can be whole unless it is "
+                             "0:%d" % (pool + (nb,)))
         return
     if pool[0] != 0 or pool[1] != tail[0] or tail[1] != nb:
         raise ValueError("the pool %d:%d and the worker's set %d:%d do not tile 0:%d (the pool must be 0:k and the "
@@ -318,10 +328,10 @@ def check_complementary(tail, pool, nb):
 
 # ---------------------------------------------------------------------------------------------------- writing
 
-def index_lines(pack, phash, sets, entries, order):
+def index_lines(pack, phash, sets, entries, order, nonce=0):
     """The index as lines, without the stamp.  The stamp (a hash of every other line) is also in each part file's header
-    page, so an index and files from different runs never go together."""
-    lines = ["ep-parts 1", "pack_hash %016x" % phash,
+    page, so an index and files from different runs never go together; the nonce makes every run's stamp its own."""
+    lines = ["ep-parts 1", "pack_hash %016x" % phash, "nonce %016x" % nonce,
              "geometry %d %d %d %d %d %d" % (pack.dim, pack.ff, pack.nl, pack.ne, UNIT, ALIGN),
              "covered " + " ".join(str(l) for l in sorted({en.layer for en in entries}))]
     for i, (name, a, b, size) in enumerate(sets):
@@ -349,10 +359,29 @@ def file_header(stamp, file, a, b):
             b.to_bytes(4, "little")).ljust(HEADER, b"\0")
 
 
-def write_parts(pack, out_dir, sets, order, log=None):
+def fsync_dir(path):
+    """Make the renames in `path` durable (a no-op where a directory cannot be opened, as on Windows)."""
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def leftover_parts(out_dir, names):
+    """The part files in `out_dir` that an index naming `names` does not use (an earlier run's other range)."""
+    return sorted(os.path.basename(x) for x in glob.glob(os.path.join(out_dir, "ep-parts-*.bin"))
+                  if os.path.basename(x) not in names)
+
+
+def write_parts(pack, out_dir, sets, order, log=None, nonce=None):
     """sets: [(a, b, [(layer, expert)...])] (each in heat order).  Writes the files and the index; returns the entries.
-    Everything goes to .tmp names first and is renamed at the end, the index last: a reader that has a file mapped keeps
-    the old bytes, and a run that stops half way leaves no index that matches the new files (the stamp says so)."""
+    Everything goes to .tmp names first (flushed to disk) and is renamed at the end, the index last: a reader that has a
+    file mapped keeps the old bytes, and a run that stops half way leaves no index that matches the new files (the
+    stamp says so, and the nonce keeps two runs' stamps apart whatever their weights).  Part files of an earlier run
+    that this index does not name are left where they are and reported through `log`.  `nonce` is for tests."""
     os.makedirs(out_dir, exist_ok=True)
     phash = pack_hash(pack.dir)
     names = [set_file_name(a, b) for a, b, _ in sets]
@@ -366,7 +395,7 @@ def write_parts(pack, out_dir, sets, order, log=None):
         file_info.append((names[fi], a, b, size))
     held = {x for _, _, experts in sets for x in experts}
     listed = [(l, e, c) for l, e, c in order if (l, e) in held]     # the heat lines: every expert of any set
-    lines = index_lines(pack, phash, file_info, all_entries, listed)
+    lines = index_lines(pack, phash, file_info, all_entries, listed, secrets.randbits(64) if nonce is None else nonce)
     stamp = stamp_of(lines)
     lines.insert(2, "stamp %016x" % stamp)
     tmps = []
@@ -390,18 +419,27 @@ def write_parts(pack, out_dir, sets, order, log=None):
                         if log and done % 500 == 0:
                             log("  %d / %d experts, %.0f s" % (done, total, time.time() - t0))
                 f.write(b"\0" * (size - pos))
+                f.flush()
+                os.fsync(f.fileno())
         index_tmp = os.path.join(out_dir, INDEX_NAME + ".tmp")
         tmps.append(index_tmp)
         with open(index_tmp, "w", newline="\n", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
         for fi, tmp in enumerate(tmps[:-1]):
             os.replace(tmp, os.path.join(out_dir, names[fi]))
         os.replace(index_tmp, os.path.join(out_dir, INDEX_NAME))
         tmps = []
+        fsync_dir(out_dir)
     finally:
         for t in tmps:
             if os.path.exists(t):
                 os.remove(t)
+    old = leftover_parts(out_dir, names)
+    if old and log:
+        log("warning: %s holds part files this index does not name (an earlier run's; not deleted): %s" %
+            (out_dir, " ".join(old)))
     return all_entries
 
 
@@ -414,6 +452,7 @@ class PartsIndex:
         self.dir = out_dir
         self.files, self.heat, self.parts = [], [], {}
         self.pack_hash = 0
+        self.stamp = self.nonce = self.covered = None
         with open(os.path.join(out_dir, INDEX_NAME), "r", encoding="utf-8") as f:
             lines = f.read().split("\n")
         if not lines or lines[0] != "ep-parts 1":
@@ -426,6 +465,8 @@ class PartsIndex:
                 self.pack_hash = int(p[1], 16)
             elif p[0] == "stamp":
                 self.stamp = int(p[1], 16)
+            elif p[0] == "nonce":
+                self.nonce = int(p[1], 16)
             elif p[0] == "covered":
                 self.covered = {int(x) for x in p[1:]}
             elif p[0] == "geometry":
@@ -445,6 +486,8 @@ class PartsIndex:
         for v in self.parts.values():
             v.sort(key=lambda x: x.a)
         self._fh = {}
+        if self.stamp is None or self.nonce is None or self.covered is None:
+            raise ValueError("%s: an index of the old format (no stamp, nonce or covered line): write the parts again" % INDEX_NAME)
         if stamp_of([x.rstrip("\r") for x in lines if x]) != self.stamp:
             raise ValueError("%s: its stamp does not match its own lines (edited or damaged)" % INDEX_NAME)
         for i, (name, a, b, size) in enumerate(self.files):

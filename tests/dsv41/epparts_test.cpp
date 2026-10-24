@@ -127,11 +127,12 @@ void put_le(std::vector<uint8_t>& v, size_t off, uint64_t x, int n) {
 }
 
 // writes the files and the index for `sets` (the naive way: whole files in memory, row by row cuts).  `salt` changes the
-// heat counts, so two runs over the same experts differ in their index (and so their stamp) but not in any size.
+// heat counts, so two runs over the same experts differ in their index (and so their stamp) but not in any size; `nonce`
+// alone does the same when nothing else differs (a re-cut with the same layout whose weights changed).
 void write_parts(const std::string& dir, const Geo& g, const std::map<std::pair<int, int>, Expert>& ex, const std::vector<SetSpec>& sets,
-                 uint64_t hash, int salt = 0) {
+                 uint64_t hash, int salt = 0, uint64_t nonce = 1) {
     fs::create_directories(dir);
-    std::string head = "ep-parts 1\npack_hash " + hex16(hash) + "\nstamp 0000000000000000\n";
+    std::string head = "ep-parts 1\npack_hash " + hex16(hash) + "\nstamp 0000000000000000\nnonce " + hex16(nonce) + "\n";
     head += "geometry " + std::to_string(g.dim) + " " + std::to_string(g.ff) + " " + std::to_string(g.nl) + " " + std::to_string(g.ne) + " 256 4096\n";
     std::string files_txt, parts, heat;
     std::set<std::pair<int, int>> heated, layers;
@@ -422,6 +423,43 @@ void refusal_tests(const fs::path& root) {
         CHECK(p.open(dir, err));
         p.close();
     }
+    // two files: the SECOND one from another run (here only the nonce differs: same layout, same counts, same sizes), or with
+    // the wrong file number or range in its header, is refused too - every file is checked, not the first alone
+    {
+        const std::string two = (root / "two").string(), two2 = (root / "two2").string();
+        const std::vector<SetSpec> sp = {{6, 9, all_experts(g)}, {0, 6, {{0, 0}, {1, 1}}}};
+        write_parts(two, g, ex, sp, 99);
+        write_parts(two2, g, ex, sp, 99, 0, 2);
+        CHECK(slurp(two + "/ep-parts.txt") != slurp(two2 + "/ep-parts.txt"));
+        CHECK(fs::file_size(two + "/ep-parts-0-6.bin") == fs::file_size(two2 + "/ep-parts-0-6.bin"));
+        CHECK(p.open(two, err));
+        CHECK(p.nonce() == 1);
+        p.close();
+        const std::string second = two + "/ep-parts-0-6.bin", mine = slurp(second);
+        spit(second, slurp(two2 + "/ep-parts-0-6.bin"));
+        CHECK(!p.open(two, err) && err.find("ep-parts-0-6.bin") != std::string::npos && err.find("another run") != std::string::npos);
+        for (size_t at : {16, 20, 24}) {   // the file number, a, b
+            std::string raw = mine;
+            raw[at] = (char) (raw[at] ^ 1);
+            spit(second, raw);
+            CHECK(!p.open(two, err) && err.find("ep-parts-0-6.bin") != std::string::npos && err.find("another run") != std::string::npos);
+        }
+        spit(second, mine);
+        CHECK(p.open(two, err));
+        p.close();
+    }
+    // an index of the old format (before the stamp, the nonce or the covered line) says so
+    for (const char* drop : {"stamp ", "nonce ", "covered "}) {
+        std::string t;
+        std::istringstream in(good);
+        for (std::string line; std::getline(in, line);)
+            if (line.compare(0, std::strlen(drop), drop) != 0) t += line + "\n";
+        const bool ok = !with(std::string(drop) == "stamp " ? t : restamp(t));
+        if (err.find("old format") == std::string::npos) std::printf("  wanted 'old format', got '%s'\n", err.c_str());
+        CHECK(ok && err.find("old format") != std::string::npos);
+    }
+    CHECK(with(good));
+    p.close();
     // CRLF index (a pack written on Windows): read the same
     {
         std::string crlf;

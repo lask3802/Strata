@@ -183,8 +183,9 @@ class Index(Base):
         self.assertEqual(lines[0], "ep-parts 1")
         self.assertEqual(lines[1], "pack_hash %016x" % ep.pack_hash(self.pack_dir))
         self.assertEqual(lines[2], "stamp %016x" % ep.stamp_of([x for x in lines if x]))          # (a hash of every other line)
-        self.assertEqual(lines[3], "geometry %d %d %d %d 256 4096" % (DIM, FF, NL, NE))
-        self.assertEqual(lines[4], "covered " + " ".join(str(l) for l in range(NL)))
+        self.assertRegex(lines[3], r"^nonce [0-9a-f]{16}$")
+        self.assertEqual(lines[4], "geometry %d %d %d %d 256 4096" % (DIM, FF, NL, NE))
+        self.assertEqual(lines[5], "covered " + " ".join(str(l) for l in range(NL)))
         files = [x.split() for x in lines if x.startswith("file ")]
         self.assertEqual([f[2] for f in files], ["ep-parts-6-9.bin", "ep-parts-0-6.bin"])
         for f in files:
@@ -361,6 +362,105 @@ class Stale(Base):
         with self.assertRaises(ValueError):
             ep.PartsIndex(a)
 
+    def sets(self, order):
+        allx = [(l, e) for l, e, _ in order]
+        return [(6, 9, allx), (0, 6, allx[:5])]
+
+    def test_the_second_file_of_another_run_is_refused(self):
+        order = self.order()
+        a, b = os.path.join(self.out, "a"), os.path.join(self.out, "b")
+        ep.write_parts(self.pack, a, self.sets(order), order)
+        ep.write_parts(self.pack, b, self.sets(order), order)       # (the same sizes; only the nonce, so the stamp, differs)
+        for n in ("ep-parts-6-9.bin", "ep-parts-0-6.bin"):
+            self.assertEqual(os.path.getsize(os.path.join(a, n)), os.path.getsize(os.path.join(b, n)))
+        ep.PartsIndex(a).close()
+        with open(os.path.join(b, "ep-parts-0-6.bin"), "rb") as f:
+            data = f.read()
+        with open(os.path.join(a, "ep-parts-0-6.bin"), "wb") as f:      # (the first file is right; the second is not)
+            f.write(data)
+        with self.assertRaises(ValueError) as cm:
+            ep.PartsIndex(a)
+        self.assertIn("ep-parts-0-6.bin", str(cm.exception))
+        self.assertIn("another run", str(cm.exception))
+
+    def test_a_second_file_with_the_wrong_number_or_range_is_refused(self):
+        order = self.order()
+        for patch in (bytes([5]), bytes([7])):                        # (file number 1 -> 5; range start 0 -> 7)
+            d = os.path.join(self.out, "n%d" % patch[0])
+            ep.write_parts(self.pack, d, self.sets(order), order)
+            path = os.path.join(d, "ep-parts-0-6.bin")
+            at = 16 if patch[0] == 5 else 20
+            with open(path, "r+b") as f:
+                f.seek(at)
+                f.write(patch)
+            with self.assertRaises(ValueError) as cm:
+                ep.PartsIndex(d)
+            self.assertIn("ep-parts-0-6.bin", str(cm.exception))
+
+    def test_a_recut_with_the_same_inputs_has_another_stamp(self):
+        order = self.order()
+        stamps = []
+        for n in range(2):
+            d = os.path.join(self.out, "r%d" % n)
+            ep.write_parts(self.pack, d, self.sets(order), order)
+            ix = ep.PartsIndex(d)
+            stamps.append(ix.stamp)
+            ix.close()
+        self.assertNotEqual(stamps[0], stamps[1])
+        fixed = []
+        for n in range(2):
+            d = os.path.join(self.out, "f%d" % n)
+            ep.write_parts(self.pack, d, self.sets(order), order, nonce=7)
+            ix = ep.PartsIndex(d)
+            fixed.append(ix.stamp)
+            ix.close()
+        self.assertEqual(fixed[0], fixed[1])                            # (the nonce is the only thing that varies)
+
+    def test_an_index_of_the_old_format_is_reported_not_a_traceback(self):
+        order = self.order()
+        ep.write_parts(self.pack, self.out, self.sets(order), order)
+        path = os.path.join(self.out, "ep-parts.txt")
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        for drop in ("stamp ", "nonce ", "covered "):
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("\n".join(l for l in lines if not l.startswith(drop)))
+            with self.assertRaises(ValueError) as cm:
+                ep.PartsIndex(self.out)
+            self.assertIn("old format", str(cm.exception))
+            msgs = []
+            self.assertEqual(ep.verify(self.pack, self.out, set(range(NL)), log=msgs.append), 1)
+            self.assertTrue(msgs[0].startswith("FAIL") and "old format" in msgs[0], msgs)
+
+    def test_every_file_and_the_index_are_flushed_before_the_renames(self):
+        order = self.order()
+        calls = []
+        real_fsync, real_replace = os.fsync, os.replace
+        os.fsync = lambda fd: (calls.append("fsync"), real_fsync(fd))[1]
+        os.replace = lambda a, b: (calls.append("replace"), real_replace(a, b))[1]
+        try:
+            ep.write_parts(self.pack, self.out, self.sets(order), order)
+        finally:
+            os.fsync, os.replace = real_fsync, real_replace
+        first = calls.index("replace")
+        self.assertEqual(calls[:first], ["fsync"] * 3)                  # (two part files and the index, before any rename)
+        self.assertEqual(calls[first:first + 3], ["replace"] * 3)
+        if os.name != "nt":
+            self.assertEqual(calls[first + 3:], ["fsync"])              # (the directory, after the renames)
+
+    def test_part_files_an_earlier_run_left_are_reported_not_deleted(self):
+        order = self.order()
+        allx = [(l, e) for l, e, _ in order]
+        ep.write_parts(self.pack, self.out, [(5, 9, allx)], order)
+        msgs = []
+        ep.write_parts(self.pack, self.out, [(6, 9, allx)], order, log=msgs.append)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "ep-parts-5-9.bin")))
+        self.assertEqual(sum("ep-parts-5-9.bin" in m and m.startswith("warning") for m in msgs), 1)
+        self.assertFalse(any("ep-parts-6-9.bin" in m for m in msgs))
+        msgs = []
+        ep.write_parts(self.pack, os.path.join(self.out, "clean"), [(6, 9, allx)], order, log=msgs.append)
+        self.assertFalse(any(m.startswith("warning") for m in msgs))
+
     def test_a_run_that_fails_leaves_the_old_files_and_no_tmp(self):
         order = self.order()
         allx = [(l, e) for l, e, _ in order]
@@ -417,12 +517,15 @@ class Geometry(Base):
 
     def test_the_two_sets_must_tile_the_blocks(self):
         ep.check_complementary((6, 9), (0, 6), 9)
-        ep.check_complementary(None, (0, 6), 9)
-        for tail, pool in (((7, 9), (0, 6)), ((6, 8), (0, 6)), ((6, 9), (1, 6)), ((6, 9), (0, 7))):
+        ep.check_complementary(None, (0, 9), 9)         # (no worker set: the pool alone is every expert's whole)
+        for tail, pool in (((7, 9), (0, 6)), ((6, 8), (0, 6)), ((6, 9), (1, 6)), ((6, 9), (0, 7)),
+                           (None, (2, 6)), (None, (0, 6)), (None, (0, 8))):
             with self.assertRaises(ValueError):
                 ep.check_complementary(tail, pool, 9)
         with self.assertRaises(SystemExit):
             ep.main([self.pack_dir, "--dry-run", "--tail", "7:9"])
+        with self.assertRaises(SystemExit):
+            ep.main([self.pack_dir, "--dry-run", "--tail", "none", "--pool", "2:6"])
 
 
 class Cli(Base):
@@ -442,6 +545,18 @@ class Cli(Base):
         ix = ep.PartsIndex(self.out)
         self.addCleanup(ix.close)
         self.assertEqual({k[0] for k in ix.parts}, {1, 2})
+
+    def test_a_pool_alone_writes_whole_experts_when_it_is_every_block(self):
+        old, sys.stdout = sys.stdout, io.StringIO()
+        try:
+            self.assertEqual(ep.main([self.pack_dir, self.out, "--tail", "none", "--pool", "0:9", "--layers", "1", "--pool-experts", "2"]), 0)
+            self.assertEqual(ep.main([self.pack_dir, self.out, "--verify", "--layers", "1"]), 0)
+        finally:
+            sys.stdout = old
+        ix = ep.PartsIndex(self.out)
+        self.addCleanup(ix.close)
+        self.assertEqual([f[0] for f in ix.files], ["ep-parts-0-9.bin"])
+        self.assertTrue(all(ix.whole(1, e) for _, e, _ in ix.heat))
 
     def test_bad_arguments(self):
         with self.assertRaises(SystemExit):

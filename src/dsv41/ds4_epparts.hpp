@@ -11,8 +11,9 @@
 // pack holds it (byte for byte) when the parts tile [0, nb).
 //
 // Every part file starts with a header page (EPPARTS1, the run's stamp, the file's number and range) and the index carries
-// the same stamp, a hash of its own lines: open() refuses files from another run than the index (a re-cut with another
-// heat order has the same sizes), an index that was edited, a part that overflows or leaves its file, and parts of one
+// the same stamp, a hash of its own lines (one of them a random per-run nonce, so a re-cut that changed only the weights
+// has another stamp too): open() refuses files from another run than the index (a re-cut with another heat order has
+// the same sizes), an index that was edited, a part that overflows or leaves its file, and parts of one
 // matrix that do not agree on type and row layout (they would not join).  `covered` lists the layers that have parts; the
 // others have no view.  The index is read in order: a line may use only what the lines before it said.
 //
@@ -83,7 +84,7 @@ public:
         if (!in) return fail(err, dir + "/ep-parts.txt: not found");
         const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         uint64_t fnv = 1469598103934665603ull;   // (the stamp checks every line but its own, each '\n' ended, no '\r')
-        bool first = true, have_stamp = false, have_geometry = false, have_covered = false;
+        bool first = true, have_stamp = false, have_nonce = false, have_geometry = false, have_covered = false;
         long ln = 0;
         for (size_t at = 0; at < text.size();) {
             size_t nl = text.find('\n', at);
@@ -108,13 +109,14 @@ public:
             if (tag == "ep-parts") {
                 std::string v;
                 if (!(s >> v) || v != "1" || !done(s)) return fail(err, where + "bad header");
-            } else if (tag == "pack_hash" || tag == "stamp") {
+            } else if (tag == "pack_hash" || tag == "stamp" || tag == "nonce") {
                 std::string h;
                 char* end = nullptr;
                 if (!(s >> h) || !done(s)) return fail(err, where + "bad " + tag);
                 const uint64_t v = std::strtoull(h.c_str(), &end, 16);
                 if (h.empty() || h[0] == '-' || h[0] == '+' || *end != '\0') return fail(err, where + "bad " + tag);
                 if (tag == "stamp") stamp_ = v, have_stamp = true;
+                else if (tag == "nonce") nonce_ = v, have_nonce = true;
                 else hash_ = v;
             } else if (tag == "geometry") {
                 uint64_t g[6] = {};
@@ -153,7 +155,10 @@ public:
                 Entry e;
                 std::string kind;
                 uint64_t v[10] = {};   // layer expert type file a b rows row_bytes offset bytes
-                if (!have_geometry || !have_covered || !unum(s, v[0]) || !unum(s, v[1]) || !(s >> kind) || !unum(s, v[2]) || !unum(s, v[3]) ||
+                if (!have_geometry || !have_covered)
+                    return fail(err, where + "part before the geometry and covered lines (an index of the old format has no covered line: "
+                                              "write the parts again)");
+                if (!unum(s, v[0]) || !unum(s, v[1]) || !(s >> kind) || !unum(s, v[2]) || !unum(s, v[3]) ||
                     !unum(s, v[4]) || !unum(s, v[5]) || !unum(s, v[6]) || !unum(s, v[7]) || !unum(s, v[8]) || !unum(s, v[9]) || !done(s))
                     return fail(err, where + "bad part line");
                 e.kind = kind == "gate" ? kGate : kind == "up" ? kUp : kind == "down" ? kDown : -1;
@@ -177,7 +182,9 @@ public:
         }
         if (first) return fail(err, "ep-parts.txt: empty");
         if (!have_geometry || !have_covered || files_.empty()) return fail(err, "ep-parts.txt: no geometry, covered line or files");
-        if (!have_stamp || stamp_ != fnv) return fail(err, "ep-parts.txt: its stamp does not match its own lines (edited or damaged)");
+        if (!have_stamp || !have_nonce)
+            return fail(err, "ep-parts.txt: an index of the old format (no stamp or nonce line): write the parts again");
+        if (stamp_ != fnv) return fail(err, "ep-parts.txt: its stamp does not match its own lines (edited or damaged)");
         std::sort(entries_.begin(), entries_.end(), [](const Entry& x, const Entry& y) {
             return key(x) != key(y) ? key(x) < key(y) : x.a < y.a;
         });
@@ -211,13 +218,14 @@ public:
         entries_.clear();
         heat_.clear();
         covered_.clear();
-        hash_ = stamp_ = 0;
+        hash_ = stamp_ = nonce_ = 0;
         dim_ = ff_ = nl_ = ne_ = unit_ = align_ = 0;
     }
 
     bool is_open() const { return !files_.empty() && files_[0].map != nullptr; }
     uint64_t pack_hash() const { return hash_; }
     uint64_t stamp() const { return stamp_; }   // the run that wrote the index and its files
+    uint64_t nonce() const { return nonce_; }   // that run's random number (part of what the stamp hashes)
     /// whether the index has parts for the layer (a parts pack of a few layers answers false for the others)
     bool covers(int layer) const { return std::binary_search(covered_.begin(), covered_.end(), layer); }
     int dim() const { return dim_; }
@@ -367,7 +375,7 @@ private:
     std::vector<Entry> entries_;   // sorted by (layer, expert, kind, a)
     std::vector<Heat> heat_;
     std::vector<int> covered_;   // sorted
-    uint64_t hash_ = 0, stamp_ = 0;
+    uint64_t hash_ = 0, stamp_ = 0, nonce_ = 0;
     int dim_ = 0, ff_ = 0, nl_ = 0, ne_ = 0, unit_ = 0, align_ = 0;
 };
 
