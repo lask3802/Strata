@@ -53,7 +53,8 @@ struct Options {
     bool threads = false;             // a host thread per GPU enqueues its layers (the hand-offs host-mapped)
     // prompts in chunks of this many tokens through each layer at once (threads): the GEMMs on the tensor cores, the
     // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
-    // -1: 2048, or 8192 with the experts read in place (every chunk streams them all from the files)
+    // -1: 2048, or 8192 with the experts read in place (every chunk streams them all from the files); a remote stage's
+    // two sides 2048 (the main process sends the worker's when that is smaller: set_stage_chunk)
     int prefill_chunk = -1;
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
@@ -286,6 +287,9 @@ public:
         std::function<void()> abort;
     };
     void set_stage_chunks(StageChunks c);
+    /// (the main process, once a link is made) its prompt chunks of at most n rows - the worker's when that is smaller
+    /// than this process's own (stage::chunk_sent); StageGeo::chunk stays this process's own, what its hello says
+    void set_stage_chunk(int n);
     /// The worker's side of a prompt chunk (stage_worker, StageGeo::chunk > 0): T tokens at p0 (which must be pos())
     /// and their rows `in` (block by block) through this process's layers on its chunked prompt path; its last layer's
     /// rows [skip, T) row by row into `out` (StageChunks::recv's layout).  `last`: the main process's last chunk of a run.

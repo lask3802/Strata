@@ -49,12 +49,13 @@
 # same chunks (DS4_YOCO=0: no long prompt's skip, which a split cannot take; DS4_PATH_PICK=0: the chunks, never
 # windows).  Twice each: with --dump-logits and --window <its length> (every row's logits, every row back over the
 # link), compared as above, then plainly (the last row's logits only) for the prompt's tokens/s.  DS4_LAYER_MAJOR and
-# the other engine variables pass through to both (DS4_LAYER_MAJOR=0: the main process chunk after chunk, overlapped
-# with the worker; else it may take its layers one after another over all the chunks, which overlaps little).
+# the other engine variables pass through to all (the split's two sides go chunk after chunk, overlapped, unless
+# DS4_LAYER_MAJOR=1: then each may take its layers one after another over all the chunks, which overlaps little; the
+# single process decides by its own gate, DS4_LAYER_MAJOR=0 never).
 # STRATA_REMOTE_ROWS=bf16 passes through as well, and turns the chunks off on both sides (windows of 16).
 set -u
 if [ $# -lt 3 ]; then
-    sed -n '2,54p' "$0"
+    sed -n '2,55p' "$0"
     exit 2
 fi
 exe=$1

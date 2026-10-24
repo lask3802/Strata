@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -131,22 +132,32 @@ inline void rows_unpack(const RowGeo& g, int T, const float* wire, float* full, 
 /// the main process's run - the worker settles its expert cache after it, as one process does after a prompt
 inline constexpr int kChunkLast = 2;
 
-/// The refusal when the main process's chunks (`sends` rows at most) do not fit the worker's (`takes`; 0: windows
-/// only), empty when they do - said the same on both sides
+/// The refusal when the main process sends prompt chunks (`sends` rows at most) and the worker takes none (`takes` 0:
+/// windows only), empty otherwise - said the same on both sides.  A worker that takes smaller chunks than the main
+/// process's own is served: the main process sends chunks of chunk_sent rows.
 inline std::string chunk_refusal(int64_t sends, int64_t takes, int max_t) {
-    if (sends <= takes) return {};
-    if (takes <= 0)
-        return "the main process sends prompt chunks of up to " + std::to_string(sends) + " tokens: the worker reads "
-               "windows of " + std::to_string(max_t) + " only (its chunked prompt path is off: --prefill-chunk 0, "
-               "DS4_WINDOWS, or its buffers did not fit) - --prefill-chunk 0 on the main process, or chunks on the worker";
-    return "the main process sends prompt chunks of up to " + std::to_string(sends) + " tokens, the worker takes " +
-           std::to_string(takes) + " at most - --prefill-chunk " + std::to_string(takes) +
-           " or less on the main process, or more on the worker";
+    if (sends <= 0 || takes > 0) return {};
+    return "the main process sends prompt chunks of up to " + std::to_string(sends) + " tokens: the worker reads "
+           "windows of " + std::to_string(max_t) + " only (its chunked prompt path is off: --prefill-chunk 0, "
+           "DS4_WINDOWS, or its buffers did not fit) - --prefill-chunk 0 on the main process, or chunks on the worker";
 }
+/// A remote stage's prompt chunk when --prefill-chunk is not given, on either side: fewer chunks over the link, each
+/// overlapped with the other side's work
+inline constexpr int kLinkChunk = 2048;
+/// Whether a run of chunks may go layer-major (every chunk through a layer, then the next layer) as far as
+/// DS4_LAYER_MAJOR (`env`, null: unset) and the remote stage say: 0 never; a remote stage's side (`linked`) only with
+/// 1 - chunk after chunk is what overlaps with the other side; one process as its own gate decides
+inline bool layer_major_allowed(bool linked, const char* env) {
+    if (env != nullptr && std::atoi(env) == 0) return false;
+    return !linked || (env != nullptr && std::atoi(env) == 1);
+}
+/// The rows of the main process's prompt chunks over a link both sides accepted: its own chunk (`own`, its hello's),
+/// or the worker's (`takes`) when that is smaller; 0 when either has none
+inline int64_t chunk_sent(int64_t own, int64_t takes) { return own <= 0 || takes <= 0 ? 0 : std::min(own, takes); }
 
 /// What this engine's worker cannot serve in a main process's hello (one of the same protocol; hello_matches has the
 /// geometry, the layers and the pack): false and why.  `mine`: the worker's own hello (its chunk: the most rows a
-/// prompt chunk may have here), `max_context` its context.
+/// prompt chunk may have here - a main process with larger ones sends chunk_sent rows), `max_context` its context.
 inline bool worker_accepts(const net::StageHello& theirs, const net::StageHello& mine, int64_t max_context,
                            std::string& err) {
     if (theirs.chunk < 0) {
@@ -195,8 +206,8 @@ inline bool worker_accepts(const net::StageHello& theirs, const net::StageHello&
 
 /// What the main process cannot use in its worker's hello (its HelloOk, after the worker accepted this side's;
 /// StageClient::connect has checked the rest): false and why.  An earlier build's worker, which replies with its last
-/// layer's streams; and its chunks larger than the worker's - a worker that accepted them says it can take them, this
-/// is the same check at this end, for a worker whose own check is not this one.
+/// layer's streams; and no chunks there when this side sends them - the worker's own check is the same, this is it at
+/// this end, for a worker whose own check is not this one.  Smaller chunks there are served (chunk_sent).
 inline bool main_accepts(const net::StageHello& worker, const net::StageHello& mine, std::string& err) {
     if ((worker.row_formats & kRowsNormed) == 0) {
         err = "remote stage: the worker is an earlier build's (it replies with its last layer's streams): this main "

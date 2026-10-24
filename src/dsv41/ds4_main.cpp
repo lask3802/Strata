@@ -47,6 +47,7 @@
 #include <memory>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <cstdlib>
 #include <cstring>
@@ -396,6 +397,10 @@ struct RemoteMain {
     strata::ds4::Model::StageConv conv0;   // (the conversions at the last line)
     int64_t gaps = 0;
     std::unique_ptr<strata::ds4::stage::ChunkLink> chunks;
+    // the prompt chunks' rows over this link (stage::chunk_sent: me.chunk, or the worker's when smaller), told to the
+    // model at each link made (chunk_to: Model::set_stage_chunk)
+    int64_t sent_chunk = 0;
+    std::function<void(int64_t)> chunk_to;
     // (slots: STRATA_DS4_SLOT_KEEP=1) the slot ids this side holds, which the worker keeps its parts of and no others;
     // serve keeps it current.  epoch: the links made so far - a worker connected to again (restarted, or taken over
     // by another main process) holds none of them
@@ -437,6 +442,14 @@ struct RemoteMain {
                 if (!strata::ds4::stage::main_accepts(peer, me, e)) {   // (a refusal: no waiting mends it, and no
                     link.close();                                        // link a later reset could take as up)
                     break;
+                }
+                sent_chunk = strata::ds4::stage::chunk_sent(me.chunk, peer.chunk);
+                if (me.chunk > 0) {
+                    if (sent_chunk < me.chunk)
+                        std::fprintf(stderr, "maya ds4: remote stage: prompt chunks of %lld rows: the worker takes %lld "
+                                             "at most (this process's own: %lld)\n", (long long) sent_chunk,
+                                     (long long) peer.chunk, (long long) me.chunk);
+                    if (chunk_to) chunk_to(sent_chunk);
                 }
                 ok = link.reset({}, e);
                 break;
@@ -1718,6 +1731,7 @@ int main(int argc, char** argv) {
         remote.at = remote_at;
         remote.me = stage_hello(m, o.pack, false, o.stage_ckpt);
         std::memcpy(remote.me.token, token.data(), token.size());
+        remote.chunk_to = [&m](int64_t c) { m.set_stage_chunk((int) c); };
         if (!remote.connect(err)) {
             std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
             return 1;
@@ -1725,7 +1739,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya ds4: remote stage %s: layers %d-%d there (context %lld, rows %s, prompt chunks of %lld "
                              "here, %lld at most there)\n", remote_at.c_str(),
                      remote.peer.layer_begin, remote.peer.n_layers - 1, (long long) remote.peer.max_context,
-                     m.stage_geo().rows_bf16 ? "bf16 (the streams; the picks exact)" : "fp32", (long long) remote.me.chunk,
+                     m.stage_geo().rows_bf16 ? "bf16 (the streams; the picks exact)" : "fp32", (long long) remote.sent_chunk,
                      (long long) remote.peer.chunk);
         remote.model = &m;
         g_remote = &remote;

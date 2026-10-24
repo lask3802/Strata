@@ -890,6 +890,7 @@ struct Model::Impl {
     unsigned win_seq = 0;             // the windows the threads ran (the hand-offs' seq)
     // the chunked prompt path (threads mode): chunk tokens a pass, runs shorter than chunk_min in windows
     int chunk = 0, chunk_min = 512;
+    int chunk_own = -1;               // (a remote stage's main process, once set_stage_chunk ran) the chunk of its load
     static constexpr bool kChunkedPromptDefault = true;   // the layer-major prompt is the default (gate: KL 0.1685 vs 0.1686, 8K prompt 6x, decode within 2% - ds4 notes-dsv41-r97)
     static constexpr int kFlowChunkMin = 2;   // chunk_min with every device's layers on the flow (see load)
     // --prefill-chunk at most (route() runs in kVlRows-row slabs).  The default stays kVlRows: a 16384-token chunk
@@ -2095,7 +2096,13 @@ struct Model::Impl {
             file_experts = exp_b - std::max(0.0, room - other_b) + (double) kRamMargin > (double) ram_avail();
         }
         const bool own_default = !(par || o.tp > 1);   // (the single-card default run the chunked path newly takes: chunks of 1024 - 8K prompt 370 tok/s on 4 x R9700, 214 at 8192; the threads / tp runs keep theirs)
-        chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : own_default ? 1024 : file_experts ? kVlRows : 2048) : 0;
+        // (a remote stage, either side: stage::kLinkChunk)
+        chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk
+                              : linked()          ? stage::kLinkChunk
+                              : own_default       ? 1024
+                              : file_experts      ? kVlRows
+                                                  : 2048)
+                           : 0;
         const char* dc = std::getenv("DS4_CHUNK");   // (tests: down to 16, a short prompt in several chunks)
         if (dc != nullptr) chunk = prompt_par ? std::atoi(dc) : 0;
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
@@ -8200,7 +8207,9 @@ struct Model::Impl {
     // sets it) - at least one expert, or not layer-major
     bool lm_begin(const Run& run) {
         static const char* env = std::getenv("DS4_LAYER_MAJOR");
-        if (devs.size() != 1 || run.T.size() < 2 || (env != nullptr && std::atoi(env) == 0)) return false;
+        // (a remote stage: chunk after chunk, which is what overlaps with the other side - layer-major only with
+        // DS4_LAYER_MAJOR=1)
+        if (devs.size() != 1 || run.T.size() < 2 || !stage::layer_major_allowed(linked(), env)) return false;
         Chunk& c = *chunks[0];
         if (!c.flow) return false;
         size_t need = 0, n_exp = 0, blob_max = 0;
@@ -9782,7 +9791,7 @@ Model::StageGeo Model::stage_geo() const {
     s.cand = (int64_t) p.cand_stride();
     s.rows_bf16 = p.bf16_rows();
     // (the link's buffers: made at load for a remote stage's chunks only - none with bf16 rows, load said so)
-    s.chunk = p.linked() && !p.bf16_rows() ? p.chunk : 0;
+    s.chunk = p.linked() && !p.bf16_rows() ? (p.chunk_own >= 0 ? p.chunk_own : p.chunk) : 0;
     return s;
 }
 void Model::set_stage_link(StageRun run, std::function<bool(int n_keep, std::string& err)> commit,
@@ -9851,6 +9860,12 @@ bool Model::stage_rollback(int n_keep, std::string& err) {
     return true;
 }
 void Model::set_stage_chunks(StageChunks c) { p_->stage_chunks = std::move(c); }
+void Model::set_stage_chunk(int n) {
+    Impl& p = *p_;
+    if (!p.o.remote_stage) return;
+    if (p.chunk_own < 0) p.chunk_own = p.chunk;   // (the first link: what the load left - the buffers' rows)
+    p.chunk = std::min(p.chunk_own, std::max(0, n));   // (each link again: its worker's, never more than the load's)
+}
 float* Model::stage_chunk_rows(int i) { return i >= 0 && i < 4 ? p_->link_pf[i] : nullptr; }
 bool Model::stage_prefill(const int64_t* tokens, int T, int64_t p0, bool last, int skip, const float* in, float* out,
                           std::string& err) {

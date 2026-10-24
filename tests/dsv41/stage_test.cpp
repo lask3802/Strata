@@ -564,9 +564,10 @@ static void chunks_over_a_link() {
         std::string e;
         net::StageHello peer;
         {
-            net::StageClient c;   // (larger chunks than the worker takes: refused there, said with both sizes)
-            CHECK(!c.connect(s.at, hello_of(128), peer, e) && has(e, "the worker refused:") && has(e, "64 at most") &&
-                  has(e, "128"));
+            net::StageClient c;   // (larger chunks than the worker takes: served - the main process sends the worker's)
+            const net::StageHello big = hello_of(128);
+            CHECK(c.connect(s.at, big, peer, e) && peer.chunk == 64 && st::main_accepts(peer, big, e) &&
+                  st::chunk_sent(big.chunk, peer.chunk) == 64);
         }
         {
             net::StageClient c;   // (windows only: any worker)
@@ -638,12 +639,16 @@ static void chunks_over_a_link() {
         net::StageClient c;
         CHECK(!c.connect(s.at, hello_of(64), peer, e) && has(e, "the worker refused:") && has(e, "windows of 16 only"));
         s.end();
-        net::StageHello worker = hello_of(32), mine = hello_of(64);
-        CHECK(!st::main_accepts(worker, mine, e) && has(e, "refused") && has(e, "32 at most"));
+        net::StageHello worker = hello_of(32), mine = hello_of(64);   // (smaller chunks there: this side sends those)
+        CHECK(st::main_accepts(worker, mine, e) && st::chunk_sent(mine.chunk, worker.chunk) == 32);
         mine.chunk = 32;
-        CHECK(st::main_accepts(worker, mine, e));
+        CHECK(st::main_accepts(worker, mine, e) && st::chunk_sent(mine.chunk, worker.chunk) == 32);
+        mine.chunk = 16;
+        CHECK(st::chunk_sent(mine.chunk, worker.chunk) == 16);
+        CHECK(!st::main_accepts(hello_of(0), hello_of(64), e) && has(e, "refused") && has(e, "windows of 16 only"));
         mine.chunk = 0;
-        CHECK(st::main_accepts(hello_of(0), mine, e));
+        CHECK(st::main_accepts(hello_of(0), mine, e) && st::chunk_sent(mine.chunk, 0) == 0);
+        CHECK(st::chunk_sent(64, 0) == 0);
     }
 }
 }  // namespace chunked
@@ -1254,14 +1259,20 @@ int main() {
         t.chunk = 2048;
         CHECK(!st::worker_accepts(t, mine, 8192, e) && e.find("chunks") != std::string::npos &&
               e.find("windows of 16 only") != std::string::npos);
-        net::StageHello w = mine;   // (one that takes chunks: up to its own)
+        net::StageHello w = mine;   // (one that takes chunks: any main process's, which sends up to the worker's)
         w.chunk = 2048;
         CHECK(st::worker_accepts(t, w, 8192, e));
         t.chunk = 1024;
         CHECK(st::worker_accepts(t, w, 8192, e));
         t.chunk = 4096;
-        CHECK(!st::worker_accepts(t, w, 8192, e) && e.find("takes 2048 at most") != std::string::npos &&
-              e.find("--prefill-chunk 2048") != std::string::npos);
+        CHECK(st::worker_accepts(t, w, 8192, e) && st::chunk_sent(t.chunk, w.chunk) == 2048);
+        // (the chunked path's policy on a remote stage: chunks of kLinkChunk unless given, chunk after chunk unless
+        // DS4_LAYER_MAJOR=1; one process as before - its own gate, DS4_LAYER_MAJOR=0 never)
+        CHECK(st::kLinkChunk == 2048);
+        CHECK(!st::layer_major_allowed(true, nullptr) && !st::layer_major_allowed(true, "0") &&
+              st::layer_major_allowed(true, "1") && !st::layer_major_allowed(true, "2"));
+        CHECK(st::layer_major_allowed(false, nullptr) && !st::layer_major_allowed(false, "0") &&
+              st::layer_major_allowed(false, "1") && st::layer_major_allowed(false, "2"));
         t.chunk = -1;
         CHECK(!st::worker_accepts(t, w, 8192, e));
     }

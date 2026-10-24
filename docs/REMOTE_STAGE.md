@@ -496,10 +496,12 @@ asked. What its remote stage does (the code is `src/dsv41/ds4_stage.hpp`; on two
 
 - **Windows** of up to 16 rows each way, the hand-off rows fp32: the streams, pre and the indexer's int32 picks and
   candidate blocks, 92,192 bytes a token. The worker's reply is its last layer's rows through the final norm.
-- **Prompt chunks** (`--prefill-chunk N`, the chunked prompt path on both PCs): the main process runs chunk c + 1
-  through its layers while the worker runs chunk c. Chunks cross as fp32 rows only. `DS4_LAYER_MAJOR=0` on the main
-  process keeps it chunk after chunk, which is what overlaps with the worker. A worker refuses chunks larger than its
-  own.
+- **Prompt chunks** (the chunked prompt path on both PCs, chunks of 2048 unless `--prefill-chunk N` says otherwise):
+  the main process runs chunk c + 1 through its layers while the worker runs chunk c. Chunks cross as fp32 rows only.
+  Both sides go chunk after chunk, which is what overlaps; `DS4_LAYER_MAJOR=1` lets a side take its layers one after
+  another over all the chunks instead. A worker that takes smaller chunks than the main process's gets chunks of its
+  size (the main process says so); only a worker with no chunks (`--prefill-chunk 0`) is refused by a main process
+  that sends them.
 - **DSpark across the split** with `--dspark on` on the main process: the drafter runs there, the worker's reply
   carries the drafter's taps of its layers, and a draft's check is a window the worker keeps in part (the rows the
   main process rejected are undone there, as one process undoes them). With the drafter loaded the main process
