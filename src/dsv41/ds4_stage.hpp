@@ -4,18 +4,28 @@
 //
 // v1: the windows only (T <= 16 rows each way, a prompt in windows of 16), the rows fp32 - each carries the
 // indexer's int32 picks and candidate blocks beside the streams, which bf16 would not keep - and no checkpoints: a
-// request that does not continue the conversation in place starts it again from token 0.
+// request that does not continue the conversation in place starts it again from token 0.  A draft's check (DSpark on
+// the main process) is a window like any other: the worker keeps its layers' backups for every window of 2 rows or
+// more, and the main process's Commit says how many of its rows stand (the rest undone there as one process undoes
+// them); the drafter's taps of the worker's layers come back in the reply (reply_tap_at).
 #pragma once
 
 #include "strata/net/stage_link.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <vector>
 
 namespace strata::ds4::stage {
+
+/// row_formats' capability bit both sides of a DeepSeek link set (hello_matches compares neither it nor the other
+/// bits 24-30): the worker's reply is reply_tap_at's layout.  An earlier build's worker sent its last layer's streams
+/// and pre back, which a main process of this one would read as the normed rows - each side refuses a peer without it
+inline constexpr uint32_t kRowsNormed = 1u << 30;
 
 inline uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
     const unsigned char* p = (const unsigned char*) data;
@@ -75,7 +85,60 @@ inline bool worker_accepts(const net::StageHello& theirs, const net::StageHello&
               std::to_string(mine.max_t) + ")";
         return false;
     }
+    if ((theirs.row_formats & kRowsNormed) == 0) {
+        err = "the main process is an earlier build's (it reads the last layer's streams back): this worker replies "
+              "with the normed rows and the drafter's taps - the same build on both PCs";
+        return false;
+    }
     return true;
+}
+
+/// What a main process cannot use in its worker's hello (StageClient::connect has checked the rest): false and why.
+inline bool main_accepts(const net::StageHello& peer, std::string& err) {
+    if ((peer.row_formats & kRowsNormed) == 0) {
+        err = "remote stage: the worker is an earlier build's (it replies with its last layer's streams): this main "
+              "process reads the normed rows and the drafter's taps - the same build on both PCs";
+        return false;
+    }
+    return true;
+}
+
+/// The worker's reply to a window of T rows, in the T x handoff_floats floats the link sends back (the request's
+/// size), block by block: its last layer's rows through the final norm (T x dim: what the head reads), then the
+/// drafter's taps - the streams' mean entering each target layer, T rows of nt x dim, target after target in a row
+/// (the main process's h_taps layout).  The rest of the reply is not read.  A target the worker does not hold leaves
+/// its slot unwritten.
+inline size_t reply_tap_at(int T, int dim, int nt, int t, int j) {
+    return (size_t) T * (size_t) dim + ((size_t) t * (size_t) nt + (size_t) j) * (size_t) dim;
+}
+/// whether a reply with nt targets' taps fits a row of handoff_floats
+inline bool reply_fits(int dim, int nt, int64_t handoff_floats) {
+    return (int64_t) dim * (1 + (int64_t) nt) <= handoff_floats;
+}
+/// (the main process) the taps of the targets from layer `end` on - the worker's - from a reply of T rows into taps
+/// (T rows of targets.size() x dim); the others' slots stay as this process's own layers wrote them
+inline void taps_from_reply(const float* reply, int T, int dim, const std::vector<int>& targets, int end, float* taps) {
+    const int nt = (int) targets.size();
+    const size_t x = (size_t) T * (size_t) dim;   // (the taps after the normed rows: their own layout from there)
+    for (int j = 0; j < nt; ++j) {
+        if (targets[(size_t) j] < end) continue;
+        for (int t = 0; t < T; ++t) {
+            const size_t at = reply_tap_at(T, dim, nt, t, j);
+            std::copy(reply + at, reply + at + dim, taps + (at - x));
+        }
+    }
+}
+
+/// A Commit of n_keep after the worker's last window of last_t rows (0: none since the last Commit): All keeps it
+/// whole, Part keeps its first n_keep rows (the rest undone from the backups a window of 2 or more rows keeps), Bad
+/// is an error (err says why).
+enum class Keep { All, Part, Bad };
+inline Keep commit_kind(int n_keep, int last_t, std::string& err) {
+    if (last_t > 0 && n_keep == last_t) return Keep::All;
+    if (last_t > 1 && n_keep >= 1 && n_keep < last_t) return Keep::Part;
+    err = last_t <= 0 ? "a commit of " + std::to_string(n_keep) + " rows with no window run since the last one"
+                      : "a commit of " + std::to_string(n_keep) + " rows of a window of " + std::to_string(last_t);
+    return Keep::Bad;
 }
 
 }  // namespace strata::ds4::stage

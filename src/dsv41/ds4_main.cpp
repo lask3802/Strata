@@ -327,7 +327,8 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
 // ---- the remote stage (docs/REMOTE_STAGE.md, ds4_stage.hpp): this PC runs layers 0 to K - 1 and the head, a worker
 // PC the rest - each window's rows go there after layer K - 1 and come back before the head
 // This side's hello: the trunk, the layers where the link cuts it, the windows (no prompt chunks), fp32 rows, no K/V
-// type to compare (the hand-off carries no attention K/V), no checkpoints, the pack's fingerprint
+// type to compare (the hand-off carries no attention K/V), the reply's layout (kRowsNormed), no checkpoints, the
+// pack's fingerprint
 strata::net::StageHello stage_hello(const strata::ds4::Model& m, const std::string& pack, bool worker) {
     const strata::ds4::Model::StageGeo sg = m.stage_geo();
     strata::net::StageHello me;
@@ -338,7 +339,8 @@ strata::net::StageHello stage_hello(const strata::ds4::Model& m, const std::stri
     me.layer_begin = worker ? sg.layer_begin : sg.layer_end;
     me.max_t = sg.max_t;
     me.kv_type = -1;
-    me.row_formats = (1u << (uint32_t) strata::net::StageRows::F32) | strata::net::kStageCapKvElem;
+    me.row_formats = (1u << (uint32_t) strata::net::StageRows::F32) | strata::net::kStageCapKvElem |
+                     strata::ds4::stage::kRowsNormed;
     me.max_context = m.max_context();
     me.chunk = 0;
     me.handoff_floats = sg.handoff_floats;
@@ -393,7 +395,7 @@ struct RemoteMain {
             link.close();
             const int left = wait_s > 0 ? std::min(strata::net::io_timeout_s(), std::max(1, (int) std::ceil(wait_s - spent()))) : 0;
             if (link.connect(at, me, peer, e, left, stop)) {
-                ok = link.reset({}, e);
+                ok = strata::ds4::stage::main_accepts(peer, e) && link.reset({}, e);
                 break;
             }
             const bool cancelled = strata::net::stage_wait_cancelled(e) || (stop != nullptr && stop->load());
@@ -429,17 +431,20 @@ struct RemoteMain {
                      lost.c_str());
         return true;
     }
-    // a window: its rows there and back, then its tokens kept (Commit: every one - no drafts in v1)
+    // a window: its rows there and back (the model commits it: Model::set_stage_link)
     bool run(int T, const int32_t* tokens, int64_t p0, const float* out, float* in, std::string& e) {
         const size_t n = (size_t) T * (size_t) me.handoff_floats;
-        return link.run(T, tokens, p0, out, n, in, n, e) && link.commit(T, e);
+        return link.run(T, tokens, p0, out, n, in, n, e);
     }
+    // the last window's first n_keep rows kept there (all of a window kept whole; a draft's check: what it accepted)
+    bool commit(int n_keep, std::string& e) { return link.commit(n_keep, e); }
 };
 RemoteMain* g_remote = nullptr;
 
 // The worker's end (--stage-worker PORT): serves one main process at a time on the port instead of stdin.  A
 // conversation starts with a Reset; its windows arrive in order and run here one at a time, each at the position
-// this worker is at.  Returns when listening fails.
+// this worker is at, and each one's Commit keeps all its rows or (a draft's check) the first n_keep - the rest undone
+// from the backups a window of 2 or more rows keeps (ds4_stage.hpp's commit_kind).  Returns when listening fails.
 int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::string& bind, int port) {
     std::string token;
     if (!stage_token(token)) return 1;
@@ -448,7 +453,7 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
                              "asks for (fp32 here)\n");
     const strata::net::StageHello me = stage_hello(m, pack, true);
     const strata::ds4::Model::StageGeo sg = m.stage_geo();
-    int last_t = 0;   // (the last window's rows: what its Commit keeps)
+    int last_t = 0;   // (the last window's rows, until its Commit)
     strata::net::StageHandlers hs;
     hs.hello = [&](const strata::net::StageHello& theirs, strata::net::StageHello& mine, std::string& e) {
         mine = me;   // (the worker's own hello carries no token)
@@ -462,10 +467,10 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
         return true;
     };
     hs.commit = [&](int n_keep, std::string& e) {
-        if (n_keep == last_t) return true;
-        e = "commit of " + std::to_string(n_keep) + " of a window of " + std::to_string(last_t) +
-            " rows: this worker keeps whole windows only (no drafts)";
-        return false;
+        const strata::ds4::stage::Keep k = strata::ds4::stage::commit_kind(n_keep, last_t, e);
+        last_t = 0;
+        if (k == strata::ds4::stage::Keep::Part) return m.stage_rollback(n_keep, e);
+        return k == strata::ds4::stage::Keep::All;
     };
     hs.prefill = [](const int64_t*, int64_t, int64_t, int64_t, int64_t, const float*, float*, std::string& e) {
         e = "a prompt chunk: this worker reads windows only";
@@ -1553,6 +1558,7 @@ int main(int argc, char** argv) {
         g_remote = &remote;
         m.set_stage_link([&remote](int T, const int32_t* tokens, int64_t p0, const float* out, float* in,
                                    std::string& e) { return remote.run(T, tokens, p0, out, in, e); },
+                         [&remote](int n_keep, std::string& e) { return remote.commit(n_keep, e); },
                          [&remote](std::string& e) { return remote.reset(e); });
     }
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);

@@ -21,6 +21,7 @@
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
+#include "ds4_stage.hpp"
 #include "ds4_store.hpp"
 #include "ds4_vision.cuh"
 #include "strata/dsv41/exl3_cpu.hpp"
@@ -823,8 +824,11 @@ struct Model::Impl {
     // a remote stage (Options::remote_stage / stage_worker): the main process's link after its last layer, and the rows
     // that cross it, pinned - link_tx out, link_rx in (kWin rows of handoff_floats each, Model::StageGeo's layout)
     Model::StageRun stage_hop;
+    std::function<bool(int, std::string&)> stage_commit;
     std::function<bool(std::string&)> stage_reset;
-    bool stage_lost = false;          // (the main process) a hop or the worker's reset failed: only position 0 goes on
+    bool stage_lost = false;          // (the main process) a hop, a commit or the worker's reset failed: only position 0
+                                      // goes on
+    int stage_t = 0;                  // (the worker) the last window's rows, while its backups stand (2 or more; 0: none)
     std::string stage_err;
     float *link_tx = nullptr, *link_rx = nullptr;
     bool linked() const { return o.remote_stage || o.stage_worker; }
@@ -1917,11 +1921,15 @@ struct Model::Impl {
         }
         ranged = lo > 0 || hi < g.nl || linked();
         if (ranged) {   // (a slot, the drafter, a picture or the prompt path's chunks would need the other layers)
-            std::fprintf(stderr, "ds4: layers [%d, %d) of %d here%s: prompts in windows of %d, no DSpark, no pictures, no "
+            // (a remote stage's main process keeps the drafter: the worker's reply carries the taps of its layers)
+            const bool d_here = o.remote_stage && o.dspark &&
+                                stage::reply_fits(g.dim, (int) g.d_targets.size(), handoff_floats());
+            std::fprintf(stderr, "ds4: layers [%d, %d) of %d here%s: prompts in windows of %d, %s, no pictures, no "
                                  "slots%s\n", lo, hi, g.nl,
                          o.remote_stage ? " (the rest: the remote stage's worker)" : o.stage_worker ? " (a remote stage's worker)" : "",
-                         kWin, linked() ? ", no checkpoints" : "");
-            o.dspark = false;
+                         kWin, d_here ? "DSpark as asked (the worker's taps come back with its rows)" : "no DSpark",
+                         linked() ? ", no checkpoints" : "");
+            if (!d_here) o.dspark = false;
             o.vision = false;
         }
         freqs_win = rope_freqs(g.rd, 0, g.rope_theta, g.factor, g.beta_fast, g.beta_slow);
@@ -2381,7 +2389,7 @@ struct Model::Impl {
                 !dalloc(d, d.grp_ptr, P, err) || !dalloc(d, d.grp_start, P + 1, err) || !dalloc(d, d.grp_ent, P, err) ||
                 !dalloc(d, d.n_groups, 4, err))
                 return false;
-            if (g.n_mtp > 0 && !dalloc(d, d.tap, (size_t) tap_cap * D, err)) return false;
+            if ((g.n_mtp > 0 || o.stage_worker) && !dalloc(d, d.tap, (size_t) tap_cap * D, err)) return false;
             if (g.n_mtp > 0 && (int) di == head_dev &&
                 (!dalloc(d, d_confv, kWin, err) || !dalloc(d, d_ints, 64, err) || !dalloc(d, d_specq, kWin, err)))
                 return false;
@@ -3735,7 +3743,7 @@ struct Model::Impl {
                 }
             }
             if (!dalloc(d, l.win, (size_t) g.win * win_rb(), err, &d.caches)) return false;
-            if (g.n_mtp > 0 && !l.mtp) {
+            if ((g.n_mtp > 0 || o.stage_worker) && !l.mtp) {   // (a worker: its main process's drafts are checked here too)
                 if (!dalloc(d, l.ring_bak, (size_t) kWin * win_rb(), err)) return false;
                 if (l.kv_src && l.ratio > 1 && (!dalloc(d, l.c_snap, (size_t) 2 * l.ratio * g.hd, err) ||
                                                 !dalloc(d, l.c_rows, (size_t) 2 * kWin * g.hd, err)))
@@ -3743,6 +3751,8 @@ struct Model::Impl {
             }
             if (!dalloc(d, l.vram_tab, (size_t) l.n_exp, err, acct)) return false;
           }
+        // (a remote stage's worker: the final norm alone - its reply's rows are the head's input)
+        if (o.stage_worker && di == head_dev && !f32(d, "norm.weight", d.norm_w, err, acct, (size_t) g.dim)) return false;
         if (d.grp == devs[(size_t) head_dev].grp && !o.stage_worker) {   // the head: each member of its group a share of the columns
             const int hn = head_nm();
             if (!mat(d, "head", d.head, err, acct, d.mi, hn, true) || !f32(d, "norm.weight", d.norm_w, err, acct, (size_t) g.dim))
@@ -6795,6 +6805,7 @@ struct Model::Impl {
         }
         drafts_q = false;
         rollback(p0, T, m + 1);
+        if (o.remote_stage && !stage_keep(m + 1, err)) return false;   // (the worker's layers: the same rows)
         if (!seed_drafter(p0, m + 1, 0, err)) return false;
         accepted = m;
         st.drafts_offered += n;
@@ -8369,14 +8380,20 @@ struct Model::Impl {
     }
 
     // the DSpark drafter's taps: the streams' mean entering target layer il, on device d (after the last seeding read
-    // h_taps)
+    // h_taps).  A remote stage's worker: into its reply (ds4_stage.hpp's reply_tap_at), for its main process's drafter
     bool tap(Dev& d, int il, int T, std::string& err) {
         const auto it = std::find(g.d_targets.begin(), g.d_targets.end(), il);
-        if (g.n_mtp == 0 || it == g.d_targets.end()) return true;
+        if ((g.n_mtp == 0 && !o.stage_worker) || it == g.d_targets.end()) return true;
         const size_t j = (size_t) (it - g.d_targets.begin()), nt = g.d_targets.size();
         const int D = g.dim;
         cudaSetDevice(d.id);
         hc_mean(d.h, T, g.hc, D, d.tap, D, d.st);
+        if (o.stage_worker) {
+            if (!stage::reply_fits(D, (int) nt, handoff_floats())) return true;   // (load said so: no DSpark there)
+            CK(cudaMemcpy2DAsync(link_tx + stage::reply_tap_at(T, D, (int) nt, 0, (int) j), nt * D * 4, d.tap,
+                                 (size_t) D * 4, (size_t) D * 4, (size_t) T, cudaMemcpyDeviceToHost, d.st));
+            return true;
+        }
         CK(cudaStreamWaitEvent(d.st, ev_seed, 0));
         CK(cudaMemcpy2DAsync(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4, (size_t) T,
                              cudaMemcpyDeviceToHost, d.st));
@@ -8504,8 +8521,8 @@ struct Model::Impl {
             err = "the head is not on the last layer's GPU";
             return false;
         }
-        if (o.stage_worker) return link_rows(link_tx, devs[(size_t) head_dev], T, true, 4, err);   // (back to the main process)
-        if (o.remote_stage && !remote_hop(head_dev, p0, T, err)) return false;
+        if (o.stage_worker) return stage_reply(devs[(size_t) head_dev], T, err);   // (back to the main process)
+        if (o.remote_stage) return remote_hop(head_dev, p0, T, err);
         return head_rows_dev(head_dev, T, err);
     }
 
@@ -8522,8 +8539,18 @@ struct Model::Impl {
                                to_host ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, d.st));
         return true;
     }
+    // a remote stage's worker after its last layer (device d): the window's rows through the final norm, then (tap()
+    // wrote them) the drafter's taps - the reply's layout, ds4_stage.hpp's reply_tap_at
+    bool stage_reply(Dev& d, int T, std::string& err) {
+        cudaSetDevice(d.id);
+        hc_pre_norm(d.h, d.pre, d.norm_w, g.dim, g.hc, T, g.eps, d.x, d.st);
+        CK(cudaMemcpyAsync(link_tx, d.x, (size_t) T * g.dim * 4, cudaMemcpyDeviceToHost, d.st));
+        return true;
+    }
     // the main process's hop after its last layer (device di): the window's rows to the worker, which runs the rest of
-    // the trunk; its streams and pre back for the head.  A failure leaves the worker's state unknown: stage_lost
+    // the trunk; its rows through the final norm back for the head, the drafter's taps of its layers into h_taps.  A
+    // window kept whole is committed here; a draft's check (spec_win) by verify(), once it knows what stands.  A
+    // failure leaves the worker's state unknown: stage_lost
     bool remote_hop(int di, int64_t p0, int T, std::string& err) {
         Dev& d = devs[(size_t) di];
         if (!link_rows(link_tx, d, T, true, 4, err)) return false;
@@ -8534,7 +8561,25 @@ struct Model::Impl {
             stage_err = err;
             return false;
         }
-        return link_rows(link_rx, d, T, false, 2, err);
+        if (!spec_win && !stage_keep(T, err)) return false;
+        if (g.n_mtp > 0) {   // (after the last seeding's read of h_taps)
+            CK(cudaEventSynchronize(ev_seed));
+            stage::taps_from_reply(link_rx, T, g.dim, g.d_targets, hi, h_taps);
+        }
+        if (n_logits <= 0) return true;
+        const int t0 = T - n_logits;
+        cudaSetDevice(d.id);
+        CK(cudaMemcpyAsync(d.x, link_rx + (size_t) t0 * g.dim, (size_t) n_logits * g.dim * 4, cudaMemcpyHostToDevice,
+                           d.st));
+        return head_share(d, d.mi, d.x, n_logits, err);
+    }
+    // the worker keeps the first n rows of the window it ran last (a failure: stage_lost)
+    bool stage_keep(int n, std::string& err) {
+        if (stage_commit && stage_commit(n, err)) return true;
+        if (!stage_commit) err = "remote stage: no link";
+        stage_lost = true;
+        stage_err = err;
+        return false;
     }
 
     // threads: each device's thread enqueues its layers (a group's members each their share) at once, the
@@ -8628,8 +8673,8 @@ struct Model::Impl {
             if (last && mi == 0 && il + 1 < hi) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
         }
         // (a remote stage: the head's group is the head device alone - load checked it)
-        if (o.stage_worker) return di != head_dev || link_rows(link_tx, d, T, true, 4, err);   // (back to the main process)
-        if (o.remote_stage && di == head_dev && !remote_hop(di, p0, T, err)) return false;
+        if (o.stage_worker) return di != head_dev || stage_reply(d, T, err);   // (back to the main process)
+        if (o.remote_stage) return di != head_dev || remote_hop(di, p0, T, err);
         if (d.grp == devs[(size_t) head_dev].grp) return head_rows_dev(di, T, err);
         return true;
     }
@@ -9309,8 +9354,10 @@ Model::StageGeo Model::stage_geo() const {
     s.handoff_floats = p.handoff_floats();
     return s;
 }
-void Model::set_stage_link(StageRun run, std::function<bool(std::string& err)> reset) {
+void Model::set_stage_link(StageRun run, std::function<bool(int n_keep, std::string& err)> commit,
+                           std::function<bool(std::string& err)> reset) {
     p_->stage_hop = std::move(run);
+    p_->stage_commit = std::move(commit);
     p_->stage_reset = std::move(reset);
 }
 float* Model::stage_rows_in() { return p_->link_rx; }
@@ -9327,7 +9374,24 @@ bool Model::stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err
         return false;
     }
     std::vector<int> tk(tokens, tokens + std::max(0, T));
-    return p.forward(tk.data(), T, 0, err);
+    p.stage_t = 0;
+    p.spec_win = T > 1;   // (a window of 2 or more rows may be a draft's check: its layers keep their backups)
+    const bool ok = p.forward(tk.data(), T, 0, err);
+    p.spec_win = false;
+    if (ok && T > 1) p.stage_t = T;
+    return ok;
+}
+bool Model::stage_rollback(int n_keep, std::string& err) {
+    Impl& p = *p_;
+    const int T = p.stage_t;
+    p.stage_t = 0;
+    if (!p.o.stage_worker || T < 2 || n_keep < 1 || n_keep >= T) {
+        err = "remote stage: " + std::to_string(n_keep) + " rows of the last window kept, which ran " + std::to_string(T) +
+              " with backups (a window of 2 or more rows keeps them)";
+        return false;
+    }
+    p.rollback(p.pos - T, T, n_keep);   // (as verify() keeps a draft's check in one process)
+    return true;
 }
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const {
