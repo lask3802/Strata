@@ -53,13 +53,14 @@ does not fit one PC well, but you have a second PC with a graphics card.
   decode on an RTX 3080, the answers differ slightly; `STRATA_VERIFY_DEFER_CPU=0` turns it off,
   [details](docs/DETAILS.md)).
 
-Measured on 2026-10-23 with 0.1.48-link.1: an RTX 2080 Ti 11 GB, plus an RTX 3080 10 GB in a second PC over
+Measured on 2026-10-23 with Link's build of engine 0.1.48 (upstream 0.2.3; it was not released on its own): an RTX 2080 Ti 11 GB, plus an RTX 3080 10 GB in a second PC over
 10 GbE (about 400 MB/s, limited by its slot). These are PCs A and B of
 [docs/REMOTE_STAGE.md](docs/REMOTE_STAGE.md#when-it-helps-measured) with their cards swapped. The model is SC117's
 GSQ-RCO abliterated IQ3_S of Qwen3.8-Flash-Next; on two PCs, layers 0-19 run on the 2080 Ti. Settings as served:
 262,144 context, `--kv int8`, `--spec 4` with the draft layer, `--prefill auto` alone and 5,888 on two PCs. Each number is the median of three
 rounds in one session (12 short prompts a round; three prompts of 29,000-29,800 tokens). A second two-PC session gave
-70.28 and 1,382 / 63.0.
+70.28 and 1,382 / 63.0. On 0.1.49.1-link.1 (2026-10-24), the same two PCs, split, model and context gave 70.22 and
+1,269 / 63.6 (one-PC rows not run again).
 
 | | 2080 Ti alone | 2080 Ti + 3080 (two PCs) |
 | --- | ---: | ---: |

@@ -9908,7 +9908,7 @@ def link_soft(eng: Path, gpu: dict) -> str | None:
     if not (eng / EXE).exists() or meta.get("backend") == "hip" or not link_outdated(meta) or \
             engine_version_key(meta) < MIN_ENGINE:
         return None
-    have = [int(a) for a in meta.get("archs", [])]
+    have = arch_numbers(meta.get("archs"))
     if [int(x) for x in gpu.get("archs", [gpu["arch"]])
             if have and int(x) not in have and not (meta.get("ptx") and int(x) > max(have))]:
         return None
