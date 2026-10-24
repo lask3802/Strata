@@ -66,7 +66,8 @@ struct Options {
     // a remote stage (docs/REMOTE_STAGE.md, src/dsv41/ds4_stage.hpp), a range's two sides on two PCs.  remote_stage:
     // the main process of one, layers [0, stage_end) - its last layer's rows go over the link (set_stage_link) and come
     // back for the head.  stage_worker: the worker, layers [stage_begin, last] - its rows come from the link
-    // (stage_run), its last layer's go back; no embedding table, no head.  Either: no conversation checkpoints
+    // (stage_run), its last layer's go back; no embedding table, no head.  Either: no conversation checkpoints; prompts
+    // on the chunked path as one process runs them (a chunk's rows over the link: set_stage_chunks / stage_prefill)
     bool remote_stage = false;
     bool stage_worker = false;
 };
@@ -199,10 +200,13 @@ public:
     /// widest window and a hand-off row's floats - the streams (hc x dim), pre (8), the indexer's picks (topk_stride
     /// int32) and the candidate blocks (cand_stride int32).  A window's T rows cross block by block: T x hc x dim
     /// floats, then T x 8, then T x topk_stride, then T x cand_stride (T x handoff_floats in all).  The worker's reply
-    /// has the same layout; the main process reads its streams and pre.
+    /// has the same layout; the main process reads its streams and pre.  chunk: the most rows of a prompt chunk this
+    /// process sends (the main process) or takes (the worker) over the link - its chunked prompt path's chunk; 0:
+    /// windows only.
     struct StageGeo {
         int dim = 0, hc = 0, n_layers = 0, n_expert = 0, layer_begin = 0, layer_end = 0, max_t = 0;
         int64_t handoff_floats = 0;
+        int chunk = 0;
     };
     StageGeo stage_geo() const;
     /// The main process's link (remote_stage).  `run`: a window's T tokens at p0 and its rows (`out`) to the worker,
@@ -218,6 +222,30 @@ public:
     float* stage_rows_in();
     float* stage_rows_out();
     bool stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err);
+    /// The main process's prompt chunks (remote_stage, StageGeo::chunk > 0; ds4_stage.hpp's ChunkLink): each chunk's
+    /// rows go to the worker as the chunk leaves this process's last layer, while the next chunk runs here.  `send`:
+    /// T tokens at p0 and their rows (T x handoff_floats, block by block as a window's), on a thread of its own - the
+    /// rows stay as they are until the next send or `wait` returns; `last`: the run's last chunk; `skip`: the rows the
+    /// reply leaves out.  `recv`: the oldest chunk's reply, rows [skip, T) row by row into `rows` (that chunk's row 0;
+    /// row r at r x handoff_floats - its streams, then its pre).  `wait`: the last send out.  `abort`: a run that failed
+    /// with chunks on the way - the link is shut, and the next reset connects again.
+    struct StageChunks {
+        std::function<bool(const int32_t* tokens, int T, int64_t p0, bool last, const float* rows, int skip,
+                           std::string& err)> send;
+        std::function<bool(float* rows, int T, int skip, std::string& err)> recv;
+        std::function<bool(std::string& err)> wait;
+        std::function<void()> abort;
+    };
+    void set_stage_chunks(StageChunks c);
+    /// The worker's side of a prompt chunk (stage_worker, StageGeo::chunk > 0): T tokens at p0 (which must be pos())
+    /// and their rows `in` (block by block) through this process's layers on its chunked prompt path; its last layer's
+    /// rows [skip, T) row by row into `out` (StageChunks::recv's layout).  `last`: the main process's last chunk of a run.
+    bool stage_prefill(const int64_t* tokens, int T, int64_t p0, bool last, int skip, const float* in, float* out,
+                       std::string& err);
+    /// The worker's prompt-chunk buffers the link lends (StageBuffers::pf_in[0], pf_in[1], pf_out[0], pf_out[1] for i
+    /// 0-3): StageGeo::chunk x handoff_floats each, pageable, its pages committed as they are first written; nullptr
+    /// without chunks.
+    float* stage_chunk_rows(int i);
 
     void save_profile() const;
     const Stats& stats() const;

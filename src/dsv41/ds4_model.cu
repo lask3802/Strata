@@ -831,6 +831,24 @@ struct Model::Impl {
     int64_t handoff_floats() const {
         return (int64_t) g.hc * g.dim + 8 + (int64_t) topk_stride() + (int64_t) cand_stride();
     }
+    // a remote stage's prompt chunks (the chunked path, chunk > 0): the main process's sends (Model::StageChunks) from
+    // two slots of chunk rows taken in turn (link_cx); the worker's four buffers the link lends (link_pf: two in, two
+    // out), and the chunk it runs - its rows in (stage_in, block by block) and out (stage_out, its rows from
+    // stage_skip on, row by row).  All pageable, committed as written (link_maps: freed at the end)
+    Model::StageChunks stage_chunks;
+    float* link_cx[2] = {nullptr, nullptr};
+    float* link_pf[4] = {nullptr, nullptr, nullptr, nullptr};
+    std::vector<std::pair<void*, size_t>> link_maps;
+    const float* stage_in = nullptr;
+    float* stage_out = nullptr;
+    int stage_skip = 0;
+    bool stage_last = true;           // (the worker) the chunk is its main process's run's last
+    // (the main process) a run's chunks sent so far, for its replies' thread (each reply read once its chunk is out:
+    // a read waits at most the link's time-out); link_stop: the run ended
+    std::mutex link_mu;
+    std::condition_variable link_cv;
+    int link_sent = 0;
+    bool link_stop = false;
     std::vector<Src> srcs;
     std::vector<Group> groups;
     std::vector<std::unique_ptr<Worker>> workers;   // threads mode: one per device
@@ -1307,6 +1325,7 @@ struct Model::Impl {
             if (chunk > 0) cudaHostUnregister(m.first);
             os::anon_free(m.first, m.second);
         }
+        for (auto& m : link_maps) os::anon_free(m.first, m.second);
     }
     std::vector<std::pair<void*, size_t>> host_maps;
 
@@ -1916,11 +1935,13 @@ struct Model::Impl {
             return false;
         }
         ranged = lo > 0 || hi < g.nl || linked();
-        if (ranged) {   // (a slot, the drafter, a picture or the prompt path's chunks would need the other layers)
-            std::fprintf(stderr, "ds4: layers [%d, %d) of %d here%s: prompts in windows of %d, no DSpark, no pictures, no "
+        if (ranged) {   // (a slot, the drafter, a picture or the prompt path's chunks would need the other layers - a
+                        // remote stage's chunks cross the link as they leave this process's last layer)
+            std::fprintf(stderr, "ds4: layers [%d, %d) of %d here%s: prompts in %s of %d, no DSpark, no pictures, no "
                                  "slots%s\n", lo, hi, g.nl,
                          o.remote_stage ? " (the rest: the remote stage's worker)" : o.stage_worker ? " (a remote stage's worker)" : "",
-                         kWin, linked() ? ", no checkpoints" : "");
+                         linked() ? "chunks over the link (the chunked path's), or windows" : "windows", kWin,
+                         linked() ? ", no checkpoints" : "");
             o.dspark = false;
             o.vision = false;
         }
@@ -1979,9 +2000,10 @@ struct Model::Impl {
         // kChunkedPromptDefault bring it to a single card's default run too (a host thread a GPU for the prompt only;
         // decode stays as asked).  --prefill-chunk 0 keeps the windows of 16 (DS4_WINDOWS=1 the same).  Off by default
         // until a prompt costs the decode nothing: its buffers hold VRAM the windowed path gives to experts
-        prompt_par = !ranged && (par || o.tp > 1 ||
-                                 ((o.prefill_chunk > 0 || (o.prefill_chunk < 0 && kChunkedPromptDefault)) &&
-                                  std::getenv("DS4_WINDOWS") == nullptr));   // (a layer range: windows, said above)
+        prompt_par = (!ranged || linked()) &&   // (a layer range: windows, said above; a remote stage: chunks across)
+                     (par || o.tp > 1 ||
+                      ((o.prefill_chunk > 0 || (o.prefill_chunk < 0 && kChunkedPromptDefault)) &&
+                       std::getenv("DS4_WINDOWS") == nullptr));
         const bool tp_all = tp > 1 && tp == (int) devs.size();
         for (size_t i = 0; i < devs.size();) {
             Group G;
@@ -2182,7 +2204,8 @@ struct Model::Impl {
             // with the chunked prompt path: the contiguous split that streams the least into its busiest member (its
             // VRAM short of its layers' experts, per member) - a chunk's groups run as a pipeline, its slowest stage
             // sets the pace; a token's decode passes every layer either way, the experts in VRAM the same in all
-            if (chunk > 0 && groups.size() > 1 && groups.size() <= 6 && std::getenv("DS4_SPLIT") == nullptr) {
+            // (a remote stage's range: the split above - this one spans the whole trunk)
+            if (chunk > 0 && !ranged && groups.size() > 1 && groups.size() <= 6 && std::getenv("DS4_SPLIT") == nullptr) {
                 const int G = (int) groups.size(), NL = g.nl;
                 std::vector<double> cap(groups.size());
                 for (int gi = 0; gi < G; ++gi) {
@@ -2688,6 +2711,22 @@ struct Model::Impl {
             }
             if (chunk > 0 && aerr.empty()) err.clear();
         }
+        // a remote stage's prompt chunks: the main process's two slots of rows out, the worker's four the link lends -
+        // pageable (a chunk's rows cross the network at its pace; a page is committed once a chunk reaches it)
+        if (linked() && chunk > 0) {
+            const size_t b = (size_t) chunk * (size_t) handoff_floats() * 4;
+            float** bufs = o.remote_stage ? link_cx : link_pf;
+            for (int i = 0; i < (o.remote_stage ? 2 : 4); ++i) {
+                void* m = os::anon_alloc(b, -1, 1);
+                if (m == nullptr) {
+                    err = "remote stage: " + std::to_string(b >> 20) + " MiB of memory for a prompt chunk's rows "
+                          "(--prefill-chunk N for smaller chunks)";
+                    return false;
+                }
+                link_maps.push_back({m, b});
+                bufs[i] = (float*) m;
+            }
+        }
         // the CPU lane's experts read in place (decided above): how much of them the load reads ahead, from what VRAM
         // now leaves over
         if (file_experts) {
@@ -2806,7 +2845,7 @@ struct Model::Impl {
                 if (all_flow && std::getenv("DS4_CHUNK_MIN") == nullptr) chunk_min = kFlowChunkMin;
             }
             for (Layer& l : L) {
-                if (l.mtp) continue;
+                if (l.mtp || elsewhere(l)) continue;   // (a layer range: its own layers')
                 for (int m = 0; m < l.nm; ++m) {   // (each member its own: the flow's members decide them each)
                     Layer& x = member(l, m);
                     if (!halloc(x.vs_pin, (size_t) l.n_exp, err)) return false;
@@ -7320,6 +7359,108 @@ struct Model::Impl {
         return ok;
     }
 
+    // ---- a remote stage's prompt chunks (ds4_stage.hpp: the rows to the worker block by block, its reply row by row)
+    // (the worker) the chunk's rows from the link (stage_in) into c's h | pre | topk | cand, on stream s
+    bool link_chunk_in(Chunk& c, int T, cudaStream_t s, std::string& err) {
+        if (stage_in == nullptr) {
+            err = "remote stage: a prompt chunk without its rows";
+            return false;
+        }
+        const Xfer x = chunk_xfer((uint8_t*) const_cast<float*>(stage_in), c, T, false);
+        for (int i = 0; i < x.n; ++i) CK(cudaMemcpyAsync(x.dst[i], x.src[i], x.bytes[i], cudaMemcpyHostToDevice, s));
+        return true;
+    }
+    // the rows chunk k's reply leaves out: none with every row's logits, all but the head's of the run's last chunk,
+    // every one of the chunks before it
+    int link_skip(const Run& run, int k) const {
+        const int T = run.T[(size_t) k];
+        return logits_all ? 0 : k + 1 == (int) run.T.size() ? T - n_logits : T;
+    }
+    // chunk k through this process's last layer (device d, its chunk state c).  The worker: its rows from stage_skip on
+    // into stage_out, row by row (streams, then pre).  The main process: its rows into slot k % 2 - the send two chunks
+    // back is out (the one before this one waited for it) - and to the worker on the link's thread, once the chunk
+    // before is out; the device's next chunk runs meanwhile
+    bool link_chunk_out(Dev& d, Chunk& c, const Run& run, int k, std::string& err) {
+        const int T = run.T[(size_t) k];
+        const size_t W = (size_t) handoff_floats(), HD = (size_t) g.hc * g.dim;
+        cudaSetDevice(d.id);
+        if (o.stage_worker) {
+            const int sk = std::max(0, std::min(stage_skip, T)), nr = T - sk;
+            if (nr <= 0) return true;
+            if (stage_out == nullptr) {
+                err = "remote stage: a prompt chunk with nowhere for its rows";
+                return false;
+            }
+            CK(cudaMemcpy2DAsync(stage_out + (size_t) sk * W, W * 4, c.h + (size_t) sk * HD, HD * 4, HD * 4, (size_t) nr,
+                                 cudaMemcpyDeviceToHost, d.st));
+            CK(cudaMemcpy2DAsync(stage_out + (size_t) sk * W + HD, W * 4, c.pre + (size_t) sk * 8, 32, 32, (size_t) nr,
+                                 cudaMemcpyDeviceToHost, d.st));
+            return true;
+        }
+        const int64_t p0 = run.p0[(size_t) k];
+        float* const tx = link_cx[k % 2];
+        if (!stage_chunks.send || tx == nullptr) {
+            err = "remote stage: no link for prompt chunks";
+            return false;
+        }
+        const Xfer x = chunk_xfer((uint8_t*) tx, c, T, true);
+        for (int i = 0; i < x.n; ++i) CK(cudaMemcpyAsync(x.dst[i], x.src[i], x.bytes[i], cudaMemcpyDeviceToHost, d.st));
+        CK(cudaStreamSynchronize(d.st));   // (pageable: done as each copy returns - and so is the chunk)
+        if (!stage_chunks.send(toks.data() + p0, T, p0, k + 1 == (int) run.T.size(), tx, link_skip(run, k), err))
+            return false;
+        {
+            std::lock_guard<std::mutex> lk(link_mu);
+            ++link_sent;
+        }
+        link_cv.notify_all();
+        return true;
+    }
+    // (the main process) the head over the worker's rows of the run - rx: the run's rows from its first, row by row -
+    // as the head group's device runs it after the last layer (chunk by chunk, 16 rows at a time, with every row's
+    // logits; else the last chunk's last n_logits rows)
+    bool link_head(const Run& run, const float* rx, std::string& err) {
+        Dev& d = devs[(size_t) head_dev];
+        Chunk& c = *chunks[(size_t) head_dev];
+        cudaSetDevice(d.id);
+        cudaStream_t s = d.st;
+        const int D = g.dim, H = g.hc;
+        const size_t W = (size_t) handoff_floats(), HD = (size_t) H * D;
+        auto rows = [&](int64_t r, int nr) -> bool {   // the run's rows [r, r + nr) into the chunk state's first nr
+            CK(cudaMemcpy2DAsync(c.h, HD * 4, rx + (size_t) r * W, W * 4, HD * 4, (size_t) nr, cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpy2DAsync(c.pre, 32, rx + (size_t) r * W + HD, W * 4, 32, (size_t) nr, cudaMemcpyHostToDevice, s));
+            return true;
+        };
+        const int nk = (int) run.T.size();
+        if (logits_all) {
+            for (int k = 0; k < nk; ++k) {
+                const int64_t r = run.p0[(size_t) k] - run.p0[0];
+                const int T = run.T[(size_t) k];
+                for (int r0 = 0; r0 < T; r0 += kWin) {
+                    const int nr = std::min(kWin, T - r0);
+                    if (!rows(r + r0, nr)) return false;
+                    hc_pre_norm(c.h, c.pre, d.norm_w, D, H, nr, g.eps, d.x, s);
+                    if (!head_share(d, d.mi, d.x, nr, err)) return false;
+                    CK(cudaMemcpyAsync(chunk_logits.data() + (size_t) (r + r0) * g.vocab, d.logits, (size_t) nr * g.vocab * 4,
+                                       cudaMemcpyDeviceToHost, s));
+                    CK(cudaStreamSynchronize(s));
+                }
+            }
+        } else if (n_logits > 0) {
+            if (!rows(run.p0.back() + run.T.back() - n_logits - run.p0[0], n_logits)) return false;
+            hc_pre_norm(c.h, c.pre, d.norm_w, D, H, n_logits, g.eps, d.x, s);
+            if (!head_share(d, d.mi, d.x, n_logits, err)) return false;
+        }
+        return true;
+    }
+    // (the main process) whether the worker holds this conversation: after a failed hop or chunk, or a worker's failed
+    // reset, only a conversation from position 0 goes on - its reset tried again first
+    bool stage_live(std::string& err) {
+        if (stage_lost && pos == 0 && stage_reset && stage_reset(stage_err)) stage_lost = false;
+        if (!stage_lost) return true;
+        err = "remote stage: " + stage_err + " - the conversation starts again from its first token";
+        return false;
+    }
+
     // layer-major (c.lm: a run of several chunks, device di every trunk layer, the flow set up by run_dev_chunks):
     // layer after layer, each through all the chunks in order - a chunk's state to host memory after each of its
     // layers and back before the next - so a layer's experts are read from the files once for the whole run (the
@@ -7371,7 +7512,9 @@ struct Model::Impl {
                     wp.eg_slot = (int) (eg_u % 2);
                     if (++eg_u < egu.size()) eg_next = std::async(std::launch::async, read_eg, eg_u);
                 }
-                if (li == 0) {   // the chunk's input: its embedding rows
+                if (li == 0 && o.stage_worker) {   // (a remote stage's worker: the main process's rows)
+                    if (!link_chunk_in(c, T, s, err)) return false;
+                } else if (li == 0) {   // the chunk's input: its embedding rows
                     if (k >= 2) CK(cudaEventSynchronize(c.emb_ev[slot]));
                     for (int t = 0; t < T; ++t)
                         std::memcpy(c.emb_host[slot] + (size_t) t * D, emb_row(p0 + t, toks[(size_t) (p0 + t)]),
@@ -7411,7 +7554,9 @@ struct Model::Impl {
                     CK(cudaEventRecord(chunk_done[(size_t) k], s));
                     chunk_rec[(size_t) k].store(1, std::memory_order_release);
                 }
-                if (logits_all) {   // every row's logits (tests): the head over the chunk's rows, 16 at a time
+                if (linked()) {   // (a remote stage: the chunk's rows over the link - the head after the worker's)
+                    if (!link_chunk_out(d, c, run, k, err)) return false;
+                } else if (logits_all) {   // every row's logits (tests): the head over the chunk's rows, 16 at a time
                     const size_t base = (size_t) (p0 - run.p0[0]) * g.vocab;
                     for (int r0 = 0; r0 < T; r0 += kWin) {
                         const int nr = std::min(kWin, T - r0);
@@ -7536,7 +7681,9 @@ struct Model::Impl {
                 if (mi < 0) continue;
                 if (!started) {   // the chunk's input: its embedding rows, or the previous group's hand-off
                     started = true;
-                    if (il == 0) {
+                    if (il == lo && o.stage_worker) {   // (a remote stage's worker: the main process's rows)
+                        if (!link_chunk_in(c, T, s, err)) return false;
+                    } else if (il == lo) {
                         if (k >= 2) CK(cudaEventSynchronize(c.emb_ev[slot]));
                         for (int t = 0; t < T; ++t)
                             std::memcpy(c.emb_host[slot] + (size_t) t * D, emb_row(p0 + t, toks[(size_t) (p0 + t)]),
@@ -7585,8 +7732,8 @@ struct Model::Impl {
                 }
                 if (!run_layer(L0, mi, p0, T, wp, S, err, run, k, il)) return false;
                 if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, il, p0, T);
-                const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
-                if (last && mi == 0 && il + 1 < g.nl) {   // the hand-off, once the next group took the chunk before last
+                const bool last = il + 1 == hi || L[(size_t) il + 1].grp != L0.grp;
+                if (last && mi == 0 && il + 1 < hi) {   // the hand-off, once the next group took the chunk before last
                     const int nnext = L[(size_t) il + 1].nm;
                     if (k >= 2) wait_flags(c.hand_ack + (size_t) slot * 8 * 32, nnext, 32, wp.win - 2, s);
                     xfer_put(chunk_xfer(c.hand[slot], c, T, true), c.hand_flag[slot], wp.win, d.xcnt, s);
@@ -7596,7 +7743,10 @@ struct Model::Impl {
                 CK(cudaEventRecord(chunk_done[(size_t) k], s));
                 chunk_rec[(size_t) k].store(1, std::memory_order_release);
             }
-            if (d.grp == devs[(size_t) head_dev].grp) {   // the head group: each member its share of the logits
+            if (linked()) {   // (a remote stage: the chunk's rows over the link from the last layer's GPU - load
+                              // checked it is alone there - and the head after the worker's)
+                if (di == head_dev && !link_chunk_out(d, c, run, k, err)) return false;
+            } else if (d.grp == devs[(size_t) head_dev].grp) {   // the head group: each member its share of the logits
                 if (logits_all) {   // every row's logits (tests): the head over the chunk's rows, 16 at a time
                     const size_t base = (size_t) (p0 - run.p0[0]) * g.vocab;
                     for (int r0 = 0; r0 < T; r0 += kWin) {
@@ -7918,7 +8068,7 @@ struct Model::Impl {
         int64_t rows = 0;
         for (int T : run.T) rows += T;
         const size_t hb = chunk_hand_bytes(), state_b = run.T.size() * hb;
-        const double moved = 2.0 * (double) rows * ((double) hb / (double) chunk) * (double) g.nl;
+        const double moved = 2.0 * (double) rows * ((double) hb / (double) chunk) * (double) (hi - lo);   // (its layers)
         if (need == 0 || (double) (run.T.size() - 1) * file_b <= moved) return false;
         size_t lc_bytes = need;
         if (const char* mb = std::getenv("DS4_LAYER_CACHE_MB")) lc_bytes = std::min(need, (size_t) std::atoll(mb) << 20);
@@ -7981,8 +8131,8 @@ struct Model::Impl {
         }();
         return m;
     }
-    int yoco_layer() const {
-        if (yoco_mode() == 0 || chunk <= 0 || g.nl < 2 || (int) g.ratios.size() < g.nl) return -1;
+    int yoco_layer() const {   // (a layer range: never - the skip's layers and the ones before it on two processes)
+        if (yoco_mode() == 0 || chunk <= 0 || ranged || g.nl < 2 || (int) g.ratios.size() < g.nl) return -1;
         int yl = -1;
         for (int il = 0; il < g.nl && yl < 0; ++il)
             if (g.ratios[(size_t) il] == 1) yl = il;
@@ -8008,6 +8158,8 @@ struct Model::Impl {
                 err = "token " + std::to_string(tk[t]) + " out of range";
                 return false;
             }
+        if (o.remote_stage && !stage_live(err)) return false;
+        if (linked()) snap_slot = -1;   // (a remote stage keeps no checkpoints: nor the state before the run's last row)
         // a long prompt's skip: the layers from yoco_layer() on (V4.1: 20-39) read the earlier positions only through
         // that layer's compressed KV and index keys, and each looks back one window (win - 1 positions) more than the
         // layer before - so they need their own work only on the last keep = (nl - yoco) (win - 1) + win rows for the
@@ -8076,6 +8228,71 @@ struct Model::Impl {
                 if (on) p->lm_end();
             }
         } lm_end_{this, lm};
+        // (a remote stage's main process) the worker's replies on a thread of their own, each once its chunk is out,
+        // into rx: the run's rows from its first, row by row (committed only where a reply writes).  Every way out of a
+        // run that did not take them all shuts the link - the worker's state is then unknown (stage_lost)
+        struct LinkRx {
+            Impl* p;
+            float* rx = nullptr;
+            size_t bytes = 0;
+            std::thread th;
+            std::atomic<int> got{0};
+            bool ok = true, open = false;
+            std::string err, why;
+            ~LinkRx() {
+                {
+                    std::lock_guard<std::mutex> lk(p->link_mu);
+                    p->link_stop = true;
+                }
+                p->link_cv.notify_all();
+                if (open) {
+                    if (p->stage_chunks.abort) p->stage_chunks.abort();
+                    p->stage_lost = true;
+                    p->stage_err = why.empty() ? "a run of prompt chunks ended before the worker's replies were in" : why;
+                }
+                if (th.joinable()) th.join();
+                if (rx != nullptr) os::anon_free(rx, bytes);
+            }
+        } lrx{this};
+        if (o.remote_stage) {
+            if (!stage_chunks.send || !stage_chunks.recv || !stage_chunks.wait || link_cx[0] == nullptr) {
+                err = "remote stage: no link for prompt chunks";
+                return false;
+            }
+            lrx.bytes = (size_t) n * (size_t) handoff_floats() * 4;
+            lrx.rx = (float*) os::anon_alloc(lrx.bytes, -1, 1);
+            if (lrx.rx == nullptr) {
+                err = "remote stage: " + std::to_string(lrx.bytes >> 20) + " MiB of memory for the worker's replies";
+                lrx.bytes = 0;
+                return false;
+            }
+            {
+                std::lock_guard<std::mutex> lk(link_mu);
+                link_sent = 0;
+                link_stop = false;
+            }
+            lrx.open = true;
+            lrx.th = std::thread([this, &run, &lrx] {
+                const size_t W = (size_t) handoff_floats();
+                for (size_t k = 0; k < run.T.size(); ++k) {
+                    {
+                        std::unique_lock<std::mutex> lk(link_mu);
+                        link_cv.wait(lk, [&] { return link_sent > (int) k || link_stop; });
+                        if (link_sent <= (int) k) {
+                            lrx.ok = false;
+                            lrx.err = "remote stage: the run ended before its chunk " + std::to_string(k) + " was sent";
+                            return;
+                        }
+                    }
+                    if (!stage_chunks.recv(lrx.rx + (size_t) (run.p0[k] - run.p0[0]) * W, run.T[k], link_skip(run, (int) k),
+                                           lrx.err)) {
+                        lrx.ok = false;
+                        return;
+                    }
+                    lrx.got.store((int) k + 1, std::memory_order_release);
+                }
+            });
+        }
         std::vector<std::string> errs(devs.size());
         halted = false;
         halt.store(false);
@@ -8100,7 +8317,10 @@ struct Model::Impl {
                 halt_k = halt_seen + 1;
                 halt.store(true, std::memory_order_release);
             }
-            if (progress && lm) {   // (layer-major: the share of the layers every chunk went through)
+            if (progress && o.remote_stage) {   // (a remote stage: the chunks whose rows came back from the worker)
+                const int r = lrx.got.load(std::memory_order_acquire);
+                if (r > 0 && r < (int) run.T.size()) progress(run.p0[(size_t) r - 1] + run.T[(size_t) r - 1] - run.p0[0]);
+            } else if (progress && lm) {   // (layer-major: the share of the layers every chunk went through)
                 const int nd = lm_layers.load(std::memory_order_acquire);
                 if (nd > 0 && nd < g.nl) progress((int64_t) n * nd / g.nl);
             } else if (progress) {   // chunks through every layer (the last layer's device past their event)
@@ -8113,6 +8333,29 @@ struct Model::Impl {
             if (all) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
+        if (o.remote_stage) {   // every chunk sent (the last one out) and every reply in, or the link is shut (lrx)
+            bool fine = true;
+            for (const std::string& e : errs) fine = fine && e.empty();
+            std::string e;
+            if (fine && !stage_chunks.wait(e)) fine = false;
+            if (fine) {
+                lrx.th.join();
+                if (!lrx.ok) {
+                    fine = false;
+                    e = lrx.err;
+                }
+            }
+            if (fine) lrx.open = false;
+            else if (!e.empty()) {
+                lrx.why = e;
+                bool dev_err = false;
+                for (const std::string& x : errs) dev_err = dev_err || !x.empty();
+                if (!dev_err) {
+                    err = e;
+                    return false;
+                }
+            }
+        }
         for (const std::string& e : errs)   // (a device's failure first: a Stop's early end is not one)
             if (!e.empty() && e != kHalted) {
                 err = e;
@@ -8124,6 +8367,7 @@ struct Model::Impl {
                 err = "stopped while reading the prompt";
                 return false;
             }
+        if (o.remote_stage && !link_head(run, lrx.rx, err)) return false;
         st.layer_ms += now_ms() - tl;
         eg_stats();
         Dev& d = devs[(size_t) head_dev];
@@ -8230,7 +8474,7 @@ struct Model::Impl {
             lm_end();
             lm_end_.on = false;
         }
-        cache_settle();
+        if (!o.stage_worker || stage_last) cache_settle();   // (a worker: after its main process's whole run)
         const int nr = std::min(T_last, tap_cap);
         if (!seed_drafter(pos - nr, nr, 0, err)) return false;
         if (snap_slot >= 0) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
@@ -9230,9 +9474,11 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     p.pm.last = -1;
     p.halted = false;
     if (p.chunk > 0 && n >= p.chunk_min) {   // a long run - or one the flow could take, if it is the faster path here
-        const double t0 = now_ms();   // (every row's logits (tests): the chunked path, which keeps them all)
-        const bool ok = logits_rows > kWin || p.pick_path(n) ? p.forward_chunks(tokens, n, logits_rows, err)
-                                                             : p.feed_windows(tokens, n, logits_rows, err);
+        const double t0 = now_ms();   // (every row's logits (tests): the chunked path, which keeps them all; a remote
+                                      // stage's main process: chunks, where windows would cross the link 16 rows a time)
+        const bool ok = logits_rows > kWin || p.o.remote_stage || p.pick_path(n)
+                            ? p.forward_chunks(tokens, n, logits_rows, err)
+                            : p.feed_windows(tokens, n, logits_rows, err);
         if (ok) p.path_done(now_ms() - t0);
         return ok;
     }
@@ -9243,7 +9489,7 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     p.pm.last = -1;
     p.halted = false;
     const double t0 = now_ms();
-    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.pick_path(n)) {   // (the last token rides along; its layers
+    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && (p.o.remote_stage || p.pick_path(n))) {   // (the last token rides along; its layers
         const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot);   // keep the state before it)
         if (ok) p.path_done(now_ms() - t0);
         return ok;
@@ -9307,6 +9553,7 @@ Model::StageGeo Model::stage_geo() const {
     s.layer_end = p.hi;
     s.max_t = kWin;
     s.handoff_floats = p.handoff_floats();
+    s.chunk = p.linked() ? p.chunk : 0;   // (the link's buffers: made at load for a remote stage's chunks only)
     return s;
 }
 void Model::set_stage_link(StageRun run, std::function<bool(std::string& err)> reset) {
@@ -9328,6 +9575,36 @@ bool Model::stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err
     }
     std::vector<int> tk(tokens, tokens + std::max(0, T));
     return p.forward(tk.data(), T, 0, err);
+}
+void Model::set_stage_chunks(StageChunks c) { p_->stage_chunks = std::move(c); }
+float* Model::stage_chunk_rows(int i) { return i >= 0 && i < 4 ? p_->link_pf[i] : nullptr; }
+bool Model::stage_prefill(const int64_t* tokens, int T, int64_t p0, bool last, int skip, const float* in, float* out,
+                          std::string& err) {
+    Impl& p = *p_;
+    if (!p.o.stage_worker || p.chunk <= 0) {
+        err = p.o.stage_worker ? "this worker reads windows only (no chunked prompt path)" : "not a remote stage's worker";
+        return false;
+    }
+    if (T < 1 || T > p.chunk) {
+        err = "a prompt chunk of " + std::to_string(T) + " tokens: this worker takes 1 to " + std::to_string(p.chunk);
+        return false;
+    }
+    if (p0 != p.pos) {   // (the main process resets the worker when it starts a conversation again)
+        err = "out of step: this worker is at position " + std::to_string(p.pos) + ", the chunk starts at " +
+              std::to_string(p0);
+        return false;
+    }
+    std::vector<int> tk(tokens, tokens + T);
+    p.stage_in = in;
+    p.stage_out = out;
+    p.stage_skip = skip;
+    p.stage_last = last;
+    p.halted = false;
+    const bool ok = p.forward_chunks(tk.data(), T, 0, err);   // (one chunk: the run's, chunk after chunk on this side)
+    p.stage_in = nullptr;
+    p.stage_out = nullptr;
+    p.stage_last = true;
+    return ok;
 }
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const {

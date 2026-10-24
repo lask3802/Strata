@@ -895,10 +895,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_executable(ds4_slot_test tests/dsv41/slot_test.cpp)
       target_include_directories(ds4_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
       target_compile_features(ds4_slot_test PRIVATE cxx_std_17)
-      # the remote stage's pack fingerprint and the worker's hello checks (ds4_stage.hpp): no GPU, no model
-      add_executable(ds4_stage_test tests/dsv41/stage_test.cpp)
+      # the remote stage's pack fingerprint, both sides' hello checks and the prompt chunks over a loopback link
+      # (ds4_stage.hpp, src/net/stage_link.cpp): no GPU, no model
+      add_executable(ds4_stage_test tests/dsv41/stage_test.cpp src/net/stage_link.cpp)
       target_include_directories(ds4_stage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41 ${CMAKE_CURRENT_SOURCE_DIR}/include)
       target_compile_features(ds4_stage_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_stage_test PRIVATE Threads::Threads)
+      if(WIN32)
+        target_link_libraries(ds4_stage_test PRIVATE ws2_32)
+      endif()
     endif()
     if(STRATA_ENABLE_HIP)
       foreach(_t strata_dsv41_kernels strata-dsv41)
