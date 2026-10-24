@@ -563,6 +563,7 @@ void test_q5k(cudaStream_t s, bool bench) {
 
 int main(int argc, char** argv) {
     const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
+    if (std::getenv("DS4_U9_Q5K") == nullptr) u9::q5k_arch() = 1;   // (the staged kernel on any device: checked here)
     cudaStream_t s;
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     if (!gg::prepare(s)) return 1;

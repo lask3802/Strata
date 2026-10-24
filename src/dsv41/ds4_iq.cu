@@ -1358,12 +1358,34 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     return true;
 }
 
+#if !defined(STRATA_USE_HIP)
+// U9 q5k on the current device (u9::q5k_arch): by its compute capability unless DS4_U9_Q5K says, once a device
+bool q5k_here() {
+    const int f = u9::q5k_arch();
+    if (f >= 0) return f != 0;
+    static std::atomic<int> seen[64];   // (0: not asked yet, 1 on, 2 off)
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int v = seen[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        int ma = 0, mi = 0;
+        cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, dev);
+        v = ma == 7 && mi == 5 ? 1 : 2;
+        if (seen[dev].exchange(v) == 0)
+            std::fprintf(stderr, "ds4 u9: q5k %s on CUDA%d (sm%d%d: sm75 only; DS4_U9_Q5K=1 any)\n",
+                         v == 1 ? "on" : "off", dev, ma, mi);
+    }
+    return v == 1;
+}
+#endif
+
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
 #if !defined(STRATA_USE_HIP)
     if constexpr (T == kQ5_K) {
-        bool st = u9::on(u9::kQ5k);
+        bool st = u9::on(u9::kQ5k) && q5k_here();
         for (int i = 0; i < nj; ++i) st = st && ((uintptr_t) J.j[i].w & 15u) == 0 && J.j[i].ld % 16 == 0;
         if (st) {
             // (DS4_U9_Q5V=0: the padded staging with decode_b's 4-byte reads instead - the two forms' A/B on the 2080 Ti)
