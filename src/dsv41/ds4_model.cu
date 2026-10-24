@@ -7509,7 +7509,7 @@ struct Model::Impl {
     bool stage_live(std::string& err) {
         if (stage_lost && pos == 0 && stage_reset && stage_reset(stage_err)) stage_lost = false;
         if (!stage_lost) return true;
-        err = "remote stage: " + stage_err + " - the conversation starts again from its first token";
+        err = stage_err + " - the conversation starts again from its first token";   // (the link's: "remote stage ...")
         return false;
     }
 
@@ -8211,7 +8211,9 @@ struct Model::Impl {
                 return false;
             }
         if (o.remote_stage && !stage_live(err)) return false;
-        if (linked()) snap_slot = -1;   // (a remote stage keeps no checkpoints: nor the state before the run's last row)
+        // (a remote stage keeps no checkpoints: nor the state before the run's last row - once its worker keeps
+        // checkpoints too, only a remote stage without them)
+        if (linked()) snap_slot = -1;
         // a long prompt's skip: the layers from yoco_layer() on (V4.1: 20-39) read the earlier positions only through
         // that layer's compressed KV and index keys, and each looks back one window (win - 1 positions) more than the
         // layer before - so they need their own work only on the last keep = (nl - yoco) (win - 1) + win rows for the
@@ -8302,7 +8304,8 @@ struct Model::Impl {
                 if (open) {
                     if (p->stage_chunks.abort) p->stage_chunks.abort();
                     p->stage_lost = true;
-                    p->stage_err = why.empty() ? "a run of prompt chunks ended before the worker's replies were in" : why;
+                    p->stage_err =
+                        why.empty() ? "remote stage: a run of prompt chunks ended before the worker's replies were in" : why;
                 }
                 if (th.joinable()) th.join();
                 if (rx != nullptr) os::anon_free(rx, bytes);

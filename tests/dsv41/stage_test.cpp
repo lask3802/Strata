@@ -100,8 +100,7 @@ struct Loop {
         h.layer_begin = 20;
         h.max_t = 16;
         h.kv_type = -1;
-        h.row_formats = (1u << (uint32_t) net::StageRows::F32) | net::kStageCapKvElem | st::kRowsNormed |
-                        (bf16 ? st::kRowsBf16Cap : 0u);
+        h.row_formats = st::hello_rows(bf16);
         h.max_context = 8192;
         h.handoff_floats = bf16 ? g.compact() : g.full();
         h.pack_hash = 0x1234;
@@ -290,7 +289,7 @@ net::StageHello hello_of(int layer_begin) {
     h.layer_begin = layer_begin;
     h.max_t = 16;
     h.kv_type = -1;
-    h.row_formats = (1u << (uint32_t) net::StageRows::F32) | net::kStageCapKvElem | st::kRowsNormed;
+    h.row_formats = st::hello_rows(false);
     h.max_context = 4096;
     h.handoff_floats = kHand;
     h.pack_hash = 0x5eed;
@@ -429,7 +428,7 @@ static net::StageHello hello_of(int64_t chunk) {
     h.layer_begin = 2;
     h.max_t = 16;
     h.kv_type = -1;
-    h.row_formats = (1u << (uint32_t) net::StageRows::F32) | net::kStageCapKvElem | st::kRowsNormed;
+    h.row_formats = st::hello_rows(false);
     h.max_context = 4096;
     h.chunk = chunk;
     h.handoff_floats = kW;
@@ -689,9 +688,12 @@ int main() {
     net::StageHello mine, theirs;
     mine.max_t = theirs.max_t = 16;
     theirs.max_context = 8192;
-    theirs.row_formats = (1u << (uint32_t) net::StageRows::F32) | net::kStageCapKvElem | st::kRowsNormed;
+    theirs.row_formats = st::hello_rows(false);
     std::string e;
     CHECK(st::worker_accepts(theirs, mine, 8192, e));
+    // (stage_hello's row_formats: fp32 for the link, the normed reply always, the compact rows' bit with bf16 only)
+    CHECK(st::hello_rows(false) == ((1u << (uint32_t) net::StageRows::F32) | net::kStageCapKvElem | st::kRowsNormed));
+    CHECK(st::hello_rows(true) == (st::hello_rows(false) | st::kRowsBf16Cap));
     {
         net::StageHello t = theirs;   // (an earlier build's: it would read the normed rows as the streams)
         t.row_formats &= ~st::kRowsNormed;

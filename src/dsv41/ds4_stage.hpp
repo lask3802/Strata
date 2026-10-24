@@ -68,8 +68,8 @@ inline uint64_t pack_hash(const std::string& pack) {
             b = b == std::string::npos ? body.size() : b + 1;
             if (!(geometry && body.compare(a, 10, "model_dir ") == 0))
                 for (size_t c = a; c < b;) {   // (the line's runs between its '\r's)
-                    size_t r = body.find('\r', c);
-                    r = r == std::string::npos || r > b ? b : r;
+                    const void* cr = std::memchr(body.data() + c, '\r', b - c);   // (within the line only)
+                    const size_t r = cr == nullptr ? b : (size_t) ((const char*) cr - body.data());
                     h = fnv1a(body.data() + c, r - c, h);
                     c = r < b ? r + 1 : b;
                 }
@@ -85,6 +85,12 @@ inline uint64_t pack_hash(const std::string& pack) {
 /// the engine packs the rows itself before the link sends them.  Both sides must have it or neither: a hello with it
 /// also has a narrower hand-off row (RowGeo::compact), so the link's own check refuses a mismatch as well.
 inline constexpr uint32_t kRowsBf16Cap = 1u << 30;
+
+/// A hello's row_formats, on both sides: the link's fp32 rows, no K/V type to compare (kStageCapKvElem with element 0:
+/// the hand-off carries no attention K/V), the reply's layout (kRowsNormed) and, with the compact rows, kRowsBf16Cap
+inline uint32_t hello_rows(bool bf16) {
+    return (1u << (uint32_t) net::StageRows::F32) | net::kStageCapKvElem | kRowsNormed | (bf16 ? kRowsBf16Cap : 0u);
+}
 
 /// A window of T rows crosses block by block (Model::StageGeo): the streams (T x `h` fp32), pre (T x `pre` fp32), the
 /// indexer's picks (T x `topk` int32), then the candidate blocks (T x `cand` int32).  Compact: only the streams as bf16

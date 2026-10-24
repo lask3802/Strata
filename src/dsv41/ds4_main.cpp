@@ -341,8 +341,7 @@ strata::net::StageHello stage_hello(const strata::ds4::Model& m, const std::stri
     me.max_t = sg.max_t;
     me.kv_type = -1;
     // (the link's format is fp32 either way; the compact rows are the engine's own and say so in a capability bit)
-    me.row_formats = (1u << (uint32_t) strata::net::StageRows::F32) | strata::net::kStageCapKvElem |
-                     strata::ds4::stage::kRowsNormed | (sg.rows_bf16 ? strata::ds4::stage::kRowsBf16Cap : 0u);
+    me.row_formats = strata::ds4::stage::hello_rows(sg.rows_bf16);
     me.max_context = m.max_context();
     me.chunk = sg.chunk;
     me.handoff_floats = sg.handoff_floats;
