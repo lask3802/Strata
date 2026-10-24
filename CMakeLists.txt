@@ -906,6 +906,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # the remote experts' send gate and reply deadline (rx::Gate, ds4_rx.hpp): no GPU, no socket
       add_executable(ds4_rx_gate_test tests/dsv41/rx_gate_test.cpp)
       target_compile_features(ds4_rx_gate_test PRIVATE cxx_std_17)
+      # the link's arrival time in the kernel (rx::Conn, SO_TIMESTAMPNS on Linux) over loopback: no GPU
+      add_executable(ds4_rx_link_test tests/dsv41/rx_link_test.cpp src/dsv41/ds4_rx.cpp)
+      target_compile_features(ds4_rx_link_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_rx_link_test PRIVATE Threads::Threads)
+      if(WIN32)
+        target_link_libraries(ds4_rx_link_test PRIVATE ws2_32)
+      endif()
       # the kept conversations' .meta file and prefix matching (ds4_slotmeta.hpp): no GPU, no model
       add_executable(ds4_slot_test tests/dsv41/slot_test.cpp)
       target_include_directories(ds4_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)

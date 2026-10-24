@@ -83,8 +83,9 @@ struct Gate {
     double rtt[kMaxRows + 1] = {}, pick[kMaxRows + 1] = {};
     int run[kMaxRows + 1] = {}, seen[kMaxRows + 1] = {};
     static void ew(double& a, double v) { a = a > 0.0 ? 0.9 * a + 0.1 * v : v; }
-    // a reply the lane waited for: its round trip (a late one: the time waited, a lower bound).  One already there when
-    // the lane finished its own part says only that the round trip was at most that long - the time is the lane's, not
+    // a reply's round trip: from the kernel's arrival time where there is one (Linux), else a reply the lane waited for
+    // (a late one: the time waited, a lower bound).  Without it, one already there when the lane finished its own part
+    // says only that the round trip was at most that long - the time is the lane's, not
     // the link's -: it may lower the estimate, never raise it.  After 4 samples a sample counts as 3 x the estimate at
     // most (one spike moves it by 20%; the late count is the reply's own time)
     void rtt_seen(int rows, double ms, bool waited = true) {
@@ -134,6 +135,9 @@ public:
     /// 1: a whole message in h / payload; 0: none by deadline (steady ms; < 0: no deadline); -1: the link failed (err)
     int recv(Hdr& h, std::vector<uint8_t>& payload, double deadline, std::string& err);
     std::string peer() const { return peer_; }
+    /// the last message recv gave: when the kernel took in the read that completed it (steady ms; SO_TIMESTAMPNS,
+    /// Linux), -1 where the kernel says nothing (Windows)
+    double arrival_ms() const { return arrival_; }
     uint64_t bytes_out = 0, bytes_in = 0;
 
 private:
@@ -142,6 +146,7 @@ private:
     std::string peer_;
     std::vector<uint8_t> rb_;   // bytes read, not yet a whole message
     double last_in_ = 0;        // when bytes last came in (steady ms)
+    double in_at_ = -1, arrival_ = -1;   // the kernel's time of the last read; of the last message's
 };
 
 /// The main process's end: the server's hello, the geometry and blobs, then requests and their replies.
@@ -161,6 +166,8 @@ public:
     /// request seq's reply: 1 and its rows (nrows x n_embd bf16, valid until the next call) in *y, the server's time
     /// in srv_us; 0: not in by the deadline (steady ms; it is skipped when it comes); -1: the link failed (err)
     int wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y, int& srv_us, std::string& err);
+    /// the last reply's arrival in the kernel (Conn::arrival_ms: steady ms, -1 unknown)
+    double arrival_ms() const { return c_.arrival_ms(); }
     /// tests: a Ping of `bytes` payload and its Pong (1; 0 none by the deadline; -1 the link failed)
     int ping(uint32_t seq, size_t bytes, double deadline, std::string& err);
     void close() { c_.close(); }

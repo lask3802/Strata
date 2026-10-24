@@ -1075,7 +1075,7 @@ struct Model::Impl {
     static_assert(rx::kMaxRows == kWin && rx::kMaxPicks == kPicks, "a request's rows and picks are a window's");
     std::vector<rx::ReqRow> rx_rows;
     mutable std::mutex rx_mu;
-    std::vector<float> rx_rtt, rx_wait;
+    std::vector<float> rx_rtt, rx_wait, rx_arr;
     bool sync_decode = std::getenv("DS4_SYNC") != nullptr;
     // a window of one through moe_gate_up / moe_down (DS4_MOE_TOKEN=0: win_experts, whose down rows run
     // before the wait for the CPU lane - the same bits, no faster)
@@ -6632,6 +6632,7 @@ struct Model::Impl {
         rx_on = held > 0;
         rx_rtt.reserve(1 << 20);
         rx_wait.reserve(1 << 20);
+        rx_arr.reserve(1 << 20);
     }
     // the link given up: the lane computes every pick from now on (said once)
     void rx_lost(const std::string& why) {
@@ -6722,7 +6723,9 @@ struct Model::Impl {
         std::string e;
         const int got = rx_on ? rx_link->wait_resp(seq, rows, deadline, &y, srv_us, e) : -1;
         const double t1 = rx::now_ms();
-        if (got >= 0) rx_gate.rtt_seen(rows, t1 - t0, t1 - tw > 0.05);   // (read within 50 us of the lane's part: there already)
+        const double ta = got == 1 ? rx_link->arrival_ms() : -1.0;   // (the kernel's time the reply came in: Linux)
+        if (ta >= t0) rx_gate.rtt_seen(rows, ta - t0);
+        else if (got >= 0) rx_gate.rtt_seen(rows, t1 - t0, t1 - tw > 0.05);   // (read within 50 us of the lane's part: there already)
         st.rx_wait_ms += t1 - tw;
         st.rx_bytes_out = (int64_t) rx_link->bytes_out();
         st.rx_bytes_in = (int64_t) rx_link->bytes_in();
@@ -6731,6 +6734,7 @@ struct Model::Impl {
             if (rx_rtt.size() < (size_t(1) << 22)) {   // (4M requests: the percentiles are of the first ones after)
                 rx_rtt.push_back(got == 1 ? (float) (t1 - t0) : -1.0f);
                 rx_wait.push_back((float) (t1 - tw));
+                rx_arr.push_back(ta >= t0 ? (float) (ta - t0) : -1.0f);
             }
         }
         if (got == 1) {
@@ -6770,11 +6774,12 @@ struct Model::Impl {
     }
     std::string rx_lines(const Stats& s0, double nt) const {
         if (st.rx_held == 0) return "";
-        std::vector<float> rt, wt;
+        std::vector<float> rt, wt, at;
         {
             std::lock_guard<std::mutex> lk(rx_mu);
             for (size_t i = (size_t) std::max<int64_t>(0, s0.rx_reqs); i < rx_rtt.size(); ++i) {
                 if (rx_rtt[i] >= 0) rt.push_back(rx_rtt[i]);
+                if (rx_arr[i] >= 0) at.push_back(rx_arr[i]);
                 wt.push_back(rx_wait[i]);
             }
         }
@@ -6791,23 +6796,24 @@ struct Model::Impl {
                           v[std::min(v.size() - 1, (size_t) ((double) v.size() * 0.99))]);
             out = b;
         };
-        std::string rts, wts;
+        std::string rts, wts, ats;
         pct(rt, rts);
         pct(wt, wts);
+        pct(at, ats);
         const double req = (double) (st.rx_reqs - s0.rx_reqs), served = (double) (st.rx_picks - s0.rx_picks);
         const double local = (double) (st.cpu_experts - s0.cpu_experts);
         char b[1024];
         std::snprintf(b, sizeof b,
                       "remote experts: %.1f%% of the CPU lane's picks served by the expert server (%.2f a token of %.2f), "
                       "%.2f a token computed here after all (%lld late replies%s); %.2f requests a token\n"
-                      "remote experts per request: round trip %s ms (the server's own %.3f ms), the lane's wait after its "
-                      "part %s ms\n"
+                      "remote experts per request: round trip %s ms (the server's own %.3f ms; send to the reply's arrival "
+                      "in the kernel %s ms), the lane's wait after its part %s ms\n"
                       "remote experts per token: the lane's own part %.2f ms + its wait %.2f ms + the late ones %.2f ms; the "
                       "link %.1f KB out, %.1f KB in; the upload %lld experts, %.2f GB in %.1f s\n",
                       local + served > 0 ? 100.0 * served / (local + served) : 0.0, served / nt, (local + served) / nt,
                       (double) (st.rx_fallback - s0.rx_fallback) / nt, (long long) (st.rx_late - s0.rx_late),
                       rx_on ? "" : ", the link given up", req / nt, rts.c_str(),
-                      (st.rx_srv_ms - s0.rx_srv_ms) / std::max<double>(1.0, (double) rt.size()), wts.c_str(),
+                      (st.rx_srv_ms - s0.rx_srv_ms) / std::max<double>(1.0, (double) rt.size()), ats.c_str(), wts.c_str(),
                       (st.cpu_ms - s0.cpu_ms) / nt, (st.rx_wait_ms - s0.rx_wait_ms) / nt,
                       (st.rx_fallback_ms - s0.rx_fallback_ms) / nt,
                       (double) (st.rx_bytes_out - s0.rx_bytes_out) / 1e3 / nt, (double) (st.rx_bytes_in - s0.rx_bytes_in) / 1e3 / nt,

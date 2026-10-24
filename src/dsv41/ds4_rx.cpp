@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <thread>
 
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(_M_ARM64EC)
@@ -28,6 +29,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/uio.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -103,6 +105,9 @@ void tune(sock_t s) {
     int buf = 8 << 20;
     setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*) &buf, sizeof buf);
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*) &buf, sizeof buf);
+#if defined(SO_TIMESTAMPNS)
+    setsockopt(s, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof one);   // (the kernel's arrival time: Conn::arrival_ms)
+#endif
     nonblock(s);
 }
 
@@ -311,14 +316,35 @@ int Conn::recv(Hdr& h, std::vector<uint8_t>& payload, double deadline, std::stri
             if (rb_.size() >= sizeof(Hdr) + h.bytes) {
                 payload.assign(rb_.begin() + sizeof(Hdr), rb_.begin() + (long) (sizeof(Hdr) + h.bytes));
                 rb_.erase(rb_.begin(), rb_.begin() + (long) (sizeof(Hdr) + h.bytes));
+                arrival_ = in_at_;
                 return 1;
             }
         }
+        double at = -1;   // (the kernel's time of this read, steady ms)
+#if defined(SO_TIMESTAMPNS)
+        iovec iv{tmp, sizeof tmp};
+        alignas(cmsghdr) char cb[CMSG_SPACE(sizeof(timespec))];
+        msghdr mh{};
+        mh.msg_iov = &iv;
+        mh.msg_iovlen = 1;
+        mh.msg_control = cb;
+        mh.msg_controllen = sizeof cb;
+        const int k = (int) ::recvmsg((sock_t) fd_, &mh, 0);
+        for (cmsghdr* cm = k > 0 ? CMSG_FIRSTHDR(&mh) : nullptr; cm != nullptr; cm = CMSG_NXTHDR(&mh, cm))
+            if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_TIMESTAMPNS) {   // (the realtime clock: its age)
+                timespec ts, rt;
+                std::memcpy(&ts, CMSG_DATA(cm), sizeof ts);
+                clock_gettime(CLOCK_REALTIME, &rt);
+                at = now_ms() - ((double) (rt.tv_sec - ts.tv_sec) * 1e3 + (double) (rt.tv_nsec - ts.tv_nsec) / 1e6);
+            }
+#else
         const int k = (int) ::recv((sock_t) fd_, (char*) tmp, (int) sizeof tmp, 0);
+#endif
         if (k > 0) {
             rb_.insert(rb_.end(), tmp, tmp + k);
             bytes_in += (uint64_t) k;
             last_in_ = now_ms();
+            in_at_ = at;
             continue;
         }
         if (k == 0 || !would_block(last_err())) {
