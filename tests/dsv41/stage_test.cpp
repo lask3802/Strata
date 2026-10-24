@@ -1,5 +1,6 @@
 // The DeepSeek engine's remote stage without a GPU (src/dsv41/ds4_stage.hpp): the pack fingerprint both hellos carry
-// (the same model on two PCs whose model_dir differs; any other line of ds4.txt or tensors.txt changes it), every
+// (the same model on two PCs whose model_dir differs, or whose files' lines end in CRLF on one; any other line of
+// ds4.txt or tensors.txt changes it), every
 // main-process hello a worker refuses and the worker's hello a main process refuses, the reply's layout (the normed
 // rows, then the drafter's taps: which ones the main process takes), what a Commit keeps; the compact bf16 rows
 // (STRATA_REMOTE_ROWS=bf16): the picks exact, the streams rounded as the link's bf16 rounds, the hello refusing a
@@ -669,6 +670,20 @@ int main() {
     fs::remove(b / "tensors.txt");   // a missing index: not the same pack
     CHECK(st::pack_hash(b.string()) != ha);
     CHECK(st::pack_hash((root / "none").string()) == 0);
+    {   // a pack written on Windows (CRLF lines) and on Linux: the same fingerprint, the model_dir line left out still
+        auto crlf = [](const std::string& s) {
+            std::string r;
+            for (const char ch : s) r += ch == '\n' ? std::string("\r\n") : std::string(1, ch);
+            return r;
+        };
+        put(b / "tensors.txt", crlf(tensors));
+        put(b / "ds4.txt", crlf("model_dir D:\\models\\ds4\n" + geo));
+        CHECK(st::pack_hash(b.string()) == ha);
+        put(b / "ds4.txt", crlf(geo) + "\r");   // (a '\r' after the last line, with no newline)
+        CHECK(st::pack_hash(b.string()) == ha);
+        put(b / "ds4.txt", crlf("hidden_size 4096\nnum_hidden_layers 42\nhc_mult 4\n"));   // another geometry
+        CHECK(st::pack_hash(b.string()) != ha);
+    }
 
     // the worker's checks of a main process's hello
     net::StageHello mine, theirs;

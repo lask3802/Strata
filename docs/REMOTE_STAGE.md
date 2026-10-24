@@ -490,7 +490,29 @@ layers 40-47 to a Windows node, 11.39 GiB in 211 s and 15.51 GiB in 184 s; UD-Q4
 PC C's RVN workers in the measurements above ran from these sparse files (PC B's RVN worker had a full copy).
 
 **DeepSeek-V4.1 (`strata-dsv41`) through the same tools.** Its worker is a different program with its own flags
-(`--stage-worker PORT --stage-begin K`, layers K to the last, no relay), so the agent starts it only when asked:
+(`--stage-worker PORT --stage-begin K`, layers K to 39 of the model's 40, no relay), so the agent starts it only when
+asked. What its remote stage does (the code is `src/dsv41/ds4_stage.hpp`; on two PCs none of it is measured yet):
+
+- **Windows** of up to 16 rows each way, the hand-off rows fp32: the streams, pre and the indexer's int32 picks and
+  candidate blocks, 92,192 bytes a token. The worker's reply is its last layer's rows through the final norm.
+- **Prompt chunks** (`--prefill-chunk N`, the chunked prompt path on both PCs): the main process runs chunk c + 1
+  through its layers while the worker runs chunk c. Chunks cross as fp32 rows only. `DS4_LAYER_MAJOR=0` on the main
+  process keeps it chunk after chunk, which is what overlaps with the worker. A worker refuses chunks larger than its
+  own.
+- **DSpark across the split** with `--dspark on` on the main process: the drafter runs there, the worker's reply
+  carries the drafter's taps of its layers, and a draft's check is a window the worker keeps in part (the rows the
+  main process rejected are undone there, as one process undoes them). With the drafter loaded the main process
+  sends its prompts in windows, not chunks: a chunk's reply carries no taps. `--dspark auto` decides as on one PC
+  (it may not load the drafter at all when the experts are far larger than the GPU).
+- **bf16 rows** (`STRATA_REMOTE_ROWS=bf16` on both PCs; a mismatch is refused at the hello): the streams cross as
+  bf16, pre and the picks exactly, 51,232 bytes a token. The engine packs the rows itself: the link's own bf16 would
+  round the picks. With bf16 rows there are no prompt chunks (prompts in windows), since a chunk's rows would be
+  converted whole.
+- `STRATA_REMOTE_TIMING=1`: the timing lines, every 64 windows, as the Qwen engine's.
+- **Not yet**: slots and conversation checkpoints (every request is read from token 0 on both PCs), relays, images,
+  `--tp` above 1 at either end of the link.
+
+The tools:
 
 ```
 python3 tools/stage_ship.py --engine dsv41 --agent http://192.0.2.11:7840 --token-file /opt/strata/stage-token \
@@ -655,7 +677,7 @@ after changing these settings.
 | | status |
 |---|---|
 | Model family | Qwen3.8-Flash-Next only (48 layers, 512 experts top-10, 4 hyper-connection streams, n_embd 2560). The hello checks the geometry. A Qwen3.6-35B-A3B file (0.1.44 runs it from the same binary, on its own engine path) is refused at start |
-| DeepSeek V4.1-Flash (0.2.4) | not supported: it runs on its own engine, `strata-dsv41` (`src/dsv41`), which has no remote stage and stops at an unknown option such as `--remote-stage` |
+| DeepSeek V4.1-Flash (`strata-dsv41`, its own engine) | two PCs, 40 layers (0-39) cut at K: the main process `--remote-stage HOST:PORT --stage-end K` (layers 0 to K - 1, Engram, the head), the worker `--stage-worker PORT --stage-begin K` (K to 39). Windows of 16; prompt chunks (fp32 rows only); DSpark across the split with `--dspark on`; bf16 rows (`STRATA_REMOTE_ROWS=bf16` on both). Not yet: slots and checkpoints (every request from token 0), relays, images, `--tp` above 1 at either end of the link. More under [Tools](#tools) (DeepSeek-V4.1). Windows with fp32 rows checked on one PC over the loopback (`tools/dsv41/remote_loopback.sh`); the chunks, DSpark across the split and bf16 rows not yet run on a GPU; not measured on two PCs |
 | RVN IQ3_S, native pack read from its GGUF | **measured** (two and three PCs) |
 | Huihui UD-Q4_K_XL (Unsloth UD layout), native pack read from its GGUF | **measured** (one, two and three PCs) |
 | Other quantizations and models of the family (the official IQ3_S, IQ3_XXS, IQ2_XS, Coder, Swift 1.5, UD-IQ4_XS) | not tested. The hand-off is fp32 rows whatever the quantization, the arena range is cut by layer from the pack's expert table and the shipper works by tensor name |

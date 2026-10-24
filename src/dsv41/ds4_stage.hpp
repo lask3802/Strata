@@ -53,7 +53,8 @@ inline uint64_t fnv1a(const void* data, size_t n, uint64_t h = 14695981039346656
 
 /// The pack's fingerprint: its tensor index and its geometry (tensors.txt, ds4.txt), as the Qwen engine's hello
 /// hashes its own index - each file's name, then its bytes.  ds4.txt's model_dir line is left out: it says where this
-/// PC keeps the model's files, which two PCs need not share.  0: neither file could be read.
+/// PC keeps the model's files, which two PCs need not share.  A line's '\r' is left out too, so a pack written on
+/// Windows (CRLF) and the same one written on Linux agree.  0: neither file could be read.
 inline uint64_t pack_hash(const std::string& pack) {
     uint64_t h = 0;
     for (const char* f : {"/tensors.txt", "/ds4.txt"}) {
@@ -65,7 +66,13 @@ inline uint64_t pack_hash(const std::string& pack) {
         for (size_t a = 0; a < body.size();) {   // (line by line, each with its newline)
             size_t b = body.find('\n', a);
             b = b == std::string::npos ? body.size() : b + 1;
-            if (!(geometry && body.compare(a, 10, "model_dir ") == 0)) h = fnv1a(body.data() + a, b - a, h);
+            if (!(geometry && body.compare(a, 10, "model_dir ") == 0))
+                for (size_t c = a; c < b;) {   // (the line's runs between its '\r's)
+                    size_t r = body.find('\r', c);
+                    r = r == std::string::npos || r > b ? b : r;
+                    h = fnv1a(body.data() + c, r - c, h);
+                    c = r < b ? r + 1 : b;
+                }
             a = b;
         }
     }

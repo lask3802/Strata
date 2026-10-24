@@ -25,9 +25,11 @@
 #        sequence: the chunks' check below); PYTHON (python3)
 #
 # Both processes read the experts in place (--mmap-experts on: the files' page cache, shared by both, no copies in
-# RAM), with no SSD store, a fixed placement (--no-expert-cache --expert-profile none) and Engram row caches of
-# ENGRAM_MB: what one PC's RAM holds twice over is the dense weights and the KV caches.  The worker listens on
-# 127.0.0.1 only and the link carries a token made here (STRATA_STAGE_TOKEN, unless one is set).
+# RAM), with no SSD store, a fixed placement (--no-expert-cache, and an expert profile file of each process's own in
+# the out dir, removed before it starts: none is read, and none is shared - not the pack's expert-profile.bin, which a
+# layer range writes its own rows into) and Engram row caches of ENGRAM_MB: what one PC's RAM holds twice over is the
+# dense weights and the KV caches.  The worker listens on 127.0.0.1 only and the link carries a token made here
+# (STRATA_STAGE_TOKEN, unless one is set).
 #
 # The split's logits are not expected to be the same bits as one process's: each process places its own experts
 # (which ones VRAM holds follows the VRAM free at its load), and a window's sum of experts in another place is another
@@ -52,7 +54,7 @@
 # STRATA_REMOTE_ROWS=bf16 passes through as well, and turns the chunks off on both sides (windows of 16).
 set -u
 if [ $# -lt 3 ]; then
-    sed -n '2,52p' "$0"
+    sed -n '2,54p' "$0"
     exit 2
 fi
 exe=$1
@@ -72,8 +74,13 @@ mkdir -p "$out"
 export STRATA_STAGE_TOKEN=${STRATA_STAGE_TOKEN:-loopback-$$-$RANDOM$RANDOM}
 export CUDA_VISIBLE_DEVICES=$gpu
 export DS4_ENGRAM_CACHE_MB=$eg_mb
-common=(--pack "$pack" --vram-experts "$vram" --mmap-experts on --ssd-cache 0 --no-expert-cache --expert-profile none
+common=(--pack "$pack" --vram-experts "$vram" --mmap-experts on --ssd-cache 0 --no-expert-cache
         --cpu-threads "$thr" --vision off --verbose)
+# a process's own expert profile file, new (the main process's runs: main.sh names one by its PID)
+prof() {
+    rm -f "$out/$1.profile"
+    echo "$out/$1.profile"
+}
 
 # the long prompt's ids (LONG, or LONG_N made up: BOS, then a fixed walk over ordinary token ids)
 long=
@@ -97,8 +104,8 @@ if [ -n "$long" ]; then
 fi
 
 # the worker, in the background until this script ends (or the single-process runs need its GPU)
-"$exe" "${common[@]}" --max-context "$ctx" --prefill-chunk "$chunk" --stage-worker "$port" --stage-bind 127.0.0.1 \
-    --stage-begin "$K" > "$out/worker.out" 2> "$out/worker.err" &
+"$exe" "${common[@]}" --expert-profile "$(prof worker)" --max-context "$ctx" --prefill-chunk "$chunk" \
+    --stage-worker "$port" --stage-bind 127.0.0.1 --stage-begin "$K" > "$out/worker.out" 2> "$out/worker.err" &
 wpid=$!
 trap 'kill $wpid 2> /dev/null; wait $wpid 2> /dev/null' EXIT
 echo "worker pid $wpid: layers $K to the last on GPU $gpu, port $port (log $out/worker.err)"
@@ -117,8 +124,10 @@ echo "  $(grep -h 'remote stage worker:' "$out/worker.err" | head -1)"
 main="$out/main.sh"
 {
     echo '#!/bin/bash'
+    printf 'p=%q/main-$$.profile; rm -f "$p"   # (each run its own profile file)\n' "$out"
     printf 'exec %q "$@"' "$exe"
     printf ' %q' "${common[@]}" --prefill-chunk "$chunk" --remote-stage "127.0.0.1:$port" --stage-end "$K"
+    printf ' --expert-profile "$p"'
     echo
 } > "$main"
 chmod +x "$main"
@@ -199,14 +208,14 @@ wait $wpid 2> /dev/null
 # one process, the whole trunk, on the same GPU
 if [ -n "${SPEC_IDS:-}" ]; then
     echo "== speculative decoding through one process"
-    DS4_CHUNK_MIN=100000 "$exe" "${common[@]}" --max-context "$ctx" --prefill-chunk 0 "${spec[@]}" --ids "@$SPEC_IDS" \
-        > "$out/spec-single.out" 2> "$out/spec-single.err"
+    DS4_CHUNK_MIN=100000 "$exe" "${common[@]}" --expert-profile "$(prof spec-single)" --max-context "$ctx" \
+        --prefill-chunk 0 "${spec[@]}" --ids "@$SPEC_IDS" > "$out/spec-single.out" 2> "$out/spec-single.err"
     s1=$?
     echo "spec single rc=$s1"
     arms="spec-split spec-single"
     if [ "${SPEC_NONE:-0}" = 1 ]; then
-        DS4_CHUNK_MIN=100000 "$exe" "${common[@]}" --max-context "$ctx" --prefill-chunk 0 --dspark none --n "$spec_n" \
-            --ids "@$SPEC_IDS" > "$out/plain-single.out" 2> "$out/plain-single.err"
+        DS4_CHUNK_MIN=100000 "$exe" "${common[@]}" --expert-profile "$(prof plain-single)" --max-context "$ctx" \
+            --prefill-chunk 0 --dspark none --n "$spec_n" --ids "@$SPEC_IDS" > "$out/plain-single.out" 2> "$out/plain-single.err"
         echo "plain single rc=$?"
         arms="$arms plain-split plain-single"
     fi
@@ -231,8 +240,8 @@ if [ -n "${SPEC_IDS:-}" ]; then
     fi
 fi
 if [ -n "${IDS:-}" ]; then
-    DS4_CHUNK_MIN=100000 "$exe" "${common[@]}" --max-context "$ctx" --prefill-chunk 0 --dspark none --n 64 --ids "$ids" \
-        --dump-logits "$out/single.f32" > "$out/single.out" 2> "$out/single.err"
+    DS4_CHUNK_MIN=100000 "$exe" "${common[@]}" --expert-profile "$(prof single)" --max-context "$ctx" --prefill-chunk 0 \
+        --dspark none --n 64 --ids "$ids" --dump-logits "$out/single.f32" > "$out/single.out" 2> "$out/single.err"
     s=$?; echo "single rc=$s"; [ $s -eq 0 ] || rc=1
     for b in split single; do
         echo "  $b: $(grep -h 'in VRAM' "$out/$b.err" | head -1 | sed 's/.*experts/experts/')"
@@ -241,11 +250,12 @@ if [ -n "${IDS:-}" ]; then
     compare "$out/split.f32" "$out/single.f32" || rc=1
 fi
 if [ -n "$long" ]; then
-    DS4_YOCO=0 DS4_PATH_PICK=0 "$exe" "${common[@]}" --max-context "$ctx" --prefill-chunk "$chunk" --dspark none --n 16 \
-        --ids "@$long" --window "$nlong" --dump-logits "$out/single-long.f32" > "$out/single-long.out" 2> "$out/single-long.err"
+    DS4_YOCO=0 DS4_PATH_PICK=0 "$exe" "${common[@]}" --expert-profile "$(prof single-long)" --max-context "$ctx" \
+        --prefill-chunk "$chunk" --dspark none --n 16 --ids "@$long" --window "$nlong" --dump-logits "$out/single-long.f32" \
+        > "$out/single-long.out" 2> "$out/single-long.err"
     s=$?; echo "single (every row's logits) rc=$s"; [ $s -eq 0 ] || rc=1
-    DS4_YOCO=0 DS4_PATH_PICK=0 "$exe" "${common[@]}" --max-context "$ctx" --prefill-chunk "$chunk" --dspark none --n 16 \
-        --ids "@$long" > "$out/single-speed.out" 2> "$out/single-speed.err"
+    DS4_YOCO=0 DS4_PATH_PICK=0 "$exe" "${common[@]}" --expert-profile "$(prof single-speed)" --max-context "$ctx" \
+        --prefill-chunk "$chunk" --dspark none --n 16 --ids "@$long" > "$out/single-speed.out" 2> "$out/single-speed.err"
     s=$?; echo "single (the prompt's speed) rc=$s"; [ $s -eq 0 ] || rc=1
     same split-long single-long
     compare "$out/split-long.f32" "$out/single-long.f32" || rc=1
