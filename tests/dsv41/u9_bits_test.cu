@@ -569,6 +569,19 @@ int main(int argc, char** argv) {
     if (!bench) test_quant(s);
     if (!bench) test_route(s);
     if (!bench) test_split(s);
+    if (!bench) {   // (U9 hc's side stream and events are made after free0: what they take of the free VRAM, if any)
+        size_t f0 = 0, f1 = 0, tot = 0;
+        CU(cudaMemGetInfo(&f0, &tot));
+        cudaStream_t s2;
+        cudaEvent_t e[2];
+        CU(cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking));
+        for (auto& ev : e) CU(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        CU(cudaMemGetInfo(&f1, &tot));
+        std::printf("info a non-blocking stream and two events took %lld bytes of the free VRAM\n",
+                    (long long) f0 - (long long) f1);
+        for (auto& ev : e) CU(cudaEventDestroy(ev));
+        CU(cudaStreamDestroy(s2));
+    }
     test_q5k(s, bench);
     std::printf("%d of %d cases failed\n", g_fail, g_cases);
     return g_fail ? 1 : 0;
