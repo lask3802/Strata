@@ -18,6 +18,7 @@
 #include "ds4_gguf.cuh"
 #include "ds4_iq.cuh"
 #include "ds4_gguf_cpu.hpp"
+#include "ds4_ffslice.hpp"
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
@@ -620,6 +621,9 @@ struct Layer {
     x3::ExpertLayout hlay;
     size_t hblob = 0;
     int ff0 = 0, ffn = 0;     // this member's FFN columns [ff0, ff0 + ffn) (split128 of n_ff; the whole one alone)
+    // expert parallelism: the routed experts' n_ff slice [ep_ff0, ep_ff0 + ep_ffn) this process's CPU lane computes (the
+    // GGUF i-quant experts, cpu_experts_iq: a partial sum of each expert's output) - the whole n_ff unless EP sets it
+    int ep_ff0 = 0, ep_ffn = 0;
     // this member's heads [ah0, ah0 + ahn) and wo_a groups [og0, og0 + ogn) - all of them alone; in a group of more
     // members than the heads split among evenly (head_members: 9, 7 or 6 over 64 heads), the first ones none: their
     // attention adds nothing to the sum
@@ -1830,23 +1834,31 @@ struct Model::Impl {
     }
     void mx_blob_to_half(const Layer& l, const uint8_t* blob, int m, uint8_t* dst) const {
         const int ffh = g.ff / l.nm;
-        const size_t gr = gg::type_row_bytes(gg::expert_type(l.lay, 0), g.dim),
-                     dr = gg::type_row_bytes(gg::expert_type(l.lay, 2), g.ff),
-                     dh = gg::type_row_bytes(gg::expert_type(l.lay, 2), ffh);
-        for (int r = 0; r < 2; ++r)
-            std::memcpy(dst + l.hlay.trellis[r], blob + l.lay.trellis[r] + (size_t) m * ffh * gr, (size_t) ffh * gr);
-        for (size_t row = 0; row < (size_t) g.dim; ++row)
-            std::memcpy(dst + l.hlay.trellis[2] + row * dh, blob + l.lay.trellis[2] + row * dr + (size_t) m * dh, dh);
+        mx_blob_to_slice(l, blob, m * ffh, ffh, l.hlay.trellis, dst);
     }
     void mx_half_to_blob(const Layer& l, const uint8_t* src, int m, uint8_t* blob) const {
         const int ffh = g.ff / l.nm;
-        const size_t gr = gg::type_row_bytes(gg::expert_type(l.lay, 0), g.dim),
-                     dr = gg::type_row_bytes(gg::expert_type(l.lay, 2), g.ff),
-                     dh = gg::type_row_bytes(gg::expert_type(l.lay, 2), ffh);
-        for (int r = 0; r < 2; ++r)
-            std::memcpy(blob + l.lay.trellis[r] + (size_t) m * ffh * gr, src + l.hlay.trellis[r], (size_t) ffh * gr);
-        for (size_t row = 0; row < (size_t) g.dim; ++row)
-            std::memcpy(blob + l.lay.trellis[2] + row * dr + (size_t) m * dh, src + l.hlay.trellis[2] + row * dh, dh);
+        mx_slice_to_blob(l, src, m * ffh, ffh, l.hlay.trellis, blob);
+    }
+    // the same for any slice [ff0, ff0 + ffn) of n_ff in whole blocks of the experts' types (ds4_ffslice.hpp), the slice's
+    // matrices at so[3]: a tensor parallel member's even share, an expert parallel side's part of n_ff
+    FfSlice mx_slice(const Layer& l, int ff0, int ffn) const {
+        const int td = gg::expert_type(l.lay, 2);
+        FfSlice s;
+        s.dim = g.dim;
+        s.ff0 = ff0;
+        s.ffn = ffn;
+        s.gr = gg::type_row_bytes(gg::expert_type(l.lay, 0), g.dim);
+        s.dr = gg::type_row_bytes(td, g.ff);
+        s.ds = gg::type_row_bytes(td, ffn);
+        s.d_off = gg::type_row_bytes(td, ff0);
+        return s;
+    }
+    void mx_blob_to_slice(const Layer& l, const uint8_t* blob, int ff0, int ffn, const size_t so[3], uint8_t* dst) const {
+        ff_blob_to_slice(mx_slice(l, ff0, ffn), blob, l.lay.trellis, dst, so);
+    }
+    void mx_slice_to_blob(const Layer& l, const uint8_t* src, int ff0, int ffn, const size_t so[3], uint8_t* blob) const {
+        ff_slice_to_blob(mx_slice(l, ff0, ffn), src, so, blob, l.lay.trellis);
     }
 
     bool expert_layout(Layer& l, std::string& err) {
@@ -2349,6 +2361,8 @@ struct Model::Impl {
         for (Layer& l : L) {
             l.ff0 = 0;
             l.ffn = g.ff;
+            l.ep_ff0 = 0;
+            l.ep_ffn = g.ff;
             l.ah0 = l.og0 = 0;
             l.ahn = g.heads;
             l.ogn = g.o_groups;
@@ -5841,15 +5855,26 @@ struct Model::Impl {
         run_nodes(ne * DB, f);
     }
     // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
-    // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same
+    // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same.
+    // With an n_ff slice (l.ep_ff0 / ep_ffn, expert parallelism): the gate / up rows of the slice, and the down over the
+    // slice's values in place (gg::iq_cpu_slice) - each entry's yd then its part of the expert's output
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
         constexpr int RB = 64;   // rows a job
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
-        const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
-        gg::IqCpu fm;
+        const int ff0 = l.ep_ff0, ffn = l.ep_ffn;
+        const bool sliced = ff0 != 0 || ffn != FF;
+        int glo[4], ghi[4], gmax = 0;   // node X's gate / up rows: its part's [X FFh, ..) within the slice
+        for (int X = 0; X < NH; ++X) {
+            glo[X] = std::max(X * FFh, ff0);
+            ghi[X] = std::min(X * FFh + FFh, ff0 + ffn);
+            gmax = std::max(gmax, ghi[X] - glo[X]);
+        }
+        const int GB = (gmax + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
+        gg::IqCpu fm, fs;
+        size_t d_off = 0;
         std::string ferr;
         if (!gg::iq_cpu_fmt(gg::expert_type(l.lay, 0), gg::expert_type(l.lay, 2), E, FF, fm, ferr) ||
-            fm.act_bytes > (size_t) E * 4 || fm.h_bytes > (size_t) E * 4) {
+            fm.act_bytes > (size_t) E * 4 || fm.h_bytes > (size_t) E * 4 || (sliced && !gg::iq_cpu_slice(fm, ff0, ffn, fs, d_off, ferr))) {
             static std::atomic<bool> said{false};
             if (!said.exchange(true)) std::fprintf(stderr, "ds4: layer %d's CPU-lane experts: %s\n", l.il, ferr.c_str());
             for (const Ent& en : ents) std::memset(c_yd.data() + (size_t) en.slot0 * E, 0, (size_t) en.n * E * 4);
@@ -5862,7 +5887,9 @@ struct Model::Impl {
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
                 if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
-                    for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
+                    for (int r = 0; r < 3; ++r)   // (a slice's gate / up rows; the down's rows hold every slice)
+                        want.push_back({mx_mat(l, en.e, r) + (r < 2 ? (size_t) ff0 * mx_row_b(l, r) : 0),
+                                        r < 2 ? (size_t) ffn * mx_row_b(l, r) : mx_part_bytes(l, r)});
             static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
             if (pf_all) os::prefetch(want);
             else os::prefetch_cold(want);
@@ -5889,7 +5916,8 @@ struct Model::Impl {
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
-                const int r0 = X * FFh + (j % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
+                const int r0 = glo[X] + (j % GB) * RB, r1 = std::min(ghi[X], r0 + RB);
+                if (r0 >= r1) return;   // (a node with fewer of the slice's rows)
                 const void* ap[kEntMax];
                 float* hp[kEntMax];
                 for (int i = 0; i < en.n; ++i) {
@@ -5904,8 +5932,9 @@ struct Model::Impl {
         run_nodes(ne * GB, f);
         for (const Ent& en : ents)
             for (int i = 0; i < en.n; ++i)
-                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
+                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF + ff0, ffn,
                                  aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+        const gg::IqCpu& fd = sliced ? fs : fm;
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
@@ -5916,7 +5945,7 @@ struct Model::Impl {
                     hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
                     yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
                 }
-                gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+                gg::iq_cpu_down(fd, mx_part_ptr(l, en.e, 2, X) + d_off, hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
             };
         run_nodes(ne * DB, f);
     }

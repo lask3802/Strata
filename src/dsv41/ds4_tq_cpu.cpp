@@ -75,7 +75,7 @@ bool tq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err
     f.n_ff = n_ff;
     f.gu_act = f.d_act = kActTq;
     f.gu_row = (size_t) (n_embd / 128) * (2 + 4 * kbits_of(tg));
-    f.d_row = (size_t) (n_ff / 128) * (2 + 4 * kbits_of(td));
+    f.d_row = f.d_stride = (size_t) (n_ff / 128) * (2 + 4 * kbits_of(td));
     f.act_bytes = act_bytes_of(n_embd);
     f.h_bytes = act_bytes_of(n_ff);
     return true;
@@ -117,7 +117,7 @@ void tq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, cons
 }
 
 void tq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1) {
-    dots(f.td, down, f.d_row, f.n_ff, hq, nt, out, r0, r1);
+    dots(f.td, down, f.d_stride, f.n_ff, hq, nt, out, r0, r1);
 }
 bool tq_cpu_type(int type) { return kbits_of(type) > 0; }
 int tq_cpu_act() { return kActTq; }
