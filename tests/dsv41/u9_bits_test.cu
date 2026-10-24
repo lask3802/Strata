@@ -3,6 +3,7 @@
 // byte.  Needs a GPU, no model.  u9_bits_test
 #include "../../src/dsv41/ds4_gguf.cuh"
 #include "../../src/dsv41/ds4_iq.cuh"
+#include "../../src/dsv41/ds4_kernels.cuh"
 #include "../../src/dsv41/ds4_u9.hpp"
 
 #include <cuda_fp16.h>
@@ -18,6 +19,7 @@
 namespace gg = strata::ds4::gguf;
 namespace x3 = strata::dsv41k::exl3;
 namespace u9 = strata::ds4::u9;
+namespace sd = strata::ds4;
 
 namespace {
 
@@ -212,6 +214,111 @@ void test_quant(cudaStream_t s) {
     for (M* m : wo) delete m;
 }
 
+// ---- item route: the gate GEMVs over BF16 rows in one launch, the lookahead + routing + publish in one launch
+uint16_t bf_of(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return (uint16_t) (u >> 16);
+}
+float f_of_bf(uint16_t b) {
+    const uint32_t u = (uint32_t) b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+void test_route(cudaStream_t s) {
+    for (int D : {4096, 5120}) {
+        const int n = 384;
+        std::vector<uint16_t> wb[3];
+        std::vector<float> wf[3];
+        uint16_t* dwb[3];
+        float* dwf[3];
+        for (int m = 0; m < 3; ++m) {
+            wb[m].resize((size_t) n * D);
+            wf[m].resize((size_t) n * D);
+            for (size_t i = 0; i < wb[m].size(); ++i) wf[m][i] = f_of_bf(wb[m][i] = bf_of(frand(0.05f)));
+            dwb[m] = dev(wb[m]);
+            dwf[m] = dev(wf[m]);
+        }
+        for (int T : {1, 3}) {
+            float* x = xbuf((size_t) T * D);
+            Outs out;
+            float* y[3];
+            for (int m = 0; m < 3; ++m) y[m] = (float*) out.add((size_t) T * 1024 * 4);
+            char what[96];
+            std::snprintf(what, sizeof(what), "route: 3 gates (BF16, one launch) vs gemv_f32, D %d T %d", D, T);
+            ab(what, u9::kRoute, out, [&] {
+                if (!u9::on(u9::kRoute)) {
+                    for (int m = 0; m < 3; ++m) sd::gemv_f32(dwf[m], x, n, D, T, y[m], 1024, s);
+                    return;
+                }
+                sd::GemvBf16 g = {};
+                for (int m = 0; m < 3; ++m) g.w[m] = dwb[m], g.y[m] = y[m], g.n[m] = n;
+                sd::gemv_bf16(g, 3, x, D, T, 1024, s);
+            }, s);
+            for (auto& b : out.b) CU(cudaFree(b.first));
+            CU(cudaFree(x));
+        }
+        for (int m = 0; m < 3; ++m) {
+            CU(cudaFree(dwb[m]));
+            CU(cudaFree(dwf[m]));
+        }
+    }
+    // the routing: scores with ties (logits and biases from a few values: many experts at the best score) and without;
+    // image rows (vl) with bias_vl; experts on the CPU lane (vram 0) so the x rows go into the request; 0, 1 and 2
+    // lookahead layers, a request or none
+    const int n = 384, k = 6, D = 5120;
+    std::vector<unsigned long long> vram(n);
+    for (int e = 0; e < n; ++e) vram[e] = (e % 3 == 0) ? 0ull : 0x1000ull + (unsigned long long) e * 64;
+    unsigned long long* dvram = dev(vram);
+    for (int ties = 0; ties < 2; ++ties) {
+        std::vector<float> bias(n), bias_vl(n), bias1(n), bias2(n);
+        for (auto* b : {&bias, &bias_vl, &bias1, &bias2})
+            for (auto& v : *b) v = ties ? (float) (rng() % 2) * 0.25f : frand(0.2f);
+        float *dbias = dev(bias), *dbias_vl = dev(bias_vl), *dbias1 = dev(bias1), *dbias2 = dev(bias2);
+        for (int T : {1, 3}) {
+            std::vector<float> lg((size_t) 3 * sd::kWin * 1024);
+            for (size_t i = 0; i < lg.size(); ++i) lg[i] = ties ? (float) ((int) (rng() % 9) - 4) * 0.5f : frand(4.0f);
+            float* dlg = dev(lg);   // [own rows (T x 1024)][lookahead 1 (kWin x 1024)][lookahead 2]
+            float* x = xbuf((size_t) T * D);
+            for (int nah = 0; nah <= 2; ++nah)
+                for (int with_req = 0; with_req < 2; ++with_req) {
+                    if (!with_req && nah > 0) continue;
+                    Outs out;
+                    int* idx = (int*) out.add((size_t) T * sd::kPicks * 4);
+                    float* w = (float*) out.add((size_t) T * sd::kPicks * 4);
+                    unsigned long long* plan = (unsigned long long*) out.add((size_t) T * sd::kPicks * 8);
+                    sd::Req* req = with_req ? (sd::Req*) out.add(sizeof(sd::Req)) : nullptr;
+                    const float* l1 = dlg + (size_t) sd::kWin * 1024;
+                    const float* l2 = l1 + (size_t) sd::kWin * 1024;
+                    const int m1 = 9, m2 = 6;
+                    char what[110];
+                    std::snprintf(what, sizeof(what), "route: fused routing, %s, T %d, %d lookahead%s", ties ? "ties" : "no ties",
+                                  T, nah, with_req ? ", request" : ", no request");
+                    ab(what, u9::kRoute, out, [&] {
+                        const unsigned vl = T > 1 ? 0x2u : 0u;   // (token 1: an image row)
+                        if (!u9::on(u9::kRoute)) {
+                            if (nah >= 1) sd::route_ahead(l1, dbias1, n, m1, T, req, 0, s);
+                            if (nah >= 2) sd::route_ahead(l2, dbias2, n, m2, T, req, sd::kAhead1, s);
+                            sd::route_publish(dlg, dbias, n, k, T, 2.5f, dvram, x, D, idx, w, plan, req, 77u, s, dbias_vl,
+                                              vl, nah >= 1 ? m1 : 0, nah >= 2 ? m2 : 0);
+                            return;
+                        }
+                        sd::RouteAhead ra = {};
+                        ra.logits[0] = l1, ra.bias[0] = dbias1, ra.n[0] = n, ra.m[0] = m1, ra.off[0] = 0;
+                        ra.logits[1] = l2, ra.bias[1] = dbias2, ra.n[1] = n, ra.m[1] = m2, ra.off[1] = sd::kAhead1;
+                        sd::route_fused(dlg, dbias, n, k, T, 2.5f, dvram, x, D, idx, w, plan, req, 77u, s, dbias_vl, vl,
+                                        nah >= 1 ? m1 : 0, nah >= 2 ? m2 : 0, ra, nah);
+                    }, s);
+                    for (auto& b : out.b) CU(cudaFree(b.first));
+                }
+            CU(cudaFree(dlg));
+            CU(cudaFree(x));
+        }
+        for (float* p : {dbias, dbias_vl, dbias1, dbias2}) CU(cudaFree(p));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -219,6 +326,7 @@ int main() {
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     if (!gg::prepare(s)) return 1;
     test_quant(s);
+    test_route(s);
     std::printf("%d of %d cases failed\n", g_fail, g_cases);
     return g_fail ? 1 : 0;
 }

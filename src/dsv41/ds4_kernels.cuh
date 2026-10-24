@@ -233,6 +233,25 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
+/// U9 route: gemv_f32 for up to 3 matrices of BF16 rows (w[i]: n[i] x k) on the same x in one launch, into y[i] (rows ldy
+/// apart).  The F32 widening of the rows is exact, so each output is gemv_f32's of the widened matrix bit for bit.
+struct GemvBf16 {
+    const uint16_t* w[3];
+    float* y[3];
+    int n[3];
+};
+void gemv_bf16(const GemvBf16& g, int nm, const float* x, int k, int T, int ldy, cudaStream_t s);
+/// U9 route: route_ahead for each lookahead layer (na of them) and route_publish in one launch, the last block to finish
+/// publishing the request: the same picks, weights, request and seq as those calls (and publish_kernel's order).
+struct RouteAhead {
+    const float* logits[2];   // (rows 1024 apart)
+    const float* bias[2];
+    int n[2], m[2], off[2];
+};
+void route_fused(const float* logits, const float* bias, int n, int k, int T, float route_scale,
+                 const unsigned long long* vram, const float* x, int dim, int* idx, float* w, unsigned long long* plan_ptr,
+                 Req* req, unsigned seq, cudaStream_t s, const float* bias_vl, unsigned vl, int na0, int na1,
+                 const RouteAhead& ah, int na);
 /// The RAM store's picks for the device (a decode token's k plan pointers): those the VRAM table left at 0 whose expert zc_tab has (the
 /// slot's device address) are copied into stage slot i (stride apart, `bytes` each) and the plan then points there.
 void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k, uint8_t* stage, size_t stride, size_t bytes,

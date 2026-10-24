@@ -891,6 +891,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       if(STRATA_ENABLE_HIP)
         target_compile_options(ds4_iq_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
       endif()
+      if(STRATA_ENABLE_CUDA)
+        # the decode GPU-part changes (ds4_u9.hpp) against the path they replace, bit for bit; needs a GPU, no model
+        add_executable(ds4_u9_test tests/dsv41/u9_bits_test.cu src/dsv41/ds4_gguf.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq.cu
+                       src/dsv41/ds4_kernels.cu)
+        target_include_directories(ds4_u9_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+        target_link_libraries(ds4_u9_test PRIVATE ${_strata_gpu_runtime_target})
+      endif()
       # the kept conversations' .meta file and prefix matching (ds4_slotmeta.hpp): no GPU, no model
       add_executable(ds4_slot_test tests/dsv41/slot_test.cpp)
       target_include_directories(ds4_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
