@@ -2,15 +2,17 @@
 // model pack's fingerprint both sides' hellos carry, and what a worker refuses in its main process's hello.  The link
 // itself is Strata's (src/net/stage_link.cpp), the engine's side of it ds4_main.cpp / ds4_model.cu.
 //
-// v1: the windows only (T <= 16 rows each way, a prompt in windows of 16), the rows fp32 - each carries the
-// indexer's int32 picks and candidate blocks beside the streams, which bf16 would not keep - and no checkpoints: a
-// request that does not continue the conversation in place starts it again from token 0.
+// v1: the windows only (T <= 16 rows each way, a prompt in windows of 16) and no checkpoints: a request that does not
+// continue the conversation in place starts it again from token 0.  The rows are fp32 - each carries the indexer's
+// int32 picks and candidate blocks beside the streams, which the link's own bf16 would not keep - or, with
+// STRATA_REMOTE_ROWS=bf16 on both sides, the engine's compact rows: the streams as bf16, pre and the picks exact (rows_pack).
 #pragma once
 
 #include "strata/net/stage_link.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -47,6 +49,43 @@ inline uint64_t pack_hash(const std::string& pack) {
     return h;
 }
 
+/// The compact rows of STRATA_REMOTE_ROWS=bf16.  The link's own bf16 (StageRows::BF16) converts every float of a
+/// message, which would round the int32 picks; this engine's hello lists fp32 for the link and carries this capability
+/// bit (row_formats bits 24-30 are free capability bits; the link reads only the format bits and kStageCapKvElem), and
+/// the engine packs the rows itself before the link sends them.  Both sides must have it or neither: a hello with it
+/// also has a narrower hand-off row (RowGeo::wire), so the link's own check refuses a mismatch as well.
+inline constexpr uint32_t kRowsBf16Cap = 1u << 30;
+
+/// A window of T rows crosses block by block (Model::StageGeo): the streams (T x `h` fp32), pre (T x `pre` fp32), the
+/// indexer's picks (T x `topk` int32), then the candidate blocks (T x `cand` int32).  Compact: only the streams as bf16
+/// (T x h / 2 words); pre, the picks and the candidates as they are.
+struct RowGeo {
+    int64_t h = 0;                // the streams: hc x dim
+    int64_t pre = 8;              // pre, fp32 either way
+    int64_t topk = 0, cand = 0;   // int32 per row
+    int64_t exact() const { return pre + topk + cand; }   // words of a row that travel as they are
+    int64_t full() const { return h + exact(); }          // words of a row, fp32
+    int64_t compact() const { return h / 2 + exact(); }   // words of a row, bf16 streams + the rest
+    bool compact_ok() const { return h > 0 && h % 2 == 0; }   // (a row's bf16 part is whole words)
+};
+
+/// T rows in the fp32 block layout `full` (T x full() words) to the compact layout `wire` (T x compact() words).  Only
+/// the streams are converted; pre and the ints are copied as bytes.
+inline void rows_pack(const RowGeo& g, int T, const float* full, float* wire) {
+    const size_t nh = (size_t) T * (size_t) g.h, ne = (size_t) T * (size_t) g.exact();
+    net::stage_rows_encode(net::StageRows::BF16, full, 1, nh, wire);
+    std::memcpy(wire + nh / 2, full + nh, ne * sizeof(float));
+}
+
+/// The compact layout back to the fp32 block layout: the streams and pre always, the ints when `ints` (a reply's ints
+/// are not read)
+inline void rows_unpack(const RowGeo& g, int T, const float* wire, float* full, bool ints = true) {
+    const size_t nh = (size_t) T * (size_t) g.h, np = (size_t) T * (size_t) g.pre,
+                 ne = (size_t) T * (size_t) g.exact();
+    net::stage_rows_decode(net::StageRows::BF16, wire, 1, nh, full);
+    std::memcpy(full + nh, wire + nh / 2, (ints ? ne : np) * sizeof(float));
+}
+
 /// What this engine's worker cannot serve in a main process's hello (one of the same protocol; hello_matches has the
 /// geometry, the layers and the pack): false and why.  `mine`: the worker's own hello, `max_context` its context.
 inline bool worker_accepts(const net::StageHello& theirs, const net::StageHello& mine, int64_t max_context,
@@ -61,8 +100,16 @@ inline bool worker_accepts(const net::StageHello& theirs, const net::StageHello&
         return false;
     }
     if (theirs.row_formats & ~(uint32_t) (1u << (uint32_t) net::StageRows::F32) & net::kStageRowsAll) {
-        err = "the main process asks for rows other than fp32 (STRATA_REMOTE_ROWS): a DeepSeek row carries the "
-              "indexer's int32 picks, which only fp32 keeps";
+        err = "the main process asks the link for rows other than fp32: a DeepSeek row carries the indexer's int32 "
+              "picks, which the link's own bf16 would round (this engine packs bf16 rows itself: its hello says so)";
+        return false;
+    }
+    const bool want = (theirs.row_formats & kRowsBf16Cap) != 0, have = (mine.row_formats & kRowsBf16Cap) != 0;
+    if (want != have) {
+        err = want ? "the main process sends bf16 rows (STRATA_REMOTE_ROWS=bf16) and this worker reads fp32: start the "
+                     "worker with STRATA_REMOTE_ROWS=bf16 too"
+                   : "this worker reads bf16 rows (STRATA_REMOTE_ROWS=bf16) and the main process sends fp32: set "
+                     "STRATA_REMOTE_ROWS=bf16 on the main process too";
         return false;
     }
     if (theirs.ckpt_max != 0) {

@@ -21,6 +21,7 @@
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
+#include "ds4_stage.hpp"
 #include "ds4_store.hpp"
 #include "ds4_vision.cuh"
 #include "strata/dsv41/exl3_cpu.hpp"
@@ -821,16 +822,30 @@ struct Model::Impl {
         return false;
     }
     // a remote stage (Options::remote_stage / stage_worker): the main process's link after its last layer, and the rows
-    // that cross it, pinned - link_tx out, link_rx in (kWin rows of handoff_floats each, Model::StageGeo's layout)
+    // that cross it, pinned - link_tx out, link_rx in (kWin rows of full_floats each, Model::StageGeo's layout)
     Model::StageRun stage_hop;
     std::function<bool(std::string&)> stage_reset;
     bool stage_lost = false;          // (the main process) a hop or the worker's reset failed: only position 0 goes on
     std::string stage_err;
     float *link_tx = nullptr, *link_rx = nullptr;
+    // (stage_bf16) the same rows as the link carries them, compact: wire_tx / wire_rx, kWin rows of handoff_floats()
+    // words, packed from link_tx after a window's last sync and unpacked into link_rx before its first copy
+    float *wire_tx = nullptr, *wire_rx = nullptr;
+    double conv_in_ms = 0, conv_out_ms = 0;   // (stage_conv)
+    int64_t conv_in_n = 0, conv_out_n = 0;
     bool linked() const { return o.remote_stage || o.stage_worker; }
-    int64_t handoff_floats() const {
-        return (int64_t) g.hc * g.dim + 8 + (int64_t) topk_stride() + (int64_t) cand_stride();
+    bool bf16_rows() const { return o.stage_bf16 && linked(); }
+    stage::RowGeo row_geo() const {
+        stage::RowGeo r;
+        r.h = (int64_t) g.hc * g.dim;
+        r.pre = 8;
+        r.topk = (int64_t) topk_stride();
+        r.cand = (int64_t) cand_stride();
+        return r;
     }
+    // a row in the fp32 block layout, and the link's (the compact one with stage_bf16)
+    int64_t full_floats() const { return row_geo().full(); }
+    int64_t handoff_floats() const { return bf16_rows() ? row_geo().compact() : full_floats(); }
     std::vector<Src> srcs;
     std::vector<Group> groups;
     std::vector<std::unique_ptr<Worker>> workers;   // threads mode: one per device
@@ -1915,6 +1930,10 @@ struct Model::Impl {
                   "; no --stage-begin)";
             return false;
         }
+        if (bf16_rows() && !row_geo().compact_ok()) {
+            err = "bf16 rows: a row's streams (" + std::to_string(row_geo().h) + " floats) are not a whole number of words";
+            return false;
+        }
         ranged = lo > 0 || hi < g.nl || linked();
         if (ranged) {   // (a slot, the drafter, a picture or the prompt path's chunks would need the other layers)
             std::fprintf(stderr, "ds4: layers [%d, %d) of %d here%s: prompts in windows of %d, no DSpark, no pictures, no "
@@ -2486,8 +2505,11 @@ struct Model::Impl {
         }
 
         // a remote stage's rows, both ways
-        if (linked() && (!halloc(link_tx, (size_t) kWin * handoff_floats(), err) ||
-                         !halloc(link_rx, (size_t) kWin * handoff_floats(), err)))
+        if (linked() && (!halloc(link_tx, (size_t) kWin * full_floats(), err) ||
+                         !halloc(link_rx, (size_t) kWin * full_floats(), err)))
+            return false;
+        if (bf16_rows() && (!halloc(wire_tx, (size_t) kWin * handoff_floats(), err) ||
+                            !halloc(wire_rx, (size_t) kWin * handoff_floats(), err)))
             return false;
         // the embedding table, pinned on the host (a remote stage's worker: none - its rows come over the link)
         if (!o.stage_worker) {
@@ -8528,11 +8550,24 @@ struct Model::Impl {
         Dev& d = devs[(size_t) di];
         if (!link_rows(link_tx, d, T, true, 4, err)) return false;
         CK(cudaStreamSynchronize(d.st));
-        if (!stage_hop || !stage_hop(T, toks.data() + p0, p0, link_tx, link_rx, err)) {
+        const bool bf = bf16_rows();
+        if (bf) {   // (the compact rows: this window's out, and the reply's streams and pre back)
+            const double t0 = now_ms();
+            stage::rows_pack(row_geo(), T, link_tx, wire_tx);
+            conv_out_ms += now_ms() - t0;
+            ++conv_out_n;
+        }
+        if (!stage_hop || !stage_hop(T, toks.data() + p0, p0, bf ? wire_tx : link_tx, bf ? wire_rx : link_rx, err)) {
             if (!stage_hop) err = "remote stage: no link";
             stage_lost = true;
             stage_err = err;
             return false;
+        }
+        if (bf) {
+            const double t0 = now_ms();
+            stage::rows_unpack(row_geo(), T, wire_rx, link_rx, false);
+            conv_in_ms += now_ms() - t0;
+            ++conv_in_n;
         }
         return link_rows(link_rx, d, T, false, 2, err);
     }
@@ -9307,14 +9342,26 @@ Model::StageGeo Model::stage_geo() const {
     s.layer_end = p.hi;
     s.max_t = kWin;
     s.handoff_floats = p.handoff_floats();
+    s.full_floats = p.full_floats();
+    s.topk = (int64_t) p.topk_stride();
+    s.cand = (int64_t) p.cand_stride();
+    s.rows_bf16 = p.bf16_rows();
     return s;
 }
 void Model::set_stage_link(StageRun run, std::function<bool(std::string& err)> reset) {
     p_->stage_hop = std::move(run);
     p_->stage_reset = std::move(reset);
 }
-float* Model::stage_rows_in() { return p_->link_rx; }
-float* Model::stage_rows_out() { return p_->link_tx; }
+float* Model::stage_rows_in() { return p_->bf16_rows() ? p_->wire_rx : p_->link_rx; }
+float* Model::stage_rows_out() { return p_->bf16_rows() ? p_->wire_tx : p_->link_tx; }
+Model::StageConv Model::stage_conv() const {
+    StageConv c;
+    c.in_ms = p_->conv_in_ms;
+    c.out_ms = p_->conv_out_ms;
+    c.in_n = p_->conv_in_n;
+    c.out_n = p_->conv_out_n;
+    return c;
+}
 bool Model::stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err) {
     Impl& p = *p_;
     if (!p.o.stage_worker) {
@@ -9326,8 +9373,26 @@ bool Model::stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err
               std::to_string(p0);
         return false;
     }
-    std::vector<int> tk(tokens, tokens + std::max(0, T));
-    return p.forward(tk.data(), T, 0, err);
+    if (T < 1 || T > kWin) {   // (before the rows are read: the link's bound, here too)
+        err = "a window of " + std::to_string(T) + " tokens";
+        return false;
+    }
+    std::vector<int> tk(tokens, tokens + T);
+    const bool bf = p.bf16_rows();
+    if (bf) {   // (the main process's compact rows into the layout the first layer's copy reads)
+        const double t0 = now_ms();
+        stage::rows_unpack(p.row_geo(), T, p.wire_rx, p.link_rx);
+        p.conv_in_ms += now_ms() - t0;
+        ++p.conv_in_n;
+    }
+    if (!p.forward(tk.data(), T, 0, err)) return false;
+    if (bf) {   // (forward ended with its last stream synchronized: the rows for the reply are in link_tx)
+        const double t0 = now_ms();
+        stage::rows_pack(p.row_geo(), T, p.link_tx, p.wire_tx);
+        p.conv_out_ms += now_ms() - t0;
+        ++p.conv_out_n;
+    }
+    return true;
 }
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const {

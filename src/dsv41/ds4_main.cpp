@@ -326,8 +326,9 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
 
 // ---- the remote stage (docs/REMOTE_STAGE.md, ds4_stage.hpp): this PC runs layers 0 to K - 1 and the head, a worker
 // PC the rest - each window's rows go there after layer K - 1 and come back before the head
-// This side's hello: the trunk, the layers where the link cuts it, the windows (no prompt chunks), fp32 rows, no K/V
-// type to compare (the hand-off carries no attention K/V), no checkpoints, the pack's fingerprint
+// This side's hello: the trunk, the layers where the link cuts it, the windows (no prompt chunks), fp32 rows (or the
+// compact bf16 ones: kRowsBf16Cap and their narrower hand-off row), no K/V type to compare (the hand-off carries no
+// attention K/V), no checkpoints, the pack's fingerprint
 strata::net::StageHello stage_hello(const strata::ds4::Model& m, const std::string& pack, bool worker) {
     const strata::ds4::Model::StageGeo sg = m.stage_geo();
     strata::net::StageHello me;
@@ -338,13 +339,26 @@ strata::net::StageHello stage_hello(const strata::ds4::Model& m, const std::stri
     me.layer_begin = worker ? sg.layer_begin : sg.layer_end;
     me.max_t = sg.max_t;
     me.kv_type = -1;
-    me.row_formats = (1u << (uint32_t) strata::net::StageRows::F32) | strata::net::kStageCapKvElem;
+    // (the link's format is fp32 either way; the compact rows are the engine's own and say so in a capability bit)
+    me.row_formats = (1u << (uint32_t) strata::net::StageRows::F32) | strata::net::kStageCapKvElem |
+                     (sg.rows_bf16 ? strata::ds4::stage::kRowsBf16Cap : 0u);
     me.max_context = m.max_context();
     me.chunk = 0;
     me.handoff_floats = sg.handoff_floats;
     me.pack_hash = strata::ds4::stage::pack_hash(pack);
     std::snprintf(me.build, sizeof me.build, "strata-dsv41 remote-stage %s", worker ? "worker" : "main");
     return me;
+}
+
+// STRATA_REMOTE_TIMING=1 (read as the Qwen engine reads it): the per-stage timing lines of docs/REMOTE_STAGE.md - the
+// link's own ("strata remote: 64 windows: mean ... = worker ... + link ...", from stage_link.cpp), the main process's
+// time between windows and the worker's own layers' time, every 64 windows, in the same words the tuner reads
+bool remote_timing() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_REMOTE_TIMING");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
 }
 
 // STRATA_STAGE_TOKEN (the shared secret, as the Qwen engine reads it); false: too long
@@ -368,6 +382,11 @@ struct RemoteMain {
     strata::net::StageClient link;
     strata::net::StageHello me, peer;
     const std::atomic<bool>* stop = nullptr;   // (serve: its STOP flag - a request's wait ends on it)
+    const strata::ds4::Model* model = nullptr;   // (the timing lines: the compact rows' conversions)
+    // (remote_timing) this process's share of a window: from one window's rows coming back to the next one's send
+    double last_end = 0, gap_ms = 0;
+    strata::ds4::Model::StageConv conv0;   // (the conversions at the last line)
+    int64_t gaps = 0;
 
     bool connect(std::string& e) {
         static const int wait_s = [] {
@@ -431,8 +450,31 @@ struct RemoteMain {
     }
     // a window: its rows there and back, then its tokens kept (Commit: every one - no drafts in v1)
     bool run(int T, const int32_t* tokens, int64_t p0, const float* out, float* in, std::string& e) {
+        const bool timing = remote_timing();
+        if (timing && last_end != 0) {
+            const double d = now_ms() - last_end;
+            if (d < 1000.0) gap_ms += d;   // (the same request: a gap of a second is the next prompt)
+            if (d < 1000.0 && ++gaps % 64 == 0) {
+                std::fprintf(stderr, "strata remote: main process between windows %.2f ms each (64 windows: head, "
+                                     "layers 0-K)\n", gap_ms / 64);
+                if (model != nullptr && model->stage_geo().rows_bf16) {
+                    // (each mean over the windows it converted since the last line: a window's pack and its reply's
+                    // unpack are not the same count at a line, and a prompt's first window has no gap)
+                    const strata::ds4::Model::StageConv c = model->stage_conv();
+                    const int64_t no = std::max<int64_t>(1, c.out_n - conv0.out_n), ni = std::max<int64_t>(1, c.in_n - conv0.in_n);
+                    std::fprintf(stderr, "strata remote: rows bf16: %lld bytes a row each way; pack %.3f ms (%lld windows) + "
+                                         "unpack %.3f ms (%lld windows) a window (part of the time between windows)\n",
+                                 (long long) (me.handoff_floats * 4), (c.out_ms - conv0.out_ms) / (double) no, (long long) no,
+                                 (c.in_ms - conv0.in_ms) / (double) ni, (long long) ni);
+                    conv0 = c;
+                }
+                gap_ms = 0;
+            }
+        }
         const size_t n = (size_t) T * (size_t) me.handoff_floats;
-        return link.run(T, tokens, p0, out, n, in, n, e) && link.commit(T, e);
+        const bool ok = link.run(T, tokens, p0, out, n, in, n, e) && link.commit(T, e);
+        last_end = timing ? now_ms() : 0;
+        return ok;
     }
 };
 RemoteMain* g_remote = nullptr;
@@ -443,9 +485,6 @@ RemoteMain* g_remote = nullptr;
 int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::string& bind, int port) {
     std::string token;
     if (!stage_token(token)) return 1;
-    if (std::getenv("STRATA_REMOTE_ROWS") != nullptr)
-        std::fprintf(stderr, "maya ds4: STRATA_REMOTE_ROWS is the main process's choice; a worker takes the rows it "
-                             "asks for (fp32 here)\n");
     const strata::net::StageHello me = stage_hello(m, pack, true);
     const strata::ds4::Model::StageGeo sg = m.stage_geo();
     int last_t = 0;   // (the last window's rows: what its Commit keeps)
@@ -455,10 +494,28 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
         if (theirs.protocol != strata::net::kStageProtocol) return true;   // (the link refuses it for its number)
         return strata::ds4::stage::worker_accepts(theirs, me, m.max_context(), e);
     };
+    // (remote_timing) every 64 windows: this worker's own time for a window - its rows unpacked, its layers, its rows
+    // packed - and the conversions' share of it
+    double own_ms = 0;
+    strata::ds4::Model::StageConv conv0;   // (the conversions at the last line)
+    int64_t windows = 0;
     hs.run = [&](int T, const int32_t* tokens, int64_t p0, std::string& e) {
         last_t = 0;
+        const double t0 = now_ms();
         if (!m.stage_run(tokens, T, p0, e)) return false;
         last_t = T;
+        if (remote_timing()) {
+            own_ms += now_ms() - t0;
+            if (++windows % 64 == 0) {
+                const strata::ds4::Model::StageConv c = m.stage_conv();
+                const int64_t no = std::max<int64_t>(1, c.out_n - conv0.out_n), ni = std::max<int64_t>(1, c.in_n - conv0.in_n);
+                std::fprintf(stderr, "strata stage worker: windows: own layers %.2f ms each (64 windows; rows in %.2f, "
+                                     "rows out %.2f)\n", own_ms / 64, (c.in_ms - conv0.in_ms) / (double) ni,
+                             (c.out_ms - conv0.out_ms) / (double) no);
+                own_ms = 0;
+                conv0 = c;
+            }
+        }
         return true;
     };
     hs.commit = [&](int n_keep, std::string& e) {
@@ -1513,6 +1570,16 @@ int main(int argc, char** argv) {
         }
         o.stage_worker = worker_mode;
         o.remote_stage = !remote_at.empty();
+        // STRATA_REMOTE_ROWS=bf16 (both sides): the compact rows (ds4_stage.hpp rows_pack).  The link's own bf16 would
+        // round the int32 picks each row carries, so the engine packs the rows itself and the hello says so
+        if (const char* v = std::getenv("STRATA_REMOTE_ROWS"); (worker_mode || o.remote_stage) && v != nullptr && *v != '\0') {
+            strata::net::StageRows f = strata::net::StageRows::F32;
+            if (!strata::net::stage_rows_parse(v, f)) {
+                std::fprintf(stderr, "maya-ds4: STRATA_REMOTE_ROWS=%s: expected fp32 or bf16\n", v);
+                return 2;
+            }
+            o.stage_bf16 = f == strata::net::StageRows::BF16;
+        }
     }
     if (o.pack.empty() || (!serve_mode && !worker_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
         usage();
@@ -1540,25 +1607,14 @@ int main(int argc, char** argv) {
         remote.at = remote_at;
         remote.me = stage_hello(m, o.pack, false);
         std::memcpy(remote.me.token, token.data(), token.size());
-        if (const char* v = std::getenv("STRATA_REMOTE_ROWS"); v != nullptr && *v != '\0') {
-            strata::net::StageRows f = strata::net::StageRows::F32;
-            if (!strata::net::stage_rows_parse(v, f)) {
-                std::fprintf(stderr, "maya-ds4: STRATA_REMOTE_ROWS=%s: expected fp32 or bf16\n", v);
-                return 1;
-            }
-            if (f != strata::net::StageRows::F32) {
-                std::fprintf(stderr, "maya-ds4: STRATA_REMOTE_ROWS=%s: a DeepSeek remote stage's rows are fp32 only (each "
-                                     "carries the indexer's int32 picks, which bf16 would not keep)\n", v);
-                return 1;
-            }
-        }
         if (!remote.connect(err)) {
             std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
             return 1;
         }
         std::fprintf(stderr, "maya ds4: remote stage %s: layers %d-%d there (context %lld, rows %s)\n", remote_at.c_str(),
                      remote.peer.layer_begin, remote.peer.n_layers - 1, (long long) remote.peer.max_context,
-                     strata::net::stage_rows_name(remote.link.rows()));
+                     m.stage_geo().rows_bf16 ? "bf16 (the streams; the picks exact)" : "fp32");
+        remote.model = &m;
         g_remote = &remote;
         m.set_stage_link([&remote](int T, const int32_t* tokens, int64_t p0, const float* out, float* in,
                                    std::string& e) { return remote.run(T, tokens, p0, out, in, e); },
