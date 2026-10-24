@@ -30,6 +30,16 @@ inline bool defaults() {   // false: DS4_U9=0 (and HIP without DS4_U9=1) - the s
 #endif
 }
 
+// q5k by the device: the staged Q5_K GEMV is 11-15% faster a grid on the 2080 Ti (sm75) but 10-20% slower on a 3070
+// (sm86), so with q5k on it runs on compute capability 7.5 only (ds4_iq.cu). DS4_U9_Q5K=1 / =0: every device / none.
+inline int& q5k_arch() {   // -1: by the device (a test sets 1)
+    static int v = [] {
+        const char* e = std::getenv("DS4_U9_Q5K");
+        return e == nullptr ? -1 : std::atoi(e) != 0 ? 1 : 0;
+    }();
+    return v;
+}
+
 inline unsigned& mask() {   // (a test sets it to compare both paths in one process)
     static unsigned m = [] {
         static const struct {
@@ -53,23 +63,17 @@ inline unsigned& mask() {   // (a test sets it to compare both paths in one proc
             p = e != nullptr ? e + 1 : nullptr;
         }
         std::fprintf(stderr, "ds4 u9: on:");
-        for (const auto& it : items)
-            if (v & it.bit) std::fprintf(stderr, " %s", it.name);
-        std::fprintf(stderr, "%s\n", v == 0 ? " none (the 747981ba path)" : "");
+        int shown = 0;
+        for (const auto& it : items) {   // (q5k on sm75 only unless DS4_U9_Q5K says: DS4_U9_Q5K=0 leaves it out)
+            if ((v & it.bit) == 0 || (it.bit == kQ5k && q5k_arch() == 0)) continue;
+            std::fprintf(stderr, " %s%s", it.name, it.bit == kQ5k && q5k_arch() < 0 ? " (sm75)" : "");
+            ++shown;
+        }
+        std::fprintf(stderr, "%s\n", shown == 0 ? " none (the 747981ba path)" : "");
         return v;
     }();
     return m;
 }
 inline bool on(unsigned item) { return (mask() & item) != 0; }
-
-// q5k by the device: the staged Q5_K GEMV is 11-15% faster a grid on the 2080 Ti (sm75) but 10-20% slower on a 3070
-// (sm86), so with q5k on it runs on compute capability 7.5 only (ds4_iq.cu). DS4_U9_Q5K=1 / =0: every device / none.
-inline int& q5k_arch() {   // -1: by the device (a test sets 1)
-    static int v = [] {
-        const char* e = std::getenv("DS4_U9_Q5K");
-        return e == nullptr ? -1 : std::atoi(e) != 0 ? 1 : 0;
-    }();
-    return v;
-}
 
 }  // namespace strata::ds4::u9
