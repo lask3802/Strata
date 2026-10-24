@@ -3,13 +3,15 @@
 //                                          tools/dsv41/ep_parts.py's), read back; exit 0: all passed
 //   ds4_epparts_test PACK PARTS [LAYERS]   a pack and the parts ep_parts.py wrote from it (read-only on both): every part
 //                                          equals the pack's own slice, every whole expert assembles to the pack's bytes,
-//                                          the index's pack_hash is ds4_stage.hpp's for PACK; LAYERS: "3" or "0-9,12"
+//                                          the index's pack_hash is ds4_stage.hpp's for PACK; LAYERS: "3" or "0-9,12";
+//                                          "none": only the index load time (the files may be sparse)
 #include "ds4_epparts.hpp"
 #include "ds4_stage.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -368,7 +370,10 @@ int real_pack(const std::string& pack, const std::string& parts, const std::stri
     const int nl = std::atoi(kv["num_hidden_layers"].c_str());
     ep::Parts p;
     std::string err;
-    if (!p.open(parts, err)) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool opened = p.open(parts, err);
+    const double open_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (!opened) {
         std::printf("FAIL open %s: %s\n", parts.c_str(), err.c_str());
         return 1;
     }
@@ -377,6 +382,8 @@ int real_pack(const std::string& pack, const std::string& parts, const std::stri
     CHECK(p.pack_hash() != 0);
     std::printf("index: %zu parts in %zu files, %zu experts in heat order, pack_hash %016llx\n", p.entries().size(), p.files().size(),
                 p.heat().size(), (unsigned long long) p.pack_hash());
+    std::printf("index load (parse, open and map the files): %.1f ms\n", open_ms);
+    if (layers_arg == "none") return fails == 0 ? 0 : 1;   // (the load time only: the files may be sparse)
     const std::vector<int> layers = parse_layers(layers_arg, nl);
     const std::set<int> want(layers.begin(), layers.end());
     std::map<int, std::ifstream> fh;
