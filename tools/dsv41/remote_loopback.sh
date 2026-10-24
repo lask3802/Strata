@@ -15,7 +15,8 @@
 #        tokens after it through the split, then through one process with the same flags, compared); SPEC_IDS (a file
 #        of prompt ids: SPEC_N (128) greedy tokens after it with --dspark on through the split and through one process,
 #        each run's token ids, its drafts offered and accepted and its decode tok/s; SPEC_CONF: --dspark-conf for both,
-#        0 checks every draft - the most rejected rows to undo); PYTHON (python3)
+#        0 checks every draft - the most rejected rows to undo; SPEC_NONE=1: the same SPEC_N tokens with --dspark
+#        none too, through each, for the drafts' speed against plain decoding); PYTHON (python3)
 #
 # Both processes read the experts in place (--mmap-experts on: the files' page cache, shared by both, no copies in
 # RAM), with no SSD store, a fixed placement (--no-expert-cache --expert-profile none) and Engram row caches of
@@ -35,7 +36,7 @@
 # near tie, and the speculative check says where.
 set -u
 if [ $# -lt 3 ]; then
-    sed -n '2,35p' "$0"
+    sed -n '2,36p' "$0"
     exit 2
 fi
 exe=$1
@@ -100,6 +101,10 @@ if [ -n "${SPEC_IDS:-}" ]; then   # (the split's run first: the worker stops bef
     "$main" --max-context "$ctx" "${spec[@]}" --ids "@$SPEC_IDS" > "$out/spec-split.out" 2> "$out/spec-split.err"
     ss=$?
     echo "spec split rc=$ss"
+    if [ "${SPEC_NONE:-0}" = 1 ]; then
+        "$main" --max-context "$ctx" --dspark none --n "$spec_n" --ids "@$SPEC_IDS" > "$out/plain-split.out" 2> "$out/plain-split.err"
+        echo "plain split rc=$?"
+    fi
 fi
 if [ -n "${IDS:-}" ]; then
     ids=$(cat "$IDS")
@@ -116,7 +121,14 @@ if [ -n "${SPEC_IDS:-}" ]; then
         > "$out/spec-single.out" 2> "$out/spec-single.err"
     s1=$?
     echo "spec single rc=$s1"
-    for b in spec-split spec-single; do
+    arms="spec-split spec-single"
+    if [ "${SPEC_NONE:-0}" = 1 ]; then
+        DS4_CHUNK_MIN=100000 "$exe" "${common[@]}" --max-context "$ctx" --prefill-chunk 0 --dspark none --n "$spec_n" \
+            --ids "@$SPEC_IDS" > "$out/plain-single.out" 2> "$out/plain-single.err"
+        echo "plain single rc=$?"
+        arms="$arms plain-split plain-single"
+    fi
+    for b in $arms; do
         echo "  $b: $(grep -h '^decode:' "$out/$b.err" | head -1 | cut -c1-60)"
         echo "    $(grep -h '^dspark:' "$out/$b.err" | head -1 | cut -c1-120)"
         echo "    $(grep -h '^ds4: layers \[' "$out/$b.err" | head -1 | cut -c1-160)"
