@@ -604,8 +604,10 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
         std::fprintf(stderr, "maya ds4: remote stage worker: %s\n", note.c_str());
     });
     float* const pf[4] = {m.stage_chunk_rows(0), m.stage_chunk_rows(1), m.stage_chunk_rows(2), m.stage_chunk_rows(3)};
-    const strata::net::StageBuffers bufs = strata::ds4::stage::worker_buffers(m.stage_rows_in(), m.stage_rows_out(), sg.max_t,
-                                                                             pf, sg.chunk, sg.handoff_floats);
+    strata::net::StageBuffers bufs = strata::ds4::stage::worker_buffers(m.stage_rows_in(), m.stage_rows_out(), sg.max_t,
+                                                                       pf, sg.chunk, sg.handoff_floats);
+    // (the link's framing is fp32: the engine packs its rows itself - the hello's log line says which)
+    bufs.engine_rows = sg.rows_bf16 ? "engine-packed bf16" : "engine rows fp32";
     strata::net::StageStats wst;
     std::fprintf(stderr, "maya ds4: remote stage worker: layers %d-%d, no head, windows of %d, prompt chunks of %d at most%s, "
                  "rows %s, port %d\n", sg.layer_begin, sg.layer_end - 1, sg.max_t, sg.chunk,

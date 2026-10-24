@@ -300,6 +300,9 @@ struct StageBuffers {
     size_t pf_floats = 0;
     int64_t handoff_floats = 0; ///< floats per verify row
     int64_t pf_row_floats = 0;  ///< floats per prompt row (D)
+    /// optional: what the engine's own rows are inside the link's (an engine that packs its rows itself, as DeepSeek's
+    /// bf16 ones in fp32 framing): the hello's log line then says "link rows <fmt> (<this>)"; nullptr: "rows <fmt>"
+    const char* engine_rows = nullptr;
 };
 
 /// A worker's position table (`cells` x (t, h, w)) from a Positions message: cells [0, cells_in) from `table`, the
