@@ -789,8 +789,10 @@ constexpr int kMaxL = 64;   // layers (the trunk's and the drafter's) a window p
 // mailbox seq of each layer (async: the device publishes its routing), the indexer's selection sizes and the candidate
 // blocks as each layer sees them, the window's hand-off seq
 struct WinPlan {
+    // (no default: whoever makes a plan says whether it is an EP window)
+    explicit WinPlan(bool ep_window) : ep(ep_window) {}
     bool par = false, async = false;
-    bool ep = false;        // an EP window (decode, a draft's verification): the layers' n_ff slices (Layer::ep_ff0)
+    bool ep;                // an EP window (decode, a draft's verification): the layers' n_ff slices (Layer::ep_ff0)
     unsigned win = 0;
     int k = 0;              // (a run of chunks) the chunk's index: its hand-off slot k % 2
     int snap_t = -1;        // (a run of chunks) the chunk's row whose state before it the layers keep (-1: none)
@@ -966,7 +968,7 @@ struct Model::Impl {
     static constexpr int kPickMax = 2048;   // (from here on the flow: windows' work grows with every 16 tokens)
     static constexpr double kPickRes = 0.9;  // (this share of the CPU-lane experts in RAM: windows if predicted faster)
     std::atomic<int> lm_layers{0};           // (layer-major) the layers every chunk went through
-    WinPlan wplan;
+    WinPlan wplan{false};                    // (plan_window sets each window's kind)
     int head_dev = 0;
     x3::Mat head;
     float* norm_w = nullptr;          // on the head device
@@ -1068,7 +1070,10 @@ struct Model::Impl {
     Resp* resps = nullptr;
     unsigned seq_issued = 0;
     std::atomic<int> layer_of[kRing];
-    bool ep_of[kRing] = {};   // the seq's window an EP window (WinPlan::ep; written before its layer_of, read after it)
+    // the seq's window an EP window (WinPlan::ep).  Written with its layer_of before the layer's kernels are launched;
+    // serve_lane reads both only once the device has written that request's seq - the launch, not layer_of's release /
+    // acquire (the slot's previous store may hold the same layer), orders them, as it does layer_of
+    bool ep_of[kRing] = {};
     std::thread service;
     std::atomic<bool> quit{false};
     bool sync_decode = std::getenv("DS4_SYNC") != nullptr;
@@ -5879,8 +5884,8 @@ struct Model::Impl {
     }
     // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
     // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same.
-    // Over the n_ff slice [ff0, ff0 + ffn) (expert parallelism's decode lane: the layer's ep_ff0 / ep_ffn; the whole n_ff
-    // otherwise): the gate / up rows of the slice, and the down over the slice's values in place (gg::iq_cpu_slice) -
+    // Over the n_ff slice [ff0, ff0 + ffn) (an EP window, on either lane: the layer's ep_ff0 / ep_ffn; any other window
+    // the whole n_ff - ep_range): the gate / up rows of the slice, and the down over the slice's values in place (gg::iq_cpu_slice) -
     // each entry's yd then its part of the expert's output
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, int ff0,
                         int ffn) {
@@ -6561,7 +6566,7 @@ struct Model::Impl {
             }
             std::atomic_thread_fence(std::memory_order_acquire);
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
-            const bool ep = ep_of[next % kRing];
+            const bool ep = ep_of[next % kRing];   // (written before the request's launch: ep_of)
             Resp& rp = resps[next % kRing];
             const int T = std::max(1, std::min(kWin, r.T));
             for (int t = 0; t < T; ++t) rp.cpu[t] = 0;
@@ -6847,9 +6852,8 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, d.st));
         embed(d.emb_rows, T, d.h, D, H, d.st);
         init_pre(d.pre, T, d.st);
-        WinPlan dp;   // (window attention alone: the mailbox seqs)
+        WinPlan dp(false);   // (window attention alone: the mailbox seqs; the drafter's layers: the main's alone, whole)
         dp.async = !sync_decode && T <= async_max_t;
-        dp.ep = false;   // (the drafter's layers: the main's alone, whole)
         for (int i = 0; i < g.n_mtp && dp.async; ++i) {
             const int il = g.nl + i;
             dp.seq[il] = ++seq_issued;
@@ -7738,10 +7742,9 @@ struct Model::Impl {
                 const int64_t p0 = run.p0[(size_t) k];
                 const int T = run.T[(size_t) k], slot = k % 2;
                 const bool last_k = k + 1 == nk;
-                WinPlan wp;
+                WinPlan wp(false);   // (a prompt's chunk: whole)
                 wp.par = true;
                 wp.async = true;
-                wp.ep = false;   // (a prompt's chunk: whole)
                 wp.win = run.seq[(size_t) k];
                 wp.k = k;
                 wp.snap_t = run.snap_pos >= p0 && run.snap_pos < p0 + T ? (int) (run.snap_pos - p0) : -1;
@@ -7904,10 +7907,9 @@ struct Model::Impl {
                 if (d.mi == 0) st.engram_ms += now_ms() - te;
                 if (k + 1 < nk) eg_next = std::async(std::launch::async, read_eg, k + 1);
             }
-            WinPlan wp;
+            WinPlan wp(false);   // (a prompt's chunk: whole)
             wp.par = true;
             wp.async = true;
-            wp.ep = false;   // (a prompt's chunk: whole)
             wp.win = run.seq[(size_t) k];
             wp.k = k;
             wp.snap_t = run.snap_pos >= p0 && run.snap_pos < p0 + T ? (int) (run.snap_pos - p0) : -1;
