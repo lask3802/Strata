@@ -24,6 +24,7 @@
 #include "ds4_pool.hpp"
 #include "ds4_stage.hpp"
 #include "ds4_store.hpp"
+#include "ds4_u9.hpp"
 #include "ds4_vision.cuh"
 #include "strata/dsv41/exl3_cpu.hpp"
 #include "strata/dsv41/exl3.hpp"
@@ -461,6 +462,9 @@ struct Dev {
     int id = 0;
     cudaStream_t st = nullptr;
     cudaEvent_t ev = nullptr;
+    // U9 hc: a sublayer's hc_mix / hc_split beside st (forked after the residual is final, joined before its hc_post)
+    cudaStream_t st2 = nullptr;
+    cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
     size_t free0 = 0, total = 0, weights = 0, experts = 0, caches = 0, scratch = 0;
     std::vector<void*> allocs;
     // a window's scratch, rows of up to kWin tokens (the routed experts' rows: kWin * kPicks)
@@ -650,6 +654,7 @@ struct Layer {
           *gate_bias_vl = nullptr;   // (the image tokens' routing bias, with the vision tower)
     uint16_t* i_wproj = nullptr;
     float* gate_w = nullptr;   // the router's weights, F32 (DeepSeek's inference computes the gate in F32)
+    uint16_t* gate_bf = nullptr;   // U9 route: instead, a BF16 file's rows as they are (gemv_bf16 widens them: the same F32)
     uint8_t* win = nullptr;                     // [win] rows of kKvFp8 (kv_row_bytes)
     float *c_kv = nullptr, *c_score = nullptr;  // the compressor's partial group (ratio > 1)
     // a run of chunks' mid-run checkpoint (feed_mark): the ring and the partial group as they were before a row
@@ -1241,7 +1246,8 @@ struct Model::Impl {
     std::mutex dump_mu;
     // DS4_PROF: the GPU's time a decoded token by stage - events in stream order at a layer's start, after its
     // attention, after the routing and the shared expert, after the experts' gate / up, after the wait for the CPU
-    // lane, after the down pass and the post - read after the token's sync, each the time since the mark before it
+    // lane, after the down pass and the post - read after the token's sync, each the time since the mark before it.
+    // (U9 tail moves the device experts' down into the gate / up stage: compare such runs by their totals, not by stage)
     bool prof_on = std::getenv("DS4_PROF") != nullptr;
     // DS4_PRED_DUMP=file (predictor data, the chunked prompt path): per layer and chunk u8 layer, u16 T, T x 384 fp16 router
     // logits, T x 256 fp16 projection of the router input.  DS4_XIN_DUMP=file (expert similarity inputs): u8 layer, u16 T,
@@ -1365,6 +1371,9 @@ struct Model::Impl {
             for (void* p : d.allocs) cudaFree(p);
             if (d.st) cudaStreamDestroy(d.st);
             if (d.ev) cudaEventDestroy(d.ev);
+            if (d.st2) cudaStreamDestroy(d.st2);
+            if (d.ev_fork) cudaEventDestroy(d.ev_fork);
+            if (d.ev_join) cudaEventDestroy(d.ev_join);
         }
         for (void* p : host_allocs) cudaFreeHost(p);
         for (Layer& l : L)
@@ -1681,6 +1690,37 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         CK(cudaMemcpy(p, v.data(), n * 4, cudaMemcpyHostToDevice));
         return true;
+    }
+    // the router's weights: F32 on the device (f32), or with U9 route a BF16 file's rows as they are (half the bytes
+    // read a token; gemv_bf16 gives gemv_f32's bits)
+    bool gate_load(Dev& d, const std::string& name, Layer& l, std::string& err, size_t* acct) {
+        const size_t want = (size_t) l.n_exp * g.dim;
+        const Tensor* t = pk.get(name);
+        if (t == nullptr || t->dtype != "BF16" || t->bytes != want * 2 || g.dim % 128 != 0 || !u9::on(u9::kRoute))
+            return f32(d, name, l.gate_w, err, acct, want);
+        std::vector<uint8_t> raw(t->bytes);
+        if (!pk.read(*t, raw.data())) {
+            err = name + ": read failed";
+            return false;
+        }
+        // (allocated at the F32 copy's size: the same cudaMalloc sizes as the F32 path, so the same VRAM is left for the
+        // experts - the driver's granules make a smaller buffer free more than its bytes; the second half stays unused)
+        if (!dalloc(d, l.gate_bf, want * 2, err, acct)) return false;
+        cudaSetDevice(d.id);
+        CK(cudaMemcpy(l.gate_bf, raw.data(), t->bytes, cudaMemcpyHostToDevice));
+        return true;
+    }
+    // the router's logits of layer l's gate on x (T rows, D apart) into y (rows 1024 apart)
+    void gate_gemv(const Layer& l, const float* x, int T, float* y, cudaStream_t s) {
+        if (l.gate_bf == nullptr) {
+            gemv_f32(l.gate_w, x, l.n_exp, g.dim, T, y, 1024, s);
+            return;
+        }
+        GemvBf16 gb = {};
+        gb.w[0] = l.gate_bf;
+        gb.y[0] = y;
+        gb.n[0] = l.n_exp;
+        gemv_bf16(gb, 1, x, g.dim, T, 1024, s);
     }
     bool f16raw(Dev& d, const std::string& name, uint16_t*& p, std::string& err, size_t* acct) {
         const Tensor* t = pk.get(name);
@@ -2042,6 +2082,8 @@ struct Model::Impl {
         if (ids.empty())
             for (int i = 0; i < ndev; ++i) ids.push_back(i);
         devs.resize(ids.size());
+        u9::mask();       // (both print their state at load)
+        attn_split();
         for (size_t i = 0; i < ids.size(); ++i) {
             Dev& d = devs[i];
             d.id = ids[i];
@@ -3039,6 +3081,15 @@ struct Model::Impl {
         preload_store();
         if (!ep_slices_ok(err)) return false;
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
+        // U9 hc's side stream and events, made last: the plan, the read-ahead, the placement and the load's report all
+        // read the free VRAM before them, as the old path's do
+        if (u9::on(u9::kHc))
+            for (Dev& d : devs) {
+                CK(cudaSetDevice(d.id));
+                CK(cudaStreamCreateWithFlags(&d.st2, cudaStreamNonBlocking));
+                CK(cudaEventCreateWithFlags(&d.ev_fork, cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&d.ev_join, cudaEventDisableTiming));
+            }
         reset();
         return true;
     }
@@ -3861,7 +3912,7 @@ struct Model::Impl {
                       f32(d, P + "hc_attn_base", l.hca_base, err, acct) && f32(d, P + "hc_ffn_fn", l.hcf_fn, err, acct) &&
                       f32(d, P + "hc_ffn_scale", l.hcf_scale, err, acct) &&
                       f32(d, P + "hc_ffn_base", l.hcf_base, err, acct) &&
-                      f32(d, P + "ffn.gate.weight", l.gate_w, err, acct, (size_t) l.n_exp * g.dim) &&
+                      gate_load(d, P + "ffn.gate.weight", l, err, acct) &&
                       f32(d, P + "ffn.gate.bias", l.gate_bias, err, acct, (size_t) l.n_exp) &&
                       (l.mtp || img_tok < 0 || pk.get(P + "ffn.gate.bias_vl") == nullptr ||
                        f32(d, P + "ffn.gate.bias_vl", l.gate_bias_vl, err, acct, (size_t) l.n_exp)) &&
@@ -6505,8 +6556,8 @@ struct Model::Impl {
         const int j = l0.il + a, end = l0.mtp ? g.nl + g.n_mtp : g.nl;
         if (j >= end || j >= (int) L.size()) return nullptr;
         const Layer& n = L[(size_t) j];
-        if (n.dev != l0.dev || n.mtp != l0.mtp || n.lay.fmt != gg::kFmtMXFP4 || n.gate_w == nullptr || n.n_exp > 1024 ||
-            (int) n.slot.size() < n.n_exp)
+        if (n.dev != l0.dev || n.mtp != l0.mtp || n.lay.fmt != gg::kFmtMXFP4 ||
+            (n.gate_w == nullptr && n.gate_bf == nullptr) || n.n_exp > 1024 || (int) n.slot.size() < n.n_exp)
             return nullptr;
         for (int e = 0; e < n.n_exp; ++e)
             if (file_read(n, e)) return &n;
@@ -7377,7 +7428,7 @@ struct Model::Impl {
         hc_split(c.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, c.f_pre, c.f_post, c.f_comb, s);
         hc_pre_norm(c.h, c.a_pre, l.ffn_norm, D, H, T, g.eps, c.x, s);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
-        gemv_f32(l.gate_w, c.x, l.n_exp, D, T, c.glog, 1024, s);   // (F32 x: the token path's bits)
+        gate_gemv(l, c.x, T, c.glog, s);   // (F32 x: the token path's bits)
         for (int r0 = 0; r0 < T; r0 += kVlRows) {   // (route()'s image bits cover kVlRows rows a call)
             const int nr = std::min(kVlRows, T - r0);
             VlBits vb;
@@ -9219,6 +9270,10 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+        // U9 hc: a sublayer's hc_mix / hc_split on st2, beside its other kernels (the pre-norm reads the previous
+        // sublayer's pre, so only hc_post needs them: it waits for ev_join)
+        const bool hc2 = nm == 1 && d.st2 != nullptr;   // (made when kHc is on)
+        cudaStream_t sx = hc2 ? d.st2 : s;
         prof_mark(d, 0);
         // Engram
         if (l.eg >= 0) {
@@ -9238,8 +9293,13 @@ struct Model::Impl {
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
         }
         // attention
-        hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
-        hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, s);
+        if (hc2) {
+            CK(cudaEventRecord(d.ev_fork, s));
+            CK(cudaStreamWaitEvent(d.st2, d.ev_fork, 0));
+        }
+        hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, sx);
+        hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, sx);
+        if (hc2) CK(cudaEventRecord(d.ev_join, d.st2));
         hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
         {
             x3::MvJob j[4];
@@ -9344,7 +9404,16 @@ struct Model::Impl {
                                               (size_t) ng * ik_rb(), l.dev, err))
                         return false;
                 }
-                if (clen_max > 0) {
+                // U9 ixfast: every query keeps all its compressed rows (n <= index_topk, no candidate restriction):
+                // topk's answer is then 0 .. n - 1 whatever the scores, so the query rows, the weights and the scores
+                // are skipped (not on the candidate source layer: its scores pick the candidate blocks)
+                bool keep_all = clen_max > 0 && u9::on(u9::kIxfast) && !l.cand_src;
+                for (int t = 0; keep_all && t < T; ++t)
+                    keep_all = lim.k[t] >= lim.n[t] &&
+                               !(l.uses_cand && (lim.n[t] + g.cand_blk - 1) / g.cand_blk > g.cand_topk);
+                if (keep_all) {
+                    topk(d.scores, (long long) o.max_context + 64, T, lim, nullptr, 0, 1, d.topk, (int) topk_stride(), s);
+                } else if (clen_max > 0) {
                     if (!mv(d, {job(l.i_wq_b, d.qr, d.iq, T, g.q_lora, (size_t) g.ix_heads * g.ix_hd)}, err)) return false;
                     Finish fi;
                     fi.rd = g.rd;
@@ -9447,36 +9516,85 @@ struct Model::Impl {
             if (!mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err)) return false;
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+        if (hc2) CK(cudaStreamWaitEvent(s, d.ev_join, 0));
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
         prof_mark(d, 1);
         // the MoE
-        hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
-        hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, s);
+        if (hc2) {
+            CK(cudaEventRecord(d.ev_fork, s));
+            CK(cudaStreamWaitEvent(d.st2, d.ev_fork, 0));
+        }
+        hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, sx);
+        hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, sx);
+        if (hc2) CK(cudaEventRecord(d.ev_join, d.st2));
         hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
             // router made), and waits for the answer only before the experts' sum
-            gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0;
             int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
-            for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
-                const Layer* nx = ahead_layer(L0, a);
-                if (nx == nullptr) break;
-                const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
-                float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
-                gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
-                                                                         // weights instead: the same hit rate)
-                route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
-                na[a - 1] = m;
+            if (u9::on(u9::kRoute)) {   // U9 route: the gates in one GEMV, the lookahead and the routing in one launch
+                const Layer* nx[2] = {nullptr, nullptr};
+                int nn = 0;
+                for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
+                    nx[a - 1] = ahead_layer(L0, a);
+                    if (nx[a - 1] == nullptr) break;
+                    na[a - 1] = a == 1 ? std::max(1, std::min(kAhead1, nx[0]->k_exp + ahead_extra))
+                                       : std::min(kPicks, nx[1]->k_exp);
+                    nn = a;
+                }
+                bool bf = l.gate_bf != nullptr;
+                for (int a = 0; a < nn; ++a) bf = bf && nx[a]->gate_bf != nullptr;
+                if (bf) {
+                    GemvBf16 gb = {};
+                    gb.w[0] = l.gate_bf;
+                    gb.y[0] = d.glog;
+                    gb.n[0] = l.n_exp;
+                    for (int a = 0; a < nn; ++a) {
+                        gb.w[1 + a] = nx[a]->gate_bf;
+                        gb.y[1 + a] = d.glog_a + (size_t) a * kWin * 1024;
+                        gb.n[1 + a] = nx[a]->n_exp;
+                    }
+                    gemv_bf16(gb, 1 + nn, d.x, D, T, 1024, s);
+                } else {
+                    gate_gemv(l, d.x, T, d.glog, s);
+                    for (int a = 0; a < nn; ++a) gate_gemv(*nx[a], d.x, T, d.glog_a + (size_t) a * kWin * 1024, s);
+                }
+                RouteAhead ra = {};
+                int nra = 0;
+                for (int a = 0; a < nn; ++a)
+                    if (na[a] > 0 && T > 0 && nx[a]->n_exp <= 1024 && a * kAhead1 + na[a] <= kAhead) {   // (route_ahead's)
+                        ra.logits[nra] = d.glog_a + (size_t) a * kWin * 1024;
+                        ra.bias[nra] = nx[a]->gate_bias;
+                        ra.n[nra] = nx[a]->n_exp;
+                        ra.m[nra] = na[a];
+                        ra.off[nra] = a * kAhead1;
+                        ++nra;
+                    }
+                route_fused(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
+                            d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
+                            na[1], ra, nra);
+            } else {
+                gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
+                for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
+                    const Layer* nx = ahead_layer(L0, a);
+                    if (nx == nullptr) break;
+                    const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
+                    float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
+                    gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
+                                                                             // weights instead: the same hit rate)
+                    route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
+                    na[a - 1] = m;
+                }
+                route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
+                              d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
+                              na[1]);
             }
-            route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
-                          d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1]);
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
@@ -9498,10 +9616,16 @@ struct Model::Impl {
                     zc_stage(d.plan_ptr, d.ridx, l.zc_tab, l.k_exp, zc_stage_buf, zc_stride, l.blob, s);
                 if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
                 else x3::moe_gate_up(ma, d.x, d.xg, s);
+                // U9 tail: the device experts' down before the wait (it reads the plan, not the answer; DS4_PROF's
+                // gate/up stretch then holds it)
+                const bool early = mx && u9::on(u9::kTail);
+                const bool down_ok = early && gg::moe_down_experts(ma, d.xg, s);   // (false: printed, as moe_down)
                 prof_mark(d, 3);
                 if (lead) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
-                if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                if (early) {
+                    if (down_ok) gg::moe_down_combine(ma, d.sh_out, d.moe_out, s);
+                } else if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
             } else {   // each distinct expert read once for the window's tokens
                 gf::MoeWin mw;
@@ -9545,6 +9669,7 @@ struct Model::Impl {
             }
             if (lead) st.experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+            if (hc2) CK(cudaStreamWaitEvent(s, d.ev_join, 0));
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
@@ -9556,7 +9681,7 @@ struct Model::Impl {
             return false;
         }
         // (glog rows are 1024 apart: route reads them so)
-        gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
+        gate_gemv(l, d.x, T, d.glog, s);
         VlBits vb = {};
         vb.w[0] = l.mtp ? 0u : wp.vl;
         route(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, d.ridx, d.rw, s, l.gate_bias_vl,
@@ -9663,6 +9788,7 @@ struct Model::Impl {
             CK(cudaMemcpyAsync(d.cpu_part, h_part, (size_t) T * D * 4, cudaMemcpyHostToDevice, s));
         }
         combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
+        if (hc2) CK(cudaStreamWaitEvent(s, d.ev_join, 0));
         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));

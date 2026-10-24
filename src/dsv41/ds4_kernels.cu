@@ -6,6 +6,7 @@
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_attn_split.cuh"
+#include "ds4_u9.hpp"
 
 #include <cuda_fp16.h>
 
@@ -1464,6 +1465,122 @@ __global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1) 
     *(volatile unsigned*) &req->seq = seq;
 }
 
+// ---- U9 route: the router chain in two launches, the same bits
+// gemv_f32_kernel over BF16 rows (what the F32 copy was widened from: the same values, the same summing order), the
+// matrices of blockIdx.z on the same x
+__global__ void __launch_bounds__(kThreads) gemv_bf16_kernel(const GemvBf16 g, const float* __restrict__ x, int k,
+                                                             int ldy) {
+    const int m = blockIdx.z;
+    const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, t = blockIdx.y;
+    if (row >= g.n[m]) return;
+    const uint2* w = (const uint2*) (g.w[m] + (size_t) row * k);
+    const float4* xv = (const float4*) (x + (size_t) t * k);
+    float acc = 0.0f;
+    for (int c = lane; c < k / 4; c += 32) {
+        const uint2 a = w[c];
+        const float4 b = xv[c];
+        acc = fmaf(__uint_as_float(a.x << 16), b.x, acc);
+        acc = fmaf(__uint_as_float(a.x & 0xffff0000u), b.y, acc);
+        acc = fmaf(__uint_as_float(a.y << 16), b.z, acc);
+        acc = fmaf(__uint_as_float(a.y & 0xffff0000u), b.w, acc);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) g.y[m][(size_t) t * ldy + row] = acc;
+}
+// the m best of bs[0 .. n) (route_publish_kernel's order: the larger score, then the lower index) by one warp, each
+// taken out (-FLT_MAX) once picked: into pick[0 .. m) (n or more: none left)
+__device__ __forceinline__ void warp_topk(float* bs, int n, int m, int* pick) {
+    const int lane = threadIdx.x & 31;
+    for (int r = 0; r < m; ++r) {
+        float best = -FLT_MAX;
+        int bix = 0x7fffffff;
+        for (int i = lane; i < n; i += 32)
+            if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+            if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+        }
+        if (lane == 0) {
+            pick[r] = bix;
+            if (bix < n) bs[bix] = -FLT_MAX;
+        }
+        __syncwarp();
+    }
+}
+// grid (T, 1 + lookahead layers): block (t, 0) route_publish_kernel's work for token t, block (t, a) route_ahead_kernel's
+// for lookahead a; with a request, the last block to finish publishes it (publish_kernel's writes; cnt back to 0)
+__global__ void __launch_bounds__(256) route_fused_kernel(const float* __restrict__ logits,
+                                                          const float* __restrict__ bias, int n, int k,
+                                                          float route_scale, const unsigned long long* __restrict__ vram,
+                                                          const float* __restrict__ x, int dim, int* idx, float* w,
+                                                          unsigned long long* plan_ptr, Req* req,
+                                                          const float* __restrict__ bias_vl, unsigned vl,
+                                                          const RouteAhead ah, unsigned seq, int na0, int na1,
+                                                          unsigned* cnt) {
+    __shared__ float sc[1024], bs[1024];
+    __shared__ int pick[kAhead1];
+    __shared__ int on_cpu;
+    const int t = blockIdx.x, a = blockIdx.y;
+    if (a == 0) {
+        logits += (size_t) t * 1024;
+        if (bias_vl != nullptr && ((vl >> t) & 1u)) bias = bias_vl;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const float l = logits[i];
+            const float sp = l > 20.0f ? l : log1pf(expf(l));
+            sc[i] = sqrtf(sp);
+            bs[i] = sc[i] + bias[i];
+        }
+        __syncthreads();
+        if (threadIdx.x < 32) warp_topk(bs, n, k, pick);
+        if (threadIdx.x == 0) {
+            float s = 0.0f;
+            for (int r = 0; r < k; ++r) s += sc[pick[r]];
+            int cpu = 0;
+            for (int r = 0; r < k; ++r) {
+                const float wv = sc[pick[r]] / (s + 1e-20f) * route_scale;
+                idx[(size_t) t * kPicks + r] = pick[r];
+                w[(size_t) t * kPicks + r] = wv;
+                plan_ptr[(size_t) t * kPicks + r] = vram[pick[r]];
+                cpu |= vram[pick[r]] == 0ull;
+                if (req != nullptr) {
+                    req->ids[t][r] = pick[r];
+                    req->w[t][r] = wv;
+                }
+            }
+            on_cpu = cpu;
+        }
+        __syncthreads();
+        if (req != nullptr && on_cpu)
+            for (int i = threadIdx.x; i < dim; i += blockDim.x) req->x[t][i] = x[(size_t) t * dim + i];
+    } else {
+        const int j = a - 1, na = ah.n[j], m = ah.m[j];
+        const float* lg = ah.logits[j] + (size_t) t * 1024;
+        for (int i = threadIdx.x; i < na; i += blockDim.x) {
+            const float l = lg[i];
+            const float sp = l > 20.0f ? l : log1pf(expf(l));
+            bs[i] = sqrtf(sp) + ah.bias[j][i];
+        }
+        __syncthreads();
+        if (threadIdx.x < 32) warp_topk(bs, na, m, pick);
+        if (threadIdx.x == 0)
+            for (int r = 0; r < m; ++r) req->ahead[t][ah.off[j] + r] = pick[r] < na ? pick[r] : -1;
+    }
+    if (req == nullptr) return;
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0 && atomicAdd(cnt, 1u) == gridDim.x * gridDim.y - 1) {
+        *cnt = 0;
+        __threadfence_system();
+        req->na[0] = na0;
+        req->na[1] = na1;
+        req->T = (int) gridDim.x;
+        __threadfence_system();
+        *(volatile unsigned*) &req->seq = seq;
+    }
+}
+
 __global__ void wait_seq_kernel(const unsigned* seq_ptr, unsigned seq) {
     if (threadIdx.x != 0) return;
     while (*(volatile const unsigned*) seq_ptr != seq) {
@@ -1789,13 +1906,19 @@ namespace {
 
 // ---- the split-KV attention's scratch: a device allocation a (device, stream), made on first use and kept
 constexpr int kSplitG = 4, kSplitR = 40, kSplitCap = 24, kSplitMaxT = 5;
-bool split_enabled() {
-    static const bool on = [] {
+bool& split_flag() {   // (a test sets it: both kernels in one process)
+    static bool on = [] {
+        // unset: on with the U9 defaults (the 2080 Ti's attention 15.9 -> 15.0 ms a token), off with DS4_U9=0 and on HIP
+        // (no gain measured on 4x R9700: 21.8 vs 21.9 tok/s)
         const char* e = std::getenv("DS4_ATTN_SPLIT");
-        return e != nullptr && std::atoi(e) != 0;   // opt-in: no gain measured on 4x R9700 (21.8 vs 21.9 tok/s)
+        const bool v = e != nullptr ? std::atoi(e) != 0 : u9::defaults();
+        std::fprintf(stderr, "ds4 attn split: %s%s\n", v ? "on" : "off", e != nullptr ? " (DS4_ATTN_SPLIT)" : "");
+        return v;
     }();
     return on;
 }
+std::atomic<unsigned long long> g_split_runs{0};   // (the split kernel's launches: a test checks which path ran)
+// (sized by the first call's heads on a (device, stream): the engine's heads a device do not change)
 attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
     static std::mutex mu;
     static std::map<std::pair<int, cudaStream_t>, attnsplit::AttnSplitScratch> m;
@@ -1819,6 +1942,9 @@ attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
 }
 }  // namespace
 
+bool& attn_split() { return split_flag(); }
+unsigned long long attn_split_runs() { return g_split_runs.load(); }
+
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
@@ -1832,6 +1958,44 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
         route_ahead_kernel<<<T, 512, 0, s>>>(logits, bias, n, m, req, off);
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { wait_seq_kernel<<<1, 32, 0, s>>>(seq_ptr, seq); }
+
+void gemv_bf16(const GemvBf16& g, int nm, const float* x, int k, int T, int ldy, cudaStream_t s) {
+    int n = 0;
+    for (int i = 0; i < nm; ++i) n = std::max(n, g.n[i]);
+    if (T > 0 && nm > 0) gemv_bf16_kernel<<<dim3(cdiv(n, kThreads / 32), T, nm), kThreads, 0, s>>>(g, x, k, ldy);
+}
+void route_fused(const float* logits, const float* bias, int n, int k, int T, float route_scale,
+                 const unsigned long long* vram, const float* x, int dim, int* idx, float* w, unsigned long long* plan_ptr,
+                 Req* req, unsigned seq, cudaStream_t s, const float* bias_vl, unsigned vl, int na0, int na1,
+                 const RouteAhead& ah, int na) {
+    // the blocks' finish count: a (device, stream)'s, zeroed on the stream before its first use, left at 0 by each launch
+    static std::mutex mu;
+    static std::map<std::pair<int, cudaStream_t>, unsigned*> cnts;
+    unsigned* cnt = nullptr;
+    if (req != nullptr) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        std::lock_guard<std::mutex> lk(mu);
+        unsigned*& c = cnts[{dev, s}];
+        if (c == nullptr) {
+            if (cudaMalloc((void**) &c, sizeof(unsigned)) == cudaSuccess) cudaMemsetAsync(c, 0, sizeof(unsigned), s);
+            else {
+                cudaGetLastError();   // (no counter: the separate launches below; the error not left for a check)
+                c = nullptr;
+            }
+        }
+        cnt = c;
+    }
+    if (req != nullptr && cnt == nullptr) {   // (no counter: the separate launches)
+        for (int j = 0; j < na; ++j) route_ahead(ah.logits[j], ah.bias[j], ah.n[j], ah.m[j], T, req, ah.off[j], s);
+        route_publish(logits, bias, n, k, T, route_scale, vram, x, dim, idx, w, plan_ptr, req, seq, s, bias_vl, vl, na0, na1);
+        return;
+    }
+    route_fused_kernel<<<dim3(T, req != nullptr ? 1 + na : 1), 256, 0, s>>>(logits, bias, n, k, route_scale, vram, x, dim,
+                                                                           idx, w, plan_ptr, req,
+                                                                           vl != 0 ? bias_vl : nullptr, vl, ah, seq, na0,
+                                                                           na1, cnt);
+}
 
 // the RAM store's experts for the device (a decode token, window of one): a pick the VRAM table left at 0 whose expert the store holds
 // (zc_tab[expert] = the slot's device address over PCIe, 0: not) is copied to staging slot i with wide coalesced loads (the PCIe
@@ -2016,17 +2180,25 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     }
     // a decode step / short verify window of packed rows: the split-KV kernel (Strata's CUDA lab, ds4_attn_split.cuh; 2.9x at
     // one query on an A4000).  The same inputs; the merge sums the chunks in another order, so the bits differ in the last
-    // place (4e-7 against a double reference).  DS4_ATTN_SPLIT=1 turns it on (off by default: no measurable decode gain on the R9700 box, the decode is bound elsewhere).
-    if (ckv_fmt == kKvFp4 && a.gen == 0 && T >= 1 && T <= kSplitMaxT && heads % kSplitG == 0 && split_enabled()) {
+    // place (4e-7 against a double reference).  DS4_ATTN_SPLIT=0 / =1 turns it off / on (split_flag: the default follows DS4_U9).
+    if (ckv_fmt == kKvFp4 && a.gen == 0 && T >= 1 && T <= kSplitMaxT && heads % kSplitG == 0 && split_flag()) {
         int total_max = 0;
         for (int t = 0; t < T; ++t) total_max = std::max(total_max, a.nwin[t] + a.nsel[t]);
+        static std::atomic<bool> told{false};   // (the first fallback is said, once)
         if (total_max > 0 && total_max <= kSplitCap * kSplitR) {
             const attnsplit::AttnSplitScratch sc = split_scratch(s, heads);
             if (sc.part != nullptr) {
+                ++g_split_runs;
                 attnsplit::sparse_attn_split<kSplitG, kSplitR>(q, win, (const uint8_t*) ckv, kv_row_bytes(kKvFp4, d), sel,
                                                                sel_stride, a, sink, heads, T, scale, out, sc, total_max, s);
                 return;
             }
+            if (!told.exchange(true))
+                std::fprintf(stderr, "ds4 attn split: its scratch (%zu MB) could not be allocated - the old kernel instead\n",
+                             (size_t) kSplitMaxT * heads * kSplitCap * 514 * sizeof(float) >> 20);
+        } else if (total_max > 0 && !told.exchange(true)) {
+            std::fprintf(stderr, "ds4 attn split: %d rows a query, above its %d - the old kernel instead\n", total_max,
+                         kSplitCap * kSplitR);
         }
     }
     // a few queries (a decode step, a short window): their selected rows decoded once a query into the scratch, then
