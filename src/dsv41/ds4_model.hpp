@@ -71,11 +71,12 @@ struct Options {
     // (stage_run), its last layer's go back through the final norm; no embedding table, no head, no drafter.
     // Either: conversation checkpoints and slots only with stage_ckpt (the worker as the main process asks); prompts on
     // the chunked path as one process runs them (a chunk's rows over
-    // the link: set_stage_chunks / stage_prefill), except with stage_bf16 or the drafter here: then in windows
+    // the link: set_stage_chunks / stage_prefill), except with the drafter here: then in windows
     bool remote_stage = false;
     bool stage_worker = false;
     // (either side) the link's rows compact: the streams as bf16, pre and the indexer's picks exact (ds4_stage.hpp
-    // rows_pack; STRATA_REMOTE_ROWS=bf16 on both sides) - the windows' rows only: no prompt chunks
+    // rows_pack) - a window's rows and a prompt chunk's.  ds4_main.cpp sets it for either side unless
+    // STRATA_REMOTE_ROWS=fp32 (both sides alike: the hello refuses a pair that differs)
     bool stage_bf16 = false;
     // remote_stage: the main process keeps its conversation checkpoints and slots across the link (STRATA_DS4_SLOT_KEEP=1,
     // set_stage_ckpt): each is taken on the worker too, under the main process's id, and used only where both hold it.
@@ -235,7 +236,7 @@ public:
     /// the rows on the link are the compact ones (ds4_stage.hpp RowGeo::compact(): handoff_floats words a row;
     /// full_floats the fp32 row) and the layout is: the streams as bf16, pre, the picks and candidates as they are.
     /// chunk: the most rows of a prompt chunk this process sends (the main process) or takes (the worker) over the link
-    /// - its chunked prompt path's chunk, fp32 rows of full_floats; 0: windows only (always with stage_bf16).
+    /// - its chunked prompt path's chunk, rows of handoff_floats on the link as a window's; 0: windows only.
     struct StageGeo {
         int dim = 0, hc = 0, n_layers = 0, n_expert = 0, layer_begin = 0, layer_end = 0, max_t = 0;
         int64_t handoff_floats = 0;
@@ -274,10 +275,11 @@ public:
     StageConv stage_conv() const;
     /// The main process's prompt chunks (remote_stage, StageGeo::chunk > 0; ds4_stage.hpp's ChunkLink): each chunk's
     /// rows go to the worker as the chunk leaves this process's last layer, while the next chunk runs here.  `send`:
-    /// T tokens at p0 and their rows (T x full_floats, block by block as a window's), on a thread of its own - the
-    /// rows stay as they are until the next send or `wait` returns; `last`: the run's last chunk; `skip`: the rows the
-    /// reply leaves out.  `recv`: the oldest chunk's reply, rows [skip, T) row by row into `rows` (that chunk's row 0;
-    /// row r at r x full_floats - its streams, then its pre).  `wait`: the last send out.  `abort`: a run that failed
+    /// T tokens at p0 and their rows (T x full_floats, block by block as a window's; the compact ones are ChunkLink's
+    /// to make), on a thread of its own - the rows stay as they are until the next send or `wait` returns; `last`: the
+    /// run's last chunk; `skip`: the rows the reply leaves out.  `recv`: the oldest chunk's reply, rows [skip, T) row
+    /// by row into `rows` (that chunk's row 0; row r at r x full_floats - its streams, then its pre, fp32).  `wait`:
+    /// the last send out.  `abort`: a run that failed
     /// with chunks on the way - the link is shut, and the next reset connects again.
     struct StageChunks {
         std::function<bool(const int32_t* tokens, int T, int64_t p0, bool last, const float* rows, int skip,
@@ -293,11 +295,13 @@ public:
     /// The worker's side of a prompt chunk (stage_worker, StageGeo::chunk > 0): T tokens at p0 (which must be pos())
     /// and their rows `in` (block by block) through this process's layers on its chunked prompt path; its last layer's
     /// rows [skip, T) row by row into `out` (StageChunks::recv's layout).  `last`: the main process's last chunk of a run.
+    /// With stage_bf16 `in` and `out` are the link's compact rows (rows_pack's, reply_rows_pack's): the chunk runs on
+    /// two fp32 buffers of its own, unpacked into and packed from here.
     bool stage_prefill(const int64_t* tokens, int T, int64_t p0, bool last, int skip, const float* in, float* out,
                        std::string& err);
     /// The worker's prompt-chunk buffers the link lends (StageBuffers::pf_in[0], pf_in[1], pf_out[0], pf_out[1] for i
-    /// 0-3): StageGeo::chunk x full_floats each, pageable, its pages committed as they are first written; nullptr
-    /// without chunks.
+    /// 0-3): StageGeo::chunk x handoff_floats each (the link's row), pageable, its pages committed as they are first
+    /// written; nullptr without chunks.
     float* stage_chunk_rows(int i);
 
     void save_profile() const;

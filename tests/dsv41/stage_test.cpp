@@ -7,11 +7,13 @@
 // mismatch - over a real link on the loopback; and, over the loopback through src/net/stage_link.cpp, a main
 // process's draft checks committed in part on a worker that runs ds4_main.cpp's Run and Commit (worker_run,
 // worker_commit) over a stand-in model keeping a history, undone past what a Commit keeps (each reply must be what the
-// kept tokens alone give); bf16 rows and prompt chunks never together, a chunk never undone by a Commit; and prompt
-// chunks over a loopback link - the worker's buffers as ds4_main.cpp lends them, the main process's ChunkLink sending
-// ahead of the replies, the rows block by block there and row by row back, the replies' skip, the last chunk's flag, a
-// chunk too large for the worker (the worker's handler stands in for Model::stage_prefill: it checks and turns the
-// rows as the layout says, no layers).
+// kept tokens alone give); bf16 rows with prompt chunks taken, a chunk never undone by a Commit; and prompt chunks over
+// a loopback link - the worker's buffers as ds4_main.cpp lends them, the main process's ChunkLink sending ahead of the
+// replies, the rows block by block there and row by row back, the replies' skip, the last chunk's flag, a chunk too
+// large for the worker (the worker's handler stands in for Model::stage_prefill: it checks and turns the rows as the
+// layout says, no layers) - with fp32 rows and with the compact ones, packed at the link's width on both sides
+// (ChunkLink; the stand-in unpacks and packs as Model::stage_prefill does): the picks and pre exact, the streams
+// rounded as bf16 rounds them each way.
 // And the checkpoints and slots the main process has its worker keep (STRATA_DS4_SLOT_KEEP): the ids CkptSave /
 // CkptRestore carry (ck_save_op / ck_restore_op), the worker's store of its parts of slots (ds4_partstore.hpp: RAM cap,
 // folder budget, keep[], a folder left by an earlier run), and the worker's handlers (worker_ck_save / worker_ck_restore,
@@ -425,8 +427,16 @@ static bool has(const std::string& s, const char* part) { return s.find(part) !=
 namespace chunked {
 constexpr int kDim = 8, kHc = 2, kTopk = 4, kCand = 4, kHD = kHc * kDim;
 constexpr int64_t kW = kHD + 8 + kTopk + kCand;   // a hand-off row's floats
+static st::RowGeo geo() {
+    st::RowGeo g;
+    g.h = kHD;
+    g.topk = kTopk;
+    g.cand = kCand;
+    return g;
+}
+static const int64_t kC = geo().compact();   // ... the compact row's words
 
-static net::StageHello hello_of(int64_t chunk) {
+static net::StageHello hello_of(int64_t chunk, bool bf16 = false) {
     net::StageHello h;
     h.n_embd = kDim;
     h.hc = kHc;
@@ -435,10 +445,10 @@ static net::StageHello hello_of(int64_t chunk) {
     h.layer_begin = 2;
     h.max_t = 16;
     h.kv_type = -1;
-    h.row_formats = st::hello_rows(false);
+    h.row_formats = st::hello_rows(bf16);
     h.max_context = 4096;
     h.chunk = chunk;
-    h.handoff_floats = kW;
+    h.handoff_floats = bf16 ? kC : kW;
     h.pack_hash = 0x5eed;
     return h;
 }
@@ -459,22 +469,28 @@ static void chunk_rows(float* rows, int64_t p0, int T) {
 }
 
 // the stand-in worker: Model::stage_prefill's checks and layout - the rows in block by block (the picks bit for bit),
-// its "last layer" h + 1 and pre x 2, out row by row from skip on
+// its "last layer" h + 1 and pre x 2, out row by row from skip on; with the compact rows (bf16) the link's buffers are
+// compact() words a row, and the chunk runs on fp32 rows unpacked from them, its reply packed back (as stage_prefill)
 struct FakeWorker {
     std::mutex mu;
     int64_t pos = 0;
     int64_t chunk = 0;
+    bool bf16 = false;
     bool rows_ok = true;
     std::vector<int> flags;   // each chunk's kChunkLast
     std::vector<std::vector<float>> run_in_out{std::vector<float>(16 * kW), std::vector<float>(16 * kW)};
     std::vector<std::vector<float>> pf;
+    std::vector<float> st_in, st_out;   // (bf16) the fp32 rows a chunk runs on
     net::StageHello mine;
     net::StageHandlers hs;
     net::StageBuffers bufs;
-    explicit FakeWorker(int64_t c) : chunk(c), mine(hello_of(c)) {
-        pf.assign(4, std::vector<float>((size_t) std::max<int64_t>(c, 1) * kW, 0.0f));
+    explicit FakeWorker(int64_t c, bool compact = false) : chunk(c), bf16(compact), mine(hello_of(c, compact)) {
+        const int64_t w = compact ? kC : kW;
+        pf.assign(4, std::vector<float>((size_t) std::max<int64_t>(c, 1) * w, 0.0f));
         float* const p[4] = {pf[0].data(), pf[1].data(), pf[2].data(), pf[3].data()};
-        bufs = st::worker_buffers(run_in_out[0].data(), run_in_out[1].data(), 16, p, chunk, kW, kW);
+        bufs = st::worker_buffers(run_in_out[0].data(), run_in_out[1].data(), 16, p, chunk, w);
+        st_in.assign((size_t) std::max<int64_t>(c, 1) * kW, 0.0f);
+        st_out.assign(st_in.size(), 0.0f);
         hs.hello = [this](const net::StageHello& theirs, net::StageHello& m, std::string& e) {
             m = mine;
             if (theirs.protocol != net::kStageProtocol) return true;
@@ -497,12 +513,19 @@ struct FakeWorker {
                 e = "out of step";
                 return false;
             }
+            float* const wire_out = out;
+            if (bf16) {   // (the compact rows in: fp32 for the "layers", the reply packed below)
+                st::rows_unpack(geo(), (int) T, in, st_in.data());
+                in = st_in.data();
+                out = st_out.data();
+            }
             const float* h = in;
             const float* pre = h + (size_t) T * kHD;
             const int32_t* topk = (const int32_t*) (pre + (size_t) T * 8);
             const int32_t* cand = topk + (size_t) T * kTopk;
             for (int64_t r = 0; r < T; ++r) {
-                rows_ok = rows_ok && tokens[r] == 100 + p0 + r && h[(size_t) r * kHD + 3] == h_of(p0 + r, 3) &&
+                const float h3 = bf16 ? bf16_round(h_of(p0 + r, 3)) : h_of(p0 + r, 3);   // (the streams rounded)
+                rows_ok = rows_ok && tokens[r] == 100 + p0 + r && h[(size_t) r * kHD + 3] == h3 &&
                           pre[(size_t) r * 8 + 1] == -(float) (p0 + r) - 1.0f &&
                           topk[(size_t) r * kTopk + 2] == (int32_t) (p0 + r) * 16 + 2 &&
                           cand[(size_t) r * kCand + 3] == -(int32_t) (p0 + r) - 3000;
@@ -510,6 +533,7 @@ struct FakeWorker {
                 for (int j = 0; j < kHD; ++j) out[(size_t) r * kW + j] = h[(size_t) r * kHD + j] + 1.0f;
                 for (int j = 0; j < 8; ++j) out[(size_t) r * kW + kHD + j] = pre[(size_t) r * 8 + j] * 2.0f;
             }
+            if (bf16) st::reply_rows_pack(geo(), (int) T, (int) skip, out, wire_out);
             flags.push_back((fl & st::kChunkLast) != 0 ? 1 : 0);
             pos = p0 + T;
             return true;
@@ -651,6 +675,73 @@ static void chunks_over_a_link() {
         CHECK(st::main_accepts(hello_of(0), mine, e) && st::chunk_sent(mine.chunk, 0) == 0);
         CHECK(st::chunk_sent(64, 0) == 0);
     }
+}
+
+// the same run of chunks with the compact rows: the link's buffers and messages compact() words a row, the main
+// process's ChunkLink packing each chunk (two slots in turn) and unpacking the replies, the worker unpacking and packing
+static void chunks_bf16_over_a_link() {
+    FakeWorker w(64, true);
+    CHECK(w.bufs.pf_row_floats == kC && w.bufs.pf_floats == (size_t) 64 * (size_t) kC && kC < kW);
+    Served s;
+    CHECK(s.start(w));
+    if (s.at.empty()) return;
+    std::string e;
+    net::StageHello peer;
+    {
+        net::StageClient c;   // (fp32 rows against a bf16 worker: refused at the hello, chunks or not)
+        CHECK(!c.connect(s.at, hello_of(64), peer, e) && has(e, "STRATA_REMOTE_ROWS"));
+    }
+    net::StageClient c;
+    e.clear();
+    const net::StageHello mine = hello_of(128, true);   // (bf16 rows and chunks together: taken)
+    CHECK(c.connect(s.at, mine, peer, e) && peer.chunk == 64 && st::main_accepts(peer, mine, e) &&
+          st::chunk_sent(mine.chunk, peer.chunk) == 64);
+    if (!e.empty()) std::printf("  bf16 chunks: %s\n", e.c_str());
+    CHECK(c.reset({}, e));
+    st::ChunkLink link(c, geo(), true);
+    std::vector<float> a((size_t) 64 * kW), b((size_t) 64 * kW), rx((size_t) 100 * kW, 0.0f);
+    std::vector<int32_t> tok(100);
+    for (int i = 0; i < 100; ++i) tok[(size_t) i] = 100 + i;
+    // three chunks (40, 40, 20), the second out before the first's reply is read, the third written into the first's
+    // buffer once the second's send returned; the last chunk's last 3 rows back
+    chunk_rows(a.data(), 0, 40);
+    CHECK(link.send(tok.data(), 40, 0, 0, a.data(), 40, e));
+    chunk_rows(b.data(), 40, 40);
+    CHECK(link.send(tok.data() + 40, 40, 40, 0, b.data(), 40, e));
+    CHECK(link.recv(rx.data(), 40, 40, e));
+    chunk_rows(a.data(), 80, 20);
+    CHECK(link.send(tok.data() + 80, 20, 80, st::kChunkLast, a.data(), 17, e));
+    CHECK(link.recv(rx.data() + (size_t) 40 * kW, 40, 40, e));
+    CHECK(link.recv(rx.data() + (size_t) 80 * kW, 20, 17, e));
+    CHECK(link.wait(e));
+    bool back = true, untouched = true, rounded = false;
+    for (int r = 0; r < 100; ++r)
+        for (int j = 0; j < kHD + 8; ++j) {
+            const float v = rx[(size_t) r * kW + j];
+            if (r < 97) untouched = untouched && v == 0.0f;
+            else if (j < kHD) {   // (rounded on the way there, the worker's +1, rounded on the way back)
+                back = back && bits_of(v) == bits_of(bf16_round(bf16_round(h_of(r, j)) + 1.0f));
+                rounded = rounded || v != h_of(r, j) + 1.0f;
+            } else
+                back = back && v == (-(float) r - (float) (j - kHD)) * 2.0f;   // (pre: exact)
+        }
+    CHECK(back);
+    CHECK(untouched);
+    CHECK(rounded);   // (the streams do lose bits: the check above is not the fp32 one)
+    {
+        std::lock_guard<std::mutex> lk(w.mu);
+        CHECK(w.rows_ok);   // (the picks and pre exact, the streams bf16-rounded, every row of every chunk)
+        CHECK(w.pos == 100);
+        CHECK((w.flags == std::vector<int>{0, 0, 1}));
+    }
+    // every row back (every row's logits), a chunk of the most the worker takes
+    CHECK(c.reset({}, e));
+    chunk_rows(a.data(), 0, 64);
+    std::fill(rx.begin(), rx.end(), 0.0f);
+    CHECK(link.send(tok.data(), 64, 0, st::kChunkLast, a.data(), 0, e) && link.recv(rx.data(), 64, 0, e) && link.wait(e));
+    CHECK(rx[(size_t) 0 * kW + 5] == bf16_round(bf16_round(h_of(0, 5)) + 1.0f) && rx[(size_t) 63 * kW + kHD] == -63.0f * 2.0f);
+    c.close();
+    s.end();
 }
 }  // namespace chunked
 
@@ -834,7 +925,7 @@ struct LinkTest {
         pf_mem.resize((size_t) 4 * (size_t) std::max(chunk, 1) * 4);
         float* const pf[4] = {pf_mem.data(), pf_mem.data() + pf_mem.size() / 4, pf_mem.data() + pf_mem.size() / 2,
                               pf_mem.data() + pf_mem.size() / 4 * 3};
-        buf = st::worker_buffers(rin.data(), rout.data(), 4, pf, chunk, 4, 4);   // (chunk 0: windows only)
+        buf = st::worker_buffers(rin.data(), rout.data(), 4, pf, chunk, 4);   // (chunk 0: windows only)
     }
     ~LinkTest() { shutdown(); }
     bool start() {
@@ -1319,19 +1410,17 @@ int main() {
         net::StageHello w = mine, t = theirs;
         w.row_formats |= st::kRowsBf16Cap;
         // a bf16 worker, an fp32 main process
-        CHECK(!st::worker_accepts(t, w, 8192, e) && e.find("STRATA_REMOTE_ROWS=bf16") != std::string::npos);
+        CHECK(!st::worker_accepts(t, w, 8192, e) && e.find("STRATA_REMOTE_ROWS=fp32 there") != std::string::npos);
         t.row_formats |= st::kRowsBf16Cap;
         CHECK(st::worker_accepts(t, w, 8192, e));
         // an fp32 worker, a bf16 main process
-        CHECK(!st::worker_accepts(t, mine, 8192, e) && e.find("STRATA_REMOTE_ROWS=bf16") != std::string::npos);
+        CHECK(!st::worker_accepts(t, mine, 8192, e) && e.find("STRATA_REMOTE_ROWS=fp32 here") != std::string::npos);
         // (the link's own bf16 stays refused: it would round the picks)
         t.row_formats |= 1u << (uint32_t) net::StageRows::BF16;
         CHECK(!st::worker_accepts(t, w, 8192, e) && e.find("fp32") != std::string::npos);
     }
 
-    // bf16 rows and prompt chunks: never both - the link's Prefill converts a chunk's whole rows (the picks with them),
-    // so a bf16 main process sends chunk 0 (windows), and a worker refuses a bf16 hello with chunks even when it takes
-    // chunks itself
+    // bf16 rows and prompt chunks together: taken (the engine packs a chunk's rows as a window's), as fp32 rows' are
     {
         net::StageHello w = mine, t = theirs;
         w.row_formats |= st::kRowsBf16Cap;
@@ -1339,15 +1428,15 @@ int main() {
         t.row_formats |= st::kRowsBf16Cap;
         CHECK(st::worker_accepts(t, w, 8192, e));   // (chunk 0: windows)
         t.chunk = 1024;
-        CHECK(!st::worker_accepts(t, w, 8192, e) && e.find("bf16") != std::string::npos &&
-              e.find("fp32 only") != std::string::npos);
+        CHECK(st::worker_accepts(t, w, 8192, e));
+        w.row_formats |= st::kRowsNormed;   // (this block's worker hello: the reply's layout too)
+        CHECK(st::main_accepts(w, t, e) && st::chunk_sent(t.chunk, w.chunk) == 1024);
         t.row_formats &= ~st::kRowsBf16Cap;   // (fp32 rows: the same chunks taken)
         w.row_formats &= ~st::kRowsBf16Cap;
         CHECK(st::worker_accepts(t, w, 8192, e));
     }
 
-    // the worker's buffers: a window's rows at the link's width (the compact one with bf16 rows), a chunk's at the
-    // fp32 width - the chunks cross as fp32 only
+    // the worker's buffers: a window's rows and a chunk's at the link's width (the compact one with bf16 rows)
     {
         st::RowGeo real;
         real.h = 4 * 5120;
@@ -1355,10 +1444,12 @@ int main() {
         real.cand = 2048;
         std::vector<float> b0(4), b1(4), b2(4), b3(4);
         float* const pf[4] = {b0.data(), b1.data(), b2.data(), b3.data()};
-        const net::StageBuffers b = st::worker_buffers(nullptr, nullptr, 16, pf, 1024, real.compact(), real.full());
+        const net::StageBuffers b = st::worker_buffers(nullptr, nullptr, 16, pf, 1024, real.compact());
         CHECK(b.handoff_floats == real.compact() && b.run_floats == (size_t) 16 * (size_t) real.compact());
-        CHECK(b.pf_row_floats == real.full() && b.pf_floats == (size_t) 1024 * (size_t) real.full());
-        const net::StageBuffers none = st::worker_buffers(nullptr, nullptr, 16, pf, 0, real.full(), real.full());
+        CHECK(b.pf_row_floats == real.compact() && b.pf_floats == (size_t) 1024 * (size_t) real.compact());
+        const net::StageBuffers f = st::worker_buffers(nullptr, nullptr, 16, pf, 1024, real.full());
+        CHECK(f.pf_row_floats == real.full() && f.pf_floats == (size_t) 1024 * (size_t) real.full());
+        const net::StageBuffers none = st::worker_buffers(nullptr, nullptr, 16, pf, 0, real.full());
         CHECK(none.pf_floats == 0 && none.pf_in[0] == nullptr);
     }
 
@@ -1436,6 +1527,43 @@ int main() {
         }
     }
 
+    // a chunk's reply, row by row: rows [skip, T) compact (streams bf16, pre exact) and back; the rows before skip and
+    // each row's rest not written either way
+    {
+        std::mt19937 rng(9);
+        st::RowGeo g;
+        g.h = 4 * 64;
+        g.topk = 40;
+        g.cand = 70;
+        const size_t W = (size_t) g.full(), C = (size_t) g.compact(), H = (size_t) g.h;
+        for (const int T : {1, 5, 16})
+            for (const int skip : {0, 1, T - 1, T}) {
+                std::vector<float> full((size_t) T * W);   // (finite floats: bf16_round's)
+                std::normal_distribution<float> nd(0.f, 3.f);
+                for (float& x : full) x = nd(rng);
+                const float mark = float_of(0xdeadbeefu);
+                std::vector<float> wire((size_t) T * C, mark), back((size_t) T * W, mark);
+                st::reply_rows_pack(g, T, skip, full.data(), wire.data());
+                st::reply_rows_unpack(g, T, skip, wire.data(), back.data());
+                bool ok = true, rounded = skip >= T;
+                for (int r = 0; r < T; ++r)
+                    for (size_t j = 0; j < W; ++j) {
+                        const float v = back[(size_t) r * W + j], f = full[(size_t) r * W + j];
+                        if (r < skip || j >= H + (size_t) g.pre) ok = ok && bits_of(v) == bits_of(mark);
+                        else if (j < H) {
+                            ok = ok && bits_of(v) == bits_of(bf16_round(f));
+                            rounded = rounded || bits_of(v) != bits_of(f);
+                        } else
+                            ok = ok && bits_of(v) == bits_of(f);
+                    }
+                for (int r = 0; r < T; ++r)   // (on the wire: the row's rest, and the rows before skip, untouched)
+                    for (size_t j = (r < skip ? 0 : H / 2 + (size_t) g.pre); j < C; ++j)
+                        ok = ok && bits_of(wire[(size_t) r * C + j]) == bits_of(mark);
+                CHECK(ok);
+                CHECK(rounded);
+            }
+    }
+
     // over a real link (loopback): bf16 to bf16, fp32 to fp32, and the two mismatches refused by the hello
     {
         std::mt19937 rng(11);
@@ -1462,7 +1590,7 @@ int main() {
             // the other format against this worker: refused at the hello, with the way out
             std::vector<float> none;
             err.clear();
-            CHECK(!link_window(w, !bf, T, rows, none, err) && err.find("STRATA_REMOTE_ROWS=bf16") != std::string::npos);
+            CHECK(!link_window(w, !bf, T, rows, none, err) && err.find("STRATA_REMOTE_ROWS") != std::string::npos);
             w.end();
             w.at.clear();
         }
@@ -1480,6 +1608,7 @@ int main() {
     commits();
     link_drafts();
     chunked::chunks_over_a_link();
+    chunked::chunks_bf16_over_a_link();
     if (fails == 0) std::printf("ds4_stage_test: all passed\n");
     return fails == 0 ? 0 : 1;
 }

@@ -8,21 +8,24 @@
 // chunked prompt path on its own layers, the main process's next chunk through its layers while the worker reads the
 // one before.  Checkpoints and slots (STRATA_DS4_SLOT_KEEP=1 on the main process) ride the link's CkptSave /
 // CkptRestore (below); without them a request that does not continue the conversation in place starts it again from
-// token 0.  The rows are fp32 - each carries the indexer's int32 picks and candidate blocks beside the streams, which
-// the link's own bf16 would not keep - or, with STRATA_REMOTE_ROWS=bf16 on both sides, the engine's compact rows: the
-// streams as bf16, pre and the picks exact (rows_pack), for windows only - the link's Prefill would convert a chunk's
-// whole rows, so with bf16 rows neither side has chunks (prompts in windows).
+// token 0.  The rows are the engine's compact ones by default: the streams as bf16, pre and the picks exact (rows_pack)
+// - each row carries the indexer's int32 picks and candidate blocks beside the streams, which the link's own bf16 would
+// not keep, so the link's format stays fp32 and the engine packs the rows itself, a window's (Model's wire_tx /
+// wire_rx) and a prompt chunk's (ChunkLink on the main process, Model::stage_prefill on the worker, at the link's
+// width: compact() words a row).  STRATA_REMOTE_ROWS=fp32 on both sides: the fp32 rows as they are (debugging).
 //
 // A draft's check (DSpark on the main process) is a window like any other: the worker keeps its layers' backups for
 // every window of 2 rows or more, and the main process's Commit says how many of its rows stand (the rest undone there
 // as one process undoes them); the drafter's taps of the worker's layers come back in the reply (reply_tap_at) - in
 // the streams block, so with bf16 rows they come back bf16 as well.  A prompt chunk is never a draft's check: it is a
-// Prefill, kept whole, with no Commit and no backups.
+// Prefill, kept whole, with no Commit and no backups.  A chunk's reply carries no taps, so a main process with the
+// drafter loaded sends no chunks (prompts in windows; ds4_model.cu).
 //
-// A chunk's rows are a window's fp32 hand-off rows (Model::StageGeo, full_floats a row).  To the worker they go block
-// by block as a window's do (T x hc x dim floats, then T x 8, T x topk_stride, T x cand_stride); the reply comes back
-// row by row - row r at r x full_floats: its streams (hc x dim), then its pre (8), the rest of the row unused - so
-// that the reply's skip leaves out whole rows (the main process reads only the rows its head needs).
+// A chunk's rows are a window's hand-off rows (Model::StageGeo, handoff_floats a row on the link).  To the worker they
+// go block by block as a window's do (T x hc x dim floats, then T x 8, T x topk_stride, T x cand_stride - compact:
+// rows_pack's); the reply comes back row by row - row r at r x the link's row: its streams (hc x dim; compact: bf16,
+// hc x dim / 2 words), then its pre (8), the rest of the row unused (reply_rows_pack) - so that the reply's skip leaves
+// out whole rows (the main process reads only the rows its head needs).
 #pragma once
 
 #include "ds4_partstore.hpp"
@@ -86,8 +89,9 @@ inline uint64_t pack_hash(const std::string& pack) {
     return h;
 }
 
-/// The compact rows of STRATA_REMOTE_ROWS=bf16.  The link's own bf16 (StageRows::BF16) converts every float of a
-/// message, which would round the int32 picks; this engine's hello lists fp32 for the link and carries this capability
+/// The compact rows (the default; STRATA_REMOTE_ROWS=fp32 turns them off).  The link's own bf16 (StageRows::BF16)
+/// converts every float of a message, which would round the int32 picks; this engine's hello lists fp32 for the link
+/// and carries this capability
 /// bit (row_formats bits 24-30 are free capability bits; the link reads only the format bits and kStageCapKvElem), and
 /// the engine packs the rows itself before the link sends them.  Both sides must have it or neither: a hello with it
 /// also has a narrower hand-off row (RowGeo::compact), so the link's own check refuses a mismatch as well.
@@ -127,6 +131,27 @@ inline void rows_unpack(const RowGeo& g, int T, const float* wire, float* full, 
                  ne = (size_t) T * (size_t) g.exact();
     net::stage_rows_decode(net::StageRows::BF16, wire, 1, nh, full);
     std::memcpy(full + nh, wire + nh / 2, (ints ? ne : np) * sizeof(float));
+}
+
+/// A prompt chunk's reply rows [skip, T), row by row, from the fp32 layout `full` (row r at r x full() words: its
+/// streams, then pre; the rest of the row unused) to the compact one `wire` (row r at r x compact(): the streams as
+/// bf16, then pre); the rows before skip and each row's rest are not written
+inline void reply_rows_pack(const RowGeo& g, int T, int skip, const float* full, float* wire) {
+    for (int r = std::max(0, skip); r < T; ++r) {
+        const float* f = full + (size_t) r * (size_t) g.full();
+        float* w = wire + (size_t) r * (size_t) g.compact();
+        net::stage_rows_encode(net::StageRows::BF16, f, 1, (size_t) g.h, w);
+        std::memcpy(w + g.h / 2, f + g.h, (size_t) g.pre * sizeof(float));
+    }
+}
+/// ... and back: rows [skip, T) of `wire` into `full`, their streams and pre
+inline void reply_rows_unpack(const RowGeo& g, int T, int skip, const float* wire, float* full) {
+    for (int r = std::max(0, skip); r < T; ++r) {
+        const float* w = wire + (size_t) r * (size_t) g.compact();
+        float* f = full + (size_t) r * (size_t) g.full();
+        net::stage_rows_decode(net::StageRows::BF16, w, 1, (size_t) g.h, f);
+        std::memcpy(f + g.h, w + g.h / 2, (size_t) g.pre * sizeof(float));
+    }
 }
 
 /// A prompt chunk's flags (StageMsg::Prefill's, bits 0-7; the Qwen engine's bit 0 is not used here): the last chunk of
@@ -180,15 +205,10 @@ inline bool worker_accepts(const net::StageHello& theirs, const net::StageHello&
     }
     const bool want = (theirs.row_formats & kRowsBf16Cap) != 0, have = (mine.row_formats & kRowsBf16Cap) != 0;
     if (want != have) {
-        err = want ? "the main process sends bf16 rows (STRATA_REMOTE_ROWS=bf16) and this worker reads fp32: start the "
-                     "worker with STRATA_REMOTE_ROWS=bf16 too"
-                   : "this worker reads bf16 rows (STRATA_REMOTE_ROWS=bf16) and the main process sends fp32: set "
-                     "STRATA_REMOTE_ROWS=bf16 on the main process too";
-        return false;
-    }
-    if (want && theirs.chunk > 0) {   // (the link's Prefill converts whole rows: the compact rows are the windows' only)
-        err = "the main process sends bf16 rows (STRATA_REMOTE_ROWS=bf16) and prompt chunks of " +
-              std::to_string(theirs.chunk) + " tokens: a chunk's rows cross as fp32 only - the same build on both PCs";
+        err = want ? "the main process sends bf16 rows (the default) and this worker reads fp32 (STRATA_REMOTE_ROWS=fp32 "
+                     "here, or an earlier build): the same STRATA_REMOTE_ROWS on both PCs - unset on both for bf16"
+                   : "this worker reads bf16 rows (the default) and the main process sends fp32 (STRATA_REMOTE_ROWS=fp32 "
+                     "there, or an earlier build): the same STRATA_REMOTE_ROWS on both PCs - unset on both for bf16";
         return false;
     }
     if (theirs.max_context > max_context || theirs.max_t > mine.max_t || theirs.max_t < 1) {
@@ -287,19 +307,37 @@ bool worker_commit(M& m, int n_keep, int& last_t, std::string& err) {
 
 /// The main process's prompt chunks over its link: each chunk's send on a thread of its own, one in flight at a time
 /// in order (net::StageRelay - a chunk's rows stay as they are until the next send() or wait() returns), its reply
-/// read by recv() in the same order, on any one thread.
+/// read by recv() in the same order, on any one thread.  The caller's rows are fp32 either way (send: block by block,
+/// recv: row by row at full()); the compact rows are staged here at the link's width - packed into one of two slots
+/// taken in turn (the relay holds the one it sends: the send before this one's, which this send waits for, is out),
+/// a reply read into a third and unpacked.
 class ChunkLink {
 public:
-    /// `row_floats`: a hand-off row's fp32 floats (Model::StageGeo::full_floats)
+    /// `row_floats`: a hand-off row's fp32 floats (Model::StageGeo::full_floats): the rows cross as they are
     ChunkLink(net::StageClient& link, int64_t row_floats) : link_(link), relay_(link), row_(row_floats) {}
+    /// `g`'s rows, compact on the link when `compact` (the hellos' kRowsBf16Cap), else as they are
+    ChunkLink(net::StageClient& link, const RowGeo& g, bool compact)
+        : link_(link), relay_(link), row_(compact ? g.compact() : g.full()), g_(g), compact_(compact) {}
     /// chunk rows `rows` (T, block by block) of tokens at p0 to the worker; `skip`: the rows its reply leaves out
     bool send(const int32_t* tokens, int T, int64_t p0, int flags, const float* rows, int skip, std::string& err) {
         tok_.assign(tokens, tokens + (T > 0 ? T : 0));
-        return relay_.send(tok_.data(), T, p0, flags, rows, (size_t) row_, skip, err);
+        const float* out = rows;
+        if (compact_ && T > 0) {
+            std::vector<float>& w = wire_[slot_];
+            slot_ ^= 1;
+            if (w.size() < (size_t) T * (size_t) row_) w.resize((size_t) T * (size_t) row_);
+            rows_pack(g_, T, rows, w.data());
+            out = w.data();
+        }
+        return relay_.send(tok_.data(), T, p0, flags, out, (size_t) row_, skip, err);
     }
     /// the oldest unanswered chunk's reply: rows [skip, T) into `rows` (that chunk's row 0), row by row
     bool recv(float* rows, int T, int skip, std::string& err) {
-        return link_.prefill_recv(rows, (size_t) row_, T, skip, err);
+        if (!compact_ || skip >= T) return link_.prefill_recv(rows, (size_t) row_, T, skip, err);   // (none back)
+        if (rx_.size() < (size_t) T * (size_t) row_) rx_.resize((size_t) T * (size_t) row_);
+        if (!link_.prefill_recv(rx_.data(), (size_t) row_, T, skip, err)) return false;
+        reply_rows_unpack(g_, T, skip, rx_.data(), rows);
+        return true;
     }
     /// the last send out (or its error)
     bool wait(std::string& err) { return relay_.wait(err); }
@@ -307,27 +345,32 @@ public:
 private:
     net::StageClient& link_;
     net::StageRelay relay_;
-    int64_t row_ = 0;
+    int64_t row_ = 0;             // (the link's row: compact() words, or full())
+    RowGeo g_;
+    bool compact_ = false;
+    std::vector<float> wire_[2], rx_;
+    int slot_ = 0;
     std::vector<int64_t> tok_;   // (StageRelay keeps its own copy once it has sent)
 };
 
 /// The worker's buffers for net::serve_stage: a window's rows (run_in / run_out: max_t rows of handoff_floats, the
 /// link's row - the compact one with bf16 rows) and, with prompt chunks (chunk > 0), two chunks' rows in and two out
-/// (pf: pf_in[0], pf_in[1], pf_out[0], pf_out[1], chunk rows each of full_floats, the fp32 row: chunks are fp32 only)
+/// (pf: pf_in[0], pf_in[1], pf_out[0], pf_out[1], chunk rows each of handoff_floats too: Model::stage_prefill turns
+/// the compact ones to fp32 and back)
 inline net::StageBuffers worker_buffers(float* run_in, float* run_out, int max_t, float* const pf[4], int64_t chunk,
-                                        int64_t handoff_floats, int64_t full_floats) {
+                                        int64_t handoff_floats) {
     net::StageBuffers b;
     b.run_in = run_in;
     b.run_out = run_out;
     b.run_floats = (size_t) max_t * (size_t) handoff_floats;
     b.handoff_floats = handoff_floats;
-    b.pf_row_floats = full_floats;   // (pf_floats 0: no prompt chunks - every one is refused as too large)
+    b.pf_row_floats = handoff_floats;   // (pf_floats 0: no prompt chunks - every one is refused as too large)
     if (chunk > 0 && pf != nullptr && pf[0] != nullptr && pf[1] != nullptr && pf[2] != nullptr && pf[3] != nullptr) {
         b.pf_in[0] = pf[0];
         b.pf_in[1] = pf[1];
         b.pf_out[0] = pf[2];
         b.pf_out[1] = pf[3];
-        b.pf_floats = (size_t) chunk * (size_t) full_floats;
+        b.pf_floats = (size_t) chunk * (size_t) handoff_floats;
     }
     return b;
 }

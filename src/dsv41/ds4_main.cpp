@@ -333,8 +333,8 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
 // ---- the remote stage (docs/REMOTE_STAGE.md, ds4_stage.hpp): this PC runs layers 0 to K - 1 and the head, a worker
 // PC the rest - each window's rows, and each prompt chunk's, go there after layer K - 1 and come back before the head
 // This side's hello: the trunk, the layers where the link cuts it, the windows, the prompt chunks (the most rows this
-// side sends, or takes: its chunked path's chunk; 0 windows only - always with bf16 rows), fp32 rows (or the compact
-// bf16 ones: kRowsBf16Cap and their narrower hand-off row), no K/V type to compare (the hand-off carries no attention
+// side sends, or takes: its chunked path's chunk; 0 windows only), the compact bf16 rows (kRowsBf16Cap and their
+// narrower hand-off row; STRATA_REMOTE_ROWS=fp32: fp32 rows), no K/V type to compare (the hand-off carries no attention
 // K/V), the reply's layout (kRowsNormed), the checkpoints the main process has the worker keep (slots: ckpt,
 // STRATA_DS4_SLOT_KEEP=1), the pack's fingerprint
 strata::net::StageHello stage_hello(const strata::ds4::Model& m, const std::string& pack, bool worker, bool ckpt = false) {
@@ -605,7 +605,7 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
     });
     float* const pf[4] = {m.stage_chunk_rows(0), m.stage_chunk_rows(1), m.stage_chunk_rows(2), m.stage_chunk_rows(3)};
     const strata::net::StageBuffers bufs = strata::ds4::stage::worker_buffers(m.stage_rows_in(), m.stage_rows_out(), sg.max_t,
-                                                                             pf, sg.chunk, sg.handoff_floats, sg.full_floats);
+                                                                             pf, sg.chunk, sg.handoff_floats);
     strata::net::StageStats wst;
     std::fprintf(stderr, "maya ds4: remote stage worker: layers %d-%d, no head, windows of %d, prompt chunks of %d at most%s, "
                  "port %d\n", sg.layer_begin, sg.layer_end - 1, sg.max_t, sg.chunk, sg.chunk > 0 ? "" : " (none: windows only)",
@@ -1680,8 +1680,10 @@ int main(int argc, char** argv) {
         }
         o.stage_worker = worker_mode;
         o.remote_stage = !remote_at.empty();
-        // STRATA_REMOTE_ROWS=bf16 (both sides): the compact rows (ds4_stage.hpp rows_pack).  The link's own bf16 would
-        // round the int32 picks each row carries, so the engine packs the rows itself and the hello says so
+        // a remote stage's rows, either side: the compact ones (ds4_stage.hpp rows_pack) unless STRATA_REMOTE_ROWS=fp32
+        // (debugging; both sides alike).  The link's own bf16 would round the int32 picks each row carries, so the
+        // engine packs the rows itself and the hello says so
+        o.stage_bf16 = worker_mode || o.remote_stage;
         if (const char* v = std::getenv("STRATA_REMOTE_ROWS"); (worker_mode || o.remote_stage) && v != nullptr && *v != '\0') {
             strata::net::StageRows f = strata::net::StageRows::F32;
             if (!strata::net::stage_rows_parse(v, f)) {
@@ -1744,7 +1746,12 @@ int main(int argc, char** argv) {
                          [&remote](int n_keep, std::string& e) { return remote.commit(n_keep, e); },
                          [&remote](std::string& e) { return remote.reset(e); });
         if (remote.me.chunk > 0) {   // (the chunked prompt path's chunks: over the link as they leave layer K - 1)
-            remote.chunks = std::make_unique<strata::ds4::stage::ChunkLink>(remote.link, m.stage_geo().full_floats);
+            const strata::ds4::Model::StageGeo sg = m.stage_geo();
+            strata::ds4::stage::RowGeo rg;   // (the hand-off row: the compact one on the link with bf16 rows)
+            rg.h = (int64_t) sg.hc * sg.dim;
+            rg.topk = sg.topk;
+            rg.cand = sg.cand;
+            remote.chunks = std::make_unique<strata::ds4::stage::ChunkLink>(remote.link, rg, sg.rows_bf16);
             strata::ds4::Model::StageChunks sc;
             sc.send = [&remote](const int32_t* tokens, int T, int64_t p0, bool last, const float* rows, int skip,
                                 std::string& e) {

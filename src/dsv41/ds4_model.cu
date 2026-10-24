@@ -862,14 +862,17 @@ struct Model::Impl {
     // a row in the fp32 block layout, and the link's (the compact one with stage_bf16)
     int64_t full_floats() const { return row_geo().full(); }
     int64_t handoff_floats() const { return bf16_rows() ? row_geo().compact() : full_floats(); }
-    // a remote stage's prompt chunks (the chunked path, chunk > 0; fp32 rows only, full_floats a row): the main
-    // process's sends (Model::StageChunks) from two slots of chunk rows taken in turn (link_cx); the worker's four
-    // buffers the link lends (link_pf: two in, two out), and the chunk it runs - its rows in (stage_in, block by block)
-    // and out (stage_out, its rows from stage_skip on, row by row).  All pageable, committed as written on Linux (at
-    // the allocation on Windows; link_maps: freed at the end)
+    // a remote stage's prompt chunks (the chunked path, chunk > 0): the main process's sends (Model::StageChunks) from
+    // two slots of chunk rows of full_floats taken in turn (link_cx; the compact rows: ChunkLink packs them); the
+    // worker's four buffers the link lends (link_pf: two in, two out, chunk rows of handoff_floats - the link's row),
+    // with bf16 rows two fp32 ones the chunk runs on (link_st: in, out - stage_prefill unpacks into the first and packs
+    // the second's reply rows), and the chunk it runs - its rows in (stage_in, block by block) and out (stage_out, its
+    // rows from stage_skip on, row by row, full_floats each).  All pageable, committed as written on Linux (at the
+    // allocation on Windows; link_maps: freed at the end)
     Model::StageChunks stage_chunks;
     float* link_cx[2] = {nullptr, nullptr};
     float* link_pf[4] = {nullptr, nullptr, nullptr, nullptr};
+    float* link_st[2] = {nullptr, nullptr};
     std::vector<std::pair<void*, size_t>> link_maps;
     const float* stage_in = nullptr;
     float* stage_out = nullptr;
@@ -1982,7 +1985,7 @@ struct Model::Impl {
                                 stage::reply_fits(g.dim, (int) g.d_targets.size(), (int64_t) g.hc * g.dim);
             std::fprintf(stderr, "ds4: layers [%d, %d) of %d here%s: prompts in %s of %d, %s, no pictures%s\n", lo, hi, g.nl,
                          o.remote_stage ? " (the rest: the remote stage's worker)" : o.stage_worker ? " (a remote stage's worker)" : "",
-                         !linked() || bf16_rows() ? "windows"
+                         !linked() ? "windows"
                          : d_here ? "chunks over the link (the chunked path's; windows if the drafter loads), or windows"
                                   : "chunks over the link (the chunked path's), or windows",
                          kWin, d_here ? "DSpark as --dspark says (the worker's taps come back with its rows)" : "no DSpark",
@@ -2045,9 +2048,9 @@ struct Model::Impl {
         // kChunkedPromptDefault bring it to a single card's default run too (a host thread a GPU for the prompt only;
         // decode stays as asked).  --prefill-chunk 0 keeps the windows of 16 (DS4_WINDOWS=1 the same).  Off by default
         // until a prompt costs the decode nothing: its buffers hold VRAM the windowed path gives to experts
-        // (a layer range: windows, said above; a remote stage: chunks across - fp32 rows only, the link's Prefill would
-        // convert a chunk's whole rows and with them the int32 picks of the compact ones: bf16 rows keep the windows)
-        prompt_par = (!ranged || (linked() && !bf16_rows())) &&
+        // (a layer range: windows, said above; a remote stage: chunks across, its rows at the link's width - the
+        // compact ones packed by the engine, ds4_stage.hpp)
+        prompt_par = (!ranged || linked()) &&
                      (par || o.tp > 1 ||
                       ((o.prefill_chunk > 0 || (o.prefill_chunk < 0 && kChunkedPromptDefault)) &&
                        std::getenv("DS4_WINDOWS") == nullptr));
@@ -2776,37 +2779,44 @@ struct Model::Impl {
             }
             if (chunk > 0 && aerr.empty()) err.clear();
         }
-        // a remote stage's prompt chunks: the main process's two slots of rows out, the worker's four the link lends -
-        // pageable (a chunk's rows cross the network at its pace; on Linux a page is committed once a chunk reaches
-        // it, on Windows at the allocation).  Memory short: chunks half as large, as the prompt path's buffers above
+        // a remote stage's prompt chunks: the main process's two slots of rows out, the worker's four the link lends
+        // (and with bf16 rows its two fp32 ones) - pageable (a chunk's rows cross the network at its pace; on Linux a
+        // page is committed once a chunk reaches it, on Windows at the allocation).  Memory short: chunks half as
+        // large, as the prompt path's buffers above
         if (linked() && chunk > 0) {
-            float** bufs = o.remote_stage ? link_cx : link_pf;
-            const int nb = o.remote_stage ? 2 : 4;
+            float** const bufs[6] = {o.remote_stage ? &link_cx[0] : &link_pf[0], o.remote_stage ? &link_cx[1] : &link_pf[1],
+                                     &link_pf[2], &link_pf[3], &link_st[0], &link_st[1]};
+            const int nb = o.remote_stage ? 2 : bf16_rows() ? 6 : 4;
+            // (a row's floats: the main process's slots and the worker's fp32 ones full_floats, the link's handoff_floats)
+            auto row_of = [&](int i) { return o.stage_worker && i < 4 ? handoff_floats() : full_floats(); };
             for (;;) {
-                const size_t b = (size_t) chunk * (size_t) full_floats() * 4;
+                size_t all = 0;
                 int got = 0;
                 for (; got < nb; ++got) {
+                    const size_t b = (size_t) chunk * (size_t) row_of(got) * 4;
                     void* m = os::anon_alloc(b, -1, 1);
                     if (m == nullptr) break;
                     link_maps.push_back({m, b});
-                    bufs[got] = (float*) m;
+                    *bufs[got] = (float*) m;
+                    all += b;
                 }
                 if (got == nb) break;
+                for (int i = 0; i < nb; ++i) all += i >= got ? (size_t) chunk * (size_t) row_of(i) * 4 : 0;
                 for (; got > 0; --got) {
                     os::anon_free(link_maps.back().first, link_maps.back().second);
                     link_maps.pop_back();
-                    bufs[got - 1] = nullptr;
+                    *bufs[got - 1] = nullptr;
                 }
                 if (chunk <= 256) {
-                    err = "remote stage: " + std::to_string((b >> 20) * (size_t) nb) + " MiB of memory for prompt "
-                          "chunks' rows (--prefill-chunk 0 for windows)";
+                    err = "remote stage: " + std::to_string(all >> 20) + " MiB of memory for prompt chunks' rows "
+                          "(--prefill-chunk 0 for windows)";
                     return false;
                 }
                 const int was = chunk;
                 chunk = chunk / 2 / 16 * 16;
                 eg_cap = (size_t) chunk;
                 std::fprintf(stderr, "ds4: remote stage: %zu MiB of memory for chunks of %d rows' hand-off rows: not "
-                                     "had - trying %d\n", (b >> 20) * (size_t) nb, was, chunk);
+                                     "had - trying %d\n", all >> 20, was, chunk);
             }
         }
         // the CPU lane's experts read in place (decided above): how much of them the load reads ahead, from what VRAM
@@ -9806,8 +9816,8 @@ Model::StageGeo Model::stage_geo() const {
     s.topk = (int64_t) p.topk_stride();
     s.cand = (int64_t) p.cand_stride();
     s.rows_bf16 = p.bf16_rows();
-    // (the link's buffers: made at load for a remote stage's chunks only - none with bf16 rows, load said so)
-    s.chunk = p.linked() && !p.bf16_rows() ? (p.chunk_own >= 0 ? p.chunk_own : p.chunk) : 0;
+    // (the link's buffers: made at load for a remote stage's chunks only)
+    s.chunk = p.linked() ? (p.chunk_own >= 0 ? p.chunk_own : p.chunk) : 0;
     return s;
 }
 void Model::set_stage_link(StageRun run, std::function<bool(int n_keep, std::string& err)> commit,
@@ -9899,10 +9909,16 @@ bool Model::stage_prefill(const int64_t* tokens, int T, int64_t p0, bool last, i
               std::to_string(p0);
         return false;
     }
+    const bool bf = p.bf16_rows();
+    if (bf && (p.link_st[0] == nullptr || p.link_st[1] == nullptr)) {
+        err = "remote stage: a bf16 prompt chunk with no fp32 rows to run it on";
+        return false;
+    }
     std::vector<int> tk(tokens, tokens + T);
+    if (bf) stage::rows_unpack(p.row_geo(), T, in, p.link_st[0]);   // (the compact rows into the layout the copies read)
     p.stage_t = 0;   // (a chunk is kept whole: no backups, and no Commit undoes a window before it)
-    p.stage_in = in;
-    p.stage_out = out;
+    p.stage_in = bf ? p.link_st[0] : in;
+    p.stage_out = bf ? p.link_st[1] : out;
     p.stage_skip = skip;
     p.stage_last = last;
     p.halted = false;
@@ -9910,6 +9926,8 @@ bool Model::stage_prefill(const int64_t* tokens, int T, int64_t p0, bool last, i
     p.stage_in = nullptr;
     p.stage_out = nullptr;
     p.stage_last = true;
+    // (forward_chunks returned with the reply's rows copied in: they go out compact, from skip on)
+    if (ok && bf) stage::reply_rows_pack(p.row_geo(), T, skip, p.link_st[1], out);
     return ok;
 }
 void Model::save_profile() const { p_->save_profile(); }
