@@ -1,7 +1,8 @@
 # Strata across two or more PCs (remote stage)
 
-> **Experimental and opt-in.** The Qwen3.8-Flash-Next family only. Measured on three PCs (Linux and Windows) with two
-> models (RVN IQ3_S, Huihui UD-Q4_K_XL). Nothing changes unless the engine is started with `--remote-stage` or
+> **Experimental and opt-in.** The Qwen3.8-Flash-Next family, measured on three PCs (Linux and Windows) with two
+> models (RVN IQ3_S, Huihui UD-Q4_K_XL); DeepSeek-V4.1-Flash in its own engine (`strata-dsv41`), checked on one PC
+> only (see [Tools](#tools)). Nothing changes unless the engine is started with `--remote-stage` or
 > `--stage-worker`. How it works inside, every measurement and what is still open:
 > [remote-stage/ENGINEERING.md](remote-stage/ENGINEERING.md). Raw numbers:
 > [lask3802/Strata, branch remote-stage-data](https://github.com/lask3802/Strata/blob/remote-stage-data/bench/results/2026-10-10-remote-stage/README.md).

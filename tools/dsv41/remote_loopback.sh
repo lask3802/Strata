@@ -183,7 +183,7 @@ if [ -n "${SPEC_IDS:-}" ]; then
     echo "spec split rc=$ss"
     if [ "${SPEC_NONE:-0}" = 1 ]; then
         "$main" --max-context "$ctx" --dspark none --n "$spec_n" --ids "@$SPEC_IDS" > "$out/plain-split.out" 2> "$out/plain-split.err"
-        echo "plain split rc=$?"
+        s=$?; echo "plain split rc=$s"; [ $s -eq 0 ] || rc=1
     fi
 fi
 if [ -n "${IDS:-}" ]; then
@@ -216,7 +216,7 @@ if [ -n "${SPEC_IDS:-}" ]; then
     if [ "${SPEC_NONE:-0}" = 1 ]; then
         DS4_CHUNK_MIN=100000 "$exe" "${common[@]}" --expert-profile "$(prof plain-single)" --max-context "$ctx" \
             --prefill-chunk 0 --dspark none --n "$spec_n" --ids "@$SPEC_IDS" > "$out/plain-single.out" 2> "$out/plain-single.err"
-        echo "plain single rc=$?"
+        s=$?; echo "plain single rc=$s"; [ $s -eq 0 ] || rc=1
         arms="$arms plain-split plain-single"
     fi
     for b in $arms; do

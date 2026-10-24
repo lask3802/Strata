@@ -26,7 +26,7 @@
 # line is read against it.
 set -u
 if [ $# -lt 4 ]; then
-    sed -n '2,28p' "$0"
+    sed -n '2,26p' "$0"
     exit 2
 fi
 exe=$1
@@ -76,8 +76,9 @@ for arm in $arms; do
         fi
         sleep 2
     done
-    STRATA_REMOTE_ROWS=$rows "$exe" "${common[@]}" --remote-stage "127.0.0.1:$port" --stage-end "$K" --max-context "$ctx" \
-        --dspark none --n 64 --ids "$ids" --dump-logits "$out/split-$arm.f32" > "$out/split-$arm.out" 2> "$out/split-$arm.err"
+    # (the prompt in windows on every arm, as the single process: fp32 rows could cross as chunks, bf16 ones cannot)
+    STRATA_REMOTE_ROWS=$rows DS4_CHUNK_MIN=100000 "$exe" "${common[@]}" --remote-stage "127.0.0.1:$port" --stage-end "$K" \
+        --max-context "$ctx" --prefill-chunk 0 --dspark none --n 64 --ids "$ids" --dump-logits "$out/split-$arm.f32" > "$out/split-$arm.out" 2> "$out/split-$arm.err"
     echo "  rc=$?"
     kill $wpid 2> /dev/null
     wait $wpid 2> /dev/null
