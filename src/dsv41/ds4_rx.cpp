@@ -318,6 +318,7 @@ int Conn::recv(Hdr& h, std::vector<uint8_t>& payload, double deadline, std::stri
         if (k > 0) {
             rb_.insert(rb_.end(), tmp, tmp + k);
             bytes_in += (uint64_t) k;
+            last_in_ = now_ms();
             continue;
         }
         if (k == 0 || !would_block(last_err())) {
@@ -325,7 +326,13 @@ int Conn::recv(Hdr& h, std::vector<uint8_t>& payload, double deadline, std::stri
             close();
             return -1;
         }
-        if (deadline >= 0 && now_ms() > deadline) return 0;
+        const double now = now_ms();
+        if (deadline >= 0 && now > deadline) return 0;
+        if (now - last_in_ > 200.0) {   // quiet: sleep in poll (a reply's wait in decode stays a spin)
+            const int ms = deadline < 0 ? 50 : (int) std::min(50.0, deadline - now) + 1;
+            (void) wait_sock((sock_t) fd_, true, ms);
+            continue;
+        }
         relax();
     }
 }

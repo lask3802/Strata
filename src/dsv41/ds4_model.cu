@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <condition_variable>
 #include <deque>
 #include <atomic>
@@ -1069,7 +1070,8 @@ struct Model::Impl {
     std::vector<uint8_t> rx_has;
     bool rx_on = false;
     double rx_timeout_ms = 20.0;
-    int rx_late_run = 0;
+    uint64_t rx_late_bits = 0;   // the last 64 requests: bit set = its reply was late (8 of them: the link given up)
+    static_assert(rx::kMaxRows == kWin && rx::kMaxPicks == kPicks, "a request's rows and picks are a window's");
     std::vector<rx::ReqRow> rx_rows;
     mutable std::mutex rx_mu;
     std::vector<float> rx_rtt, rx_wait;
@@ -6517,8 +6519,13 @@ struct Model::Impl {
         const int64_t max_n = mv_ != nullptr && *mv_ != '\0' ? std::atoll(mv_) : INT64_MAX;
         const char* tv = std::getenv("STRATA_STAGE_TOKEN");
         const std::string token = tv != nullptr ? tv : "";
-        std::fprintf(stderr, "ds4: remote experts: waiting up to %d s for an expert server on %s%s\n", wait_s,
-                     o.remote_experts.c_str(), token.empty() ? " (WARNING: no STRATA_STAGE_TOKEN)" : "");
+        if (token.empty() && o.remote_experts.rfind("127.0.0.1:", 0) != 0) {   // (no token: loopback only)
+            std::fprintf(stderr, "ds4: remote experts: no STRATA_STAGE_TOKEN, refusing to listen on %s (only 127.0.0.1:PORT "
+                                 "without one) - the CPU lane computes all its experts\n", o.remote_experts.c_str());
+            return;
+        }
+        std::fprintf(stderr, "ds4: remote experts: waiting up to %d s for an expert server on %s\n", wait_s,
+                     o.remote_experts.c_str());
         auto link = std::make_unique<rx::Main>();
         std::string e;
         if (!link->accept(o.remote_experts, token, wait_s, e)) {
@@ -6710,8 +6717,10 @@ struct Model::Impl {
         st.rx_bytes_in = (int64_t) rx_link->bytes_in();
         {
             std::lock_guard<std::mutex> lk(rx_mu);
-            rx_rtt.push_back(got == 1 ? (float) (t1 - t0) : -1.0f);
-            rx_wait.push_back((float) (t1 - tw));
+            if (rx_rtt.size() < (size_t(1) << 22)) {   // (4M requests: the percentiles are of the first ones after)
+                rx_rtt.push_back(got == 1 ? (float) (t1 - t0) : -1.0f);
+                rx_wait.push_back((float) (t1 - tw));
+            }
         }
         if (got == 1) {
             const int D = g.dim;
@@ -6729,14 +6738,15 @@ struct Model::Impl {
             st.rx_picks += (int64_t) rpk.size();
             st.rx_rtt_ms += t1 - t0;
             st.rx_srv_ms += srv_us / 1000.0;
-            rx_late_run = 0;
+            rx_late_bits <<= 1;
             return;
         }
         if (got == 0) {
             if (++st.rx_late == 1)
                 std::fprintf(stderr, "ds4: remote experts: a reply later than %.2f ms (layer %d): its %zu picks computed "
                                      "here (said once; the count is in the stats)\n", rx_timeout_ms, l.il, rpk.size());
-            if (++rx_late_run >= 8) rx_lost("8 replies in a row later than DS4_RX_TIMEOUT_MS");
+            rx_late_bits = rx_late_bits << 1 | 1u;
+            if (std::bitset<64>(rx_late_bits).count() >= 8) rx_lost("8 of the last 64 replies later than DS4_RX_TIMEOUT_MS");
         } else {
             rx_lost(e.empty() ? "the link failed" : e);
         }
@@ -6826,7 +6836,8 @@ struct Model::Impl {
                 std::vector<std::pair<int, int>> picks;   // (expert, t * kPicks + i), CPU-lane only
                 // (--remote-experts) the CPU-lane picks the expert server holds: sent before the lane computes the rest
                 std::vector<std::pair<int, int>> rpicks;
-                const bool rxl = rx_on && !l.mtp && li < g.nl && li < (int) (rx_has.size() / (size_t) g.n_exp);
+                const bool rxl = rx_on && !l.mtp && li < g.nl && l.n_exp == g.n_exp &&
+                                 li < (int) (rx_has.size() / (size_t) g.n_exp);
                 if (trace_f != nullptr && !l.mtp) {   // DS4_TRACE=file: one record a route request: u8 layer, u8 T, T x k int16 expert ids
                     // DS4_TRACE_AHEAD=1: T has bit 7 set and the guesses follow: u8 na1, u8 na2, T x (na1 + na2) int16 (the
                     // next layer's likely picks by rank, then the one after's), as the lookahead made them for THIS layer's
@@ -6872,12 +6883,13 @@ struct Model::Impl {
                             st.ahead_hit2 += (fl[e] >> 2) & 1;
                         }
                         if (l.slot[(size_t) e] < 0) {
-                            if (rxl && rx_has[(size_t) li * g.n_exp + e]) {   // (the expert server's: not a swap candidate)
-                                rpicks.push_back({e, t * kPicks + i});
-                                continue;
+                            const bool zc = T == 1 && !l.zc.empty() && l.zc[(size_t) e];
+                            if (!zc && rxl && rx_has[(size_t) li * g.n_exp + e]) {   // (the expert server's: not a swap
+                                rpicks.push_back({e, t * kPicks + i});              // candidate; one the device computes
+                                continue;                                           // from the store stays the device's)
                             }
                             l.cpu_hits.push_back(e);
-                            if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
+                            if (zc) {   // the device computed it from the store's slot
                                 store->touch(li, e);
                                 ++st.store_zc;
                                 continue;

@@ -78,7 +78,8 @@ double now_ms();          // steady clock
 void relax();             // a spin-wait's pause
 
 /// One TCP connection, either end.  Sends block (a full socket buffer waits for room); receives poll the socket
-/// (non-blocking) until a whole message is in, spinning, until a deadline.
+/// (non-blocking) until a whole message is in, spinning while bytes came in the last 200 ms (a link that has gone quiet
+/// waits in poll, so an idle server does not burn a core), until a deadline.
 class Conn {
 public:
     Conn() = default;
@@ -103,6 +104,7 @@ private:
     std::intptr_t fd_ = -1;
     std::string peer_;
     std::vector<uint8_t> rb_;   // bytes read, not yet a whole message
+    double last_in_ = 0;        // when bytes last came in (steady ms)
 };
 
 /// The main process's end: the server's hello, the geometry and blobs, then requests and their replies.
