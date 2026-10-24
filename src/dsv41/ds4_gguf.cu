@@ -5,6 +5,7 @@
 
 #include "ds4_iq.cuh"
 #include "ds4_numerics.cuh"
+#include "ds4_u9.hpp"
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
@@ -1058,6 +1059,54 @@ void mv_set(int f, const BfJobs& J, int nj, int max_n, int max_c, bool vec, cuda
     else if (max_c <= 8) mv_launch<8>(f, J, nj, max_n, vec, s);
     else mv_launch<16>(f, J, nj, max_n, vec, s);
 }
+// mv's int8 inputs (U9 quant): a job whose activations are an earlier job's reuses its rows (wq_a and wkv, s1 and s3:
+// the same x), and single-activation jobs whose x follow at one stride share a launch (wo_a's slices of d.o).  Each
+// 32 values round on their own, so the rows are the bits the job's own q8_quant would give
+struct QuantPlan {
+    struct Launch {
+        const float* x;
+        size_t ldx;
+        int rows, k, ncol;   // ncol > 1: one job's rows (ldx its stride); else rows jobs' single rows, ldx apart
+        int8_t* q;
+        float* d;
+    } l[x3::kMaxMvJobs];
+    struct Seen {
+        const float* x;
+        size_t ldx;
+        int ncol, k;
+        int8_t* q;
+        float* d;
+    } j[x3::kMaxMvJobs];
+    int nl = 0, nj = 0;
+    // job's x (ncol activations ldx apart, k values each) -> its int8 rows q and scales d (q_at / d_at: the job's own
+    // part of the scratch, used when it starts a launch)
+    void add(const float* x, size_t ldx, int ncol, int k, int8_t* q_at, float* d_at, int8_t*& q, float*& d) {
+        for (int a = 0; a < nj; ++a)
+            if (j[a].x == x && j[a].ncol == ncol && j[a].k == k && (ncol == 1 || j[a].ldx == ldx)) {
+                q = j[a].q;
+                d = j[a].d;
+                return;
+            }
+        Launch* b = nl > 0 ? &l[nl - 1] : nullptr;
+        const ptrdiff_t gap = b != nullptr ? x - b->x : 0;
+        if (ncol == 1 && b != nullptr && b->ncol == 1 && b->k == k && gap > 0 &&
+            (b->rows == 1 || (size_t) gap == b->ldx * (size_t) b->rows)) {
+            // (rows jobs fit: the launch starts in the first one's part, kMaxMvCols x kMaxQK values a job)
+            if (b->rows == 1) b->ldx = (size_t) gap;
+            q = b->q + (size_t) b->rows * k;
+            d = b->d + (size_t) b->rows * (k / 32);
+            ++b->rows;
+        } else {
+            l[nl++] = {x, ncol > 1 ? ldx : (size_t) k, ncol, k, ncol, q_at, d_at};
+            q = q_at;
+            d = d_at;
+        }
+        j[nj++] = {x, ldx, ncol, k, q, d};
+    }
+    void run(cudaStream_t s) const {
+        for (int a = 0; a < nl; ++a) q8_quant(l[a].x, l[a].ldx, l[a].rows, l[a].k, l[a].q, l[a].d, s);
+    }
+};
 }  // namespace
 
 x3::Mat view(const x3::Mat& m, int c0, int nc) {
@@ -1077,6 +1126,8 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
     bool vec[3] = {true, true, true};
     iq::MvJob IJ[x3::kMaxMvJobs];   // the low-bit ones (ds4_iq: a launch a type)
     int nij = 0;
+    const bool uq = u9::on(u9::kQuant);   // (off: each int8 job its own q8_quant, launched as it is met)
+    QuantPlan qp;
     for (int i = 0; i < n; ++i) {
         const x3::MvJob& q = jobs[i];
         const x3::Mat& m = *q.m;
@@ -1089,7 +1140,10 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
                 return false;
             }
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+            int8_t* xq = sc->mq + at;
+            float* xd = sc->md + at / 32;
+            if (uq) qp.add(q.xf, q.xf_cs, q.ncol, m.k, sc->mq + at, sc->md + at / 32, xq, xd);
+            else q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, xq, xd, s);
             iq::MvJob& b = IJ[nij++];
             b.w = (const uint8_t*) m.raw;
             b.ld = row_stride(m);
@@ -1097,8 +1151,8 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
             b.k = m.k;
             b.n = m.n;
             b.ncol = q.ncol;
-            b.xq = sc->mq + at;
-            b.xd = sc->md + at / 32;
+            b.xq = xq;
+            b.xd = xd;
             b.y = q.y;
             b.ycs = q.y_cs;
             b.bias = q.bias;
@@ -1136,14 +1190,18 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
                 return false;
             }
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
-            b.xq = sc->mq + at;
-            b.xd = sc->md + at / 32;
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+            int8_t* xq = sc->mq + at;
+            float* xd = sc->md + at / 32;
+            if (uq) qp.add(q.xf, q.xf_cs, q.ncol, m.k, sc->mq + at, sc->md + at / 32, xq, xd);
+            else q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, xq, xd, s);
+            b.xq = xq;
+            b.xd = xd;
             vec[f] = vec[f] && b.ld % 4 == 0 && ((uintptr_t) b.w & 3u) == 0 && (m.k / 32) % 2 == 0;
         } else {
             vec[f] = vec[f] && xa && (f != 0 || (m.k % 8 == 0 && b.ld % 8 == 0 && ((uintptr_t) b.w & 15u) == 0));
         }
     }
+    if (uq) qp.run(s);
     for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
     if (nij > 0 && !iq::mv(IJ, nij, s)) {
         fail("mv: a low-bit job not covered");
