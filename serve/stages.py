@@ -38,18 +38,24 @@ WAIT_STALE_S = 25.0        # a request's wait for its worker says so every 10 s 
 
 
 def remote_args(args) -> tuple[str | None, int | None]:
-    """The engine's --remote-stage HOST:PORT and its --layer-split K (the worker's first layer), or None."""
+    """The engine's --remote-stage HOST:PORT and the worker's first layer, or None: its --layer-split K, or DeepSeek-V4.1's
+    own --stage-end K (this PC runs layers 0 to K - 1; it wins when both are there, as the engine reads only that one -
+    the server may have added a --layer-split auto)."""
     args = list(args or [])
-    addr = k = None
+    addr = k = end = None
     for i, a in enumerate(args[:-1]):
         if a == "--remote-stage":
             addr = str(args[i + 1])
-        elif a == "--layer-split":
+        elif a in ("--layer-split", "--stage-end"):
             try:
-                k = int(str(args[i + 1]).split(",")[0])
+                v = int(str(args[i + 1]).split(",")[0])
             except ValueError:
-                pass
-    return addr, k
+                continue
+            if a == "--stage-end":
+                end = v
+            else:
+                k = v
+    return addr, end if end is not None and addr is not None else k
 
 
 def host_of(addr: str) -> str:

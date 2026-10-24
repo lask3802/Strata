@@ -234,6 +234,8 @@ DSV41_FLAGS = {
     "--no-expert-cache": ("", "Do not keep the most used experts in graphics memory."),
     "--vision": ("on|off", "Let the model read pictures."),
     "--verbose": ("", "Print more about what the engine does."),
+    "--remote-stage": ("HOST:PORT", "Run the model's last layers on another computer (its worker listens there); needs --stage-end."),
+    "--stage-end": ("K", "With --remote-stage: this computer runs layers 0 to K - 1 and the other one the rest."),
 }
 
 

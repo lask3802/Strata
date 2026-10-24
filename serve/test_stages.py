@@ -423,6 +423,13 @@ class WorkerLogTest(unittest.TestCase):
     def test_args(self):
         self.assertEqual(stages.remote_args(["--layer-split", "26", "--remote-stage", "h:1"]), ("h:1", 26))
         self.assertEqual(stages.remote_args(["--layer-split", "26"]), (None, 26))
+        # DeepSeek-V4.1's main process: its own --stage-end, which wins over a --layer-split (the server's "auto", say)
+        self.assertEqual(stages.remote_args(["--remote-stage", "h:1", "--stage-end", "20"]), ("h:1", 20))
+        self.assertEqual(stages.remote_args(["--remote-stage", "h:1", "--stage-end", "20", "--layer-split", "auto"]), ("h:1", 20))
+        self.assertEqual(stages.remote_args(["--layer-split", "24", "--remote-stage", "h:1", "--stage-end", "20"]), ("h:1", 20))
+        self.assertEqual(stages.remote_args(["--layer-split", "auto", "--remote-stage", "h:1"]), ("h:1", None))
+        # (a relay worker's --stage-end is not a main process's: no --remote-stage, no K from it)
+        self.assertEqual(stages.remote_args(["--stage-end", "40", "--layer-split", "24"]), (None, 24))
         self.assertEqual(stages.host_of("[fe80::1]:7841"), "fe80::1")
         self.assertEqual(stages.port_of("10.0.0.2:7841"), 7841)
 
