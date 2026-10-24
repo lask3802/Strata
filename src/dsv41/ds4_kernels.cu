@@ -1918,10 +1918,15 @@ bool& split_flag() {   // (a test sets it: both kernels in one process)
     return on;
 }
 std::atomic<unsigned long long> g_split_runs{0};   // (the split kernel's launches: a test checks which path ran)
-// (sized by the first call's heads on a (device, stream): the engine's heads a device do not change)
-attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
+struct SplitScratch {
+    attnsplit::AttnSplitScratch sc;
+    int heads = 0;   // the heads it is sized for
+};
+// (sized by the first call's heads on a (device, stream): the engine's heads a device do not change; a call with more
+// heads than that must not use it - the old kernel then)
+SplitScratch split_scratch(cudaStream_t s, int heads) {
     static std::mutex mu;
-    static std::map<std::pair<int, cudaStream_t>, attnsplit::AttnSplitScratch> m;
+    static std::map<std::pair<int, cudaStream_t>, SplitScratch> m;
     int dev = 0;
     cudaGetDevice(&dev);
     std::lock_guard<std::mutex> lk(mu);
@@ -1937,8 +1942,8 @@ attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
         if (sc.part != nullptr) cudaFree(sc.part);
         sc = attnsplit::AttnSplitScratch{};
     }
-    m[{dev, s}] = sc;
-    return sc;
+    m[{dev, s}] = SplitScratch{sc, heads};
+    return m[{dev, s}];
 }
 }  // namespace
 
@@ -2184,19 +2189,23 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     if (ckv_fmt == kKvFp4 && a.gen == 0 && T >= 1 && T <= kSplitMaxT && heads % kSplitG == 0 && split_flag()) {
         int total_max = 0;
         for (int t = 0; t < T; ++t) total_max = std::max(total_max, a.nwin[t] + a.nsel[t]);
-        static std::atomic<bool> told{false};   // (the first fallback is said, once)
+        static std::atomic<bool> told_mem{false}, told_heads{false}, told_cap{false};   // (each fallback's first, once)
         if (total_max > 0 && total_max <= kSplitCap * kSplitR) {
-            const attnsplit::AttnSplitScratch sc = split_scratch(s, heads);
-            if (sc.part != nullptr) {
+            const SplitScratch ss = split_scratch(s, heads);
+            const attnsplit::AttnSplitScratch& sc = ss.sc;
+            if (sc.part != nullptr && heads <= ss.heads) {
                 ++g_split_runs;
                 attnsplit::sparse_attn_split<kSplitG, kSplitR>(q, win, (const uint8_t*) ckv, kv_row_bytes(kKvFp4, d), sel,
                                                                sel_stride, a, sink, heads, T, scale, out, sc, total_max, s);
                 return;
             }
-            if (!told.exchange(true))
+            if (sc.part == nullptr && !told_mem.exchange(true))
                 std::fprintf(stderr, "ds4 attn split: its scratch (%zu MB) could not be allocated - the old kernel instead\n",
                              (size_t) kSplitMaxT * heads * kSplitCap * 514 * sizeof(float) >> 20);
-        } else if (total_max > 0 && !told.exchange(true)) {
+            else if (sc.part != nullptr && !told_heads.exchange(true))
+                std::fprintf(stderr, "ds4 attn split: %d heads, its scratch here is for %d - the old kernel instead\n",
+                             heads, ss.heads);
+        } else if (total_max > 0 && !told_cap.exchange(true)) {
             std::fprintf(stderr, "ds4 attn split: %d rows a query, above its %d - the old kernel instead\n", total_max,
                          kSplitCap * kSplitR);
         }

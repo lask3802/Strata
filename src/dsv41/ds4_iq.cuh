@@ -115,6 +115,8 @@ struct MvJob {
     float alpha = 1.0f;
 };
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// U9 q5k: the staged Q5_K kernel's launches so far (0 under HIP), for a test to tell it ran.
+unsigned long long q5k_staged_runs();
 
 /// n rows of k values of a matrix of the type (ld bytes a row) as BF16 (bf16) or F16 bits, dst[n][k]: the chunked prompt path's
 /// dense GEMM operand.  false: a type not covered.

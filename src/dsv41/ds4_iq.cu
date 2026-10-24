@@ -1359,6 +1359,7 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
 }
 
 #if !defined(STRATA_USE_HIP)
+std::atomic<unsigned long long> g_q5k_runs{0};   // (the staged Q5_K kernel's launches: a test checks which path ran)
 // U9 q5k on the current device (u9::q5k_arch): by its compute capability unless DS4_U9_Q5K says, once a device
 bool q5k_here() {
     const int f = u9::q5k_arch();
@@ -1388,6 +1389,7 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
         bool st = u9::on(u9::kQ5k) && q5k_here();
         for (int i = 0; i < nj; ++i) st = st && ((uintptr_t) J.j[i].w & 15u) == 0 && J.j[i].ld % 16 == 0;
         if (st) {
+            ++g_q5k_runs;
             // (DS4_U9_Q5V=0: the padded staging with decode_b's 4-byte reads instead - the two forms' A/B on the 2080 Ti)
             static const bool v = [] {
                 const char* e = std::getenv("DS4_U9_Q5V");
@@ -1629,5 +1631,11 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         }
     return true;
 }
+
+#if !defined(STRATA_USE_HIP)
+unsigned long long q5k_staged_runs() { return g_q5k_runs.load(); }
+#else
+unsigned long long q5k_staged_runs() { return 0; }
+#endif
 
 }  // namespace strata::ds4::gguf::iq

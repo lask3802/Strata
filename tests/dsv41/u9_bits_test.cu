@@ -524,7 +524,19 @@ void test_q5k(cudaStream_t s, bool bench) {
             };
             char what[96];
             std::snprintf(what, sizeof(what), "q5k: %s (n %d k %d) T %d", sh.name, sh.n, sh.k, T);
-            ab(what, u9::kQ5k, out, go, s);
+            unsigned long long runs[2] = {0, 0};   // the staged kernel's launches with q5k off / on: 0 and 1
+            ab(what, u9::kQ5k, out, [&] {
+                const unsigned long long r0 = gg::iq::q5k_staged_runs();
+                go();
+                runs[u9::on(u9::kQ5k)] += gg::iq::q5k_staged_runs() - r0;
+            }, s);
+            {   // (the old kernel both times passes the bytes: say a launch the alignment check took back)
+                const bool ok = runs[0] == 0 && runs[1] == 1;
+                ++g_cases;
+                if (!ok) ++g_fail;
+                std::printf("%-4s %-58s staged launches off %llu on %llu (must be 0 and 1)\n", ok ? "ok" : "FAIL", what,
+                            runs[0], runs[1]);
+            }
             if (bench) {   // us a launch, off / on (the int8 rounding included), and the weights' GB/s
                 const double bytes = (double) gg::type_row_bytes(gg::iq::kQ5_K, sh.k) * sh.n * sh.jobs;
                 const unsigned keep = u9::mask();
@@ -563,7 +575,7 @@ void test_q5k(cudaStream_t s, bool bench) {
 
 int main(int argc, char** argv) {
     const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
-    if (std::getenv("DS4_U9_Q5K") == nullptr) u9::q5k_arch() = 1;   // (the staged kernel on any device: checked here)
+    u9::q5k_arch() = 1;   // (the staged kernel on any device, DS4_U9_Q5K=0 inherited or not: checked here)
     cudaStream_t s;
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     if (!gg::prepare(s)) return 1;
