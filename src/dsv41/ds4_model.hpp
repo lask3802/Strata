@@ -64,9 +64,11 @@ struct Options {
     int stage_begin = 0;
     int stage_end = -1;
     // a remote stage (docs/REMOTE_STAGE.md, src/dsv41/ds4_stage.hpp), a range's two sides on two PCs.  remote_stage:
-    // the main process of one, layers [0, stage_end) - its last layer's rows go over the link (set_stage_link) and come
-    // back for the head.  stage_worker: the worker, layers [stage_begin, last] - its rows come from the link
-    // (stage_run), its last layer's go back; no embedding table, no head.  Either: no conversation checkpoints
+    // the main process of one, layers [0, stage_end) - its last layer's rows go over the link (set_stage_link) and the
+    // worker's normed rows come back for the head (with DSpark: and the drafter's taps of the worker's layers; the
+    // drafter is here).  stage_worker: the worker, layers [stage_begin, last] - its rows come from the link
+    // (stage_run), its last layer's go back through the final norm; no embedding table, no head, no drafter.
+    // Either: no conversation checkpoints
     bool remote_stage = false;
     bool stage_worker = false;
     // (either side) the link's rows compact: the streams as bf16, pre and the indexer's picks exact (ds4_stage.hpp
@@ -202,7 +204,7 @@ public:
     /// widest window and a hand-off row's floats - the streams (hc x dim), pre (8), the indexer's picks (topk_stride
     /// int32) and the candidate blocks (cand_stride int32).  A window's T rows cross block by block: T x hc x dim
     /// floats, then T x 8, then T x topk_stride, then T x cand_stride (T x handoff_floats in all).  The worker's reply
-    /// has the same layout; the main process reads its streams and pre.  With stage_bf16 the rows on the link are the
+    /// has the same layout; the main process reads its streams block (ds4_stage.hpp's reply_tap_at).  With stage_bf16 the rows on the link are the
     /// compact ones (ds4_stage.hpp RowGeo::compact(): handoff_floats words a row; full_floats the fp32 row) and the
     /// layout is: the streams as bf16, pre, the picks and candidates as they are.
     struct StageGeo {
@@ -214,18 +216,24 @@ public:
     };
     StageGeo stage_geo() const;
     /// The main process's link (remote_stage).  `run`: a window's T tokens at p0 and its rows (`out`) to the worker,
-    /// the worker's rows back into `in` (T x handoff_floats each).  `reset`: the worker's session from position 0, as
+    /// the worker's reply back into `in` (T x handoff_floats each; ds4_stage.hpp's reply_tap_at layout).  `commit`:
+    /// how many of the window's rows the worker keeps - all of a window kept whole, right after its run; a draft's
+    /// check (verify) the ones it accepted, after the verdict.  `reset`: the worker's session from position 0, as
     /// reset() starts this one (a failure is kept: the next window at position 0 tries it again, any other fails).  A
-    /// failed run leaves the conversation unusable until reset().
+    /// failed run or commit leaves the conversation unusable until reset().
     using StageRun = std::function<bool(int T, const int32_t* tokens, int64_t p0, const float* out, float* in,
                                         std::string& err)>;
-    void set_stage_link(StageRun run, std::function<bool(std::string& err)> reset);
+    void set_stage_link(StageRun run, std::function<bool(int n_keep, std::string& err)> commit,
+                        std::function<bool(std::string& err)> reset);
     /// The worker's side (stage_worker): a window's rows land in stage_rows_in() (pinned, kWin x handoff_floats);
-    /// stage_run() runs this process's layers on them at p0 (which must be pos()) and leaves its last layer's rows in
-    /// stage_rows_out().
+    /// stage_run() runs this process's layers on them at p0 (which must be pos()) and leaves the reply in
+    /// stage_rows_out(): the last layer's rows through the final norm, then the drafter's taps of the target layers
+    /// here.  A window of 2 or more rows keeps its layers' backups: stage_rollback() then keeps its first n_keep rows
+    /// and undoes the rest (a draft's check the main process rejected part of), as verify() does in one process.
     float* stage_rows_in();
     float* stage_rows_out();
     bool stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err);
+    bool stage_rollback(int n_keep, std::string& err);
     /// The compact rows' conversions so far (stage_bf16): the time and the windows converted, rows in = fp32 rows from the
     /// link's, rows out = to the link's (the main process: its window's rows out, the reply's back in; the worker: the
     /// reverse).  Each count is of its own conversions, so a mean divides by its own.
