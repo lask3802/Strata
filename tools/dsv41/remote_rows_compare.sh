@@ -112,7 +112,10 @@ for a in $arms; do
     p=$(placement "$a")
     echo "  split-$a:"
     echo "$p" | sed 's/^/      /'
-    if [ -z "$first" ]; then
+    if [ "$(counts "$a" | grep -o 'in VRAM' | wc -l)" -ne 2 ]; then
+        echo "FAIL: split-$a's logs do not say its experts in VRAM ($(counts "$a"))"
+        rc=1
+    elif [ -z "$first" ]; then
         first=$a
         first_p=$(counts "$a")
     elif [ "$(counts "$a")" != "$first_p" ]; then

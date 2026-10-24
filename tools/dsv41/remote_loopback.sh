@@ -55,15 +55,17 @@
 # windows).  Twice each: with --dump-logits and --window <its length> (every row's logits, every row back over the
 # link), compared as above over the prompt's rows (the dump's last write, after the tokens, is the prompt's rows again:
 # a chunk's every-row logits are what the engine's logits() still holds after a decode step), then plainly (the last
-# row's logits only) for the prompt's tokens/s.  DS4_LAYER_MAJOR and
+# row's logits only) for the prompt's tokens/s; with FLOOR_VRAM a third single-process run, every row's logits only
+# (the noise floor).  DS4_LAYER_MAJOR and
 # the other engine variables pass through to all (the split's two sides go chunk after chunk, overlapped, unless
 # DS4_LAYER_MAJOR=1: then the main process may take its layers one after another over all the chunks (the worker
 # reads one chunk at a time either way), which overlaps little; the
 # single process decides by its own gate, DS4_LAYER_MAJOR=0 never).
-# STRATA_REMOTE_ROWS=bf16 passes through as well, and turns the chunks off on both sides (windows of 16).
+# STRATA_REMOTE_ROWS=bf16 passes through as well, and turns the chunks off on both sides of the split (windows of 16;
+# the single process reads no such variable, so with IDS and CHUNK > 0 it is chunks against windows then).
 set -u
 if [ $# -lt 3 ]; then
-    sed -n '2,63p' "$0"
+    sed -n '2,65p' "$0"
     exit 2
 fi
 exe=$1
@@ -167,8 +169,8 @@ def kl_top(ref, got):   # KL(ref || got) of each position, and the positions whe
 a, b = load(sys.argv[1]), load(sys.argv[2])
 kl, top = kl_top(b, a)
 n = len(kl)
-if n == 0:
-    print("  FAIL: no logits to compare")
+if n == 0 or (rows > 0 and n < rows):
+    print("  FAIL: %d positions of logits to compare%s" % (n, " of %d" % rows if rows > 0 else ""))
     sys.exit(1)
 print("  %d positions: top-1 agrees at %d, KL(single || split) mean %.3e max %.3e" % (n, top, np.mean(kl), np.max(kl)))
 kl_max, top_min, fx, ft = (float(v) for v in sys.argv[4:8])
@@ -182,7 +184,7 @@ if len(sys.argv) > 8:
     kl_lim, top_need = max(kl_max, fx * np.mean(fkl)), ftop / n - ft
     print("  the rule against the floor: KL mean <= %.3e (max(KL_MAX %g, %g x the floor)), top-1 >= %.1f%% (the floor %.1f%% less %g)"
           % (kl_lim, kl_max, fx, 100 * top_need, 100 * ftop / n, 100 * ft))
-    if np.mean(kl) > kl_lim or top < top_need * n:
+    if np.mean(kl) > kl_lim or top < ftop - ft * n - 1e-6:   # (top-1 counts, not shares: no rounding at the bound)
         print("  FAIL: the split is further from one process than the noise floor allows")
         sys.exit(1)
 elif np.mean(kl) > kl_max or top < top_min * n:
