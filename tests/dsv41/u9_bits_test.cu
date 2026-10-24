@@ -349,7 +349,7 @@ struct SplitCase {
     int heads, T, nwin[5], nsel[5];
     bool fallback;   // (above the cap: the old kernel's bytes)
 };
-const SplitCase kSplitCases[] = {
+const SplitCase kSplitCases[] = {   // (64 heads first: the split's scratch is sized by a stream's first call)
     {"T 1, win 128 + sel 512 (16 chunks)", 64, 1, {128}, {512}, false},
     {"T 1, win 128 + sel 301 (a partial last chunk)", 64, 1, {128}, {301}, false},
     {"T 1, win 37, no sel", 64, 1, {37}, {0}, false},
@@ -378,9 +378,13 @@ void test_split(cudaStream_t s) {
     scr.max_t = sd::kAttnScratchT;
     scr.cap = stride;
     const bool keep = sd::attn_split();
-    for (int ci = 0; ci <= (int) (sizeof(kSplitCases) / sizeof(kSplitCases[0])); ++ci) {
-        // (the last round: the first case on a new stream with the device's memory taken, so the scratch fails)
-        const bool starve = ci == (int) (sizeof(kSplitCases) / sizeof(kSplitCases[0]));
+    // (the last round: the first case on a new stream with the device's memory taken for a moment, so the scratch
+    // fails - for an idle GPU: U9_TEST_STARVE=0 leaves it out where another process allocates on the same card)
+    const int ncase = (int) (sizeof(kSplitCases) / sizeof(kSplitCases[0]));
+    const char* sv = std::getenv("U9_TEST_STARVE");
+    const int rounds = ncase + (sv != nullptr && std::atoi(sv) == 0 ? 0 : 1);
+    for (int ci = 0; ci < rounds; ++ci) {
+        const bool starve = ci == ncase;
         const SplitCase& c = kSplitCases[starve ? 0 : ci];
         const int T = c.T, heads = c.heads;
         sd::AttnRows ar = {};
@@ -416,11 +420,12 @@ void test_split(cudaStream_t s) {
         if (starve) CU(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
         std::vector<uint8_t> r[2];
         void* hog = nullptr;
+        unsigned long long ran[2] = {0, 0};   // (the split kernel's launches in each run)
         for (int on = 0; on < 2; ++on) {
-            if (starve && on == 1) {   // (all but a few MiB taken: the split's ~16 MB scratch cannot be made)
+            if (starve && on == 1) {   // (all but a few MiB taken, less than the split's ~16 MB scratch)
                 size_t fr = 0, tot = 0;
                 CU(cudaMemGetInfo(&fr, &tot));
-                for (size_t keep_mib = 4; hog == nullptr && keep_mib < 64 && fr > (keep_mib << 20); keep_mib += 4)
+                for (size_t keep_mib = 2; hog == nullptr && keep_mib <= 12 && fr > (keep_mib << 20); keep_mib += 2)
                     if (cudaMalloc(&hog, fr - (keep_mib << 20)) != cudaSuccess) {
                         cudaGetLastError();
                         hog = nullptr;
@@ -428,9 +433,11 @@ void test_split(cudaStream_t s) {
             }
             sd::attn_split() = on == 1;
             out.clear();
+            const unsigned long long n0 = sd::attn_split_runs();
             sd::sparse_attn(dq, dwin, dck, dsel, stride, ar, dsink, heads, d, T, scale, o, st, sd::kKvFp4, 0, &scr);
             CU(cudaStreamSynchronize(st));
             CU(cudaGetLastError());
+            ran[on] = sd::attn_split_runs() - n0;
             r[on] = out.get();
         }
         if (hog != nullptr) CU(cudaFree(hog));
@@ -470,12 +477,18 @@ void test_split(cudaStream_t s) {
         for (double& e : err) e /= mx + 1e-30;
         size_t diff = 0;
         for (size_t i = 0; i < r[0].size(); ++i) diff += r[0][i] != r[1][i];
-        const bool same = c.fallback || starve;
-        const bool ok = err[0] < 1e-4 && err[1] < 1e-4 && (!same || diff == 0) && (hog != nullptr) == starve;
-        ++g_cases;
-        if (!ok) ++g_fail;
-        std::printf("%-4s split: %s%s   rel err old %.1e split %.1e, %zu bytes differ%s\n", ok ? "ok" : "FAIL", c.name,
-                    starve ? " - no scratch" : "", err[0], err[1], diff, same ? " (must be 0: the old kernel)" : "");
+        const bool same = c.fallback || starve;   // (the old kernel must run: its bytes)
+        // (starved, the split ran anyway: the scratch was allocated after all - a driver that spills to host memory)
+        const bool skip = starve && (hog == nullptr || ran[1] != 0);
+        const bool ok = err[0] < 1e-4 && err[1] < 1e-4 && ran[0] == 0 && ran[1] == (same ? 0u : 1u) &&
+                        (!same || diff == 0) && (hog != nullptr) == starve;
+        if (!skip) {
+            ++g_cases;
+            if (!ok) ++g_fail;
+        }
+        std::printf("%-4s split: %s%s   rel err old %.1e split %.1e, split launches %llu, %zu bytes differ%s\n",
+                    skip ? "skip" : ok ? "ok" : "FAIL", c.name, starve ? " - no scratch" : "", err[0], err[1], ran[1],
+                    diff, same ? " (must be 0: the old kernel)" : "");
         if (starve) CU(cudaStreamDestroy(st));
         for (void* p : std::initializer_list<void*>{dwin, dq, dsink, dsel}) CU(cudaFree(p));
         for (auto& b : out.b) CU(cudaFree(b.first));

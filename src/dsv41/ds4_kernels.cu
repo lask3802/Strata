@@ -1917,6 +1917,8 @@ bool& split_flag() {   // (a test sets it: both kernels in one process)
     }();
     return on;
 }
+std::atomic<unsigned long long> g_split_runs{0};   // (the split kernel's launches: a test checks which path ran)
+// (sized by the first call's heads on a (device, stream): the engine's heads a device do not change)
 attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
     static std::mutex mu;
     static std::map<std::pair<int, cudaStream_t>, attnsplit::AttnSplitScratch> m;
@@ -1941,6 +1943,7 @@ attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
 }  // namespace
 
 bool& attn_split() { return split_flag(); }
+unsigned long long attn_split_runs() { return g_split_runs.load(); }
 
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
@@ -2184,6 +2187,7 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
         if (total_max > 0 && total_max <= kSplitCap * kSplitR) {
             const attnsplit::AttnSplitScratch sc = split_scratch(s, heads);
             if (sc.part != nullptr) {
+                ++g_split_runs;
                 attnsplit::sparse_attn_split<kSplitG, kSplitR>(q, win, (const uint8_t*) ckv, kv_row_bytes(kKvFp4, d), sel,
                                                                sel_stride, a, sink, heads, T, scale, out, sc, total_max, s);
                 return;
@@ -2290,7 +2294,7 @@ void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaSt
 }
 void win_submit(cudaStream_t s) {
 #if defined(_WIN32)
-    static bool on = [] {
+    static const bool on = [] {
         const char* v = std::getenv("DS4_WIN_SUBMIT");
         return v == nullptr || std::atoi(v) != 0;
     }();
