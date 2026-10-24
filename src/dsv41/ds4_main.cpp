@@ -570,9 +570,14 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
     double own_ms = 0;
     strata::ds4::Model::StageConv conv0;   // (the conversions at the last line)
     int64_t windows = 0;
+    // (--remote-experts) the expert server's share of this worker's CPU lane, printed when a main process leaves: its
+    // windows since it came ("a token" in those lines is a window here)
+    strata::ds4::Stats rx0 = m.stats();
+    int64_t rx_windows = 0;
     hs.run = [&](int T, const int32_t* tokens, int64_t p0, std::string& e) {
         const double t0 = now_ms();
         if (!strata::ds4::stage::worker_run(m, tokens, T, p0, last_t, e)) return false;
+        ++rx_windows;
         if (remote_timing()) {
             own_ms += now_ms() - t0;
             if (++windows % 64 == 0) {
@@ -600,6 +605,13 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
         return true;
     };
     hs.disconnected = [&] {
+        if (rx_windows > 0) {
+            const std::string rl = m.rx_lines(rx0, (double) rx_windows);
+            if (!rl.empty()) std::fprintf(stderr, "strata stage worker: %lld windows; a window each below:\n%s",
+                                          (long long) rx_windows, rl.c_str());
+        }
+        rx0 = m.stats();
+        rx_windows = 0;
         strata::ds4::stage::worker_disconnected(m, parts);   // (a new main process is a new id space)
         m.save_profile();
         last_t = 0;
