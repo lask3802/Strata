@@ -53,6 +53,21 @@ int main() {
         g.rtt_seen(1, 0.66);
         check(near(g.deadline(sent, 101.0, 2.0, 1), 103.0), "T=1: the lane's part + 2 ms is the later one");
     }
+    {
+        // the slot's rx-ds arm (2ce60ad7): replies already there when the lane finished its part, timed at the lane's
+        // end, made the round trip at 1 row 6.9 ms (the 1.1-6 ms of a window's own picks) and kept 168 of 176 T=1 windows
+        rx::Gate g;
+        g.pick_seen(1, 0.27);
+        g.rtt_seen(1, 6.9, true);
+        check(!g.send(1, 1, 1, 4), "an estimate of 6.9 ms keeps a T=1 window here (1.35 ms of lane)");
+        g.rtt_seen(1, 9.0, false);
+        check(near(g.rtt[1], 6.9), "a reply there already, after 9 ms of lane: no higher");
+        for (int i = 0; i < 40; ++i) g.rtt_seen(1, 1.1, false);
+        check(g.rtt[1] < 1.35, "replies there already after 1.1 ms of lane: the estimate falls under that");
+        check(g.send(1, 1, 1, 4), "and the T=1 window goes out again");
+        g.rtt_seen(1, 2.0, true);
+        check(g.rtt[1] > 1.1, "a reply the lane waited 2 ms for raises it");
+    }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;
 }

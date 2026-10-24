@@ -83,7 +83,12 @@ struct Gate {
     double rtt[kMaxRows + 1] = {}, pick[kMaxRows + 1] = {};
     int run[kMaxRows + 1] = {};
     static void ew(double& a, double v) { a = a > 0.0 ? 0.9 * a + 0.1 * v : v; }
-    void rtt_seen(int rows, double ms) { ew(rtt[rows], ms); }          // (a late reply: the time waited, a lower bound)
+    // a reply the lane waited for: its round trip (a late one: the time waited, a lower bound).  One already there when
+    // the lane finished its own part says only that the round trip was at most that long - the time is the lane's, not
+    // the link's -: it may lower the estimate, never raise it
+    void rtt_seen(int rows, double ms, bool waited = true) {
+        if (waited || rtt[rows] <= 0.0 || ms < rtt[rows]) ew(rtt[rows], ms);
+    }
     void pick_seen(int T, double ms_a_pick) { ew(pick[T], ms_a_pick); }
     bool send(int T, int rows, size_t n_remote, size_t n_local) {
         const double rt = rtt[rows], c = pick[T];

@@ -6722,7 +6722,7 @@ struct Model::Impl {
         std::string e;
         const int got = rx_on ? rx_link->wait_resp(seq, rows, deadline, &y, srv_us, e) : -1;
         const double t1 = rx::now_ms();
-        if (got >= 0) rx_gate.rtt_seen(rows, t1 - t0);
+        if (got >= 0) rx_gate.rtt_seen(rows, t1 - t0, t1 - tw > 0.05);   // (read within 50 us of the lane's part: there already)
         st.rx_wait_ms += t1 - tw;
         st.rx_bytes_out = (int64_t) rx_link->bytes_out();
         st.rx_bytes_in = (int64_t) rx_link->bytes_in();
