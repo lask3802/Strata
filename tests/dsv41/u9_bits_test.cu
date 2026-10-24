@@ -1,6 +1,6 @@
 // tests/dsv41/u9_bits_test.cu - the decode GPU-part changes (src/dsv41/ds4_u9.hpp) against the path they replace, bit
 // for bit: each case runs the same inputs with the change off (the 747981ba path) and on and compares every output
-// byte.  Needs a GPU, no model.  u9_bits_test
+// byte.  Needs a GPU, no model.  u9_bits_test [--bench: the Q5_K GEMV shapes timed, off and on]
 #include "../../src/dsv41/ds4_gguf.cuh"
 #include "../../src/dsv41/ds4_iq.cuh"
 #include "../../src/dsv41/ds4_kernels.cuh"
@@ -319,14 +319,76 @@ void test_route(cudaStream_t s) {
     }
 }
 
+// ---- item q5k: the staged Q5_K GEMV (the decode's dense shapes: wq_b, wo_a's slices, wo_b, the shared expert, the head)
+struct Shape {
+    const char* name;
+    int n, k, jobs;
+};
+const Shape kQ5Shapes[] = {{"wq_b", 32768, 1280, 1}, {"wo_a x 8", 1024, 4096, 8}, {"wo_b", 5120, 8192, 1},
+                           {"s1 + s3", 2304, 5120, 2}, {"s2", 5120, 2304, 1}, {"odd rows", 1003, 768, 3}};
+void test_q5k(cudaStream_t s, bool bench) {
+    for (const Shape& sh : kQ5Shapes)
+        for (int T : {1, 3, 16}) {
+            if (bench && T != 1) continue;
+            std::vector<M*> m;
+            for (int j = 0; j < sh.jobs; ++j) m.push_back(new M(gg::kFmtGG, sh.k, sh.n));
+            float* x = xbuf((size_t) T * sh.k * sh.jobs);
+            Outs out;
+            float* y = (float*) out.add((size_t) T * sh.n * sh.jobs * 4);
+            auto go = [&] {
+                x3::MvJob j[8];
+                for (int i = 0; i < sh.jobs; ++i)
+                    j[i] = job(*m[i], x + (size_t) i * sh.k, y + (size_t) i * sh.n, T, (size_t) sh.k * sh.jobs,
+                               (size_t) sh.n * sh.jobs);
+                gg::mv(j, sh.jobs, s);
+            };
+            char what[96];
+            std::snprintf(what, sizeof(what), "q5k: %s (n %d k %d) T %d", sh.name, sh.n, sh.k, T);
+            ab(what, u9::kQ5k, out, go, s);
+            if (bench) {   // us a launch, off / on (the int8 rounding included), and the weights' GB/s
+                const double bytes = (double) gg::type_row_bytes(gg::iq::kQ5_K, sh.k) * sh.n * sh.jobs;
+                const unsigned keep = u9::mask();
+                double us[2];
+                for (int on = 0; on < 2; ++on) {
+                    u9::mask() = on ? (keep | u9::kQ5k) : (keep & ~u9::kQ5k);
+                    cudaEvent_t e0, e1;
+                    CU(cudaEventCreate(&e0));
+                    CU(cudaEventCreate(&e1));
+                    for (int r = 0; r < 5; ++r) go();
+                    const int reps = 50;
+                    CU(cudaEventRecord(e0, s));
+                    for (int r = 0; r < reps; ++r) go();
+                    CU(cudaEventRecord(e1, s));
+                    CU(cudaEventSynchronize(e1));
+                    float ms = 0;
+                    CU(cudaEventElapsedTime(&ms, e0, e1));
+                    us[on] = 1000.0 * ms / reps;
+                    CU(cudaEventDestroy(e0));
+                    CU(cudaEventDestroy(e1));
+                }
+                u9::mask() = keep;
+                std::printf("     bench %-10s %9.1f us -> %9.1f us   %6.1f -> %6.1f GB/s\n", sh.name, us[0], us[1],
+                            bytes / us[0] / 1e3, bytes / us[1] / 1e3);
+            }
+            for (auto& b : out.b) CU(cudaFree(b.first));
+            CU(cudaFree(x));
+            for (M* p : m) {
+                CU(cudaFree(p->w));
+                delete p;
+            }
+        }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     cudaStream_t s;
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     if (!gg::prepare(s)) return 1;
-    test_quant(s);
-    test_route(s);
+    if (!bench) test_quant(s);
+    if (!bench) test_route(s);
+    test_q5k(s, bench);
     std::printf("%d of %d cases failed\n", g_fail, g_cases);
     return g_fail ? 1 : 0;
 }

@@ -4,6 +4,7 @@
 // ggml's (ggml-common.h, MIT, third_party/ggml/LICENSE); the sign and grid tricks are llama.cpp's vecdotq.cuh.
 #include "ds4_iq.cuh"
 #include "ds4_numerics.cuh"
+#include "ds4_u9.hpp"
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
@@ -931,6 +932,96 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
         }
 }
 
+#if !defined(STRATA_USE_HIP)
+// U9 q5k: mv_kernel<kQ5_K> with each warp's 32 sub-blocks (4 blocks, 704 bytes) staged in shared memory by 16-byte
+// loads, the next 704 in flight while these decode.  mv_kernel reads each lane's qs / qh words straight from the row: 16
+// scattered 4-byte loads a sub-block (the L1 pipe's load, the suspected bound on Turing; on an RTX 3070 mv_kernel is
+// faster).  The same decode, sums and order: the same bits.  Rows 16-byte aligned.  V: the blocks as they lie, decoded
+// by 16-byte reads (decode_q5k_v); else 45 words a block (a step's 4 blocks' qs words of a lane in 4 banks), decode_b.
+// decode_b<kQ5_K> of a staged block (16-byte aligned words): its header, qh and qs words by 16-byte loads; the same
+// integer operations, so the same Sub
+__device__ __forceinline__ void decode_q5k_v(const uint32_t* blk, int ib, Sub& s) {
+    const uint4 hd = *(const uint4*) blk;   // d | dmin, scales[12]
+    const uint8_t sb[12] = {(uint8_t) hd.y, (uint8_t) (hd.y >> 8), (uint8_t) (hd.y >> 16), (uint8_t) (hd.y >> 24),
+                            (uint8_t) hd.z, (uint8_t) (hd.z >> 8), (uint8_t) (hd.z >> 16), (uint8_t) (hd.z >> 24),
+                            (uint8_t) hd.w, (uint8_t) (hd.w >> 8), (uint8_t) (hd.w >> 16), (uint8_t) (hd.w >> 24)};
+    int sc, m;
+    q4k_scale(sb, ib, sc, m);
+    const uint4 h0 = *(const uint4*) (blk + 4), h1 = *(const uint4*) (blk + 8);
+    const uint4 q0 = *(const uint4*) (blk + 12 + 8 * (ib >> 1)), q1 = *(const uint4*) (blk + 16 + 8 * (ib >> 1));
+    const uint32_t qh[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+    const uint32_t qs[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+    const int sh = 4 * (ib & 1);
+#pragma unroll
+    for (int t = 0; t < 8; ++t) s.q[t] = (int) (((qs[t] >> sh) & 0x0f0f0f0fu) | (((qh[t] >> ib) & 0x01010101u) << 4));
+    s.s0 = s.s1 = sc;
+    s.d = __half2float(__ushort_as_half((unsigned short) (hd.x & 0xffffu)));
+    s.m0 = s.m1 = __half2float(__ushort_as_half((unsigned short) (hd.x >> 16))) * (float) m;
+}
+constexpr int kQ5Pad = 45;
+template <int NC, bool V>
+__global__ void __launch_bounds__(kThreads) mv_q5k_st_kernel(const Jobs J) {
+    constexpr int BW = V ? 44 : kQ5Pad;   // words a staged block
+    __shared__ __align__(16) uint32_t stage[kWarps][4 * BW];
+    const MvJob& b = J.j[blockIdx.y];
+    const int wp = threadIdx.x >> 5, row = blockIdx.x * kWarps + wp, lane = threadIdx.x & 31;
+    if (row >= b.n) return;
+    const uint4* w = (const uint4*) (b.w + (size_t) row * b.ld);
+    const int nsb = b.k / 32, nblk = nsb / 8;   // (k % 256 == 0)
+    uint32_t* sw = stage[wp];
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    uint4 r0 = make_uint4(0, 0, 0, 0), r1 = r0;   // step s: the row's 16-byte words 44 s + lane, 44 s + lane + 32
+    {
+        const int nv = min(4, nblk) * 11;
+        if (lane < nv) r0 = w[lane];
+        if (lane + 32 < nv) r1 = w[lane + 32];
+    }
+    for (int b0 = 0; b0 < nsb; b0 += 32) {
+        const int nv = min(4, nblk - b0 / 8) * 11;
+        __syncwarp();   // (the step before has read its blocks)
+        if (V) {   // (the blocks as they lie: 16-byte stores)
+            if (lane < nv) ((uint4*) sw)[lane] = r0;
+            if (lane + 32 < nv) ((uint4*) sw)[lane + 32] = r1;
+        } else {
+            if (lane < nv) {
+                uint32_t* o = sw + (lane / 11) * BW + (lane % 11) * 4;
+                o[0] = r0.x, o[1] = r0.y, o[2] = r0.z, o[3] = r0.w;
+            }
+            if (lane + 32 < nv) {
+                uint32_t* o = sw + ((lane + 32) / 11) * BW + ((lane + 32) % 11) * 4;
+                o[0] = r1.x, o[1] = r1.y, o[2] = r1.z, o[3] = r1.w;
+            }
+        }
+        __syncwarp();
+        if (b0 + 32 < nsb) {   // the next step's words, in flight while these decode
+            const uint4* wn = w + (size_t) (b0 / 8 + 4) * 11;
+            const int nn = min(4, nblk - b0 / 8 - 4) * 11;
+            if (lane < nn) r0 = wn[lane];
+            if (lane + 32 < nn) r1 = wn[lane + 32];
+        }
+        const int kb = b0 + lane;
+        if (kb >= nsb) continue;
+        Sub s;
+        if (V) decode_q5k_v(sw + (lane >> 3) * BW, lane & 7, s);
+        else decode_b<kQ5_K>((const uint8_t*) (sw + (lane >> 3) * BW), lane & 7, nullptr, s);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<kQ5_K>(s, xp[0], xp[1]), acc[c]);
+            }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (c < b.ncol) {
+            const float v = warp_sum(acc[c]);
+            if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+        }
+}
+#endif
+
 // ---------------------------------------------------------------- the prompt sets' light experts
 // A set's experts of a few rows (<= kLightRows: a prompt of a few hundred tokens spreads ~10 over most of 384 experts)
 // in the token kernels' form: each weight sub-block decoded once and dotted with every row's int8 input (rounded per 32
@@ -1270,6 +1361,29 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
+#if !defined(STRATA_USE_HIP)
+    if constexpr (T == kQ5_K) {
+        bool st = u9::on(u9::kQ5k);
+        for (int i = 0; i < nj; ++i) st = st && ((uintptr_t) J.j[i].w & 15u) == 0 && J.j[i].ld % 16 == 0;
+        if (st) {
+            // (DS4_U9_Q5V=0: the padded staging with decode_b's 4-byte reads instead - the two forms' A/B on the 2080 Ti)
+            static const bool v = [] {
+                const char* e = std::getenv("DS4_U9_Q5V");
+                return e == nullptr || std::atoi(e) != 0;
+            }();
+            if (v) {
+                if (max_c <= 1) mv_q5k_st_kernel<1, true><<<grid, kThreads, 0, s>>>(J);
+                else if (max_c <= 4) mv_q5k_st_kernel<4, true><<<grid, kThreads, 0, s>>>(J);
+                else mv_q5k_st_kernel<16, true><<<grid, kThreads, 0, s>>>(J);
+                return;
+            }
+            if (max_c <= 1) mv_q5k_st_kernel<1, false><<<grid, kThreads, 0, s>>>(J);
+            else if (max_c <= 4) mv_q5k_st_kernel<4, false><<<grid, kThreads, 0, s>>>(J);
+            else mv_q5k_st_kernel<16, false><<<grid, kThreads, 0, s>>>(J);
+            return;
+        }
+    }
+#endif
     if (max_c <= 1) mv_kernel<T, 1><<<grid, kThreads, 0, s>>>(J);
     else if (max_c <= 4) mv_kernel<T, 4><<<grid, kThreads, 0, s>>>(J);
     else mv_kernel<T, 16><<<grid, kThreads, 0, s>>>(J);

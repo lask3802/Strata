@@ -9533,10 +9533,16 @@ struct Model::Impl {
                     zc_stage(d.plan_ptr, d.ridx, l.zc_tab, l.k_exp, zc_stage_buf, zc_stride, l.blob, s);
                 if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
                 else x3::moe_gate_up(ma, d.x, d.xg, s);
+                // U9 tail: the device experts' down before the wait (it reads the plan, not the answer; DS4_PROF's
+                // gate/up stretch then holds it)
+                const bool early = mx && u9::on(u9::kTail);
+                const bool down_ok = early && gg::moe_down_experts(ma, d.xg, s);   // (false: printed, as moe_down)
                 prof_mark(d, 3);
                 if (lead) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
-                if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                if (early) {
+                    if (down_ok) gg::moe_down_combine(ma, d.sh_out, d.moe_out, s);
+                } else if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
             } else {   // each distinct expert read once for the window's tokens
                 gf::MoeWin mw;
