@@ -171,7 +171,7 @@ static void check(const Expert& x, int nt, const std::vector<std::vector<int>>& 
         std::string what;
         for (size_t i = 0; i + 1 < cut.size(); ++i) what += (i ? "+" : "") + std::string("[") + std::to_string(cut[i]) + "," + std::to_string(cut[i + 1]) + ")";
         std::vector<std::vector<float>> fsum((size_t) nt, std::vector<float>(E, 0.0f));
-        bool h_ok = true, q_ok = true, p_ok = true;
+        bool h_ok = true, q_ok = true, p_ok = true, nan = false;
         const size_t hb = whole.hq[0].size() / NB;   // bytes of the down's activation a 256 values
         for (size_t i = 0; i + 1 < cut.size(); ++i) {
             const int ff0 = cut[i] * 256, ffn = (cut[i + 1] - cut[i]) * 256;
@@ -182,6 +182,8 @@ static void check(const Expert& x, int nt, const std::vector<std::vector<int>>& 
             const size_t po[3] = {0, al256((size_t) ffn * fs.gr), 2 * al256((size_t) ffn * fs.gr)};
             std::vector<uint8_t> pk(po[2] + (size_t) E * fs.ds);
             strata::ds4::ff_blob_to_slice(fs, x.blob.data(), x.off, pk.data(), po);
+            for (int r = 0; r < 2; ++r)   // (its gate / up rows, which the packed run below does not read)
+                p_ok = p_ok && std::memcmp(pk.data() + po[r], x.blob.data() + x.off[r] + (size_t) ff0 * fs.gr, (size_t) ffn * fs.gr) == 0;
             Run p;
             if (!run(x, fm, xa, ff0, ffn, p, pk.data(), po)) { ++fails; return; }
             for (int t = 0; t < nt; ++t) {
@@ -196,13 +198,14 @@ static void check(const Expert& x, int nt, const std::vector<std::vector<int>>& 
         for (int t = 0; t < nt; ++t)
             for (int r = 0; r < E; ++r) {
                 const double d = std::fabs((double) fsum[(size_t) t][(size_t) r] - whole.y[(size_t) t][(size_t) r]);
+                nan = nan || !std::isfinite(d);
                 we = std::max(we, d / (FLT_EPSILON * l1[(size_t) t][(size_t) r] + 1e-30));
                 wr = std::max(wr, d / (ymax[(size_t) t] + 1e-30));
             }
         worst_eps = std::max(worst_eps, we);
         worst_rel = std::max(worst_rel, wr);
         // a sum of 9 block terms a row (each an exact integer sum times a float scale): reassociating them moves it by a few eps of L1
-        const bool ok = h_ok && q_ok && p_ok && we <= 32.0;
+        const bool ok = h_ok && q_ok && p_ok && !nan && we <= 32.0;
         if (!ok || std::getenv("EP_SLICE_VERBOSE"))
             std::printf("  %-30s %-38s nt %d: h %s, h quantized %s, in place == packed %s, |sum - whole| %.2f eps L1 (max %.2e of max|y|)  %s\n",
                         x.name.c_str(), what.c_str(), nt, h_ok ? "same" : "DIFFER", q_ok ? "same" : "DIFFER", p_ok ? "yes" : "NO", we, wr, ok ? "ok" : "FAIL");
@@ -301,8 +304,9 @@ int main(int argc, char** argv) {
     for (int k = 1; k < NB; ++k) cuts.push_back({0, k, NB});
     cuts.push_back({0, 2, 6, NB});
     cuts.push_back({0, 1, 2, 3, 4, 5, 6, 7, 8, NB});
-    // the rows: ggml-cpu's dot, Strata's AVX2 i-quant rows always, the default rule (the AVX-512 rows where the CPU has them)
-    const char* mode_name[3] = {"ggml-cpu dots", "AVX2 rows", "default rule"};
+    // the rows: ggml-cpu's dot, Strata's own rows always (AVX2; the AVX-512 ones where ds4_gg_cpu.cpp's want_512 takes
+    // them: Zen 4 / 5), the default rule
+    const char* mode_name[3] = {"ggml-cpu dots", "own rows", "default rule"};
     const int modes[3] = {0, 1, 2};
     for (int mi = 0; mi < 3; ++mi) {
         gg::gg_cpu_set_iq256(modes[mi]);
@@ -330,7 +334,7 @@ int main(int argc, char** argv) {
     }
     for (const Expert& x : xs)
         for (const auto& c : cuts) round_trip(x, c);
-    {   // a tensor parallel member's even share (mx_blob_to_half's slices): three of 768
+    {   // even thirds of 768 (the form of a tensor parallel member's share; mx_blob_to_half's own experts are MXFP4)
         for (const Expert& x : xs) round_trip(x, {0, 3, 6, 9});
         std::printf("round trips: %zu experts x %zu partitions + thirds, blob -> slices -> blob\n", xs.size(), cuts.size());
     }
