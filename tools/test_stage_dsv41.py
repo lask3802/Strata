@@ -25,13 +25,19 @@ import test_stage_node as tsn  # noqa: E402  (its ShipTest.agent: an agent in th
 
 # A worker that says it listens and leaves its command line and the pack's ds4.txt in its log (the log is the agent's).
 FAKE_ENGINE = """\
-import json, sys
+import json, os, sys
 print(json.dumps(sys.argv[1:]))
 pack = sys.argv[sys.argv.index("--pack") + 1] if "--pack" in sys.argv else ""
 try:
     print("ds4.txt:", open(pack + "/ds4.txt").read().splitlines()[-1])
 except OSError:
     print("ds4.txt: none")
+print("rows:", os.environ.get("STRATA_REMOTE_ROWS"))
+prof = sys.argv[sys.argv.index("--expert-profile") + 1] if "--expert-profile" in sys.argv else ""
+try:
+    print("profile:", open(prof, "rb").read().decode())
+except OSError:
+    print("profile: none")
 print("strata stage worker: listening on 127.0.0.1:7899 (a token is required)", flush=True)
 import time
 time.sleep(30)
@@ -307,10 +313,11 @@ class StartTest(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         pack = str(self.data / "packs" / "ds-pack")
         self.assertEqual(self.argv[0], ["strata-dsv41", "--pack", pack, "--stage-worker", str(self.PORT), "--stage-begin",
-                                        "20", "--stage-bind", "127.0.0.1", "--max-context", "8192", "--vision", "off",
-                                        "--cpu-threads", "6"])
+                                        "20", "--stage-bind", "127.0.0.1", "--expert-profile",
+                                        str(self.data / "packs" / "ds-pack" / "expert-profile.from-20.bin"),
+                                        "--max-context", "8192", "--vision", "off", "--cpu-threads", "6"])
         # (none of the Qwen engine's: it stops on a flag it does not know)
-        for f in ("--serve", "--native", "--ple-gguf", "--expert-cache", "--prefill", "--expert-profile", "--stage-end"):
+        for f in ("--serve", "--native", "--ple-gguf", "--expert-cache", "--prefill", "--stage-end"):
             self.assertNotIn(f, self.argv[0])
         self.assertEqual(json.loads(self.log()[0]), self.argv[0][1:])
 
@@ -326,6 +333,53 @@ class StartTest(unittest.TestCase):
         self.assertTrue(self.w.start({"engine": "dsv41", "begin": 20, "port": self.PORT,
                                       "model": {"dir": "ds-model", "pack": "ds-pack"}})["ok"])
         self.assertEqual(self.log()[1], "ds4.txt: model_dir " + str(self.data / "models" / "ds-model"))
+
+    def test_the_worker_learns_into_its_own_profile_file(self):
+        """A ranged process saves its layers' rows into the file it was given, after reading it: the pack's
+        expert-profile.bin is the main process's too, so the worker gets a copy named for its range."""
+        packd = self.data / "packs" / "ds-pack"
+        shipped = packd / "expert-profile.bin"
+        req = {"engine": "dsv41", "begin": 20, "port": self.PORT, "model": {"dir": "ds-model", "pack": "ds-pack"}}
+        self.assertTrue(self.w.start(req)["ok"])
+        mine = packd / "expert-profile.from-20.bin"
+        self.assertEqual(mine.read_bytes(), b"prof")                # seeded from the shipped one
+        self.assertIn("profile: prof", self.log())                  # and the engine read that one
+        mine.write_bytes(b"learned")                                # (what the worker saves)
+        shipped.write_bytes(b"main")                                # a ship sends the pack's file again
+        self.assertTrue(self.w.start(req)["ok"])
+        self.assertEqual(mine.read_bytes(), b"learned")             # the worker's own is not undone by it
+        self.assertEqual(shipped.read_bytes(), b"main")             # and it never wrote the shipped one
+        self.assertIn("profile: learned", self.log())
+        # another first layer is another file
+        self.assertTrue(self.w.start({**req, "begin": 24})["ok"])
+        self.assertEqual((packd / "expert-profile.from-24.bin").read_bytes(), b"main")
+        # a pack with none: the path is still given (the engine starts without a profile)
+        shipped.unlink()
+        self.assertTrue(self.w.start({**req, "begin": 30})["ok"])
+        self.assertFalse((packd / "expert-profile.from-30.bin").exists())
+        self.assertIn("profile: none", self.log())
+        self.assertEqual(self.argv[-1][self.argv[-1].index("--expert-profile") + 1], str(packd / "expert-profile.from-30.bin"))
+
+    def test_the_rows_precision_is_the_start_requests_and_nothing_else(self):
+        """STRATA_REMOTE_ROWS has to be the main process's on the worker too (the hello refuses a pair that differs)."""
+        req = {"engine": "dsv41", "begin": 20, "port": self.PORT, "model": {"dir": "ds-model", "pack": "ds-pack"}}
+        with mock.patch.dict(os.environ, {"STRATA_REMOTE_ROWS": "bf16"}):     # (the agent's own environment)
+            self.assertTrue(self.w.start(req)["ok"])
+            self.assertIn("rows: None", self.log())                            # not inherited
+            self.assertTrue(self.w.start({**req, "env": {"STRATA_REMOTE_ROWS": "fp32"}})["ok"])
+            self.assertIn("rows: fp32", self.log())
+        self.assertTrue(self.w.start({**req, "env": {"STRATA_REMOTE_ROWS": "bf16"}})["ok"])
+        self.assertIn("rows: bf16", self.log())
+        n = len(self.argv)
+        for env in ({"STRATA_REMOTE_ROWS": "int8"}, {"LD_PRELOAD": "/x.so"}, {"STRATA_REMOTE_ROWS": ["bf16"]}, ["bf16"], "bf16"):
+            r = self.w.start({**req, "env": env})
+            self.assertFalse(r["ok"], env)
+            self.assertIn("env: STRATA_REMOTE_ROWS is fp32 or bf16", r["error"], env)
+        self.assertEqual(len(self.argv), n)                                    # none of them started anything
+        # the Qwen worker takes it too
+        self.w.stop(self.PORT)
+        self.assertTrue(self.w.start({"begin": 24, "port": self.PORT, "env": {"STRATA_REMOTE_ROWS": "bf16"}})["ok"])
+        self.assertIn("rows: bf16", self.log())
 
     def test_nodes_own_pack_is_left_alone(self):
         own = self.d / "own-pack"

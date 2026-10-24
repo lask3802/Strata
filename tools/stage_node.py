@@ -54,7 +54,12 @@ only the tuner and the main process drive this PC.  Endpoints (JSON in and out):
                                "engine": "dsv41" starts DeepSeek-V4.1's worker instead (Workers.model_dsv41): layers
                                K to the last, no relay; "model": {"dir": D, "pack": P} is data_dir/models/D (the
                                pack's weights, ds4.txt's model_dir is set to it at the start) and data_dir/packs/P;
-                               "prefill", "cache" and "native" are the Qwen engine's and do not apply
+                               "prefill", "cache" and "native" are the Qwen engine's and do not apply;
+                               its learned expert profile is its own file, <pack>/expert-profile.from-K.bin (made
+                               from the pack's expert-profile.bin the first time), never the shipped one
+                               "env": {"STRATA_REMOTE_ROWS": "fp32"|"bf16"} (either engine): the rows' precision on the
+                               link.  The main process's value goes here (the hello refuses a pair that differs);
+                               without it the worker reads fp32, whatever this agent's own environment says
     POST /stop                 {"port": 7841} (no port: every worker) - and no start again
     GET  /log?port=P&lines=N   a worker's log tail (&prev=1: the last run that listened before this one,
                                stage-worker-P.prev.log)
@@ -101,6 +106,9 @@ DSV41_EXTRA_ALLOWED = {"--max-context", "--stage-bind", "--vram-experts", "--cpu
                        "--ssd-cache", "--ssd-policy", "--no-expert-cache", "--gpus", "--reserve-mib", "--tp",
                        "--threads", "--vision", "--verbose"}
 ENGINES = ("strata", "dsv41")
+# the environment variables a /start may set for its worker, with the values each takes (the main process's value of
+# STRATA_REMOTE_ROWS must be the worker's too); nothing else of the request reaches the worker's environment
+ENV_ALLOWED = {"STRATA_REMOTE_ROWS": ("fp32", "bf16")}
 PLAIN_NAME = re.compile(r"[A-Za-z0-9._-]+")   # a /start's model names: no separator, no drive, no space
 DEVICE_NAME = re.compile(r"(CON|PRN|AUX|NUL|COM\d|LPT\d)(\..*)?", re.I)   # a Windows device in any directory
 LISTEN_TIMEOUT_S = 600     # loading a worker's experts: up to ~30 GB from disk on a cold cache
@@ -402,6 +410,10 @@ class Workers:
         engine = req.get("engine", "strata")
         if engine not in ENGINES:
             return {"ok": False, "error": f"engine: one of {list(ENGINES)}, not {engine!r}"}
+        env = req.get("env", {})
+        if not isinstance(env, dict) or any(ENV_ALLOWED.get(k) is None or v not in ENV_ALLOWED[k] for k, v in env.items()):
+            return {"ok": False, "error": "env: " + ", ".join(f"{k} is {' or '.join(v)}" for k, v in ENV_ALLOWED.items())
+                                          + " and nothing else"}
         allowed = (DSV41_EXTRA_ALLOWED if engine == "dsv41" else EXTRA_ALLOWED) | set(self.cfg.get("extra_allow", []))
         bad = [str(a) for a in req.get("extra", []) if str(a).startswith("-") and str(a) not in allowed]
         if bad:
@@ -449,14 +461,18 @@ class Workers:
         dsv41 = req.get("engine") == "dsv41"
         if dsv41:
             # strata-dsv41: no --serve, --native, --ple-gguf, --expert-cache or --prefill (they are the Qwen engine's;
-            # it stops on a flag it does not know); the profile is the pack's own <pack>/expert-profile.bin
+            # it stops on a flag it does not know); the profile is this range's own file (seed_profile)
             if m["model_dir"]:
                 try:
                     pin_model_dir(Path(m["pack"]), Path(m["model_dir"]))
                 except OSError as e:
                     return {"ok": False, "port": port, "error": f"cannot set the pack's model_dir: {e}"}
+            try:
+                profile = seed_profile(Path(m["pack"]), int(req["begin"]))
+            except OSError as e:
+                return {"ok": False, "port": port, "error": f"cannot make the worker's expert profile: {e}"}
             args = [c["dsv41_exe"], "--pack", m["pack"], "--stage-worker", str(port), "--stage-begin",
-                    str(int(req["begin"])), "--stage-bind", c["bind"]]
+                    str(int(req["begin"])), "--stage-bind", c["bind"], "--expert-profile", str(profile)]
             args += [str(a) for a in c.get("dsv41_args", [])] + extra
         else:
             args = [c["exe"], "--serve", "--stage-worker", str(port), "--stage-begin", str(int(req["begin"]))]
@@ -469,6 +485,8 @@ class Workers:
         env = dict(os.environ)
         env["STRATA_STAGE_TOKEN"] = c["_token"]
         env["STRATA_REMOTE_TIMING"] = "1"
+        env.pop("STRATA_REMOTE_ROWS", None)   # (the rows' precision is the main process's: only /start says it)
+        env.update({k: str(v) for k, v in req.get("env", {}).items()})
         libs = os.pathsep.join(c.get("lib_dirs", []))
         if libs:
             var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -673,6 +691,22 @@ def pin_model_dir(pack: Path, model_dir: Path) -> bool:
     tmp.write_bytes(nl.join(lines))
     os.replace(tmp, f)
     return True
+
+
+def seed_profile(pack: Path, begin: int) -> Path:
+    """The expert profile a DeepSeek-V4.1 worker of layers `begin` to the last reads and saves: <pack>/
+    expert-profile.from-<begin>.bin, copied from the pack's expert-profile.bin the first time.  A ranged process
+    saves by reading the file, replacing its own layers' rows and writing it back, so it must not share a file with
+    the main process (or another worker); and the shipped expert-profile.bin stays as it was shipped, which
+    tools/stage_ship.py can send again without undoing what the worker learned.  No expert-profile.bin in the pack: the
+    path is returned all the same (the engine starts without a profile and saves one)."""
+    mine = pack / f"expert-profile.from-{begin}.bin"
+    src = pack / "expert-profile.bin"
+    if not mine.exists() and src.is_file():
+        tmp = mine.with_name(mine.name + ".tmp")
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, mine)
+    return mine
 
 
 def merge_ranges(rs: list[list[int]]) -> list[list[int]]:

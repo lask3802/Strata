@@ -510,7 +510,16 @@ curl -H "X-Stage-Token: $T" -d '{"engine":"dsv41","begin":20,"model":{"dir":"<mo
 - The flags a `/start` may add are the engine's own (`--max-context`, `--cpu-threads`, `--vram-experts`, ...; the Qwen
   engine's `--kv`, `--spec`, `--prefill` are refused). The main process: `--remote-stage HOST:PORT --stage-end K` in the
   config's `args`, or the Qwen spelling (`--layer-split K --split-device 0 --remote-stage HOST:PORT`) that the server turns
-  into it for DeepSeek. Put `STRATA_STAGE_TOKEN` in the config's `env`. Not yet measured on two PCs.
+  into it for DeepSeek. Put `STRATA_STAGE_TOKEN` in the config's `env`. The Workers card reads K from `--stage-end` (it
+  wins over a `--layer-split`, which the engine ignores). Not yet measured on two PCs.
+- `STRATA_REMOTE_ROWS` (`fp32` or `bf16`) has to be the same in the main process's environment and the worker's. The
+  worker's comes from the `/start` request, `"env": {"STRATA_REMOTE_ROWS": "bf16"}` (the one variable an agent takes
+  from it, and either engine); the agent's own environment is not passed on, so a request without it is fp32.
+- A ranged process saves its learned expert profile by reading the file, replacing its own layers' rows and writing it
+  back, so a main process and a worker must not share one file. The agent starts a DeepSeek worker with `--expert-profile
+  <pack>/expert-profile.from-K.bin`, copied from the pack's `expert-profile.bin` the first time; the shipped file is
+  never written by it, and shipping again does not undo what the worker learned. Give the main process its own
+  `--expert-profile` too when it shares a pack folder with another process.
 
 **`tools/stage_tune.py`: the layer-split tuner**, run on the main PC. It measures for real: for every configuration
 it restarts the workers (through their agents) and the main server, reads one long prompt and three short ones, and
