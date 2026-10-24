@@ -42,8 +42,10 @@ inline void ep_resolve(int& ff0, int& ffn, int n_ff) {
         ffn = n_ff;
     }
 }
-/// The n_ff range a call of the CPU lane computes: the layer's EP slice on the decode lane (ep), the whole n_ff on every
-/// other path (the prompt path, calibrate_paths: one PC's until prompts split too), whatever the layer's fields say
+/// The n_ff range a call of the CPU lane computes: the layer's EP slice in an EP window (ep: decode, a draft's
+/// verification - both PCs' slices sum to the whole), the whole n_ff in every other (the prompt's windows and chunks,
+/// feed_mark's last token, calibrate_paths: the main's alone until prompts split too), whatever the layer's fields say.
+/// The window's kind, not the lane it takes (serve_lane or the host-routed path): the lane cannot change the sum
 inline void ep_range(bool ep, int ep_ff0, int ep_ffn, int n_ff, int& ff0, int& ffn) {
     ff0 = 0;
     ffn = n_ff;
@@ -55,10 +57,18 @@ inline void ep_range(bool ep, int ep_ff0, int ep_ffn, int n_ff, int& ff0, int& f
 /// Why a layer cannot take the n_ff slice [ff0, ff0 + ffn) of its routed experts (nullptr: it can, or it has none).  Only
 /// the GGUF i-quant CPU lane (cpu_experts_iq) computes a slice; any other path computes an expert whole, which the other
 /// PC's part would then add a second time - so a layer with one of them is refused at setup until it takes slices too.
-inline const char* ep_slice_refusal(int ff0, int ffn, int n_ff, bool iq_cpu_lane, bool vram_tier, bool store_zc) {
+/// So are the drafter's layers (mtp: they run on the main alone), a remote stage's worker (stage_worker: the link does not
+/// say a window's kind) and STRATA_DS4_DISK_SKIP_W (disk_skip: it drops experts by what is in this PC's RAM, which the
+/// other PC's differs from)
+inline const char* ep_slice_refusal(int ff0, int ffn, int n_ff, bool iq_cpu_lane, bool vram_tier, bool store_zc, bool mtp,
+                                    bool stage_worker, bool disk_skip) {
+    ep_resolve(ff0, ffn, n_ff);   // (fields the load has not resolved yet: -1 is the whole)
     if (ff0 == 0 && ffn == n_ff) return nullptr;
     if (n_ff % 256 != 0 || ff0 < 0 || ffn <= 0 || ff0 % 256 != 0 || ffn % 256 != 0 || ff0 + ffn > n_ff)
         return "not whole 256-value blocks inside n_ff";
+    if (mtp) return "a drafter (DSpark) layer: the main runs them alone, whole";
+    if (stage_worker) return "a remote stage's worker: the link does not carry a window's kind (EP or whole) yet";
+    if (disk_skip) return "STRATA_DS4_DISK_SKIP_W skips experts by this PC's RAM, which the other PC's differs from";
     if (!iq_cpu_lane) return "its CPU lane computes these experts whole (MXFP4 / EXL3: only the GGUF i-quants take slices)";
     if (vram_tier) return "its VRAM tier computes experts whole (--vram-experts 0 for the layers that take slices)";
     if (store_zc) return "the RAM store's GPU-visible slots are computed whole on the device";

@@ -332,14 +332,15 @@ int main(int argc, char** argv) {
                     refused == 6 && whole ? "ok" : "FAIL");
         fails += !(refused == 6 && whole);
     }
-    {   // the setup side: ep_ffn -1 resolves to the whole n_ff, only the decode lane's calls take the slice, and which layers
+    {   // the setup side: ep_ffn -1 resolves to the whole n_ff, only an EP window's calls take the slice, and which layers
         // a slice is refused on (ds4_ffslice.hpp)
         int a0 = 512, an = -1, b0 = 512, bn = 1536, c0 = 0, cn = FF;
         strata::ds4::ep_resolve(a0, an, FF);
         strata::ds4::ep_resolve(b0, bn, FF);
         strata::ds4::ep_resolve(c0, cn, FF);
         bool res = a0 == 0 && an == FF && b0 == 512 && bn == 1536 && c0 == 0 && cn == FF;
-        {   // ep_range: the decode lane (ep) takes the layer's slice; the prompt path and calibrate_paths (!ep) the whole n_ff
+        {   // ep_range: an EP window (ep: decode, verify) takes the layer's slice; a prompt's window or chunk and
+            // calibrate_paths (!ep) the whole n_ff - on either lane, which passes the window's kind alike
             int f0, fn;
             strata::ds4::ep_range(false, 1536, 768, FF, f0, fn);  res = res && f0 == 0 && fn == FF;
             strata::ds4::ep_range(false, 0, 1536, FF, f0, fn);    res = res && f0 == 0 && fn == FF;
@@ -347,19 +348,28 @@ int main(int argc, char** argv) {
             strata::ds4::ep_range(true, 0, -1, FF, f0, fn);       res = res && f0 == 0 && fn == FF;
         }
         using strata::ds4::ep_slice_refusal;
-        struct Case { int ff0, ffn; bool iq, vram, zc, refused; };
+        struct Case { int ff0, ffn, nff; bool iq, vram, zc, mtp, worker, dsk, refused; };
         const Case cs[] = {
-            {0, FF, false, true, true, false},       // no slice: every path takes it, whatever it is
-            {0, 1536, true, false, false, false},    // the main's [0, 6) on the i-quant CPU lane alone
-            {1536, 768, true, false, false, false},  // the worker's [6, 9)
-            {0, 1536, false, false, false, true},    // MXFP4 / EXL3 CPU lane: computes whole
-            {0, 1536, true, true, false, true},      // a VRAM tier: computes whole
-            {0, 1536, true, false, true, true},      // GPU-visible store slots: computed whole
-            {128, 1536, true, false, false, true},   // not whole blocks
-            {2048, 512, true, false, false, true},   // past n_ff
+            {0, FF, FF, false, true, true, true, true, true, false},       // no slice: every path takes it, whatever it is
+            {512, -1, FF, false, true, true, true, true, true, false},     // ep_ffn -1 unresolved: the whole n_ff, too
+            {0, 1536, FF, true, false, false, false, false, false, false}, // the main's [0, 6) on the i-quant CPU lane alone
+            {1536, 768, FF, true, false, false, false, false, false, false},  // the other PC's [6, 9)
+            {0, 1536, FF, false, false, false, false, false, false, true}, // MXFP4 / EXL3 CPU lane: computes whole
+            {0, 1536, FF, true, true, false, false, false, false, true},   // a VRAM tier: computes whole
+            {0, 1536, FF, true, false, true, false, false, false, true},   // GPU-visible store slots: computed whole
+            {0, 1536, FF, true, false, false, true, false, false, true},   // a drafter layer: the main's alone
+            {0, 1536, FF, true, false, false, false, true, false, true},   // a remote stage's worker: no window kind
+            {0, 1536, FF, true, false, false, false, false, true, true},   // DISK_SKIP_W: skips by this PC's RAM
+            {128, 1536, FF, true, false, false, false, false, false, true},   // ff0 not whole blocks
+            {0, 1000, FF, true, false, false, false, false, false, true},  // ffn not whole blocks
+            {0, 256, 2300, true, false, false, false, false, false, true}, // n_ff not whole blocks
+            {256, 0, FF, true, false, false, false, false, false, true},   // an empty slice
+            {-256, 512, FF, true, false, false, false, false, false, true},   // ff0 < 0
+            {2048, 512, FF, true, false, false, false, false, false, true},   // past n_ff
         };
         int bad = 0;
-        for (const Case& c : cs) bad += (ep_slice_refusal(c.ff0, c.ffn, FF, c.iq, c.vram, c.zc) != nullptr) != c.refused;
+        for (const Case& c : cs)
+            bad += (ep_slice_refusal(c.ff0, c.ffn, c.nff, c.iq, c.vram, c.zc, c.mtp, c.worker, c.dsk) != nullptr) != c.refused;
         std::printf("ep_resolve / ep_range %s; ep_slice_refusal: %d of %zu cases as expected  %s\n", res ? "ok" : "WRONG",
                     (int) (sizeof cs / sizeof cs[0]) - bad, sizeof cs / sizeof cs[0], res && bad == 0 ? "ok" : "FAIL");
         fails += !(res && bad == 0);

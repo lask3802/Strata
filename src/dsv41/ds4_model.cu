@@ -621,10 +621,11 @@ struct Layer {
     x3::ExpertLayout hlay;
     size_t hblob = 0;
     int ff0 = 0, ffn = 0;     // this member's FFN columns [ff0, ff0 + ffn) (split128 of n_ff; the whole one alone)
-    // expert parallelism: the routed experts' n_ff slice [ep_ff0, ep_ff0 + ep_ffn) this process's decode CPU lane computes
-    // (serve_lane -> the GGUF i-quant experts' cpu_experts_iq: a partial sum of each expert's output; the prompt path and
-    // calibrate_paths compute them whole) - ep_ffn -1: the whole n_ff (resolved at load, ep_resolve); a slice on a layer
-    // whose experts another path computes is refused there (ep_slices_ok)
+    // expert parallelism: the routed experts' n_ff slice [ep_ff0, ep_ff0 + ep_ffn) this process's CPU lane computes in an
+    // EP window (decode, a draft's verification: WinPlan::ep, on either lane -> the GGUF i-quant experts' cpu_experts_iq,
+    // a partial sum of each expert's output; the prompt's windows and calibrate_paths compute them whole) - ep_ffn -1:
+    // the whole n_ff (resolved at load, ep_resolve); a slice on a layer whose experts another path computes is refused
+    // there (ep_slices_ok)
     int ep_ff0 = 0, ep_ffn = -1;
     // this member's heads [ah0, ah0 + ahn) and wo_a groups [og0, og0 + ogn) - all of them alone; in a group of more
     // members than the heads split among evenly (head_members: 9, 7 or 6 over 64 heads), the first ones none: their
@@ -789,6 +790,7 @@ constexpr int kMaxL = 64;   // layers (the trunk's and the drafter's) a window p
 // blocks as each layer sees them, the window's hand-off seq
 struct WinPlan {
     bool par = false, async = false;
+    bool ep = false;        // an EP window (decode, a draft's verification): the layers' n_ff slices (Layer::ep_ff0)
     unsigned win = 0;
     int k = 0;              // (a run of chunks) the chunk's index: its hand-off slot k % 2
     int snap_t = -1;        // (a run of chunks) the chunk's row whose state before it the layers keep (-1: none)
@@ -1066,6 +1068,7 @@ struct Model::Impl {
     Resp* resps = nullptr;
     unsigned seq_issued = 0;
     std::atomic<int> layer_of[kRing];
+    bool ep_of[kRing] = {};   // the seq's window an EP window (WinPlan::ep; written before its layer_of, read after it)
     std::thread service;
     std::atomic<bool> quit{false};
     bool sync_decode = std::getenv("DS4_SYNC") != nullptr;
@@ -1842,12 +1845,14 @@ struct Model::Impl {
         const int ffh = g.ff / l.nm;
         mx_slice_to_blob(l, src, m * ffh, ffh, l.hlay.trellis, blob);
     }
-    // expert parallelism's n_ff slices: every layer with one must have its experts on the i-quant CPU lane alone (no VRAM
-    // tier, no GPU-visible store slots) - false (err) otherwise.  At load, and again by whatever sets a slice later
+    // expert parallelism's n_ff slices: every layer with one must be a trunk layer with its experts on the i-quant CPU lane
+    // alone (no VRAM tier, no GPU-visible store slots), in a process that is no remote stage's worker and skips no expert
+    // by its RAM (STRATA_DS4_DISK_SKIP_W) - false (err) otherwise.  At load, and again by whatever sets a slice later
     bool ep_slices_ok(std::string& err) const {
         for (const Layer& l : L)
             if (const char* why = ep_slice_refusal(l.ep_ff0, l.ep_ffn, g.ff, l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay),
-                                                   l.n_slots > 0, !l.zc.empty())) {
+                                                   l.n_slots > 0, !l.zc.empty(), l.mtp, o.stage_worker,
+                                                   disk_skip_w > 0.0f)) {
                 err = "expert parallelism: layer " + std::to_string(l.il) + "'s n_ff slice [" + std::to_string(l.ep_ff0) + ", " +
                       std::to_string(l.ep_ff0 + l.ep_ffn) + "): " + why;
                 return false;
@@ -5781,8 +5786,8 @@ struct Model::Impl {
     // them, exact integer sums a block; every CPU tier the same bits): each token's input quantized once, whatever
     // number of entries take it, and each job its band of h straight into the down's int8 input.
     // (ord: the order the entries are computed in - their slots, so the sums, stay the same; null: as they are)
-    void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, bool ep = false) {
-        if (!gg::mx_experts(l.lay)) {   // (ep: the decode lane, the layer's EP slice; every other caller the whole n_ff)
+    void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, bool ep) {
+        if (!gg::mx_experts(l.lay)) {   // (ep: an EP window, the layer's slice; false: the whole n_ff - ep_range)
             int ff0, ffn;
             ep_range(ep, l.ep_ff0, l.ep_ffn, g.ff, ff0, ffn);
             return cpu_experts_iq(l, x, ents, ldx, ord, ff0, ffn);
@@ -5987,8 +5992,7 @@ struct Model::Impl {
             if (m) m->store->release(layer, es.data(), (int) es.size(), ok);
         }
     };
-    void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
-                     const int* ord = nullptr, bool ep = false) {
+    void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, bool ep) {
         if (ldx == 0) ldx = (size_t) g.dim;
         if (l.lay.fmt == gg::kFmtMXFP4) {
             StoreHold hold(this, l, ents);
@@ -6557,6 +6561,7 @@ struct Model::Impl {
             }
             std::atomic_thread_fence(std::memory_order_acquire);
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
+            const bool ep = ep_of[next % kRing];
             Resp& rp = resps[next % kRing];
             const int T = std::max(1, std::min(kWin, r.T));
             for (int t = 0; t < T; ++t) rp.cpu[t] = 0;
@@ -6682,7 +6687,7 @@ struct Model::Impl {
                 }
                 if (!ents.empty()) {
                     const double tc = now_ms();
-                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, true);   // (the decode lane: the layer's EP slice)
+                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, ep);   // (an EP window: the layer's slice)
                     const int D = g.dim;
                     for (int t = 0; t < T; ++t) {
                         bool any = false;
@@ -6844,9 +6849,11 @@ struct Model::Impl {
         init_pre(d.pre, T, d.st);
         WinPlan dp;   // (window attention alone: the mailbox seqs)
         dp.async = !sync_decode && T <= async_max_t;
+        dp.ep = false;   // (the drafter's layers: the main's alone, whole)
         for (int i = 0; i < g.n_mtp && dp.async; ++i) {
             const int il = g.nl + i;
             dp.seq[il] = ++seq_issued;
+            ep_of[dp.seq[il] % kRing] = dp.ep;
             layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
         }
         const size_t hs = (size_t) T * H * D, rs = (size_t) g.win * g.hd;
@@ -7009,7 +7016,7 @@ struct Model::Impl {
         for (int i = 0; i < n; ++i) tk[i + 1] = drafts[(size_t) i];
         spec_win = true;
         const double tv = now_ms();
-        const bool ok = forward(tk, T, T, err, 0);
+        const bool ok = forward(tk, T, T, true, err, 0);
         st.verify_ms += now_ms() - tv;
         spec_win = false;
         if (!ok) return false;
@@ -7115,7 +7122,7 @@ struct Model::Impl {
     }
 
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
-    bool step(int token, bool want_logits, std::string& err) { return forward(&token, 1, want_logits ? 1 : 0, err); }
+    bool step(int token, bool want_logits, std::string& err) { return forward(&token, 1, want_logits ? 1 : 0, true, err); }
 
 
     // layer L0 for a chunk of T tokens at p0 as group member mi: layer()'s arithmetic over the chunk's rows (the
@@ -7734,6 +7741,7 @@ struct Model::Impl {
                 WinPlan wp;
                 wp.par = true;
                 wp.async = true;
+                wp.ep = false;   // (a prompt's chunk: whole)
                 wp.win = run.seq[(size_t) k];
                 wp.k = k;
                 wp.snap_t = run.snap_pos >= p0 && run.snap_pos < p0 + T ? (int) (run.snap_pos - p0) : -1;
@@ -7899,6 +7907,7 @@ struct Model::Impl {
             WinPlan wp;
             wp.par = true;
             wp.async = true;
+            wp.ep = false;   // (a prompt's chunk: whole)
             wp.win = run.seq[(size_t) k];
             wp.k = k;
             wp.snap_t = run.snap_pos >= p0 && run.snap_pos < p0 + T ? (int) (run.snap_pos - p0) : -1;
@@ -8118,12 +8127,12 @@ struct Model::Impl {
             for (size_t i = 0; i < x.size(); ++i) x[i] = 0.02f * std::sin(0.37f * (float) i);
             const double bytes = (double) ents.size() * (double) l.blob;
             double a = now_ms();
-            cpu_experts(l, x.data(), ents, (size_t) g.dim);
+            cpu_experts(l, x.data(), ents, (size_t) g.dim, nullptr, false);   // (whole: the main's speed)
             const double t_first = now_ms() - a;
             double t_warm = 1e30;
             for (int rep = 0; rep < 2; ++rep) {
                 a = now_ms();
-                cpu_experts(l, x.data(), ents, (size_t) g.dim);
+                cpu_experts(l, x.data(), ents, (size_t) g.dim, nullptr, false);
                 t_warm = std::min(t_warm, now_ms() - a);
             }
             pm.cpu = bytes / std::max(1e-3, t_warm / 1000.0);
@@ -8253,7 +8262,7 @@ struct Model::Impl {
         logits_all = false;
         for (int a = 0; a < n; a += kWin) {
             const int T = std::min(kWin, n - a);
-            if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, err)) return false;
+            if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, false, err)) return false;   // (a prompt's: whole)
         }
         return true;
     }
@@ -8756,9 +8765,11 @@ struct Model::Impl {
     }
 
     // the window's plan, in window order (the indexer's and the candidate source's sizes carry from window to window)
-    void plan_window(int64_t p0, int T, WinPlan& wp) {
+    // (ep: an EP window - decode, a draft's verification - whichever lane async picks for it)
+    void plan_window(int64_t p0, int T, bool ep, WinPlan& wp) {
         wp.par = par;
         wp.async = par || (!sync_decode && T <= async_max_t);
+        wp.ep = ep;
         wp.vl = 0;
         for (int t = 0; t < T && !imgs.empty(); ++t)
             if (in_image(p0 + t)) wp.vl |= 1u << t;
@@ -8782,6 +8793,7 @@ struct Model::Impl {
             }
             if (wp.async && !elsewhere(l)) {   // (the service thread answers the seqs in order: only the layers run here)
                 wp.seq[il] = ++seq_issued;
+                ep_of[wp.seq[il] % kRing] = wp.ep;
                 layer_of[wp.seq[il] % kRing].store(il, std::memory_order_release);
             }
         }
@@ -8880,7 +8892,8 @@ struct Model::Impl {
         return true;
     }
 
-    bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
+    // (ep: an EP window - decode, a draft's verification - its layers' n_ff slices; false: the prompt's, whole)
+    bool forward(const int* tk, int T, int logits_rows, bool ep, std::string& err, int seed_rows = -1) {
         if (T < 1 || T > kWin) {
             err = "a window of " + std::to_string(T) + " tokens";
             return false;
@@ -8919,7 +8932,7 @@ struct Model::Impl {
         const int D = g.dim;
         for (int t = 0; t < T && !o.stage_worker; ++t)   // (h_emb is written again by the next window, after this one's last sync)
             std::memcpy(h_emb + (size_t) t * D, emb_row(p0 + t, tk[t]), (size_t) D * 2);
-        plan_window(p0, T, wplan);
+        plan_window(p0, T, ep, wplan);
         prof_window = prof_on && T == 1;
         n_logits = std::min(logits_rows, T);
         const double tl = now_ms();
@@ -9636,7 +9649,7 @@ struct Model::Impl {
         }
         if (!ents.empty()) {
             const double tc = now_ms();
-            cpu_experts(l, h_x, ents);
+            cpu_experts(l, h_x, ents, 0, nullptr, wp.ep);   // (the window's kind, as serve_lane would take it)
             std::fill(h_part, h_part + (size_t) T * D, 0.0f);
             for (int sl = 0; sl < nslots; ++sl) {
                 float* o = h_part + (size_t) cpu_rows[(size_t) sl].first * D;
@@ -9909,7 +9922,7 @@ bool Model::stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err
     }
     p.stage_t = 0;
     p.spec_win = T > 1;   // (a window of 2 or more rows may be a draft's check: its layers keep their backups)
-    const bool ok = p.forward(tk.data(), T, 0, err);
+    const bool ok = p.forward(tk.data(), T, 0, false, err);   // (the link carries no window kind: no slices here, ep_slices_ok)
     p.spec_win = false;
     if (!ok) return false;
     if (T > 1) p.stage_t = T;
