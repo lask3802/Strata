@@ -157,12 +157,15 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     std::vector<uint16_t> yb((size_t) kMaxRows * D);
     int rc = 0;
     int64_t served = 0;
-    double busy = 0;
+    double busy = 0, prep = 0, gpu = 0;
     const int errs0 = gg::launch_errors();
     for (;;) {
         if (c.recv(h, p, -1, err) != 1) {
-            std::fprintf(stderr, "expert server: main process %s gone (%s); %lld requests served, %.1f us each\n",
-                         c.peer().c_str(), err.c_str(), (long long) served, served > 0 ? busy * 1000.0 / served : 0.0);
+            const double n = (double) std::max<int64_t>(1, served);
+            std::fprintf(stderr, "expert server: main process %s gone (%s); %lld requests served, %.1f us each (the "
+                                 "rows' prep %.1f, the GPU from the copy in to the copy out %.1f, bf16 and send %.1f)\n",
+                         c.peer().c_str(), err.c_str(), (long long) served, busy * 1000.0 / n, prep * 1000.0 / n,
+                         gpu * 1000.0 / n, (busy - prep - gpu) * 1000.0 / n);
             break;
         }
         if (h.type != Req) continue;
@@ -200,6 +203,8 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
             std::fprintf(stderr, "expert server: %s\n", why.c_str());
             break;
         }
+        const double tg = now_ms();
+        prep += tg - tr;
         RX_CK(cudaMemcpyAsync(b.d_plan, b.h_plan, (size_t) kMaxRows * 8 * 8 + (size_t) kMaxRows * 8 * 4, cudaMemcpyHostToDevice, s));
         RX_CK(cudaMemcpyAsync(b.d_x, b.h_x, (size_t) nr * D * 4, cudaMemcpyHostToDevice, s));
         for (int j = 0; j < nr; ++j) {
@@ -218,6 +223,7 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         }
         RX_CK(cudaMemcpyAsync(b.h_y, b.d_y, (size_t) nr * D * 4, cudaMemcpyDeviceToHost, s));
         RX_CK(cudaStreamSynchronize(s));
+        gpu += now_ms() - tg;
         if (gg::launch_errors() != errs0) {
             const char w2[] = "a kernel launch failed on the expert server";
             (void) c.send(Error, h.seq, 0, 0, 0, w2, sizeof w2 - 1, err);
