@@ -3188,6 +3188,30 @@ def drafting_card_class() -> str:
     return _CARD_CLASS[0]
 
 
+def deepseek_remote_args(args: list[str]) -> list[str]:
+    """DeepSeek-V4.1's remote stage (docs/REMOTE_STAGE.md; the worker: tools/stage_node.py "engine": "dsv41"): the Qwen
+    engine's way to ask for one is `--layer-split K --split-device 0 --remote-stage HOST:PORT`, and strata-dsv41 takes
+    `--remote-stage HOST:PORT --stage-end K` (this PC runs layers 0 to K - 1 and the head) and stops on a flag it does not
+    know.  So a config written the Qwen way works here too: `--split-device V` is left out and `--layer-split K` gives
+    `--stage-end K` when the args have none (the engine reads `--layer-split` as the server's and ignores it; the
+    Workers card reads K from it).  Args without `--remote-stage` are returned as they are."""
+    if "--remote-stage" not in args:
+        return args
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--split-device":
+            i += 2
+            continue
+        out.append(args[i])
+        i += 1
+    if "--stage-end" not in out and "--layer-split" in out[:-1]:
+        k = str(out[out.index("--layer-split") + 1]).split(",")[0]
+        if k.isdigit():                                  # ("auto" and the like: the engine says it needs --stage-end)
+            out += ["--stage-end", k]
+    return out
+
+
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
@@ -3231,6 +3255,8 @@ def engine_args(cfg: dict) -> list[str]:
     # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
     if layer_split_of(cfg) and cfg.get("split_skip_if_fits") and "--split-skip-if-fits" not in args:
         args.append("--split-skip-if-fits")
+    if (cfg.get("arch") or "") == "deepseek41":
+        args = deepseek_remote_args(args)
     # #533 (opt-in): "vram_elastic": true - the expert cache in segments, so POST /v1/vram can give VRAM back to other
     # programs and take it back; "vram_segment_mib" sets the segment size (the engine's default: 512)
     if cfg.get("vram_elastic") is True and "--vram-elastic" not in args:

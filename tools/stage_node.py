@@ -24,7 +24,9 @@ node.json (paths are this PC's):
       "gpu_clocks": {"graphics": [1500, 1905], "memory": [7001, 7001]}
                                                    optional: lock the GPU's clocks (MHz) while a worker runs - for a
                                                    Windows worker (see Workers.lock_clocks); needs administrator/root
-      "restart": true                              default: start a worker that ended by itself again (Workers.exited)
+      "restart": true,                             default: start a worker that ended by itself again (Workers.exited)
+      "dsv41_exe": "/srv/stage/bin/strata-dsv41",  optional: the DeepSeek-V4.1 engine, for a /start with "engine": "dsv41"
+      "dsv41_args": ["--max-context", "8192"],     its flags for every such worker ("dsv41_pack": a pack node.json names)
     }
 
 What the token allows: a holder can start and stop this PC's workers with the engine and model files node.json
@@ -49,6 +51,10 @@ only the tuner and the main process drive this PC.  Endpoints (JSON in and out):
                                - stops the worker on that port, starts this one and answers when it listens (or with
                                its log's tail when it exits).  "model" runs a model shipped under data_dir
                                (data_dir/models/D/F, data_dir/packs/P), so one agent serves every model shipped to it
+                               "engine": "dsv41" starts DeepSeek-V4.1's worker instead (Workers.model_dsv41): layers
+                               K to the last, no relay; "model": {"dir": D, "pack": P} is data_dir/models/D (the
+                               pack's weights, ds4.txt's model_dir is set to it at the start) and data_dir/packs/P;
+                               "prefill", "cache" and "native" are the Qwen engine's and do not apply
     POST /stop                 {"port": 7841} (no port: every worker) - and no start again
     GET  /log?port=P&lines=N   a worker's log tail (&prev=1: the last run that listened before this one,
                                stage-worker-P.prev.log)
@@ -90,6 +96,11 @@ EXTRA_ALLOWED = {"--max-context", "--stage-bind", "--vram-reserve-mib", "--vram-
                  "--kv", "--kv-resident", "--pcie-frac", "--pool-workers", "--adapt-every", "--adapt-swaps",
                  "--adapt-decay", "--spec-min-p",
                  "--vision"}   # a main process that reads images needs its workers' position tables (no file named)
+# a DeepSeek-V4.1 worker's (strata-dsv41): the flags of the engine's own list that shape one process, none that names a file
+DSV41_EXTRA_ALLOWED = {"--max-context", "--stage-bind", "--vram-experts", "--cpu-threads", "--mmap-experts",
+                       "--ssd-cache", "--ssd-policy", "--no-expert-cache", "--gpus", "--reserve-mib", "--tp",
+                       "--threads", "--vision", "--verbose"}
+ENGINES = ("strata", "dsv41")
 PLAIN_NAME = re.compile(r"[A-Za-z0-9._-]+")   # a /start's model names: no separator, no drive, no space
 DEVICE_NAME = re.compile(r"(CON|PRN|AUX|NUL|COM\d|LPT\d)(\..*)?", re.I)   # a Windows device in any directory
 LISTEN_TIMEOUT_S = 600     # loading a worker's experts: up to ~30 GB from disk on a cold cache
@@ -322,6 +333,8 @@ class Workers:
         shard by tensor name), tools/stage_ship.py's layout.  Names of letters, digits, '.', '_' and '-' only, not
         dots alone and not a Windows device, so every path stays inside data_dir (a Windows "C:.." would replace the
         root); a symlink the PC's owner put under data_dir is followed (/put makes none)."""
+        if req.get("engine") == "dsv41":
+            return self.model_dsv41(req)
         c = self.cfg
         m = req.get("model")
         if m is None:
@@ -349,6 +362,34 @@ class Workers:
                 raise ValueError(f"model {k} is not shipped here: tools/stage_ship.py first")
         return {k: str(p or "") for k, p in out.items()}
 
+    def model_dsv41(self, req: dict) -> dict:
+        """The files a DeepSeek-V4.1 worker runs: {"pack": the pack folder, "model_dir": where its weights are, to be
+        written into the pack's ds4.txt ("" when node.json's own pack is used as it is)}.  node.json's "dsv41_pack"
+        when /start names no model; else {"model": {"dir": D, "pack": P}} is data_dir/packs/P and data_dir/models/D, the
+        layout of tools/stage_ship.py --engine dsv41 (the pack's other files, "../<shared>/x.gguf" in tensors.txt, sit
+        beside D).  The names are checked as model() checks them."""
+        c = self.cfg
+        m = req.get("model")
+        if m is None:
+            if not c.get("dsv41_pack"):
+                raise ValueError("node.json names no dsv41_pack: /start must name a model shipped here")
+            return {"pack": str(c["dsv41_pack"]), "model_dir": ""}
+        if not c.get("data_dir"):
+            raise ValueError("this node has no data_dir: it runs node.json's model only")
+        if not isinstance(m, dict) or not all(isinstance(m.get(k), str) for k in ("dir", "pack")):
+            raise ValueError('model: {"dir": ..., "pack": ...} expected')
+        for k in ("dir", "pack"):
+            v = m[k]
+            if not PLAIN_NAME.fullmatch(v) or not v.strip(".") or DEVICE_NAME.fullmatch(v):
+                raise ValueError(f"model {k}: a plain file or directory name expected, not {v!r}")
+        root = Path(c["data_dir"])
+        out = {"pack": root / "packs" / m["pack"], "model_dir": root / "models" / m["dir"]}
+        for k, p in out.items():
+            if not p.is_dir():
+                raise ValueError(f"model {'dir' if k == 'model_dir' else k} is not shipped here: "
+                                 f"tools/stage_ship.py --engine dsv41 first")
+        return {k: str(p) for k, p in out.items()}
+
     def _refusal(self, req: dict) -> dict | None:
         """A start's answer when it cannot run here (a number that is not one, flags not allowed, a relay without
         both end and next, a model not shipped here); None when it can."""
@@ -358,11 +399,22 @@ class Workers:
                 int(req["end"])
         except (KeyError, TypeError, ValueError):
             return {"ok": False, "error": "begin, end, port and prefill must be whole numbers"}
-        allowed = EXTRA_ALLOWED | set(self.cfg.get("extra_allow", []))
+        engine = req.get("engine", "strata")
+        if engine not in ENGINES:
+            return {"ok": False, "error": f"engine: one of {list(ENGINES)}, not {engine!r}"}
+        allowed = (DSV41_EXTRA_ALLOWED if engine == "dsv41" else EXTRA_ALLOWED) | set(self.cfg.get("extra_allow", []))
         bad = [str(a) for a in req.get("extra", []) if str(a).startswith("-") and str(a) not in allowed]
         if bad:
             return {"ok": False, "error": f"flags not allowed here: {bad} (node.json extra_allow)"}
-        if (req.get("end") is None) != (req.get("next") is None):
+        if engine == "dsv41":
+            # (the DeepSeek engine's worker runs layer K to the last and relays to no one: ds4_model.cu, ds4_main.cpp)
+            if req.get("end") is not None or req.get("next") is not None:
+                return {"ok": False, "error": "a DeepSeek-V4.1 worker runs layer K to the last: no end, no next"}
+            if int(req["begin"]) < 1:
+                return {"ok": False, "error": "a DeepSeek-V4.1 worker's first layer is 1 or more"}
+            if not self.cfg.get("dsv41_exe"):
+                return {"ok": False, "error": "node.json names no dsv41_exe"}
+        elif (req.get("end") is None) != (req.get("next") is None):
             return {"ok": False, "error": "a relay needs both end and next"}
         try:
             self.model(req)
@@ -394,13 +446,26 @@ class Workers:
                 return {"ok": False, "port": port, "error": "stopped meanwhile"}
         self._stop_procs([port])
         c = self.cfg
-        args = [c["exe"], "--serve", "--stage-worker", str(port), "--stage-begin", str(int(req["begin"]))]
-        if req.get("end") is not None:
-            args += ["--stage-end", str(int(req["end"])), "--stage-next", str(req["next"])]
-        args += ["--pack", m["pack"], "--native", m["native"]] + (["--ple-gguf", m["ple_gguf"]] if m["ple_gguf"] else [])
-        args += ["--expert-profile", m["expert_profile"], "--expert-cache", str(req.get("cache", "auto")),
-                 "--prefill", str(int(req.get("prefill", 2048))), "--stage-bind", c["bind"]]
-        args += [str(a) for a in c.get("args", [])] + extra
+        dsv41 = req.get("engine") == "dsv41"
+        if dsv41:
+            # strata-dsv41: no --serve, --native, --ple-gguf, --expert-cache or --prefill (they are the Qwen engine's;
+            # it stops on a flag it does not know); the profile is the pack's own <pack>/expert-profile.bin
+            if m["model_dir"]:
+                try:
+                    pin_model_dir(Path(m["pack"]), Path(m["model_dir"]))
+                except OSError as e:
+                    return {"ok": False, "port": port, "error": f"cannot set the pack's model_dir: {e}"}
+            args = [c["dsv41_exe"], "--pack", m["pack"], "--stage-worker", str(port), "--stage-begin",
+                    str(int(req["begin"])), "--stage-bind", c["bind"]]
+            args += [str(a) for a in c.get("dsv41_args", [])] + extra
+        else:
+            args = [c["exe"], "--serve", "--stage-worker", str(port), "--stage-begin", str(int(req["begin"]))]
+            if req.get("end") is not None:
+                args += ["--stage-end", str(int(req["end"])), "--stage-next", str(req["next"])]
+            args += ["--pack", m["pack"], "--native", m["native"]] + (["--ple-gguf", m["ple_gguf"]] if m["ple_gguf"] else [])
+            args += ["--expert-profile", m["expert_profile"], "--expert-cache", str(req.get("cache", "auto")),
+                     "--prefill", str(int(req.get("prefill", 2048))), "--stage-bind", c["bind"]]
+            args += [str(a) for a in c.get("args", [])] + extra
         env = dict(os.environ)
         env["STRATA_STAGE_TOKEN"] = c["_token"]
         env["STRATA_REMOTE_TIMING"] = "1"
@@ -442,7 +507,9 @@ class Workers:
             text = log.read_text(encoding="utf-8", errors="replace")
             if "listening on" in text:
                 self.listened[port] = True
-                if c.get("drop_cache", True):   # its experts are pinned now: the cached file pages are a second copy
+                # its experts are pinned now: the cached file pages are a second copy.  Not for strata-dsv41: it reads its
+                # experts in place from the mapped files, so the page cache is its RAM store, not a copy of one
+                if c.get("drop_cache", True) and not dsv41:
                     for f in model_files(m):
                         drop_cache(f)
                 with self.lock:
@@ -582,6 +649,30 @@ def model_files(cfg: dict) -> list[Path]:
     if cfg.get("pack") and Path(cfg["pack"]).is_dir():
         out += [p for p in Path(cfg["pack"]).rglob("*") if p.is_file()]
     return out
+
+
+def pin_model_dir(pack: Path, model_dir: Path) -> bool:
+    """A shipped DeepSeek-V4.1 pack's ds4.txt says where its weights are ("model_dir <path>", the PC it was made on's),
+    and the engine opens tensors.txt's files under it.  Set the line to this node's folder (tools/stage_ship.py
+    --engine dsv41 puts the files in data_dir/models/<D>); the pack's fingerprint leaves that line out, so the main
+    process's hello still matches.  True when the file changed.  Written under a temporary name and moved over it."""
+    f = pack / "ds4.txt"
+    raw = f.read_bytes()
+    nl = b"\r\n" if b"\r\n" in raw else b"\n"
+    want = b"model_dir " + str(model_dir).encode()
+    lines = raw.split(nl)
+    for i, line in enumerate(lines):
+        if line.startswith(b"model_dir "):
+            if line == want:
+                return False
+            lines[i] = want
+            break
+    else:
+        lines = [x for x in lines if x] + [want, b""]   # (none: added, with the file's last newline)
+    tmp = f.with_name(f.name + ".tmp")
+    tmp.write_bytes(nl.join(lines))
+    os.replace(tmp, f)
+    return True
 
 
 def merge_ranges(rs: list[list[int]]) -> list[list[int]]:

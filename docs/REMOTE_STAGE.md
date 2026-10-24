@@ -489,6 +489,29 @@ layers 40-47 to a Windows node, 11.39 GiB in 211 s and 15.51 GiB in 184 s; UD-Q4
 27.63 GiB in 342 s, and layers 40-47 more later (12.85 GiB in 162 s, the rest skipped). The UD-Q4_K_XL workers and
 PC C's RVN workers in the measurements above ran from these sparse files (PC B's RVN worker had a full copy).
 
+**DeepSeek-V4.1 (`strata-dsv41`) through the same tools.** Its worker is a different program with its own flags
+(`--stage-worker PORT --stage-begin K`, layers K to the last, no relay), so the agent starts it only when asked:
+
+```
+python3 tools/stage_ship.py --engine dsv41 --agent http://192.0.2.11:7840 --token-file /opt/strata/stage-token \
+    --pack-dir /data/packs/<pack> [--bin-dir <folder with strata-dsv41>] --layers 20- --data-dir /data/stage
+# node.json: "dsv41_exe": "/data/stage/bin/strata-dsv41", "lib_dirs": [...], "dsv41_args": ["--max-context", "8192"]
+curl -H "X-Stage-Token: $T" -d '{"engine":"dsv41","begin":20,"model":{"dir":"<model dir>","pack":"<pack>"}}' \
+    http://192.0.2.11:7840/start
+```
+
+- The pack names the weights' files (`tensors.txt`) under `model_dir` (`ds4.txt`). The engine opens and maps every one
+  of them but a worker reads only its layers' tensors (not the embedding table, the head, the DSpark drafter or, from
+  layer 15 on, the Engram tables). `--engine dsv41` sends those bytes at their own offsets and the other files as empty
+  sparse files of their full sizes, and the pack folder whole. `--dry-run` lists the files and the bytes without an agent.
+- `/start` writes the node's `models/<dir>` into the pack's `ds4.txt` first; the two PCs' hellos still match because
+  the pack's fingerprint leaves that line out. The agent leaves the page cache alone for this worker: it reads its experts
+  in place from the mapped files, so the cache is where they live.
+- The flags a `/start` may add are the engine's own (`--max-context`, `--cpu-threads`, `--vram-experts`, ...; the Qwen
+  engine's `--kv`, `--spec`, `--prefill` are refused). The main process: `--remote-stage HOST:PORT --stage-end K` in the
+  config's `args`, or the Qwen spelling (`--layer-split K --split-device 0 --remote-stage HOST:PORT`) that the server turns
+  into it for DeepSeek. Put `STRATA_STAGE_TOKEN` in the config's `env`. Not yet measured on two PCs.
+
 **`tools/stage_tune.py`: the layer-split tuner**, run on the main PC. It measures for real: for every configuration
 it restarts the workers (through their agents) and the main server, reads one long prompt and three short ones, and
 takes each stage's own times from the timing lines.

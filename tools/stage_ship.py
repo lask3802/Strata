@@ -22,6 +22,17 @@ command resumes.
 On the node the files land under its data_dir: models/<model dir name>/, packs/<pack name>/, data/<profile>,
 bin/.  A /start that names the model ({"model": {"dir": ..., "native": ..., "pack": ...}}, as stage_tune.py sends)
 runs it from there; --data-dir prints the paths for a node.json that should run it by default.
+
+DeepSeek-V4.1 (--engine dsv41): the model is the pack (tools/dsv41/pack_gguf.py), whose tensors.txt names the weights'
+files under ds4.txt's model_dir.  A worker for layers LO-HI opens every file and reads only its layers' tensors, so
+those bytes are sent at their own offsets (the shards of other layers, the Engram and the drafter: empty sparse files of
+their sizes), and the pack folder whole; --model-dir names the weights' folder when ds4.txt's is not this PC's.
+
+    python3 tools/stage_ship.py --engine dsv41 --agent http://192.0.2.12:7840 --token-file /opt/strata/stage-token \\
+        --pack-dir /data/packs/<pack> [--bin-dir /opt/strata/build/bin] --layers 20- [--data-dir <the node's data_dir>]
+
+--layers LO- runs to the trunk's last layer.  The node agent writes its own folder into the pack's ds4.txt when /start
+runs the worker (tools/stage_node.py, "engine": "dsv41").
 """
 from __future__ import annotations
 
@@ -30,6 +41,7 @@ import hashlib
 import http.client
 import json
 import os
+import posixpath
 import queue
 import re
 import stat
@@ -116,6 +128,71 @@ def gguf_items(model_dir: Path, lo: int, hi: int) -> list[Item]:
         it = Item(path, f"models/{model_dir.name}/{path.name}", rs)
         with open(path, "rb") as f:   # the header names every tensor's offset: same header, same layout
             it.fp = hashlib.sha256(f.read(g.data_start)).hexdigest()[:32] + f"-{it.total}"
+        items.append(it)
+    return items
+
+
+def dsv41_pack_files(pack_dir: Path) -> tuple[dict[str, str], dict[int, str], list[tuple[str, int, int, int]]]:
+    """A DeepSeek-V4.1 pack's description (tools/dsv41/pack_gguf.py): ds4.txt's keys, tensors.txt's "file I NAME" lines
+    (the weights' files, relative to ds4.txt's model_dir - the shared Engram and drafter files as "../<dir>/x.gguf") and
+    its tensors as (name, file, offset, bytes)."""
+    kv: dict[str, str] = {}
+    for line in (pack_dir / "ds4.txt").read_text(encoding="utf-8").splitlines():
+        k, _, v = line.partition(" ")
+        if v:
+            kv[k] = v
+    files: dict[int, str] = {}
+    tensors: list[tuple[str, int, int, int]] = []
+    with open(pack_dir / "tensors.txt", encoding="utf-8") as f:
+        for line in f:
+            p = line.split()
+            if len(p) >= 3 and p[0] == "file":
+                files[int(p[1])] = p[2]
+            elif len(p) >= 6 and p[0] == "t":
+                tensors.append((p[1], int(p[3]), int(p[4]), int(p[5])))
+    if not files or not tensors:
+        raise SystemExit(f"{pack_dir}: tensors.txt names no files or no tensors")
+    return kv, files, tensors
+
+
+def dsv41_wanted(name: str, lo: int, hi: int) -> bool:
+    """Whether a worker for layers [lo, hi) reads this tensor (src/dsv41/ds4_model.cu: tensor_here, and the loads it
+    skips): the trunk layers' own - with the Engram tables' tensors of an Engram layer among them (the layers 1 and 14,
+    so none for a worker from layer 15 on) - and the few outside the layers; not the embedding table (the main process
+    embeds), the head (it keeps the logits), or the DSpark drafter (mtp.*: a range runs without it)."""
+    if name.startswith("layers."):
+        try:
+            return lo <= int(name.split(".", 2)[1]) < hi
+        except ValueError:
+            return False
+    return not (name == "embed.weight" or name.startswith(("head.", "mtp.")))
+
+
+def dsv41_items(pack_dir: Path, model_dir: Path | None, lo: int, hi: int | None = None) -> list[Item]:
+    """Every file the pack names, in the node's models/<model dir name>/ at the names tensors.txt gives: the bytes of
+    the tensors a worker for layers [lo, hi) reads at their own offsets, in files of the originals' sizes (sparse on the
+    node); a file with no such tensor (the Engram's, the drafter's, a trunk shard of other layers) as an empty file of
+    its size, because the engine opens and maps every file tensors.txt names.  The pack's folder is sent whole."""
+    kv, files, tensors = dsv41_pack_files(pack_dir)
+    nl = int(kv.get("num_hidden_layers", "0"))
+    hi = nl if hi is None else hi
+    if not 0 < lo < hi <= nl:
+        raise SystemExit(f"layers [{lo}, {hi}): a worker needs a range of the trunk's {nl} layers, from layer 1 on")
+    model_dir = model_dir or Path(kv.get("model_dir", ""))
+    if not model_dir.is_dir():
+        raise SystemExit(f"{model_dir}: the weights' folder (ds4.txt's model_dir, or --model-dir) is not here")
+    ranges: dict[int, list[list[int]]] = {i: [] for i in files}
+    for name, i, off, n in tensors:
+        if dsv41_wanted(name, lo, hi):
+            ranges[i].append([off, n])
+    items = []
+    for i, fn in sorted(files.items()):
+        rel = posixpath.normpath(posixpath.join("models", model_dir.name, fn.replace("\\", "/")))
+        if not rel.startswith("models/") or rel.count("/") < 2:
+            raise SystemExit(f"{fn}: tensors.txt names a file outside the models folder")
+        it = Item(model_dir / fn, rel, ranges[i])
+        with open(it.local, "rb") as f:   # no header to fingerprint (the engine reads none): the first MiB and the size
+            it.fp = hashlib.sha256(f.read(1 << 20)).hexdigest()[:32] + f"-{it.total}"
         items.append(it)
     return items
 
@@ -212,6 +289,8 @@ def ship(agent: Agent, items: list[Item], say=print, parallel: int = 4) -> int:
         miss = subtract(it.ranges, got)
         if it.total == 0:   # an empty file: one empty put creates it, unless the node has it (size None: missing)
             miss = [] if have.get("size") == 0 else [[0, 0]]
+        elif not it.ranges:   # a file the node opens but reads none of (a DeepSeek pack's): created at its size, a hole
+            miss = [] if same and have.get("size") == it.total else [[0, 0]]
         if it.whole and not miss and it.total > 0:   # a whole file the node has: the same bytes?
             remote = agent.sha256(it.rel)
             if remote.get("sha256") != file_sha256(it.local):
@@ -343,6 +422,27 @@ def plan(model_dir: Path, pack_dir: Path, profile: Path, bin_dir: Path | None, l
     return items
 
 
+def plan_dsv41(pack_dir: Path, model_dir: Path | None, bin_dir: Path | None, lo: int, hi: int | None) -> list[Item]:
+    """What a DeepSeek-V4.1 worker for layers [lo, hi) needs: its weights' bytes and the pack (its expert profile is in
+    it: <pack>/expert-profile.bin)."""
+    items = dsv41_items(pack_dir, model_dir, lo, hi)
+    items += tree_items(pack_dir, "packs")
+    if bin_dir is not None:
+        items += [Item(p, f"bin/{p.name}") for p in sorted(bin_dir.iterdir()) if p.is_file()]
+    return items
+
+
+def node_paths_dsv41(data_dir: str, model_name: str, pack_dir: Path, begin: int) -> dict:
+    """node.json's paths for a shipped DeepSeek-V4.1 pack, and the /start that runs its worker."""
+    win = bool(re.match(r"[A-Za-z]:", data_dir)) or "\\" in data_dir
+    sep = "\\" if win else "/"
+    d = data_dir.rstrip("/\\")
+    j = lambda *parts: sep.join([d, *parts])   # noqa: E731
+    return {"node.json": {"dsv41_exe": j("bin", "strata-dsv41.exe" if win else "strata-dsv41"), "lib_dirs": [j("bin")],
+                          "dsv41_pack": j("packs", pack_dir.name)},
+            "/start": {"engine": "dsv41", "begin": begin, "model": {"dir": model_name, "pack": pack_dir.name}}}
+
+
 def node_paths(data_dir: str, model_dir: Path, pack_dir: Path, profile: Path) -> dict:
     """node.json's paths for what plan() ships."""
     shards = sorted(p.name for p in model_dir.glob("*.gguf"))
@@ -358,27 +458,53 @@ def node_paths(data_dir: str, model_dir: Path, pack_dir: Path, profile: Path) ->
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--agent", required=True)
+    ap.add_argument("--engine", choices=("strata", "dsv41"), default="strata",
+                    help="the model's engine: strata (GGUF shards + a native pack, the default) or dsv41 (DeepSeek-V4.1)")
+    ap.add_argument("--agent")
     ap.add_argument("--token-file")
-    ap.add_argument("--model-dir", required=True, type=Path)
+    ap.add_argument("--model-dir", type=Path, help="strata: the GGUF shards' folder; dsv41: the weights' folder when "
+                                                   "the pack's ds4.txt names another PC's")
     ap.add_argument("--pack-dir", required=True, type=Path)
-    ap.add_argument("--profile", required=True, type=Path)
+    ap.add_argument("--profile", type=Path)
     ap.add_argument("--bin-dir", type=Path)
-    ap.add_argument("--layers", required=True, help="LO-HI, both included (the node's first and last layer)")
+    ap.add_argument("--layers", required=True, help="LO-HI, both included (the node's first and last layer); dsv41 "
+                                                    "also LO- (to the trunk's last layer)")
     ap.add_argument("--data-dir", help="the node's data_dir: print the node.json paths for what was shipped")
     ap.add_argument("--parallel", type=int, default=4,
                     help="pieces in flight at once, each on its own connection (default 4; 1: one at a time)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="list the files and the bytes the node would need, ask no agent, send nothing")
     a = ap.parse_args()
     if a.parallel < 1:
         ap.error("--parallel: 1 or more")
+    missing = [f for f, v in (("--agent", True if a.dry_run else a.agent),
+                              ("--model-dir", a.model_dir if a.engine == "strata" else True),
+                              ("--profile", a.profile if a.engine == "strata" else True)) if v is None or v == ""]
+    if missing:
+        ap.error("the following arguments are required: " + ", ".join(missing))
     token = (Path(a.token_file).read_text().strip() if a.token_file else os.environ.get("STRATA_STAGE_TOKEN", ""))
-    lo, hi = (int(x) for x in a.layers.split("-"))
-    items = plan(a.model_dir, a.pack_dir, a.profile, a.bin_dir, lo, hi + 1)
+    lo, _, hi = a.layers.partition("-")
+    if a.engine == "dsv41":
+        lo, hi = int(lo), (int(hi) + 1 if hi else None)
+        items = plan_dsv41(a.pack_dir, a.model_dir, a.bin_dir, lo, hi)
+    else:
+        lo, hi = int(lo), int(hi)   # (as before: "LO-HI" or an error)
+        items = plan(a.model_dir, a.pack_dir, a.profile, a.bin_dir, lo, hi + 1)
+    if a.dry_run:
+        for it in items:
+            print(f"{it.nbytes / 2**30:10.3f} GiB of {it.total / 2**30:9.3f} GiB  {it.rel}")
+        print(f"total {sum(it.nbytes for it in items) / 2**30:.3f} GiB wanted ({len(items)} files)")
+        return
     t0 = time.time()
     sent = ship(Agent(a.agent, token), items, parallel=a.parallel)
     print(f"ship: {sent / 2**30:.2f} GiB in {time.time() - t0:.0f} s")
     if a.data_dir:
-        print("node.json paths:", json.dumps(node_paths(a.data_dir, a.model_dir, a.pack_dir, a.profile), indent=1))
+        if a.engine == "dsv41":
+            kv, _, _ = dsv41_pack_files(a.pack_dir)
+            md = (a.model_dir or Path(kv.get("model_dir", ""))).name
+            print("node paths:", json.dumps(node_paths_dsv41(a.data_dir, md, a.pack_dir, lo), indent=1))
+        else:
+            print("node.json paths:", json.dumps(node_paths(a.data_dir, a.model_dir, a.pack_dir, a.profile), indent=1))
 
 
 if __name__ == "__main__":
