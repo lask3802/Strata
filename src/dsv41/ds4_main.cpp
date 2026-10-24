@@ -7,6 +7,10 @@
 //   maya-ds4 --pack ... --serve                                       Maya's engine protocol on stdin / stdout
 //   maya-ds4 --pack ... --stage-begin K --stage-end E ...             only layers [K, E): the embedding into K, the head
 //                                                                     after E - 1 (a split's memory plan, by itself)
+//   maya-ds4 --pack ... --stage-worker PORT --stage-begin K           a remote stage's worker: layers K to the last for
+//                                                                     the main process below, on PORT (no head)
+//   maya-ds4 --pack ... --remote-stage HOST:PORT --stage-end K ...    layers 0 to K - 1 and the head here, the rest on
+//                                                                     the worker (docs/REMOTE_STAGE.md; any mode above)
 //
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
 // `GEN <max_new> [key=value ...] <id,id,...>` answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
@@ -24,6 +28,7 @@
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
 #include "ds4_slotmeta.hpp"
+#include "ds4_stage.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -90,7 +95,9 @@ void usage() {
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto] [--stage-begin K] [--stage-end E]\n"
+                 "           [--remote-stage HOST:PORT --stage-end K]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
+                 "           | --stage-worker PORT [--stage-bind ADDR] --stage-begin K\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
                  "           | --pack-info)\n");
 }
@@ -317,6 +324,177 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
 
+// ---- the remote stage (docs/REMOTE_STAGE.md, ds4_stage.hpp): this PC runs layers 0 to K - 1 and the head, a worker
+// PC the rest - each window's rows go there after layer K - 1 and come back before the head
+// This side's hello: the trunk, the layers where the link cuts it, the windows (no prompt chunks), fp32 rows, no K/V
+// type to compare (the hand-off carries no attention K/V), no checkpoints, the pack's fingerprint
+strata::net::StageHello stage_hello(const strata::ds4::Model& m, const std::string& pack, bool worker) {
+    const strata::ds4::Model::StageGeo sg = m.stage_geo();
+    strata::net::StageHello me;
+    me.n_embd = sg.dim;
+    me.hc = sg.hc;
+    me.n_layers = sg.n_layers;
+    me.n_expert = sg.n_expert;
+    me.layer_begin = worker ? sg.layer_begin : sg.layer_end;
+    me.max_t = sg.max_t;
+    me.kv_type = -1;
+    me.row_formats = (1u << (uint32_t) strata::net::StageRows::F32) | strata::net::kStageCapKvElem;
+    me.max_context = m.max_context();
+    me.chunk = 0;
+    me.handoff_floats = sg.handoff_floats;
+    me.pack_hash = strata::ds4::stage::pack_hash(pack);
+    std::snprintf(me.build, sizeof me.build, "strata-dsv41 remote-stage %s", worker ? "worker" : "main");
+    return me;
+}
+
+// STRATA_STAGE_TOKEN (the shared secret, as the Qwen engine reads it); false: too long
+bool stage_token(std::string& tok) {
+    const char* v = std::getenv("STRATA_STAGE_TOKEN");
+    tok = v != nullptr ? v : "";
+    if (tok.size() < sizeof(strata::net::StageHello::token)) return true;
+    std::fprintf(stderr, "maya-ds4: STRATA_STAGE_TOKEN is longer than %zu characters\n",
+                 sizeof(strata::net::StageHello::token) - 1);
+    return false;
+}
+
+// The main process's end: one link, made at the start and again when a reset finds it lost (the worker or its PC
+// started again, the network went away while idle), with the same hello.  A worker that does not listen yet, a
+// network that does not reach it or a name that does not resolve yet is tried every 2 s until STRATA_REMOTE_CONNECT_S
+// (180 s; 0: one try) have passed; a refusal (token, model, layers, context) does not change by waiting.  While a
+// request waits (serve), `INFO remote_stage_wait=S` every 10 s tells the server the engine is not frozen, and a STOP
+// ends the wait.  Every new connection starts with a Reset: the worker's session from position 0.
+struct RemoteMain {
+    std::string at;
+    strata::net::StageClient link;
+    strata::net::StageHello me, peer;
+    const std::atomic<bool>* stop = nullptr;   // (serve: its STOP flag - a request's wait ends on it)
+
+    bool connect(std::string& e) {
+        static const int wait_s = [] {
+            const char* v = std::getenv("STRATA_REMOTE_CONNECT_S");
+            return v != nullptr && *v != '\0' ? std::max(0, std::atoi(v)) : 180;
+        }();
+        const double t0 = now_ms();
+        auto spent = [&] { return (now_ms() - t0) / 1000.0; };
+        std::mutex mu;
+        std::condition_variable cv;
+        bool done = false;
+        std::thread beat;
+        if (stop != nullptr)   // (in a request: the heartbeat)
+            beat = std::thread([&] {
+                std::unique_lock<std::mutex> lk(mu);
+                while (!cv.wait_for(lk, std::chrono::seconds(10), [&] { return done; })) {
+                    std::printf("INFO remote_stage_wait=%lld\n", (long long) spent());
+                    std::fflush(stdout);
+                }
+            });
+        bool said = false, ok = false;
+        for (;;) {
+            link.close();
+            const int left = wait_s > 0 ? std::min(strata::net::io_timeout_s(), std::max(1, (int) std::ceil(wait_s - spent()))) : 0;
+            if (link.connect(at, me, peer, e, left, stop)) {
+                ok = link.reset({}, e);
+                break;
+            }
+            const bool cancelled = strata::net::stage_wait_cancelled(e) || (stop != nullptr && stop->load());
+            if (cancelled || !strata::net::stage_link_lost(e) || spent() + 2 > (double) wait_s) break;
+            if (!said) {
+                std::fprintf(stderr, "maya ds4: remote stage: waiting for the worker at %s (%s), up to %d s "
+                                     "(STRATA_REMOTE_CONNECT_S)\n", at.c_str(), e.c_str(), wait_s);
+                said = true;
+            }
+            for (int i = 0; i < 8 && !(stop != nullptr && stop->load()); ++i)   // 2 s, or until a STOP
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+        if (beat.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                done = true;
+            }
+            cv.notify_all();
+            beat.join();
+        }
+        return ok;
+    }
+    // the worker's session from position 0 (Model::reset): connecting again when the link is lost
+    bool reset(std::string& e) {
+        if (link.connected() && link.reset({}, e)) return true;
+        if (link.connected() && !strata::net::stage_link_lost(e)) return false;   // (the worker's own error)
+        const std::string lost = e.empty() ? "the link is down" : e;
+        if (!connect(e)) {
+            e = lost + "; connecting again: " + e;
+            return false;
+        }
+        std::fprintf(stderr, "maya ds4: remote stage: the link to %s was lost (%s): connected again\n", at.c_str(),
+                     lost.c_str());
+        return true;
+    }
+    // a window: its rows there and back, then its tokens kept (Commit: every one - no drafts in v1)
+    bool run(int T, const int32_t* tokens, int64_t p0, const float* out, float* in, std::string& e) {
+        const size_t n = (size_t) T * (size_t) me.handoff_floats;
+        return link.run(T, tokens, p0, out, n, in, n, e) && link.commit(T, e);
+    }
+};
+RemoteMain* g_remote = nullptr;
+
+// The worker's end (--stage-worker PORT): serves one main process at a time on the port instead of stdin.  A
+// conversation starts with a Reset; its windows arrive in order and run here one at a time, each at the position
+// this worker is at.  Returns when listening fails.
+int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::string& bind, int port) {
+    std::string token;
+    if (!stage_token(token)) return 1;
+    if (std::getenv("STRATA_REMOTE_ROWS") != nullptr)
+        std::fprintf(stderr, "maya ds4: STRATA_REMOTE_ROWS is the main process's choice; a worker takes the rows it "
+                             "asks for (fp32 here)\n");
+    const strata::net::StageHello me = stage_hello(m, pack, true);
+    const strata::ds4::Model::StageGeo sg = m.stage_geo();
+    int last_t = 0;   // (the last window's rows: what its Commit keeps)
+    strata::net::StageHandlers hs;
+    hs.hello = [&](const strata::net::StageHello& theirs, strata::net::StageHello& mine, std::string& e) {
+        mine = me;   // (the worker's own hello carries no token)
+        if (theirs.protocol != strata::net::kStageProtocol) return true;   // (the link refuses it for its number)
+        return strata::ds4::stage::worker_accepts(theirs, me, m.max_context(), e);
+    };
+    hs.run = [&](int T, const int32_t* tokens, int64_t p0, std::string& e) {
+        last_t = 0;
+        if (!m.stage_run(tokens, T, p0, e)) return false;
+        last_t = T;
+        return true;
+    };
+    hs.commit = [&](int n_keep, std::string& e) {
+        if (n_keep == last_t) return true;
+        e = "commit of " + std::to_string(n_keep) + " of a window of " + std::to_string(last_t) +
+            " rows: this worker keeps whole windows only (no drafts)";
+        return false;
+    };
+    hs.prefill = [](const int64_t*, int64_t, int64_t, int64_t, int64_t, const float*, float*, std::string& e) {
+        e = "a prompt chunk: this worker reads windows only";
+        return false;
+    };
+    hs.reset = [&](const std::vector<int64_t>&, std::string&) {
+        m.reset();
+        m.save_profile();
+        last_t = 0;
+        return true;
+    };
+    hs.disconnected = [&] {
+        m.reset();
+        m.save_profile();
+        last_t = 0;
+    };
+    strata::net::StageBuffers bufs;
+    bufs.run_in = m.stage_rows_in();
+    bufs.run_out = m.stage_rows_out();
+    bufs.run_floats = (size_t) sg.max_t * (size_t) sg.handoff_floats;
+    bufs.handoff_floats = sg.handoff_floats;
+    bufs.pf_row_floats = (int64_t) sg.hc * sg.dim;   // (pf_floats 0: no prompt chunks)
+    strata::net::StageStats wst;
+    std::fprintf(stderr, "maya ds4: remote stage worker: layers %d-%d, no head, windows of %d, port %d\n", sg.layer_begin,
+                 sg.layer_end - 1, sg.max_t, port);
+    std::fflush(stderr);
+    return strata::net::serve_stage(bind, port, token, hs, bufs, wst, nullptr);
+}
+
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack) {
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
@@ -325,6 +503,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::fprintf(stderr, "maya ds4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; STOP, QUIT\n");
     Lines in;
     in.start();
+    if (g_remote != nullptr) g_remote->stop = &in.stop;   // (a request's wait for the worker ends on a STOP)
     std::string line;
     unsigned long long counter = 0;
     std::vector<Pic> held;   // the pictures the state holds (start, hash, span)
@@ -684,6 +863,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             m.reset();
             held.clear();
         }
+        if (g_remote != nullptr) {   // (a remote stage whose link went down while idle: its worker holds nothing of the
+            std::string e;           // conversation - read it again from token 0, connecting again at the reset)
+            if (!g_remote->link.alive(e)) {
+                std::fprintf(stderr, "maya ds4: remote stage: %s\n", e.empty() ? "the link is down" : e.c_str());
+                m.reset();
+                held.clear();
+            }
+        }
         const auto& st = m.tokens();
         const size_t n_state = st.size();
         size_t c = 0;
@@ -906,6 +1093,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                            off, acc, err, r.cum)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     finish = "cancel";
+                    if (g_remote != nullptr) {   // (a remote stage: the worker's state is unknown - the next request
+                        m.reset();               // reads from token 0)
+                        held.clear();
+                    }
                     break;
                 }
                 d_off += off;
@@ -1202,6 +1393,8 @@ int main(int argc, char** argv) {
     bool pack_info_mode = false;
     std::string images, enc_rgb, enc_out;
     std::string score_ids, score_out, prof_ids, spec_ids;
+    std::string remote_at, stage_bind;   // (a remote stage: the worker's HOST:PORT; a worker's address to listen on)
+    int worker_port = 0;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1271,6 +1464,9 @@ int main(int argc, char** argv) {
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--stage-begin") o.stage_begin = std::atoi(val("--stage-begin").c_str());
         else if (a == "--stage-end") o.stage_end = std::atoi(val("--stage-end").c_str());
+        else if (a == "--remote-stage") remote_at = val("--remote-stage");
+        else if (a == "--stage-worker") worker_port = std::atoi(val("--stage-worker").c_str());
+        else if (a == "--stage-bind") stage_bind = val("--stage-bind");
         else if (a == "--help" || a == "-h") {
             usage();
             return 0;
@@ -1287,7 +1483,29 @@ int main(int argc, char** argv) {
         }
         return strata::ds4::pack_info(o.pack, stdout);
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
+    // a remote stage (ds4_stage.hpp): the worker (--stage-worker PORT --stage-begin K) serves its main process instead
+    // of a mode of its own; the main process (--remote-stage HOST:PORT --stage-end K) runs any mode
+    const bool worker_mode = worker_port != 0;
+    {
+        std::string why;
+        if (worker_mode && !remote_at.empty()) why = "--stage-worker or --remote-stage, not both";
+        else if (worker_mode && (worker_port < 1 || worker_port > 65535)) why = "--stage-worker PORT: 1 to 65535";
+        else if (worker_mode && (o.stage_begin < 1 || o.stage_end >= 0))
+            why = "--stage-worker needs --stage-begin K (1 or more) and runs to the last layer (no --stage-end: no relay)";
+        else if (worker_mode && (!ids_s.empty() || !score_ids.empty() || !prof_ids.empty() || !spec_ids.empty()))
+            why = "--stage-worker serves its main process only (not with --ids, --score, --profile-run or --spec-eval)";
+        else if (!remote_at.empty() && (o.stage_end < 1 || o.stage_begin != 0))
+            why = "--remote-stage needs --stage-end K: this PC runs layers 0 to K - 1 and the head, the worker the rest";
+        else if ((worker_mode || !remote_at.empty()) && !enc_rgb.empty()) why = "--encode-image: not with a remote stage";
+        else if (!stage_bind.empty() && !worker_mode) why = "--stage-bind is a worker's (--stage-worker)";
+        if (!why.empty()) {
+            std::fprintf(stderr, "maya-ds4: %s\n", why.c_str());
+            return 2;
+        }
+        o.stage_worker = worker_mode;
+        o.remote_stage = !remote_at.empty();
+    }
+    if (o.pack.empty() || (!serve_mode && !worker_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
         usage();
         return 2;
     }
@@ -1298,6 +1516,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya-ds4: --encode-image reads no layers: not with --stage-begin / --stage-end\n");
         return 2;
     }
+    RemoteMain remote;   // (before the model: the model's hooks call it until the model is gone)
     strata::ds4::Model m;
     std::string err;
     if (!m.load(o, err)) {
@@ -1305,6 +1524,37 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
+    if (o.stage_worker) return stage_worker(m, o.pack, stage_bind, worker_port);
+    if (o.remote_stage) {
+        std::string token;
+        if (!stage_token(token)) return 1;
+        remote.at = remote_at;
+        remote.me = stage_hello(m, o.pack, false);
+        std::memcpy(remote.me.token, token.data(), token.size());
+        if (const char* v = std::getenv("STRATA_REMOTE_ROWS"); v != nullptr && *v != '\0') {
+            strata::net::StageRows f = strata::net::StageRows::F32;
+            if (!strata::net::stage_rows_parse(v, f)) {
+                std::fprintf(stderr, "maya-ds4: STRATA_REMOTE_ROWS=%s: expected fp32 or bf16\n", v);
+                return 1;
+            }
+            if (f != strata::net::StageRows::F32) {
+                std::fprintf(stderr, "maya-ds4: STRATA_REMOTE_ROWS=%s: a DeepSeek remote stage's rows are fp32 only (each "
+                                     "carries the indexer's int32 picks, which bf16 would not keep)\n", v);
+                return 1;
+            }
+        }
+        if (!remote.connect(err)) {
+            std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "maya ds4: remote stage %s: layers %d-%d there (context %lld, rows %s)\n", remote_at.c_str(),
+                     remote.peer.layer_begin, remote.peer.n_layers - 1, (long long) remote.peer.max_context,
+                     strata::net::stage_rows_name(remote.link.rows()));
+        g_remote = &remote;
+        m.set_stage_link([&remote](int T, const int32_t* tokens, int64_t p0, const float* out, float* in,
+                                   std::string& e) { return remote.run(T, tokens, p0, out, in, e); },
+                         [&remote](std::string& e) { return remote.reset(e); });
+    }
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
     const int window_given = window;
     if (window == 0) window = 16;   // (the scoring / profiling runs; the plain run below takes the model's feed unit)
