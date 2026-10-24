@@ -800,6 +800,24 @@ struct Model::Impl {
     Geo g;
     std::vector<Dev> devs;
     std::vector<Layer> L;
+    // a layer range (Options::stage_begin / stage_end): the trunk's layers [lo, hi) here.  The others keep their Layer
+    // and its roles (the window plan's selection sizes follow every layer) but no device (dev -1), experts, weights or
+    // memory; every loop that runs or allocates layers passes them by.  ranged: not the whole trunk - [0, nl) asked
+    // for outright is the default run
+    int lo = 0, hi = 0;
+    bool ranged = false;
+    bool local(int il) const { return il >= g.nl || (il >= lo && il < hi); }
+    static bool elsewhere(const Layer& l) { return l.dev < 0; }
+    // a tensor of the pack this process loads (a layer range: not the other layers' "layers.N." ones)
+    bool tensor_here(const std::string& n) const {
+        return !ranged || n.rfind("layers.", 0) != 0 || local(std::atoi(n.c_str() + 7));
+    }
+    // (a layer range) an Engram layer among its layers
+    bool eg_here() const {
+        for (int il : g.eg_layers)
+            if (local(il)) return true;
+        return false;
+    }
     std::vector<Src> srcs;
     std::vector<Group> groups;
     std::vector<std::unique_ptr<Worker>> workers;   // threads mode: one per device
@@ -1864,6 +1882,20 @@ struct Model::Impl {
                   std::to_string(g.ix_hd) + ", experts per token " + std::to_string(g.k_exp) + ")";
             return false;
         }
+        lo = o.stage_begin;
+        hi = o.stage_end < 0 ? g.nl : o.stage_end;
+        if (lo < 0 || lo >= hi || hi > g.nl) {
+            err = "layers [" + std::to_string(lo) + ", " + std::to_string(hi) + "): not a range of the trunk's " +
+                  std::to_string(g.nl) + " layers";
+            return false;
+        }
+        ranged = lo > 0 || hi < g.nl;
+        if (ranged) {   // (a slot, the drafter, a picture or the prompt path's chunks would need the other layers)
+            std::fprintf(stderr, "ds4: layers [%d, %d) of %d here: prompts in windows of %d, no DSpark, no pictures, no "
+                                 "slots\n", lo, hi, g.nl, kWin);
+            o.dspark = false;
+            o.vision = false;
+        }
         freqs_win = rope_freqs(g.rd, 0, g.rope_theta, g.factor, g.beta_fast, g.beta_slow);
         freqs_comp = rope_freqs(g.rd, g.orig_ctx, g.comp_theta, g.factor, g.beta_fast, g.beta_slow);
 
@@ -1919,9 +1951,9 @@ struct Model::Impl {
         // kChunkedPromptDefault bring it to a single card's default run too (a host thread a GPU for the prompt only;
         // decode stays as asked).  --prefill-chunk 0 keeps the windows of 16 (DS4_WINDOWS=1 the same).  Off by default
         // until a prompt costs the decode nothing: its buffers hold VRAM the windowed path gives to experts
-        prompt_par = par || o.tp > 1 ||
-                     ((o.prefill_chunk > 0 || (o.prefill_chunk < 0 && kChunkedPromptDefault)) &&
-                      std::getenv("DS4_WINDOWS") == nullptr);
+        prompt_par = !ranged && (par || o.tp > 1 ||
+                                 ((o.prefill_chunk > 0 || (o.prefill_chunk < 0 && kChunkedPromptDefault)) &&
+                                  std::getenv("DS4_WINDOWS") == nullptr));   // (a layer range: windows, said above)
         const bool tp_all = tp > 1 && tp == (int) devs.size();
         for (size_t i = 0; i < devs.size();) {
             Group G;
@@ -1955,7 +1987,7 @@ struct Model::Impl {
             for (const auto& kt : pk.t) {
                 const std::string& n = kt.first;
                 if (n.find(".engram.embed.") != std::string::npos || n.rfind("vision.", 0) == 0 || n == "embed.weight" ||
-                    (!o.dspark && n.rfind("mtp.", 0) == 0))
+                    (!o.dspark && n.rfind("mtp.", 0) == 0) || !tensor_here(n))
                     continue;
                 (n.find(".ffn.experts.") != std::string::npos ? exp_b : other_b) += (double) kt.second.bytes;
             }
@@ -1974,6 +2006,7 @@ struct Model::Impl {
             chunk = std::min(kMaxChunk, std::max(dc != nullptr ? 16 : 256, chunk / 16 * 16));
             eg_cap = (size_t) chunk;
             tap_cap = std::max(kWin, 128);
+        } else if (ranged) {   // (said with the range)
         } else   // (only as asked for: --prefill-chunk 0, or --tp 1 with --threads off)
             std::fprintf(stderr,
                          "ds4: prompts run in windows of %d tokens (%s): long prompts prefill far slower than in\n"
@@ -2010,6 +2043,7 @@ struct Model::Impl {
         if (o.dspark_block > 0 && std::getenv("DS4_DSPARK_MAX") == nullptr) max_drafts = o.dspark_block;   // (--dspark-block N: at most N drafts a round)
         L.resize((size_t) (g.nl + g.n_mtp));
         int last_src = -1;
+        int far_src = -1;   // (a layer range) the latest KV source, when it is a layer outside the range
         for (int il = 0; il < g.nl + g.n_mtp; ++il) {
             Layer& l = L[(size_t) il];
             l.il = il;
@@ -2032,6 +2066,15 @@ struct Model::Impl {
             l.owns_k = l.kv_src;
             l.cand_src = il == g.cand_src;
             l.uses_cand = g.cand_src >= 0 && g.cand_src < il && l.ix_src;
+            if (!local(il)) {   // (another process's: its roles stay - the window plan follows every layer's - but no
+                l.dev = l.grp = -1;   // device, no experts, no source of its own here)
+                l.n_exp = l.k_exp = 0;
+                if (l.kv_src) {
+                    last_src = -1;
+                    far_src = il;
+                }
+                continue;
+            }
             if (l.kv_src) {
                 Src s;
                 s.layer = il;
@@ -2039,8 +2082,15 @@ struct Model::Impl {
                 s.cap = (o.max_context + l.ratio - 1) / l.ratio + 1;
                 srcs.push_back(s);
                 last_src = (int) srcs.size() - 1;
+                far_src = -1;
             }
             if (l.ratio > 0) {
+                if (last_src < 0 && far_src >= 0) {   // (its compressed KV would have to cross too)
+                    err = "layer " + std::to_string(il) + " reads the compressed KV of layer " + std::to_string(far_src) +
+                          ", outside layers [" + std::to_string(lo) + ", " + std::to_string(hi) +
+                          "): the range must start at a KV source";
+                    return false;
+                }
                 if (last_src < 0 || srcs[(size_t) last_src].ratio != l.ratio) {
                     err = "layer " + std::to_string(il) + ": compress ratio " + std::to_string(l.ratio) +
                           " without a KV source of that ratio before it";
@@ -2056,6 +2106,7 @@ struct Model::Impl {
 
         // the split: each layer's dense weights + its experts, the head on the last GPU
         for (Layer& l : L) {
+            if (elsewhere(l)) continue;   // (another process's: nothing of it here)
             const std::string& P = l.name;
             size_t b = 0;
             if (l.mtp && l.il == g.nl) b += mat_bytes("mtp.0.main_proj");
@@ -2089,7 +2140,7 @@ struct Model::Impl {
             for (Layer& l : L)
                 if (l.mtp) order.push_back(&l);
             for (Layer& l : L)
-                if (!l.mtp) order.push_back(&l);
+                if (!l.mtp && !elsewhere(l)) order.push_back(&l);
             for (Layer* lp : order) {
                 Layer& l = *lp;
                 const double lb = (double) l.dense_bytes + (double) l.blob * l.n_exp;
@@ -2155,16 +2206,17 @@ struct Model::Impl {
                     while (*q && *q != ',') ++q;
                     if (*q == ',') ++q;
                 }
-                int il = 0;
+                int il = lo;   // (a layer range: its layers, from its first)
                 for (size_t gi = 0; gi < n.size() && gi < groups.size(); ++gi)
-                    for (int j = 0; j < n[gi] && il < g.nl; ++j) L[(size_t) il++].grp = (int) gi;
-                for (; il < g.nl; ++il) L[(size_t) il].grp = (int) groups.size() - 1;
+                    for (int j = 0; j < n[gi] && il < hi; ++j) L[(size_t) il++].grp = (int) gi;
+                for (; il < hi; ++il) L[(size_t) il].grp = (int) groups.size() - 1;
             }
             for (Layer& l : L) {
+                if (elsewhere(l)) continue;
                 l.dev = groups[(size_t) l.grp].mem[0];
                 l.nm = l.mtp ? 1 : (int) groups[(size_t) l.grp].mem.size();   // (the drafter's blocks: on the lead alone)
             }
-            head_dev = L[(size_t) g.nl - 1].dev;
+            head_dev = L[(size_t) hi - 1].dev;   // (a layer range: after its last layer)
             d_dev = g.n_mtp > 0 ? L[(size_t) g.nl].dev : 0;
         }
         // the groups' members: copies of each layer's device state, a member's part of an expert
@@ -2449,7 +2501,7 @@ struct Model::Impl {
             !halloc(h_emb, (size_t) std::max(kWin, chunk) * g.dim, err) ||
             !halloc(h_eg, (size_t) std::max(1, pk.eg_layers) * eg_cap * cols * (pk.eg_hd + pk.eg_hd / 32) + 64, err))
             return false;
-        if (pk.eg_layers > 0) {
+        if (pk.eg_layers > 0 && (!ranged || eg_here())) {
             // the Engram rows' reader: threads enough to keep an SSD's queue busy (reads from the page cache need few);
             // the row cache a small share of the RAM free (DS4_ENGRAM_CACHE_MB: its size, 0 off; DS4_ENGRAM_THREADS)
             const size_t row = (size_t) pk.eg_hd + pk.eg_hd / 32;
@@ -3878,6 +3930,7 @@ struct Model::Impl {
                                  "programs)\n", room0 / 1e9, commit_margin() / 1e9);
         }
         for (Layer& l : L) {
+            if (elsewhere(l)) continue;
             // the hottest experts of the profile first, then by index
             std::vector<int> order((size_t) l.n_exp);
             std::iota(order.begin(), order.end(), 0);
@@ -4137,7 +4190,7 @@ struct Model::Impl {
         for (auto& t : wt) t.join();
         if (o.verbose && nw > 0)
             std::fprintf(stderr, "ds4: %zu CPU-lane experts read ahead (%.1f GB) in %.1f s\n", nw,
-                         nw * (double) L[0].blob / 1e9, (now_ms() - t0) / 1000.0);
+                         nw * (double) L[(size_t) lo].blob / 1e9, (now_ms() - t0) / 1000.0);
         return true;
     }
 
@@ -4189,6 +4242,7 @@ struct Model::Impl {
         NH = nh;
         cp_lay.assign(L.size(), {0, 0, 0, 0});
         for (const Layer& l : L) {
+            if (elsewhere(l)) continue;
             size_t off = 0;
             for (int r = 0; r < 3; ++r) {
                 cp_lay[(size_t) l.il][(size_t) r] = off;
@@ -4292,7 +4346,7 @@ struct Model::Impl {
     }
 
     bool load_experts(std::string& err) {
-        if (!L.empty() && L[0].lay.fmt == gg::kFmtMXFP4) return load_experts_mx(err);
+        if (!L.empty() && L[(size_t) lo].lay.fmt == gg::kFmtMXFP4) return load_experts_mx(err);
         // every expert's region, in file order, by a few threads; VRAM ones through a pinned staging blob.  In place
         // (file_experts) the CPU lane's experts are not copied: the most-routed of them (the profile's share of their
         // layer) are read once, up to warm_bytes, so the page cache starts with them, and the VRAM ones' pages are
@@ -4469,10 +4523,10 @@ struct Model::Impl {
     }
     void init_store() {
         const double gb = store_gb();
-        if (gb <= 0.0 || L.empty() || L[0].lay.fmt != gg::kFmtMXFP4 || !file_experts) return;
+        if (gb <= 0.0 || L.empty() || L[(size_t) lo].lay.fmt != gg::kFmtMXFP4 || !file_experts) return;
         std::vector<ExpertStore::LayerGeo> geo((size_t) g.nl);   // (the trunk's layers: the drafter's bigger experts stay in place)
         for (const Layer& l : L) {
-            if (l.il >= g.nl) continue;
+            if (l.il >= g.nl || elsewhere(l)) continue;   // (another process's: no experts here)
             ExpertStore::LayerGeo& gl = geo[(size_t) l.il];
             gl.n_exp = l.n_exp;
             for (int r = 0; r < 3; ++r) {
@@ -4496,7 +4550,7 @@ struct Model::Impl {
         // 5070 / PCIe 5.0 - the staging copy sits in the layer's critical path - and its answers depend on the timing of which lane
         // took which expert, the CPU lane's are the mmap path's byte for byte)
         const bool want_zc = std::getenv("DS4_STORE_ZC") && std::atoi(std::getenv("DS4_STORE_ZC")) != 0 && devs.size() == 1 &&
-                             L[0].nm == 1;
+                             L[(size_t) lo].nm == 1;
         if (want_zc) {   // the arena's chunks registered for the GPU to read in place (zero-copy over PCIe)
             const int dev0 = devs[0].id;
             cfg.map_chunk = [dev0](void* h, size_t n) -> void* {
@@ -4585,7 +4639,7 @@ struct Model::Impl {
         const size_t leave = (size_t) (std::getenv("DS4_STORE_RESERVE") ? std::atoi(std::getenv("DS4_STORE_RESERVE")) : 192) + 64;
         const size_t n = store->preload(list, leave);
         std::fprintf(stderr, "ds4: RAM store: %zu of the profile's hottest experts read in (%.1f GB) in %.1f s\n", n,
-                     (double) n * (double) L[0].blob / 1e9, (now_ms() - t0) / 1000.0);
+                     (double) n * (double) L[(size_t) lo].blob / 1e9, (now_ms() - t0) / 1000.0);
     }
     // at a window boundary: the store's ready slots become the device's (zero-copy) experts, taken back when it needs the room;
     // each touched layer's whole table is written again (VRAM slots, the store's, 0), in stream order before the next window
@@ -4669,7 +4723,7 @@ struct Model::Impl {
         slot_held = false;
         for (Check& c0 : ck) c0.pos = -1;
         for (Layer& l0 : L)
-            for (int m = 0; m < l0.nm; ++m) {
+            for (int m = 0; m < l0.nm && !elsewhere(l0); ++m) {
                 Layer& l = member(l0, m);
                 Dev& d = devs[(size_t) l.dev];
                 cudaSetDevice(d.id);
@@ -4692,6 +4746,7 @@ struct Model::Impl {
         c.comp.resize(L.size() * 2);
         for (size_t i = 0; i < L.size(); ++i) {
             Layer& l = L[i];
+            if (elsewhere(l)) continue;
             Dev& d = devs[(size_t) l.dev];
             cudaSetDevice(d.id);
             c.win[i].resize((size_t) g.win * win_rb());
@@ -4754,7 +4809,7 @@ struct Model::Impl {
         if (b < 0) return false;
         const Check& c = ck[b];
         for (size_t i = 0; i < L.size(); ++i)
-            for (int m = 0; m < L[i].nm; ++m) {   // (a group's members hold the same state: the lead's copy)
+            for (int m = 0; m < L[i].nm && !elsewhere(L[i]); ++m) {   // (a group's members hold the same state: the lead's copy)
                 Layer& l = member(L[i], m);
                 Dev& d = devs[(size_t) l.dev];
                 cudaSetDevice(d.id);
@@ -4800,6 +4855,10 @@ struct Model::Impl {
     }
 
     uint64_t slot_save(std::vector<uint8_t>& out, std::string& err) {
+        if (ranged) {
+            err = "this process holds only layers [" + std::to_string(lo) + ", " + std::to_string(hi) + ")";
+            return 0;
+        }
         if (slot_held) {
             err = "it is already set aside";
             return 0;
@@ -4905,6 +4964,10 @@ struct Model::Impl {
     }
 
     bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
+        if (ranged) {
+            err = "this process holds only layers [" + std::to_string(lo) + ", " + std::to_string(hi) + ")";
+            return false;
+        }
         size_t off = 0;
         bool wrote = false, ok = false;
         // a load that stops after some of another conversation's state went into the layers leaves a state no
@@ -6704,7 +6767,7 @@ struct Model::Impl {
         // the ring rows: one launch a device for all its layers (a launch a layer and member was ~300 on 8-way tensor
         // parallel, a millisecond of the host's before the next draft)
         std::vector<RingBatch> rb(devs.size());
-        for (int il = 0; il < g.nl; ++il)
+        for (int il = lo; il < hi; ++il)
             for (int m = 0; m < L[(size_t) il].nm; ++m) {
                 Layer& l = member(L[(size_t) il], m);
                 RingBatch& b = rb[(size_t) l.dev];
@@ -6721,7 +6784,7 @@ struct Model::Impl {
                 cudaSetDevice(devs[di].id);
                 ring_restore_batch(rb[di], p0, g.win, keep, T, g.hd, devs[di].st);
             }
-        for (int il = 0; il < g.nl; ++il)
+        for (int il = lo; il < hi; ++il)
             for (int m = 0; m < L[(size_t) il].nm; ++m) {
                 Layer& l = member(L[(size_t) il], m);
                 Dev& d = devs[(size_t) l.dev];
@@ -8180,7 +8243,7 @@ struct Model::Impl {
                 }
                 for (int t = 0; t < T; ++t) wp.topk[il][t] = cur_topk_n[t];
             }
-            if (wp.async) {
+            if (wp.async && !elsewhere(l)) {   // (the service thread answers the seqs in order: only the layers run here)
                 wp.seq[il] = ++seq_issued;
                 layer_of[wp.seq[il] % kRing].store(il, std::memory_order_release);
             }
@@ -8299,6 +8362,7 @@ struct Model::Impl {
         const double te = now_ms();
         const int64_t eg_w0 = eg_wait_ns.load();
         for (int li = 0; li < pk.eg_layers; ++li) {
+            if (ranged && (li >= (int) eg_win.size() || !local(g.eg_layers[(size_t) li]))) continue;   // (another process's)
             EgBatch& b = *eg_win[(size_t) li];
             if (b.live) eg_finish(b);   // (a window that failed midway: its reads end before h_eg is reused)
             eg_issue(p0, T, li, nullptr, b);
@@ -8335,7 +8399,7 @@ struct Model::Impl {
     // one thread: the layers device after device, the hand-offs through pinned memory and events
     bool forward_serial(int64_t p0, int T, std::string& err) {
         const int D = g.dim, H = g.hc;
-        int cur = L[0].dev;
+        int cur = L[(size_t) lo].dev;
         {
             Dev& d = devs[(size_t) cur];
             cudaSetDevice(d.id);
@@ -8345,7 +8409,7 @@ struct Model::Impl {
         }
         std::vector<float> dump;
         if (dump_h != nullptr) dump.resize((size_t) T * g.nl * H * D);
-        for (int il = 0; il < g.nl; ++il) {
+        for (int il = lo; il < hi; ++il) {
             Layer& l = L[(size_t) il];
             if (l.dev != cur) {
                 Dev& a = devs[(size_t) cur];
@@ -8431,7 +8495,7 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc;
         bool started = false;
         std::vector<char> got(srcs.size(), 0);
-        for (int il = 0; il < g.nl; ++il) {
+        for (int il = lo; il < hi; ++il) {
             Layer& L0 = L[(size_t) il];
             int mi = -1;
             for (int m = 0; m < L0.nm; ++m)
@@ -8439,7 +8503,7 @@ struct Model::Impl {
             if (mi < 0) continue;
             if (!started) {   // the window's input: the embedding rows, or the previous group's hand-off
                 started = true;
-                if (il == 0) {
+                if (il == lo) {
                     CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, s));
                     embed(d.emb_rows, T, d.h, D, H, s);
                     init_pre(d.pre, T, s);
@@ -8473,8 +8537,8 @@ struct Model::Impl {
             if (mi == 0 && !tap(d, il, T, err)) return false;
             if (!layer(L0, mi, p0, T, wp, err)) return false;
             if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, il, p0, T);
-            const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
-            if (last && mi == 0 && il + 1 < g.nl) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
+            const bool last = il + 1 == hi || L[(size_t) il + 1].grp != L0.grp;
+            if (last && mi == 0 && il + 1 < hi) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
         }
         if (d.grp == devs[(size_t) head_dev].grp) return head_rows_dev(di, T, err);
         return true;
@@ -8995,10 +9059,27 @@ struct Model::Impl {
 
     void save_profile() const {
         if (o.profile.empty()) return;
-        const std::string tmp = o.profile + ".tmp";
+        // (a layer range: its layers' rows into the profile as it is now - the other layers' are another process's,
+        // which may share the file)
+        std::vector<uint32_t> mine;
+        if (ranged) {
+            mine.assign((size_t) g.nl * g.n_exp, 0u);
+            if (std::FILE* r = std::fopen(o.profile.c_str(), "rb")) {
+                std::vector<uint32_t> b(1 << 16);
+                mine.clear();
+                for (size_t n; (n = std::fread(b.data(), 4, b.size(), r)) > 0;) mine.insert(mine.end(), b.begin(), b.begin() + (long) n);
+                std::fclose(r);
+                if (mine.size() < (size_t) g.nl * g.n_exp) mine.resize((size_t) g.nl * g.n_exp, 0u);
+            }
+            for (int il = lo; il < hi; ++il)
+                std::copy(prof.begin() + (long) ((size_t) il * g.n_exp), prof.begin() + (long) ((size_t) (il + 1) * g.n_exp),
+                          mine.begin() + (long) ((size_t) il * g.n_exp));
+        }
+        const std::vector<uint32_t>& out = ranged ? mine : prof;
+        const std::string tmp = o.profile + ".tmp" + (ranged ? "." + std::to_string(lo) : std::string());
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
         if (f == nullptr) return;
-        const bool ok = std::fwrite(prof.data(), 4, prof.size(), f) == prof.size();
+        const bool ok = std::fwrite(out.data(), 4, out.size(), f) == out.size();
         std::fclose(f);
         // (the old profile replaced: std::rename does not replace an existing file on Windows, so there the profile
         // never moved on and only .tmp files were left)
@@ -9009,11 +9090,12 @@ struct Model::Impl {
         std::vector<std::string> v;
         int nh = 0;
         for (const Layer& l : L) nh += l.n_exp - l.n_vram;
+        const int n_here = ranged ? (hi - lo) * g.n_exp : g.nl * g.n_exp;   // (a layer range: its layers' experts)
         char b[512];
         // kv=fp4: DeepSeek's own cache layout (the compressed KV and the index keys FP4, the window FP8)
         std::snprintf(b, sizeof b, "INFO context=%lld kv=fp4 kv_resident=%lld expert_slots=%d engine_kind=ds4 "
                                    "cpu_experts=%d ram_experts=%d engine=ds4-0.1",
-                      (long long) o.max_context, (long long) o.max_context, g.nl * g.n_exp - nh, nh, ram_held);
+                      (long long) o.max_context, (long long) o.max_context, n_here - nh, nh, ram_held);
         v.push_back(b);
         if (commit_kept > 0) {   // (Windows, an integrated GPU: the commit kept experts off the GPU - the server says so)
             std::snprintf(b, sizeof b,
@@ -9123,6 +9205,7 @@ bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::str
     return p_->slot_load(data, bytes, n_pos, err);
 }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
+bool Model::ranged() const { return p_->ranged; }
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const {
     Stats& st = p_->st;

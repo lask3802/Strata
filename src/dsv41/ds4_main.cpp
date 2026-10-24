@@ -5,6 +5,8 @@
 //   maya-ds4 --pack <model>/maya-ds4 --ids 0,128803,... --n 16          greedy tokens after the ids
 //   maya-ds4 --pack ... --ids ... --dump-logits out.f32                every position's logits (the oracle's check)
 //   maya-ds4 --pack ... --serve                                       Maya's engine protocol on stdin / stdout
+//   maya-ds4 --pack ... --stage-begin K --stage-end E ...             only layers [K, E): the embedding into K, the head
+//                                                                     after E - 1 (a split's memory plan, by itself)
 //
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
 // `GEN <max_new> [key=value ...] <id,id,...>` answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
@@ -87,7 +89,7 @@ void usage() {
                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F]\n"
-                 "           [--vision on|off] [--mmap-experts on|off|auto]\n"
+                 "           [--vision on|off] [--mmap-experts on|off|auto] [--stage-begin K] [--stage-end E]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
                  "           | --pack-info)\n");
@@ -348,6 +350,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
     const bool reuse = std::getenv("STRATA_DS4_REUSE") == nullptr || std::atoi(std::getenv("STRATA_DS4_REUSE")) != 0;
     int slot_max = slot_keep ? std::max(0, (int) env_num("STRATA_DS4_SLOT_CAP", 4)) : 0;
+    if (slot_max > 0 && m.ranged()) {   // (a slot holds every layer's state; the folder's are left as they are)
+        std::fprintf(stderr, "ds4 slots: off - this process holds only some of the layers (STRATA_DS4_SLOT_KEEP ignored)\n");
+        slot_max = 0;
+    }
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_DS4_SLOT_MIN", 1024));
     const double slot_days = env_num("STRATA_DS4_SLOT_DAYS", 7);
     const uint64_t slot_budget = (uint64_t) (env_num("STRATA_DS4_SLOT_GB", 16) * 1073741824.0);
@@ -1263,6 +1269,8 @@ int main(int argc, char** argv) {
         else if (a == "--serve") serve_mode = true;
         else if (a == "--pack-info") pack_info_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
+        else if (a == "--stage-begin") o.stage_begin = std::atoi(val("--stage-begin").c_str());
+        else if (a == "--stage-end") o.stage_end = std::atoi(val("--stage-end").c_str());
         else if (a == "--help" || a == "-h") {
             usage();
             return 0;
@@ -1286,6 +1294,10 @@ int main(int argc, char** argv) {
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
     if (o.profile == "none") o.profile.clear();
     o.vision_only = !enc_rgb.empty();
+    if (o.vision_only && (o.stage_begin != 0 || o.stage_end >= 0)) {
+        std::fprintf(stderr, "maya-ds4: --encode-image reads no layers: not with --stage-begin / --stage-end\n");
+        return 2;
+    }
     strata::ds4::Model m;
     std::string err;
     if (!m.load(o, err)) {

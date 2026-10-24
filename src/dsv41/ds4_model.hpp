@@ -58,6 +58,11 @@ struct Options {
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
     bool verbose = false;
+    // a range of the trunk's layers: this process holds layers [stage_begin, stage_end) only (-1: to the last), the
+    // others no device, no weights and no memory - the embedding into the first, the head after the last.  Prompts
+    // then run in windows of 16, without DSpark, pictures or slots (tensor parallel and checkpoints stay)
+    int stage_begin = 0;
+    int stage_end = -1;
 };
 
 /// A picture in the prompt: its span's rows (every position of the span carries the image token), BF16 [span][dim]
@@ -180,6 +185,10 @@ public:
     /// The pictures of the prompt about to be fed ({}: none): positions inside a span read its rows (and route with
     /// the image bias, and take no part in the Engram n-grams); the rest the embedding table's.
     void set_images(std::vector<Image> images);
+
+    /// A layer range (Options::stage_begin / stage_end): a slot would hold only some layers' state, so there are none
+    /// (slot_save / slot_load refuse).
+    bool ranged() const;
 
     void save_profile() const;
     const Stats& stats() const;
