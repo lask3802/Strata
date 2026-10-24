@@ -20,13 +20,15 @@
 #   - does not prove: the speed over 10 GbE (the wire time is in the notes of the unit's report: 92192 bytes a token in
 #     fp32, 51232 in bf16)
 # The arms place their experts by the VRAM each finds free at its load (the "in VRAM" line each prints), so a split's
-# logits differ from the single process's by placement too (remote_loopback.sh says why).  The script FAILS (exit 1)
-# when the split arms' placement lines differ - the KL between them would then be placement, not rows - and when the
-# logits dumps differ in length.  KL(split-fp32 || split-fp32b) is what two runs of the same rows differ by; the bf16
-# line is read against it.
+# logits differ from the single process's by placement too (remote_loopback.sh says why).  Every arm's worker and main
+# process run --prefill-chunk 0 (an fp32 worker would allocate chunk buffers a bf16 one does not, and place fewer
+# experts); VRAM_EXPERTS=0 leaves none in VRAM on any arm.  The script FAILS (exit 1) when the split arms' expert counts
+# in VRAM ("(N of M in VRAM)", main and worker) differ - the KL between them would then be placement, not rows - and
+# when the logits dumps differ in length.  KL(split-fp32 || split-fp32b) is what two runs of the same rows differ by;
+# the bf16 line is read against it.
 set -u
 if [ $# -lt 4 ]; then
-    sed -n '2,26p' "$0"
+    sed -n '2,28p' "$0"
     exit 2
 fi
 exe=$1
@@ -65,8 +67,9 @@ rows_of() {
 for arm in $arms; do
     rows=$(rows_of "$arm")
     echo "== split, $arm rows ($rows)"
-    STRATA_REMOTE_ROWS=$rows "$exe" "${common[@]}" --max-context "$ctx" --stage-worker "$port" --stage-bind 127.0.0.1 \
-        --stage-begin "$K" > "$out/worker-$arm.out" 2> "$out/worker-$arm.err" &
+    : > "$out/worker-$arm.err"   # (made first: the wait below never reads a file the background shell has not opened)
+    STRATA_REMOTE_ROWS=$rows "$exe" "${common[@]}" --max-context "$ctx" --prefill-chunk 0 --stage-worker "$port" \
+        --stage-bind 127.0.0.1 --stage-begin "$K" > "$out/worker-$arm.out" 2> "$out/worker-$arm.err" &
     wpid=$!
     until grep -q 'remote stage worker:' "$out/worker-$arm.err"; do
         if ! kill -0 $wpid 2> /dev/null; then
@@ -96,6 +99,13 @@ placement() {
     echo "worker: $(grep -h 'in VRAM' "$out/worker-$1.err" | head -1 | sed 's/.*experts/experts/')"
 }
 
+# an arm's expert counts in VRAM, main and worker: what the arms must agree on (the lines' free MiB may differ by the
+# rows' buffers)
+counts() {
+    echo "main $(grep -h -o '([0-9]* of [0-9]* in VRAM)' "$out/split-$1.err" | head -1)," \
+        "worker $(grep -h -o '([0-9]* of [0-9]* in VRAM)' "$out/worker-$1.err" | head -1)"
+}
+
 echo "== placement and speed"
 first=""
 for a in $arms; do
@@ -104,9 +114,9 @@ for a in $arms; do
     echo "$p" | sed 's/^/      /'
     if [ -z "$first" ]; then
         first=$a
-        first_p=$p
-    elif [ "$p" != "$first_p" ]; then
-        echo "FAIL: the placement of split-$a differs from split-$first's: the KL between them would be placement, not rows"
+        first_p=$(counts "$a")
+    elif [ "$(counts "$a")" != "$first_p" ]; then
+        echo "FAIL: the experts in VRAM of split-$a ($(counts "$a")) differ from split-$first's ($first_p): the KL between them would be placement, not rows"
         rc=1
     fi
 done
