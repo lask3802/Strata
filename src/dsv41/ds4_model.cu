@@ -9330,7 +9330,16 @@ struct Model::Impl {
                                               (size_t) ng * ik_rb(), l.dev, err))
                         return false;
                 }
-                if (clen_max > 0) {
+                // U9 ixfast: every query keeps all its compressed rows (n <= index_topk, no candidate restriction):
+                // topk's answer is then 0 .. n - 1 whatever the scores, so the query rows, the weights and the scores
+                // are skipped (not on the candidate source layer: its scores pick the candidate blocks)
+                bool keep_all = clen_max > 0 && u9::on(u9::kIxfast) && !l.cand_src;
+                for (int t = 0; keep_all && t < T; ++t)
+                    keep_all = lim.k[t] >= lim.n[t] &&
+                               !(l.uses_cand && (lim.n[t] + g.cand_blk - 1) / g.cand_blk > g.cand_topk);
+                if (keep_all) {
+                    topk(d.scores, (long long) o.max_context + 64, T, lim, nullptr, 0, 1, d.topk, (int) topk_stride(), s);
+                } else if (clen_max > 0) {
                     if (!mv(d, {job(l.i_wq_b, d.qr, d.iq, T, g.q_lora, (size_t) g.ix_heads * g.ix_hd)}, err)) return false;
                     Finish fi;
                     fi.rd = g.rd;
