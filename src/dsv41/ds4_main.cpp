@@ -20,13 +20,18 @@
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.  With
 // STRATA_DS4_SLOT_KEEP=1 the conversations are kept when another one takes the model (a slot each: the state, the
 // compressed KV included), and across runs in STRATA_DS4_SLOT_DIR - so a request that does not continue the state but
-// does continue a kept conversation reads only its new tokens.
+// does continue a kept conversation reads only its new tokens.  With --remote-stage the same switch keeps the checkpoints
+// and the slots across the link: the worker takes its layers' part of each under the main process's id (CkptSave /
+// CkptRestore, ds4_stage.hpp), a slot or checkpoint is used only where both sides hold it, and one the worker does not
+// hold (restarted, dropped for its own bounds STRATA_DS4_SLOT_CAP / _GB / _DIR, set at the worker too) is read from token 0;
+// the main process's folder is then <STRATA_DS4_SLOT_DIR or <pack>/slots>/split-K and holds nothing across runs.
 // `pin=N` on a GEN marks the first N prompt tokens as a start other requests share (a system prompt and its tools): the
 // read stops there for a checkpoint, so a request behind the same start - another agent - goes back to it instead of
 // reading it again (also without slots).  STRATA_DS4_REUSE=0 turns every reuse off (each request reads its whole prompt).
 #include "ds4_model.hpp"
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
+#include "ds4_partstore.hpp"
 #include "ds4_slotmeta.hpp"
 #include "ds4_stage.hpp"
 
@@ -327,8 +332,9 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
 // ---- the remote stage (docs/REMOTE_STAGE.md, ds4_stage.hpp): this PC runs layers 0 to K - 1 and the head, a worker
 // PC the rest - each window's rows go there after layer K - 1 and come back before the head
 // This side's hello: the trunk, the layers where the link cuts it, the windows (no prompt chunks), fp32 rows, no K/V
-// type to compare (the hand-off carries no attention K/V), no checkpoints, the pack's fingerprint
-strata::net::StageHello stage_hello(const strata::ds4::Model& m, const std::string& pack, bool worker) {
+// type to compare (the hand-off carries no attention K/V), the checkpoints the main process has the worker keep (slots:
+// ckpt, STRATA_DS4_SLOT_KEEP=1), the pack's fingerprint
+strata::net::StageHello stage_hello(const strata::ds4::Model& m, const std::string& pack, bool worker, bool ckpt = false) {
     const strata::ds4::Model::StageGeo sg = m.stage_geo();
     strata::net::StageHello me;
     me.n_embd = sg.dim;
@@ -342,6 +348,7 @@ strata::net::StageHello stage_hello(const strata::ds4::Model& m, const std::stri
     me.max_context = m.max_context();
     me.chunk = 0;
     me.handoff_floats = sg.handoff_floats;
+    me.ckpt_max = !worker && ckpt ? strata::ds4::stage::kMainSlotsMax + 1 : 0;
     me.pack_hash = strata::ds4::stage::pack_hash(pack);
     std::snprintf(me.build, sizeof me.build, "strata-dsv41 remote-stage %s", worker ? "worker" : "main");
     return me;
@@ -368,6 +375,11 @@ struct RemoteMain {
     strata::net::StageClient link;
     strata::net::StageHello me, peer;
     const std::atomic<bool>* stop = nullptr;   // (serve: its STOP flag - a request's wait ends on it)
+    // (slots: STRATA_DS4_SLOT_KEEP=1) the slot ids this side holds, which the worker keeps its parts of and no others;
+    // serve keeps it current.  epoch: the links made so far - a worker connected to again (restarted, or taken over
+    // by another main process) holds none of them
+    std::vector<int64_t> keep;
+    uint64_t epoch = 0;
 
     bool connect(std::string& e) {
         static const int wait_s = [] {
@@ -393,6 +405,7 @@ struct RemoteMain {
             link.close();
             const int left = wait_s > 0 ? std::min(strata::net::io_timeout_s(), std::max(1, (int) std::ceil(wait_s - spent()))) : 0;
             if (link.connect(at, me, peer, e, left, stop)) {
+                ++epoch;   // (the worker holds no part of anything from before, whether or not this reset comes through)
                 ok = link.reset({}, e);
                 break;
             }
@@ -418,7 +431,7 @@ struct RemoteMain {
     }
     // the worker's session from position 0 (Model::reset): connecting again when the link is lost
     bool reset(std::string& e) {
-        if (link.connected() && link.reset({}, e)) return true;
+        if (link.connected() && link.reset(keep, e)) return true;
         if (link.connected() && !strata::net::stage_link_lost(e)) return false;   // (the worker's own error)
         const std::string lost = e.empty() ? "the link is down" : e;
         if (!connect(e)) {
@@ -428,6 +441,17 @@ struct RemoteMain {
         std::fprintf(stderr, "maya ds4: remote stage: the link to %s was lost (%s): connected again\n", at.c_str(),
                      lost.c_str());
         return true;
+    }
+    // the worker's checkpoint of a role, the pin, a slot's part (CkptSave: ids as ds4_stage.hpp has them) at position L;
+    // `stored` false: it did not keep it.  A slot's id is in keep[] by now, as the main process holds it
+    bool ck_save(int64_t id, int64_t L, bool& stored, std::string& e) {
+        std::vector<int64_t> k = keep;
+        if (id >= strata::ds4::stage::kSlotId0 && std::find(k.begin(), k.end(), id) == k.end()) k.push_back(id);
+        return link.ckpt_save(id, L, k, stored, e);
+    }
+    // the worker back at a checkpoint (CkptRestore) or with a slot's part; `missing`: it does not hold it, nothing changed
+    bool ck_restore(int64_t id, int64_t L, bool& missing, std::string& e) {
+        return link.ckpt_restore(id, L, keep, missing, e);
     }
     // a window: its rows there and back, then its tokens kept (Commit: every one - no drafts in v1)
     bool run(int T, const int32_t* tokens, int64_t p0, const float* out, float* in, std::string& e) {
@@ -449,6 +473,15 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
     const strata::net::StageHello me = stage_hello(m, pack, true);
     const strata::ds4::Model::StageGeo sg = m.stage_geo();
     int last_t = 0;   // (the last window's rows: what its Commit keeps)
+    // the worker's parts of the main process's slots (ds4_stage.hpp, ds4_partstore.hpp), bounded as the main process
+    // bounds its own: STRATA_DS4_SLOT_CAP (4) parts in RAM, the rest in STRATA_DS4_SLOT_DIR (default <pack>/slots-stage),
+    // STRATA_DS4_SLOT_GB (16) of them at most.  CAP and GB both 0: this worker keeps no slots (the main process then
+    // reads a conversation that left the model from its first token)
+    const auto env_number = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
+    strata::ds4::stage::PartStore parts(
+        std::getenv("STRATA_DS4_SLOT_DIR") != nullptr ? std::string(std::getenv("STRATA_DS4_SLOT_DIR")) : pack + "/slots-stage",
+        (size_t) std::max(0.0, env_number("STRATA_DS4_SLOT_CAP", 4)),
+        (uint64_t) (std::max(0.0, env_number("STRATA_DS4_SLOT_GB", 16)) * 1073741824.0));
     strata::net::StageHandlers hs;
     hs.hello = [&](const strata::net::StageHello& theirs, strata::net::StageHello& mine, std::string& e) {
         mine = me;   // (the worker's own hello carries no token)
@@ -471,16 +504,31 @@ int stage_worker(strata::ds4::Model& m, const std::string& pack, const std::stri
         e = "a prompt chunk: this worker reads windows only";
         return false;
     };
-    hs.reset = [&](const std::vector<int64_t>&, std::string&) {
-        m.reset();
+    hs.reset = [&](const std::vector<int64_t>& keep, std::string&) {
+        strata::ds4::stage::worker_reset(m, parts, keep);
         m.save_profile();
         last_t = 0;
         return true;
     };
     hs.disconnected = [&] {
-        m.reset();
+        strata::ds4::stage::worker_disconnected(m, parts);   // (a new main process is a new id space)
         m.save_profile();
         last_t = 0;
+    };
+    // the main process's checkpoints and slots (CkptSave / CkptRestore, ids as ds4_stage.hpp has them).  serve_stage has
+    // checked the position of a save and tracks it across a restore
+    hs.ckpt_save = [&](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) -> int {
+        std::string note;
+        const int r = strata::ds4::stage::worker_ck_save(m, parts, id, L, keep, e, note);
+        if (!note.empty()) std::fprintf(stderr, "maya ds4: remote stage worker: %s\n", note.c_str());
+        return r;
+    };
+    hs.ckpt_restore = [&](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) {
+        std::string note;
+        const bool ok = strata::ds4::stage::worker_ck_restore(m, parts, id, L, keep, e, note);
+        if (!note.empty()) std::fprintf(stderr, "maya ds4: remote stage worker: %s\n", note.c_str());
+        last_t = 0;
+        return ok;
     };
     strata::net::StageBuffers bufs;
     bufs.run_in = m.stage_rows_in();
@@ -529,10 +577,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
     const bool reuse = std::getenv("STRATA_DS4_REUSE") == nullptr || std::atoi(std::getenv("STRATA_DS4_REUSE")) != 0;
     int slot_max = slot_keep ? std::max(0, (int) env_num("STRATA_DS4_SLOT_CAP", 4)) : 0;
-    if (slot_max > 0 && m.ranged()) {   // (a slot holds every layer's state; the folder's are left as they are)
+    if (slot_max > 0 && m.ranged() && !m.stage_ckpt_on()) {   // (a slot holds every layer's state; the folder's are left as they are)
         std::fprintf(stderr, "ds4 slots: off - this process holds only some of the layers (STRATA_DS4_SLOT_KEEP ignored)\n");
         slot_max = 0;
     }
+    // a remote stage's main process (Options::stage_ckpt): a slot is this process's layers' part and the worker's, kept
+    // there under an id of its own (ds4_stage.hpp; the worker's parts end with its link, so a slot is used only where
+    // both sides hold it, and the folder is this mode's own, emptied at the start and at the end)
+    const bool rslots = slot_max > 0 && g_remote != nullptr && m.stage_ckpt_on();
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_DS4_SLOT_MIN", 1024));
     const double slot_days = env_num("STRATA_DS4_SLOT_DAYS", 7);
     const uint64_t slot_budget = (uint64_t) (env_num("STRATA_DS4_SLOT_GB", 16) * 1073741824.0);
@@ -544,9 +596,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         uint64_t bytes = 0, used = 0;
         std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
         std::vector<int64_t> cks;                     // the positions short of its end it can be taken back at
+        int64_t id = 0;                               // a remote stage: the worker's part of it (0: none)
     };
     std::vector<Slot> slots;
     uint64_t slot_clock = 0, slot_seq = 0;
+    int64_t remote_slot_seq = strata::ds4::stage::kSlotId0 - 1;
+    uint64_t slots_epoch = rslots ? g_remote->epoch : 0;
     const std::string slot_identity = m.slot_identity();
     const auto note = [&](const std::string& msg) {
         std::fprintf(stderr, "ds4 slots: %s\n", msg.c_str());
@@ -574,6 +629,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (ec) return 1e9;
         return std::chrono::duration<double>(fs::file_time_type::clock::now() - t).count() / 86400.0;
     };
+    // (a remote stage) the ids the worker keeps its parts of: the slots held
+    const auto sync_keep = [&]() {
+        if (!rslots) return;
+        g_remote->keep.clear();
+        for (const Slot& s : slots)
+            if (s.id != 0) g_remote->keep.push_back(s.id);
+    };
     const auto slot_drop = [&](size_t i) {
         if (slots[i].data)   // a RAM slot: its buffer simply dies
             slots[i].data.reset();
@@ -583,6 +645,18 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::filesystem::remove(meta_of(slots[i].path), ec);
         }
         slots.erase(slots.begin() + (long) i);
+        sync_keep();
+    };
+    // (a remote stage) a worker connected to again - restarted, or taken over by another main process - holds none of
+    // the parts: the slots go (their prompts are read from token 0, as without them)
+    const auto slots_stale = [&]() {
+        if (!rslots || g_remote->epoch == slots_epoch) return;
+        slots_epoch = g_remote->epoch;
+        if (slots.empty()) return;
+        const size_t n = slots.size();
+        while (!slots.empty()) slot_drop(slots.size() - 1);
+        note("the worker was connected again and holds no part of the " + std::to_string(n) +
+             " kept conversation(s): they are removed");
     };
     const auto slot_count = [&](int& ram, int& disk) {
         ram = disk = 0;
@@ -664,10 +738,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (slot_max <= 0) return;
         const std::vector<int32_t>& t = m.tokens();
         if (t.size() < slot_min) return;   // (a fresh engine's 0-token state is no conversation: nothing to set aside)
+        slots_stale();
         const auto t0 = std::chrono::steady_clock::now();
         auto buf = std::make_shared<std::vector<uint8_t>>();
         std::string e;
-        const uint64_t bytes = m.slot_save(*buf, e);   // (a state unchanged since it was taken refuses here: nothing
+        const int64_t rid = rslots ? ++remote_slot_seq : 0;
+        const uint64_t bytes = m.slot_save(*buf, e, rid);   // (a state unchanged since it was taken refuses here: nothing
         if (bytes == 0) {                             // changes, its slot stays)
             if (e != "it is already set aside")
                 std::fprintf(stderr, "ds4 slots: setting the conversation aside failed (%s) - it is read from token 0 "
@@ -677,8 +753,17 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
             if (slots[i].tokens.size() <= t.size() && std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
                 slot_drop(i);
-        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions()});
+        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions(), rid});
         slots.back().data = buf;
+        if (rslots) {   // the worker's parts are the link's to carry: only so many slots in all, the least recently used goes
+            while (slots.size() > (size_t) strata::ds4::stage::kMainSlotsMax) {
+                size_t lru = 0;
+                for (size_t i = 1; i < slots.size(); ++i)
+                    if (slots[i].used < slots[lru].used) lru = i;
+                slot_drop(lru);
+            }
+            sync_keep();
+        }
         while (true) {   // past the cap: the least recently used conversation in RAM to the folder, or gone
             int ram = 0, disk = 0;
             slot_count(ram, disk);
@@ -706,6 +791,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const auto slot_take = [&](const std::vector<int>& prompt, size_t floor, bool& whole) -> size_t {
         whole = false;
         if (slot_max <= 0 || prompt.size() < 2) return 0;
+        slots_stale();
         std::vector<strata::ds4::slotmeta::Cand> cands;
         for (const Slot& sl : slots) cands.push_back({&sl.tokens, &sl.cks});
         size_t len = 0;
@@ -716,7 +802,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         const bool ram = slots[best].data != nullptr;
         std::string e;
         bool back = false;
-        if (ram) back = m.slot_load(slots[best].data->data(), slots[best].data->size(), (int64_t) whole_len, e);
+        if (ram) back = m.slot_load(slots[best].data->data(), slots[best].data->size(), (int64_t) whole_len, e, slots[best].id);
         else {
             std::ifstream f(slots[best].path, std::ios::binary);
             std::vector<uint8_t> file;
@@ -727,7 +813,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 if (n > 0) {
                     file.resize((size_t) n);
                     if (f.read((char*) file.data(), n))
-                        back = m.slot_load(file.data(), file.size(), (int64_t) whole_len, e);
+                        back = m.slot_load(file.data(), file.size(), (int64_t) whole_len, e, slots[best].id);
                     else e = "reading " + slots[best].path + " failed";
                 } else e = slots[best].path + " is empty";
             } else e = "cannot read " + slots[best].path;
@@ -762,12 +848,19 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     if (slot_max > 0) {
         slot_dir = std::getenv("STRATA_DS4_SLOT_DIR") ? std::filesystem::path(std::getenv("STRATA_DS4_SLOT_DIR"))
                                                       : std::filesystem::path(pack) / "slots";
+        if (rslots)   // (this mode's own folder: its .meta files carry the layers' range, no single process's slot is one)
+            slot_dir /= "split-" + std::to_string(m.stage_geo().layer_end);
         std::error_code ec;
         std::filesystem::create_directories(slot_dir, ec);
         if (!std::filesystem::is_directory(slot_dir, ec)) {
             std::fprintf(stderr, "ds4 slots: %s is not writable - conversations are not set aside\n",
                          slot_dir.string().c_str());
             slot_max = 0;
+        } else if (rslots) {   // (the worker's parts ended with the link they were made on: nothing here can be taken back)
+            size_t gone = 0;
+            for (const auto& de : std::filesystem::directory_iterator(slot_dir, ec))
+                if (de.path().filename().string().rfind("slot-", 0) == 0 && std::filesystem::remove(de.path(), ec)) ++gone;
+            if (gone > 0) note("folder " + slot_dir.string() + ": " + std::to_string(gone) + " file(s) of an earlier run removed");
         } else {
             struct Found {
                 std::string bin;
@@ -870,6 +963,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 m.reset();
                 held.clear();
             }
+            slots_stale();
         }
         const auto& st = m.tokens();
         const size_t n_state = st.size();
@@ -1128,7 +1222,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
     // RAM is written to the folder, so the next run reads on from them
-    if (slot_max > 0) {
+    if (rslots) {   // (the worker's parts end with its link: nothing here would be taken back by the next run)
+        while (!slots.empty()) slot_drop(slots.size() - 1);
+    } else if (slot_max > 0) {
         if (held.empty()) slot_put(" as the engine ended");
         size_t written = 0;
         while (true) {   // (a write can take the folder's least recently used conversation away: the list is asked again)
@@ -1504,6 +1600,11 @@ int main(int argc, char** argv) {
         }
         o.stage_worker = worker_mode;
         o.remote_stage = !remote_at.empty();
+        // the kept conversations (STRATA_DS4_SLOT_KEEP=1; STRATA_DS4_REUSE=0 turns every reuse off) across the link
+        const char* keep_env = std::getenv("STRATA_DS4_SLOT_KEEP");
+        const char* reuse_env = std::getenv("STRATA_DS4_REUSE");
+        o.stage_ckpt = o.remote_stage && serve_mode && keep_env != nullptr && std::atoi(keep_env) != 0 &&
+                       (reuse_env == nullptr || std::atoi(reuse_env) != 0);
     }
     if (o.pack.empty() || (!serve_mode && !worker_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
         usage();
@@ -1529,7 +1630,7 @@ int main(int argc, char** argv) {
         std::string token;
         if (!stage_token(token)) return 1;
         remote.at = remote_at;
-        remote.me = stage_hello(m, o.pack, false);
+        remote.me = stage_hello(m, o.pack, false, o.stage_ckpt);
         std::memcpy(remote.me.token, token.data(), token.size());
         if (const char* v = std::getenv("STRATA_REMOTE_ROWS"); v != nullptr && *v != '\0') {
             strata::net::StageRows f = strata::net::StageRows::F32;
@@ -1551,6 +1652,11 @@ int main(int argc, char** argv) {
                      remote.peer.layer_begin, remote.peer.n_layers - 1, (long long) remote.peer.max_context,
                      strata::net::stage_rows_name(remote.link.rows()));
         g_remote = &remote;
+        if (o.stage_ckpt)
+            m.set_stage_ckpt({[&remote](int64_t id, int64_t L, bool& stored, std::string& e) { return remote.ck_save(id, L, stored, e); },
+                              [&remote](int64_t id, int64_t L, bool& missing, std::string& e) {
+                                  return remote.ck_restore(id, L, missing, e);
+                              }});
         m.set_stage_link([&remote](int T, const int32_t* tokens, int64_t p0, const float* out, float* in,
                                    std::string& e) { return remote.run(T, tokens, p0, out, in, e); },
                          [&remote](std::string& e) { return remote.reset(e); });

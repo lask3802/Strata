@@ -69,6 +69,10 @@ struct Options {
     // (stage_run), its last layer's go back; no embedding table, no head.  Either: no conversation checkpoints
     bool remote_stage = false;
     bool stage_worker = false;
+    // remote_stage: the main process keeps its conversation checkpoints and slots across the link (STRATA_DS4_SLOT_KEEP=1,
+    // set_stage_ckpt): each is taken on the worker too, under the main process's id, and used only where both hold it.
+    // Off: no checkpoints, every request that does not continue the conversation in place starts from token 0
+    bool stage_ckpt = false;
 };
 
 /// A picture in the prompt: its span's rows (every position of the span carries the image token), BF16 [span][dim]
@@ -174,10 +178,16 @@ public:
     /// blocks' included), the compressors' partial groups and each KV source's compressed KV and index keys up to it,
     /// the pieces the state a prompt continues is made of.  0 and err: nothing was set aside (it holds pictures, there
     /// is no conversation, or the conversation is already set aside - unchanged since).
-    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err);
+    /// `remote_id` (a remote stage's main process, Options::stage_ckpt; non-zero): the worker's layers' part of the slot
+    /// is taken first, under that id, and the slot is this process's layers' part - 0 and err when the worker did not
+    /// keep it.
+    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err, int64_t remote_id = 0);
     /// `data` (a slot's bytes) back into the model: the state at the slot's position n_pos, as slot_save took it -
     /// what a prompt that continues the slot's tokens reads on from (the caller checked the tokens are a prefix).
-    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err);
+    /// `remote_id`: the worker puts its part back first.  False when it does not hold it (nothing changed on either
+    /// side); after a link or worker failure, or when this process's own load fails past that point, the conversation
+    /// is reset (both sides).
+    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err, int64_t remote_id = 0);
     /// What a saved conversation must match: this engine's version, this model's geometry and files and the drafter's
     /// blocks - a slot naming anything else is not this model's state (a file's .meta says so; slot_load refuses).
     std::string slot_identity() const;
@@ -193,8 +203,22 @@ public:
     void set_images(std::vector<Image> images);
 
     /// A layer range (Options::stage_begin / stage_end): a slot would hold only some layers' state, so there are none
-    /// (slot_save / slot_load refuse).
+    /// (slot_save / slot_load refuse) - except the two ends of a remote stage that keep checkpoints (stage_ckpt_on), where
+    /// each holds its own layers' part.
     bool ranged() const;
+    /// A remote stage's main process that keeps checkpoints and slots across the link, or a worker (which does as it
+    /// is asked): checkpoint / restore / pin / slot_save / slot_load work on this process's layers.
+    bool stage_ckpt_on() const;
+    /// The main process's end of that (Options::stage_ckpt): the worker takes (`save`) or puts back (`restore`) the
+    /// state of an id, at position L (the worker is there on a save).  The ids are ds4_stage.hpp's: a checkpoint's role,
+    /// the pin, a restore at L, or a slot's.  `stored` false (a save): the worker did not keep it; `missing` (a
+    /// restore, false returned): it does not hold it and nothing changed there.  Any other failure: the worker's
+    /// session is lost - the conversation is reset (a checkpoint: the next window fails until it is).
+    struct StageCkpt {
+        std::function<bool(int64_t id, int64_t L, bool& stored, std::string& err)> save;
+        std::function<bool(int64_t id, int64_t L, bool& missing, std::string& err)> restore;
+    };
+    void set_stage_ckpt(StageCkpt c);
     /// What a remote stage's hello carries: the trunk's geometry, this process's layers [layer_begin, layer_end), the
     /// widest window and a hand-off row's floats - the streams (hc x dim), pre (8), the indexer's picks (topk_stride
     /// int32) and the candidate blocks (cand_stride int32).  A window's T rows cross block by block: T x hc x dim
