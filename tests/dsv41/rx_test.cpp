@@ -6,6 +6,8 @@
 // than its deadline is skipped (the next request gets its own).  No model, no GPU here.
 //   ds4_rx_test [--listen [BIND:]PORT] [--layers 29/29,16/16,17/17,16/17] [--experts N] [--reqs N] [--rtt N] [--picks K]
 //               [--ref N (rows also checked against the double reference)]
+//               [--rtt-only 1 (no correctness or late-reply checks: a DS4_RX_NULL server's zeros)]
+//               [--ping N (then N pings of 56 B and of 10,320 B each way: the link and both ends' sockets alone)]
 //   (STRATA_STAGE_TOKEN: the same as the server's)
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_iq.cuh"
@@ -61,7 +63,7 @@ struct Layer {
 
 int main(int argc, char** argv) {
     std::string at = "7861", layers_s = "29/29,16/16,17/17,16/17";
-    int n_exp = 8, n_req = 200, n_rtt = 1000, picks = 6, n_ref = 24;
+    int n_exp = 8, n_req = 200, n_rtt = 1000, picks = 6, n_ref = 24, rtt_only = 0, n_ping = 0;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--listen") at = v;
@@ -70,6 +72,8 @@ int main(int argc, char** argv) {
         else if (a == "--reqs") n_req = std::atoi(v.c_str());
         else if (a == "--rtt") n_rtt = std::atoi(v.c_str());
         else if (a == "--ref") n_ref = std::atoi(v.c_str());
+        else if (a == "--rtt-only") rtt_only = std::atoi(v.c_str());
+        else if (a == "--ping") n_ping = std::atoi(v.c_str());
         else if (a == "--picks") picks = std::max(1, std::min(rx::kMaxPicks, std::atoi(v.c_str())));
         else { std::printf("unknown option %s\n", a.c_str()); return 2; }
     }
@@ -236,7 +240,7 @@ int main(int argc, char** argv) {
     uint32_t seq = 1;
     std::vector<rx::ReqRow> rows;
     std::vector<std::vector<float>> xs;
-    for (int q = 0; q < n_req; ++q, ++seq) {
+    for (int q = 0; q < (rtt_only ? 0 : n_req); ++q, ++seq) {
         const int li = (int) (rng() % L.size());
         const int T = q % 4 == 0 ? 1 + (int) (rng() % rx::kMaxRows) : 1;
         const int k = 1 + (int) (rng() % (uint64_t) picks);
@@ -274,14 +278,14 @@ int main(int argc, char** argv) {
             }
         }
     }
-    std::printf("correctness: %d requests, %d rows: relative error (L2) of the server's bf16 sums to the CPU lane's mean "
+    if (!rtt_only) std::printf("correctness: %d requests, %d rows: relative error (L2) of the server's bf16 sums to the CPU lane's mean "
                 "%.2e, max %.2e; on %d rows to the double reference: the server mean %.2e max %.2e, the CPU lane mean "
                 "%.2e max %.2e -> %s\n", n_req, nrow, nrow ? sum_rel / nrow : 0.0, worst, n_ref_done,
                 n_ref_done ? ref_s / n_ref_done : 0.0, ref_s_max, n_ref_done ? ref_c / n_ref_done : 0.0, ref_c_max,
                 fails ? "FAIL" : "ok");
 
     // ---- a late reply is skipped: a request whose deadline has passed, then one that must get its own reply
-    {
+    if (!rtt_only) {
         make_req(1, picks, rows, xs);
         const uint32_t late = seq++;
         if (!m.send_req(late, 0, 1, rows.data(), ptrs(xs), err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
@@ -313,9 +317,16 @@ int main(int argc, char** argv) {
     }
 
     // ---- the round trip of T = 1 requests, `picks` picks each (the decode shape), and T = 4
+    auto st = [](std::vector<double> v, const char* what) {
+        std::sort(v.begin(), v.end());
+        double s = 0;
+        for (double x : v) s += x;
+        std::printf(" %s mean %.3f p50 %.3f p99 %.3f max %.3f ms;", what, s / v.size(), v[v.size() / 2],
+                    v[(size_t) (v.size() * 0.99)], v.back());
+    };
     for (int T : {1, 4}) {
         if (n_rtt <= 0) break;   // (--rtt 0: correctness only)
-        std::vector<double> rt, srv;
+        std::vector<double> rt, srv, cs;
         make_req(T, picks, rows, xs);
         const int warm = 50;
         for (int q = 0; q < n_rtt + warm; ++q, ++seq) {
@@ -325,25 +336,34 @@ int main(int argc, char** argv) {
             for (int t = 0; t < T; ++t)   // (expert ids distinct within the row)
                 for (int i = 1; i < picks; ++i) rows[(size_t) t].e[i] = (int16_t) ((q + i) % n_exp);
             if (!m.send_req(seq, li, T, rows.data(), ptrs(xs), err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
+            const double a1 = rx::now_ms();
             const uint16_t* y = nullptr;
             int us = 0;
             if (m.wait_resp(seq, T, rx::now_ms() + 5000.0, &y, us, err) != 1) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
             if (q >= warm) {
                 rt.push_back(rx::now_ms() - a);
                 srv.push_back(us / 1000.0);
+                cs.push_back(a1 - a);
             }
         }
-        auto st = [](std::vector<double> v, const char* what) {
-            std::sort(v.begin(), v.end());
-            double s = 0;
-            for (double x : v) s += x;
-            std::printf(" %s mean %.3f p50 %.3f p99 %.3f max %.3f ms;", what, s / v.size(), v[v.size() / 2],
-                        v[(size_t) (v.size() * 0.99)], v.back());
-        };
         std::printf("round trip T=%d, %d picks a row, %d requests:", T, picks, n_rtt);
         st(rt, "send to reply");
         st(srv, "the server's own");
+        st(cs, "this end's send (bf16 x and the send call)");
         std::printf(" %.1f KB out, %.1f KB in a request\n", (T * (sizeof(rx::ReqRow) + E * 2.0) + 32) / 1e3, (T * E * 2.0 + 32) / 1e3);
+    }
+    // ---- pings: the same round trip with nothing done at the server (an echo), 56 B and a T = 1 request's size
+    for (size_t bytes : {(size_t) 24, (size_t) 10288}) {
+        if (n_ping <= 0) break;
+        std::vector<double> rt;
+        for (int q = 0; q < n_ping + 50; ++q, ++seq) {
+            const double a = rx::now_ms();
+            if (m.ping(seq, bytes, a + 5000.0, err) != 1) { std::printf("FAILED: ping: %s\n", err.c_str()); return 1; }
+            if (q >= 50) rt.push_back(rx::now_ms() - a);
+        }
+        std::printf("ping %zu B each way, %d pings:", bytes + 32, n_ping);
+        st(rt, "send to echo");
+        std::printf("\n");
     }
     m.close();
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");

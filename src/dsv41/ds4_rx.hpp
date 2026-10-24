@@ -39,6 +39,8 @@ enum Msg : uint32_t {
     Req = 6,        // main -> server: seq, a = layer, b = rows; payload rows x (ReqRow, then bf16 x[n_embd])
     Resp = 7,       // server -> main: seq, a = rows, c = the server's time (us); payload rows x bf16 y[n_embd]
     Error = 9,      // either way: payload the message
+    Ping = 10,      // main -> server (tests: the link alone): seq; the server answers Pong with the same payload at once
+    Pong = 11,
 };
 
 #pragma pack(push, 1)
@@ -124,6 +126,8 @@ public:
     /// request seq's reply: 1 and its rows (nrows x n_embd bf16, valid until the next call) in *y, the server's time
     /// in srv_us; 0: not in by the deadline (steady ms; it is skipped when it comes); -1: the link failed (err)
     int wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y, int& srv_us, std::string& err);
+    /// tests: a Ping of `bytes` payload and its Pong (1; 0 none by the deadline; -1 the link failed)
+    int ping(uint32_t seq, size_t bytes, double deadline, std::string& err);
     void close() { c_.close(); }
     bool ok() const { return c_.ok(); }
     uint64_t bytes_out() const { return c_.bytes_out; }

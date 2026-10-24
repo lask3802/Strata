@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <unordered_map>
@@ -50,6 +51,8 @@ struct Bufs {
     float *d_w = nullptr, *d_x = nullptr, *d_h = nullptr, *d_y = nullptr;
     size_t stage = 0;   // bytes of plan + w + x, one copy
 };
+
+enum class Copy { Base, Nr, One, Map };   // (DS4_RX_COPY: how a request's inputs reach the GPU)
 
 // one main process: 0 when it went away, -1 on a CUDA error
 int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cudaStream_t s) {
@@ -137,8 +140,27 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     if (!c.send(BlobsOk, 0, (int32_t) ok.size(), 0, 0, ok.data(), ok.size(), err)) return 0;
     std::fprintf(stderr, "expert server: %zu blobs (%.2f GB) in VRAM in %.1f s; serving\n", ss.blobs.size(),
                  (double) ss.used / 1e9, (now_ms() - t0) / 1000.0);
-    // the requests
+    // the requests.  Diagnostics (env, read at each session; without them the path is the plain one):
+    //   DS4_RX_NULL=1    a reply of zeros at once: no prep, no CUDA call (the link and both ends' sockets alone)
+    //   DS4_RX_COPY=nr   the plan and weights of the request's rows only, packed, then x: two copies (the plain path
+    //                    copies all kMaxRows rows' plan and weights)
+    //               one  the plan, weights and x packed: one copy
+    //               map  the plan and weights packed (one copy); x read and y written by the kernels in mapped host
+    //                    memory (no x or y copy)
+    //   DS4_RX_EVENTS=1  cudaEvents between the GPU parts (plan in, x in, gate_up, down, y out), printed with the host
+    //                    parts' at the session's end
     const int D = g.n_embd, FF = g.n_ff;
+    const char* nv = std::getenv("DS4_RX_NULL");
+    const bool null_reply = nv != nullptr && *nv == '1';
+    const char* cv = std::getenv("DS4_RX_COPY");
+    const std::string cm = cv != nullptr && *cv != '\0' ? cv : "base";
+    const Copy cp = cm == "nr" ? Copy::Nr : cm == "one" ? Copy::One : cm == "map" ? Copy::Map : Copy::Base;
+    const char* ev = std::getenv("DS4_RX_EVENTS");
+    const bool evs = ev != nullptr && *ev == '1';
+    const bool diag = null_reply || evs || cp != Copy::Base;
+    if (diag)
+        std::fprintf(stderr, "expert server: diagnostics: %s, copies %s, events %s\n", null_reply ? "NULL replies" : "replies",
+                     cm.c_str(), evs ? "on" : "off");
     Bufs b;
     b.stage = (size_t) kMaxRows * 8 * 8 + (size_t) kMaxRows * 8 * 4 + (size_t) kMaxRows * D * 4;
     void* hs = nullptr;
@@ -154,9 +176,28 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     b.d_x = b.d_w + kMaxRows * 8;
     b.d_y = b.d_x + (size_t) kMaxRows * D;
     b.d_h = b.d_y + (size_t) kMaxRows * D;
+    void* hm = nullptr;   // (DS4_RX_COPY=map: x, then y, mapped)
+    float* dm = nullptr;
+    if (cp == Copy::Map) {
+        RX_CK(cudaHostAlloc(&hm, (size_t) 2 * kMaxRows * D * 4, cudaHostAllocMapped));
+        RX_CK(cudaHostGetDevicePointer((void**) &dm, hm, 0));
+    }
+    constexpr int kEv = 3 + 2 * kMaxRows + 1;
+    cudaEvent_t evt[kEv] = {};
+    if (evs)
+        for (cudaEvent_t& e : evt) RX_CK(cudaEventCreate(&e));
+    enum { kPrep, kEnq, kSync, kPost, kAll, kPlanIn, kXIn, kGateUp, kDown, kYOut, kSpan, kParts };
+    static const char* const part_name[kParts] = {"host: the rows' prep", "host: the copies' and kernels' enqueue",
+                                                  "host: the sync's wait", "host: bf16 and send", "host: the whole request",
+                                                  "GPU: plan in", "GPU: x in", "GPU: gate_up (q8 + dots)",
+                                                  "GPU: down (q8 + dots + combine)", "GPU: y out", "GPU: first copy to last"};
+    std::vector<float> parts[kParts];
+    auto keep = [&](int k, double ms) {
+        if (parts[k].size() < (size_t(1) << 20)) parts[k].push_back((float) (ms * 1000.0));
+    };
     std::vector<uint16_t> yb((size_t) kMaxRows * D);
     int rc = 0;
-    int64_t served = 0;
+    int64_t served = 0, pings = 0;
     double busy = 0, prep = 0, gpu = 0;
     const int errs0 = gg::launch_errors();
     for (;;) {
@@ -166,7 +207,23 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
                                  "rows' prep %.1f, the GPU from the copy in to the copy out %.1f, bf16 and send %.1f)\n",
                          c.peer().c_str(), err.c_str(), (long long) served, busy * 1000.0 / n, prep * 1000.0 / n,
                          gpu * 1000.0 / n, (busy - prep - gpu) * 1000.0 / n);
+            if (pings > 0) std::fprintf(stderr, "expert server: %lld pings answered\n", (long long) pings);
+            for (int k = 0; diag && k < kParts; ++k) {
+                std::vector<float>& v = parts[k];
+                if (v.empty()) continue;
+                std::sort(v.begin(), v.end());
+                double s = 0;
+                for (float x : v) s += x;
+                std::fprintf(stderr, "expert server: part %-36s mean %7.1f p50 %7.1f p99 %7.1f us (%zu)\n", part_name[k],
+                             s / (double) v.size(), (double) v[v.size() / 2], (double) v[(size_t) ((double) v.size() * 0.99)],
+                             v.size());
+            }
             break;
+        }
+        if (h.type == Ping) {
+            if (!c.send(Pong, h.seq, 0, 0, 0, p.data(), p.size(), err)) break;
+            ++pings;
+            continue;
         }
         if (h.type != Req) continue;
         const double tr = now_ms();
@@ -174,6 +231,27 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         const size_t per = sizeof(ReqRow) + (size_t) D * 2;
         std::string why;
         if (li < 0 || li >= g.n_layers || nr < 1 || nr > kMaxRows || p.size() != (size_t) nr * per) why = "a malformed request";
+        if (null_reply && why.empty()) {
+            std::fill(yb.begin(), yb.begin() + (long) ((size_t) nr * D), (uint16_t) 0);
+            const double dt = now_ms() - tr;
+            if (!c.send(Resp, h.seq, nr, 0, (int32_t) (dt * 1000.0), yb.data(), (size_t) nr * D * 2, err)) break;
+            keep(kAll, now_ms() - tr);
+            busy += dt;
+            ++served;
+            continue;
+        }
+        // where this request's plan, weights and x go (host and device)
+        const bool packed = cp != Copy::Base;
+        const size_t pw = (size_t) nr * (8 * 8 + 8 * 4);   // (packed: the rows' plan, then their weights)
+        const size_t xoff = (pw + 255) / 256 * 256;
+        unsigned long long* hp = packed ? (unsigned long long*) hs : b.h_plan;
+        float* hw = packed ? (float*) (hp + (size_t) nr * 8) : b.h_w;
+        unsigned long long* dp = packed ? (unsigned long long*) ds : b.d_plan;
+        float* dw = packed ? (float*) (dp + (size_t) nr * 8) : b.d_w;
+        float* hx = cp == Copy::One ? (float*) ((char*) hs + xoff) : cp == Copy::Map ? (float*) hm : b.h_x;
+        float* dx = cp == Copy::One ? (float*) ((char*) ds + xoff) : cp == Copy::Map ? dm : b.d_x;
+        float* hy = cp == Copy::Map ? (float*) hm + (size_t) kMaxRows * D : b.h_y;
+        float* dy = cp == Copy::Map ? dm + (size_t) kMaxRows * D : b.d_y;
         for (int j = 0; why.empty() && j < nr; ++j) {
             ReqRow rw;
             std::memcpy(&rw, p.data() + (size_t) j * per, sizeof rw);
@@ -191,11 +269,11 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
                     }
                     d = it->second;
                 }
-                b.h_plan[j * 8 + i] = (unsigned long long) d;
-                b.h_w[j * 8 + i] = i < rw.n ? rw.w[i] : 0.0f;
+                hp[j * 8 + i] = (unsigned long long) d;
+                hw[j * 8 + i] = i < rw.n ? rw.w[i] : 0.0f;
             }
             const uint16_t* xb = (const uint16_t*) (p.data() + (size_t) j * per + sizeof(ReqRow));
-            float* xf = b.h_x + (size_t) j * D;
+            float* xf = hx + (size_t) j * D;
             for (int i = 0; i < D; ++i) xf[i] = bf2f(xb[i]);
         }
         if (!why.empty()) {
@@ -205,32 +283,49 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         }
         const double tg = now_ms();
         prep += tg - tr;
-        RX_CK(cudaMemcpyAsync(b.d_plan, b.h_plan, (size_t) kMaxRows * 8 * 8 + (size_t) kMaxRows * 8 * 4, cudaMemcpyHostToDevice, s));
-        RX_CK(cudaMemcpyAsync(b.d_x, b.h_x, (size_t) nr * D * 4, cudaMemcpyHostToDevice, s));
+        int ne = 0;
+        if (evs) RX_CK(cudaEventRecord(evt[ne++], s));
+        switch (cp) {
+            case Copy::Base:
+                RX_CK(cudaMemcpyAsync(b.d_plan, b.h_plan, (size_t) kMaxRows * 8 * 8 + (size_t) kMaxRows * 8 * 4,
+                                      cudaMemcpyHostToDevice, s));
+                break;
+            case Copy::Nr:
+            case Copy::Map: RX_CK(cudaMemcpyAsync(ds, hs, pw, cudaMemcpyHostToDevice, s)); break;
+            case Copy::One: RX_CK(cudaMemcpyAsync(ds, hs, xoff + (size_t) nr * D * 4, cudaMemcpyHostToDevice, s)); break;
+        }
+        if (evs) RX_CK(cudaEventRecord(evt[ne++], s));
+        if (cp == Copy::Base || cp == Copy::Nr) RX_CK(cudaMemcpyAsync(dx, hx, (size_t) nr * D * 4, cudaMemcpyHostToDevice, s));
+        if (evs) RX_CK(cudaEventRecord(evt[ne++], s));
         for (int j = 0; j < nr; ++j) {
             ReqRow rw;
             std::memcpy(&rw, p.data() + (size_t) j * per, sizeof rw);
             x3::MoeArgs ma;
-            ma.plan_ptr = b.d_plan + j * 8;
-            ma.plan_w = b.d_w + j * 8;
+            ma.plan_ptr = dp + j * 8;
+            ma.plan_w = dw + j * 8;
             ma.lay = ss.lay[(size_t) li];
             ma.k = rw.n;
             ma.n_embd = D;
             ma.n_ff = FF;
             ma.limit = g.limit;
-            gg::moe_gate_up(ma, b.d_x + (size_t) j * D, b.d_h, s);
-            gg::moe_down(ma, b.d_h, nullptr, b.d_y + (size_t) j * D, s);
+            gg::moe_gate_up(ma, dx + (size_t) j * D, b.d_h, s);
+            if (evs) RX_CK(cudaEventRecord(evt[ne++], s));
+            gg::moe_down(ma, b.d_h, nullptr, dy + (size_t) j * D, s);
+            if (evs) RX_CK(cudaEventRecord(evt[ne++], s));
         }
-        RX_CK(cudaMemcpyAsync(b.h_y, b.d_y, (size_t) nr * D * 4, cudaMemcpyDeviceToHost, s));
+        if (cp != Copy::Map) RX_CK(cudaMemcpyAsync(hy, dy, (size_t) nr * D * 4, cudaMemcpyDeviceToHost, s));
+        if (evs) RX_CK(cudaEventRecord(evt[ne++], s));
+        const double te = now_ms();
         RX_CK(cudaStreamSynchronize(s));
-        gpu += now_ms() - tg;
+        const double ts = now_ms();
+        gpu += ts - tg;
         if (gg::launch_errors() != errs0) {
             const char w2[] = "a kernel launch failed on the expert server";
             (void) c.send(Error, h.seq, 0, 0, 0, w2, sizeof w2 - 1, err);
             rc = -1;
             break;
         }
-        for (size_t i = 0; i < (size_t) nr * D; ++i) yb[i] = f2bf(b.h_y[i]);
+        for (size_t i = 0; i < (size_t) nr * D; ++i) yb[i] = f2bf(hy[i]);
         const double dt = now_ms() - tr;
         if (!c.send(Resp, h.seq, nr, 0, (int32_t) (dt * 1000.0), yb.data(), (size_t) nr * D * 2, err)) {
             std::fprintf(stderr, "expert server: reply failed (%s)\n", err.c_str());
@@ -238,8 +333,37 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         }
         busy += dt;
         ++served;
+        if (diag) {
+            const double tz = now_ms();
+            keep(kPrep, tg - tr);
+            keep(kEnq, te - tg);
+            keep(kSync, ts - te);
+            keep(kPost, tz - ts);
+            keep(kAll, tz - tr);
+        }
+        if (evs) {
+            auto el = [&](int a, int z) {
+                float ms = 0;
+                cudaEventElapsedTime(&ms, evt[a], evt[z]);
+                return (double) ms;
+            };
+            keep(kPlanIn, el(0, 1));
+            keep(kXIn, el(1, 2));
+            double gu = 0, dn = 0;
+            for (int j = 0; j < nr; ++j) {
+                gu += el(2 + 2 * j, 3 + 2 * j);
+                dn += el(3 + 2 * j, 4 + 2 * j);
+            }
+            keep(kGateUp, gu);
+            keep(kDown, dn);
+            keep(kYOut, el(ne - 2, ne - 1));
+            keep(kSpan, el(0, ne - 1));
+        }
     }
     cudaStreamSynchronize(s);
+    if (evs)
+        for (cudaEvent_t& e : evt) cudaEventDestroy(e);
+    if (hm != nullptr) cudaFreeHost(hm);
     cudaFree(ds);
     cudaFreeHost(hs);
     return rc;

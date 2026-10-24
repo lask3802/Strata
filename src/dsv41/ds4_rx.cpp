@@ -421,4 +421,15 @@ int Main::wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y
     }
 }
 
+int Main::ping(uint32_t seq, size_t bytes, double deadline, std::string& err) {
+    tx_.assign(bytes, 0);
+    if (!c_.send(Ping, seq, 0, 0, 0, tx_.data(), bytes, err)) return -1;
+    for (;;) {
+        Hdr h;
+        const int got = c_.recv(h, rx_, deadline, err);
+        if (got <= 0) return got;
+        if (h.type == Pong && h.seq == seq) return rx_.size() == bytes ? 1 : -1;
+    }
+}
+
 }  // namespace strata::ds4::rx
