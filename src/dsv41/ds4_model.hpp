@@ -63,6 +63,12 @@ struct Options {
     // then run in windows of 16, without DSpark, pictures or slots (tensor parallel and checkpoints stay)
     int stage_begin = 0;
     int stage_end = -1;
+    // a remote stage (docs/REMOTE_STAGE.md, src/dsv41/ds4_stage.hpp), a range's two sides on two PCs.  remote_stage:
+    // the main process of one, layers [0, stage_end) - its last layer's rows go over the link (set_stage_link) and come
+    // back for the head.  stage_worker: the worker, layers [stage_begin, last] - its rows come from the link
+    // (stage_run), its last layer's go back; no embedding table, no head.  Either: no conversation checkpoints
+    bool remote_stage = false;
+    bool stage_worker = false;
 };
 
 /// A picture in the prompt: its span's rows (every position of the span carries the image token), BF16 [span][dim]
@@ -189,6 +195,29 @@ public:
     /// A layer range (Options::stage_begin / stage_end): a slot would hold only some layers' state, so there are none
     /// (slot_save / slot_load refuse).
     bool ranged() const;
+    /// What a remote stage's hello carries: the trunk's geometry, this process's layers [layer_begin, layer_end), the
+    /// widest window and a hand-off row's floats - the streams (hc x dim), pre (8), the indexer's picks (topk_stride
+    /// int32) and the candidate blocks (cand_stride int32).  A window's T rows cross block by block: T x hc x dim
+    /// floats, then T x 8, then T x topk_stride, then T x cand_stride (T x handoff_floats in all).  The worker's reply
+    /// has the same layout; the main process reads its streams and pre.
+    struct StageGeo {
+        int dim = 0, hc = 0, n_layers = 0, n_expert = 0, layer_begin = 0, layer_end = 0, max_t = 0;
+        int64_t handoff_floats = 0;
+    };
+    StageGeo stage_geo() const;
+    /// The main process's link (remote_stage).  `run`: a window's T tokens at p0 and its rows (`out`) to the worker,
+    /// the worker's rows back into `in` (T x handoff_floats each).  `reset`: the worker's session from position 0, as
+    /// reset() starts this one (a failure is kept: the next window at position 0 tries it again, any other fails).  A
+    /// failed run leaves the conversation unusable until reset().
+    using StageRun = std::function<bool(int T, const int32_t* tokens, int64_t p0, const float* out, float* in,
+                                        std::string& err)>;
+    void set_stage_link(StageRun run, std::function<bool(std::string& err)> reset);
+    /// The worker's side (stage_worker): a window's rows land in stage_rows_in() (pinned, kWin x handoff_floats);
+    /// stage_run() runs this process's layers on them at p0 (which must be pos()) and leaves its last layer's rows in
+    /// stage_rows_out().
+    float* stage_rows_in();
+    float* stage_rows_out();
+    bool stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err);
 
     void save_profile() const;
     const Stats& stats() const;

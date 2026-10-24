@@ -808,8 +808,10 @@ struct Model::Impl {
     bool ranged = false;
     bool local(int il) const { return il >= g.nl || (il >= lo && il < hi); }
     static bool elsewhere(const Layer& l) { return l.dev < 0; }
-    // a tensor of the pack this process loads (a layer range: not the other layers' "layers.N." ones)
+    // a tensor of the pack this process loads (a layer range: not the other layers' "layers.N." ones; a remote stage's
+    // worker: no head)
     bool tensor_here(const std::string& n) const {
+        if (o.stage_worker && n.rfind("head.", 0) == 0) return false;
         return !ranged || n.rfind("layers.", 0) != 0 || local(std::atoi(n.c_str() + 7));
     }
     // (a layer range) an Engram layer among its layers
@@ -817,6 +819,17 @@ struct Model::Impl {
         for (int il : g.eg_layers)
             if (local(il)) return true;
         return false;
+    }
+    // a remote stage (Options::remote_stage / stage_worker): the main process's link after its last layer, and the rows
+    // that cross it, pinned - link_tx out, link_rx in (kWin rows of handoff_floats each, Model::StageGeo's layout)
+    Model::StageRun stage_hop;
+    std::function<bool(std::string&)> stage_reset;
+    bool stage_lost = false;          // (the main process) a hop or the worker's reset failed: only position 0 goes on
+    std::string stage_err;
+    float *link_tx = nullptr, *link_rx = nullptr;
+    bool linked() const { return o.remote_stage || o.stage_worker; }
+    int64_t handoff_floats() const {
+        return (int64_t) g.hc * g.dim + 8 + (int64_t) topk_stride() + (int64_t) cand_stride();
     }
     std::vector<Src> srcs;
     std::vector<Group> groups;
@@ -1889,10 +1902,25 @@ struct Model::Impl {
                   std::to_string(g.nl) + " layers";
             return false;
         }
-        ranged = lo > 0 || hi < g.nl;
+        if (o.remote_stage && o.stage_worker) {
+            err = "a remote stage's main process or its worker, not both";
+            return false;
+        }
+        if (o.stage_worker && (lo == 0 || hi != g.nl)) {   // (v1: no relay - the worker runs the trunk to its end)
+            err = "a remote stage's worker runs layers K to the last (--stage-begin K, 1 or more; no --stage-end)";
+            return false;
+        }
+        if (o.remote_stage && (lo != 0 || hi == g.nl)) {
+            err = "a remote stage's main process runs layers 0 to K - 1 (--stage-end K, below " + std::to_string(g.nl) +
+                  "; no --stage-begin)";
+            return false;
+        }
+        ranged = lo > 0 || hi < g.nl || linked();
         if (ranged) {   // (a slot, the drafter, a picture or the prompt path's chunks would need the other layers)
-            std::fprintf(stderr, "ds4: layers [%d, %d) of %d here: prompts in windows of %d, no DSpark, no pictures, no "
-                                 "slots\n", lo, hi, g.nl, kWin);
+            std::fprintf(stderr, "ds4: layers [%d, %d) of %d here%s: prompts in windows of %d, no DSpark, no pictures, no "
+                                 "slots%s\n", lo, hi, g.nl,
+                         o.remote_stage ? " (the rest: the remote stage's worker)" : o.stage_worker ? " (a remote stage's worker)" : "",
+                         kWin, linked() ? ", no checkpoints" : "");
             o.dspark = false;
             o.vision = false;
         }
@@ -2119,7 +2147,7 @@ struct Model::Impl {
             b += (size_t) g.win * win_rb() + (2u << 20);
             l.dense_bytes = b;
         }
-        const size_t head_b = mat_bytes("head") + (size_t) g.vocab * 4 + (16u << 20);
+        const size_t head_b = o.stage_worker ? 0 : mat_bytes("head") + (size_t) g.vocab * 4 + (16u << 20);   // (a worker: none)
         const size_t per_dev_fixed = (size_t) o.reserve_mib << 20;
         const size_t kv_per_src_dev = 0;   // counted after the split
         (void) kv_per_src_dev;
@@ -2216,8 +2244,18 @@ struct Model::Impl {
                 l.dev = groups[(size_t) l.grp].mem[0];
                 l.nm = l.mtp ? 1 : (int) groups[(size_t) l.grp].mem.size();   // (the drafter's blocks: on the lead alone)
             }
-            head_dev = L[(size_t) hi - 1].dev;   // (a layer range: after its last layer)
+            head_dev = L[(size_t) hi - 1].dev;   // (a layer range: after its last layer; a worker: its rows' way out)
             d_dev = g.n_mtp > 0 ? L[(size_t) g.nl].dev : 0;
+        }
+        // a remote stage: the link's rows go in and out of one GPU at each end (v1: a tensor-parallel group's members
+        // would each need them)
+        if (linked()) {
+            const size_t first = groups[(size_t) L[(size_t) lo].grp].mem.size(), last = groups[(size_t) devs[(size_t) head_dev].grp].mem.size();
+            if ((o.stage_worker && first > 1) || (o.remote_stage && last > 1)) {
+                err = "remote stage: the GPUs at this end of the link are a tensor-parallel group of " +
+                      std::to_string(std::max(first, last)) + ": v1 hands one GPU's rows over (--tp 1)";
+                return false;
+            }
         }
         // the groups' members: copies of each layer's device state, a member's part of an expert
         for (Layer& l : L) {
@@ -2337,7 +2375,7 @@ struct Model::Impl {
                      dalloc(d, d.eg_x, W * cols * pk.eg_hd, err) && dalloc(d, d.eg_kv, W * (g.hc + 1) * D, err);
                 if (!ok) return false;
             }
-            if ((int) di == head_dev && !dalloc(d, d.logits, (size_t) kWin * g.vocab, err)) return false;
+            if ((int) di == head_dev && !o.stage_worker && !dalloc(d, d.logits, (size_t) kWin * g.vocab, err)) return false;
             if (!halloc(d.bounce, bounce_bytes(), err)) return false;
             if (!dalloc(d, d.xcnt, 4, err) || !hmap(d.hand, bounce_bytes(), err) || !hmap(d.hand_flag, 32, err) ||
                 !dalloc(d, d.grp_ptr, P, err) || !dalloc(d, d.grp_start, P + 1, err) || !dalloc(d, d.grp_ent, P, err) ||
@@ -2447,8 +2485,12 @@ struct Model::Impl {
             mk_split = true;
         }
 
-        // the embedding table, pinned on the host
-        {
+        // a remote stage's rows, both ways
+        if (linked() && (!halloc(link_tx, (size_t) kWin * handoff_floats(), err) ||
+                         !halloc(link_rx, (size_t) kWin * handoff_floats(), err)))
+            return false;
+        // the embedding table, pinned on the host (a remote stage's worker: none - its rows come over the link)
+        if (!o.stage_worker) {
             const Tensor* t = pk.get("embed.weight");
             const size_t nv = (size_t) g.vocab * g.dim;
             const bool q8 = t != nullptr && t->dtype == "Q8_0" && t->bytes == nv / 32 * gg::kQ8Bytes;
@@ -3701,7 +3743,7 @@ struct Model::Impl {
             }
             if (!dalloc(d, l.vram_tab, (size_t) l.n_exp, err, acct)) return false;
           }
-        if (d.grp == devs[(size_t) head_dev].grp) {   // the head: each member of its group a share of the columns
+        if (d.grp == devs[(size_t) head_dev].grp && !o.stage_worker) {   // the head: each member of its group a share of the columns
             const int hn = head_nm();
             if (!mat(d, "head", d.head, err, acct, d.mi, hn, true) || !f32(d, "norm.weight", d.norm_w, err, acct, (size_t) g.dim))
                 return false;
@@ -4482,7 +4524,8 @@ struct Model::Impl {
             std::snprintf(line, sizeof line,
                           "ds4: CUDA%d layers [%d, %d]%s%s: weights %.2f GB, experts %.2f GB (%d of %d in VRAM), caches "
                           "%.2f GB, %.0f MiB free\n",
-                          d.id, a, b, tp, (int) di == head_dev ? " + head" : "", d.weights / 1e9, d.experts / 1e9, ev, et,
+                          d.id, a, b, tp, (int) di != head_dev ? "" : o.stage_worker ? " + the link's rows" : " + head",
+                          d.weights / 1e9, d.experts / 1e9, ev, et,
                           d.caches / 1e9, fr / 1048576.0);
             s << line;
         }
@@ -4735,11 +4778,14 @@ struct Model::Impl {
             cudaSetDevice(d.id);
             cudaStreamSynchronize(d.st);
         }
+        stage_lost = false;   // (a remote stage's main process: the worker starts again with it)
+        if (stage_reset && !stage_reset(stage_err)) stage_lost = true;
     }
 
     // the state at pos into checkpoint `slot` (the window rings and the compressors' partial groups: the rest of the
     // state is indexed by position, and what lies past a restored position is written again)
     void checkpoint(int slot) {
+        if (linked()) return;   // (a remote stage: the worker's layers would need theirs too - none, restore() goes nowhere)
         Check& c = ck[slot & (kChecks - 1)];
         c.pos = pos;
         c.win.resize(L.size());
@@ -4805,7 +4851,7 @@ struct Model::Impl {
     }
 
     bool restore(int64_t limit) {
-        const int b = best_check(limit);
+        const int b = linked() ? -1 : best_check(limit);   // (a remote stage keeps no checkpoints)
         if (b < 0) return false;
         const Check& c = ck[b];
         for (size_t i = 0; i < L.size(); ++i)
@@ -8351,6 +8397,11 @@ struct Model::Impl {
                 err = "token " + std::to_string(tk[t]) + " out of range";
                 return false;
             }
+        if (stage_lost && pos == 0 && stage_reset && stage_reset(stage_err)) stage_lost = false;   // (the worker back)
+        if (stage_lost) {   // (the worker's layers hold another state, or none: only a conversation from 0 goes on)
+            err = "remote stage: " + stage_err + " - the conversation starts again from its first token";
+            return false;
+        }
         const int64_t p0 = pos;
         slot_held = false;   // (the state grows now: what slot_save took is no longer the conversation)
         for (int t = 0; t < T; ++t) {
@@ -8369,7 +8420,7 @@ struct Model::Impl {
         }
         st.engram_ms += now_ms() - te;
         const int D = g.dim;
-        for (int t = 0; t < T; ++t)   // (h_emb is written again by the next window, after this one's last sync)
+        for (int t = 0; t < T && !o.stage_worker; ++t)   // (h_emb is written again by the next window, after this one's last sync)
             std::memcpy(h_emb + (size_t) t * D, emb_row(p0 + t, tk[t]), (size_t) D * 2);
         plan_window(p0, T, wplan);
         prof_window = prof_on && T == 1;
@@ -8403,9 +8454,13 @@ struct Model::Impl {
         {
             Dev& d = devs[(size_t) cur];
             cudaSetDevice(d.id);
-            CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, d.st));
-            embed(d.emb_rows, T, d.h, D, H, d.st);
-            init_pre(d.pre, T, d.st);
+            if (o.stage_worker) {   // (a remote stage's worker: the main process's rows)
+                if (!link_rows(link_rx, d, T, false, 4, err)) return false;
+            } else {
+                CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, d.st));
+                embed(d.emb_rows, T, d.h, D, H, d.st);
+                init_pre(d.pre, T, d.st);
+            }
         }
         std::vector<float> dump;
         if (dump_h != nullptr) dump.resize((size_t) T * g.nl * H * D);
@@ -8449,7 +8504,37 @@ struct Model::Impl {
             err = "the head is not on the last layer's GPU";
             return false;
         }
+        if (o.stage_worker) return link_rows(link_tx, devs[(size_t) head_dev], T, true, 4, err);   // (back to the main process)
+        if (o.remote_stage && !remote_hop(head_dev, p0, T, err)) return false;
         return head_rows_dev(head_dev, T, err);
+    }
+
+    // a remote stage's rows (host, Model::StageGeo's layout) <-> device d's h | pre | topk | cand - the first `blocks`
+    // of them - on d's stream
+    bool link_rows(float* host, Dev& d, int T, bool to_host, int blocks, std::string& err) {
+        const size_t nb[4] = {(size_t) T * g.hc * g.dim * 4, (size_t) T * 8 * 4, (size_t) T * topk_stride() * 4,
+                              (size_t) T * cand_stride() * 4};
+        void* dv[4] = {d.h, d.pre, d.topk, d.cand};
+        uint8_t* hb = (uint8_t*) host;
+        cudaSetDevice(d.id);
+        for (int i = 0; i < blocks; hb += nb[i], ++i)
+            CK(cudaMemcpyAsync(to_host ? (void*) hb : dv[i], to_host ? (const void*) dv[i] : (const void*) hb, nb[i],
+                               to_host ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, d.st));
+        return true;
+    }
+    // the main process's hop after its last layer (device di): the window's rows to the worker, which runs the rest of
+    // the trunk; its streams and pre back for the head.  A failure leaves the worker's state unknown: stage_lost
+    bool remote_hop(int di, int64_t p0, int T, std::string& err) {
+        Dev& d = devs[(size_t) di];
+        if (!link_rows(link_tx, d, T, true, 4, err)) return false;
+        CK(cudaStreamSynchronize(d.st));
+        if (!stage_hop || !stage_hop(T, toks.data() + p0, p0, link_tx, link_rx, err)) {
+            if (!stage_hop) err = "remote stage: no link";
+            stage_lost = true;
+            stage_err = err;
+            return false;
+        }
+        return link_rows(link_rx, d, T, false, 2, err);
     }
 
     // threads: each device's thread enqueues its layers (a group's members each their share) at once, the
@@ -8503,7 +8588,9 @@ struct Model::Impl {
             if (mi < 0) continue;
             if (!started) {   // the window's input: the embedding rows, or the previous group's hand-off
                 started = true;
-                if (il == lo) {
+                if (il == lo && o.stage_worker) {   // (a remote stage's worker: the main process's rows)
+                    if (!link_rows(link_rx, d, T, false, 4, err)) return false;
+                } else if (il == lo) {
                     CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, s));
                     embed(d.emb_rows, T, d.h, D, H, s);
                     init_pre(d.pre, T, s);
@@ -8540,6 +8627,9 @@ struct Model::Impl {
             const bool last = il + 1 == hi || L[(size_t) il + 1].grp != L0.grp;
             if (last && mi == 0 && il + 1 < hi) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
         }
+        // (a remote stage: the head's group is the head device alone - load checked it)
+        if (o.stage_worker) return di != head_dev || link_rows(link_tx, d, T, true, 4, err);   // (back to the main process)
+        if (o.remote_stage && di == head_dev && !remote_hop(di, p0, T, err)) return false;
         if (d.grp == devs[(size_t) head_dev].grp) return head_rows_dev(di, T, err);
         return true;
     }
@@ -9206,6 +9296,39 @@ bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::str
 }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
 bool Model::ranged() const { return p_->ranged; }
+Model::StageGeo Model::stage_geo() const {
+    const Impl& p = *p_;
+    StageGeo s;
+    s.dim = p.g.dim;
+    s.hc = p.g.hc;
+    s.n_layers = p.g.nl;
+    s.n_expert = p.g.n_exp;
+    s.layer_begin = p.lo;
+    s.layer_end = p.hi;
+    s.max_t = kWin;
+    s.handoff_floats = p.handoff_floats();
+    return s;
+}
+void Model::set_stage_link(StageRun run, std::function<bool(std::string& err)> reset) {
+    p_->stage_hop = std::move(run);
+    p_->stage_reset = std::move(reset);
+}
+float* Model::stage_rows_in() { return p_->link_rx; }
+float* Model::stage_rows_out() { return p_->link_tx; }
+bool Model::stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err) {
+    Impl& p = *p_;
+    if (!p.o.stage_worker) {
+        err = "not a remote stage's worker";
+        return false;
+    }
+    if (p0 != p.pos) {   // (the main process resets the worker when it starts a conversation again)
+        err = "out of step: this worker is at position " + std::to_string(p.pos) + ", the window starts at " +
+              std::to_string(p0);
+        return false;
+    }
+    std::vector<int> tk(tokens, tokens + std::max(0, T));
+    return p.forward(tk.data(), T, 0, err);
+}
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const {
     Stats& st = p_->st;
