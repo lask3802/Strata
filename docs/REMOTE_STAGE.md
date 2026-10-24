@@ -503,15 +503,21 @@ asked. What its remote stage does (the code is `src/dsv41/ds4_stage.hpp`; on two
 - **DSpark across the split** with `--dspark on` on the main process: the drafter runs there, the worker's reply
   carries the drafter's taps of its layers, and a draft's check is a window the worker keeps in part (the rows the
   main process rejected are undone there, as one process undoes them). With the drafter loaded the main process
-  sends its prompts in windows, not chunks: a chunk's reply carries no taps. `--dspark auto` decides as on one PC
-  (it may not load the drafter at all when the experts are far larger than the GPU).
+  sends its prompts in windows, not chunks: a chunk's reply carries no taps. `--dspark auto` judges by this PC's GPU
+  as on one PC (the routed experts against what the GPU holds: off on a 2080 Ti), so drafts across the split take
+  `--dspark on`. bf16 rows and drafts go together (the taps come back bf16).
 - **bf16 rows** (`STRATA_REMOTE_ROWS=bf16` on both PCs; a mismatch is refused at the hello): the streams cross as
   bf16, pre and the picks exactly, 51,232 bytes a token. The engine packs the rows itself: the link's own bf16 would
   round the picks. With bf16 rows there are no prompt chunks (prompts in windows), since a chunk's rows would be
   converted whole.
+- **Slots and conversation checkpoints** with `STRATA_DS4_SLOT_KEEP=1` on the main process (serve): each side keeps
+  its own layers' part, the worker under the main process's ids (its bounds `STRATA_DS4_SLOT_CAP` / `_GB` / `_DIR`
+  set on the worker), and a conversation is taken back only when both sides hold it - one the worker does not hold
+  is read from token 0. The parts end with the link, so they do not survive a restart of either side
+  ([DEEPSEEK41.md](DEEPSEEK41.md)). Without the switch every request that does not continue the conversation in
+  place is read from token 0 on both PCs.
 - `STRATA_REMOTE_TIMING=1`: the timing lines, every 64 windows, as the Qwen engine's.
-- **Not yet**: slots and conversation checkpoints (every request is read from token 0 on both PCs), relays, images,
-  `--tp` above 1 at either end of the link.
+- **Not yet**: relays, images, `--tp` above 1 at either end of the link.
 
 The tools:
 
@@ -678,7 +684,7 @@ after changing these settings.
 | | status |
 |---|---|
 | Model family | Qwen3.8-Flash-Next only (48 layers, 512 experts top-10, 4 hyper-connection streams, n_embd 2560). The hello checks the geometry. A Qwen3.6-35B-A3B file (0.1.44 runs it from the same binary, on its own engine path) is refused at start |
-| DeepSeek V4.1-Flash (`strata-dsv41`, its own engine) | two PCs, 40 layers (0-39) cut at K: the main process `--remote-stage HOST:PORT --stage-end K` (layers 0 to K - 1, Engram, the head), the worker `--stage-worker PORT --stage-begin K` (K to 39). Windows of 16; prompt chunks (fp32 rows only); DSpark across the split with `--dspark on`; bf16 rows (`STRATA_REMOTE_ROWS=bf16` on both). Not yet: slots and checkpoints (every request from token 0), relays, images, `--tp` above 1 at either end of the link. More under [Tools](#tools) (DeepSeek-V4.1). Windows with fp32 rows checked on one PC over the loopback (`tools/dsv41/remote_loopback.sh`); the chunks, DSpark across the split and bf16 rows not yet run on a GPU; not measured on two PCs |
+| DeepSeek V4.1-Flash (`strata-dsv41`, its own engine) | two PCs, 40 layers (0-39) cut at K: the main process `--remote-stage HOST:PORT --stage-end K` (layers 0 to K - 1, Engram, the head), the worker `--stage-worker PORT --stage-begin K` (K to 39). Windows of 16; prompt chunks (fp32 rows only); DSpark across the split with `--dspark on`; bf16 rows (`STRATA_REMOTE_ROWS=bf16` on both); slots and checkpoints with `STRATA_DS4_SLOT_KEEP=1` (each side its part). Not yet: relays, images, `--tp` above 1 at either end of the link. More under [Tools](#tools) (DeepSeek-V4.1). Windows with fp32 rows checked on one PC over the loopback (`tools/dsv41/remote_loopback.sh`); the chunks, DSpark across the split, bf16 rows and the slots not yet run on a GPU; not measured on two PCs |
 | RVN IQ3_S, native pack read from its GGUF | **measured** (two and three PCs) |
 | Huihui UD-Q4_K_XL (Unsloth UD layout), native pack read from its GGUF | **measured** (one, two and three PCs) |
 | Other quantizations and models of the family (the official IQ3_S, IQ3_XXS, IQ2_XS, Coder, Swift 1.5, UD-IQ4_XS) | not tested. The hand-off is fp32 rows whatever the quantization, the arena range is cut by layer from the pack's expert table and the shipper works by tensor name |

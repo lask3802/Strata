@@ -20,6 +20,7 @@
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
+#include "ds4_stage.hpp"
 #include "ds4_pool.hpp"
 #include "ds4_stage.hpp"
 #include "ds4_store.hpp"
@@ -826,6 +827,7 @@ struct Model::Impl {
     Model::StageRun stage_hop;
     std::function<bool(int, std::string&)> stage_commit;
     std::function<bool(std::string&)> stage_reset;
+    Model::StageCkpt stage_ck;        // (the main process) the link's checkpoints and slots (Options::stage_ckpt)
     bool stage_lost = false;          // (the main process) a hop, a commit or the worker's reset failed: only position 0
                                       // goes on
     int stage_t = 0;                  // (the worker) the last window's rows, while its backups stand (2 or more; 0: none)
@@ -845,6 +847,18 @@ struct Model::Impl {
         r.topk = (int64_t) topk_stride();
         r.cand = (int64_t) cand_stride();
         return r;
+    }
+    // checkpoints (checkpoint / restore / pin): not in a remote stage, except a worker (the main process asks, over the
+    // link, for what it keeps itself) and a main process that keeps them across the link
+    bool ckpt_ok() const {
+        return !linked() || o.stage_worker || (o.stage_ckpt && stage_ck.save != nullptr && stage_ck.restore != nullptr);
+    }
+    // a slot: the whole trunk in one process, or the two ends of a remote stage that keeps checkpoints (each its layers')
+    bool slot_ok() const { return !ranged || (linked() && ckpt_ok()); }
+    const char* ckpt_link_note() const {   // (the load line's)
+        if (o.stage_worker) return ", checkpoints and slots as the main process asks";
+        if (o.remote_stage && o.stage_ckpt) return ", checkpoints and slots across the link";
+        return linked() ? ", no slots, no checkpoints" : ", no slots";
     }
     // a row in the fp32 block layout, and the link's (the compact one with stage_bf16)
     int64_t full_floats() const { return row_geo().full(); }
@@ -1024,6 +1038,7 @@ struct Model::Impl {
         std::vector<std::vector<float>> comp;
     };
     static constexpr int kChecks = 4;
+    static_assert(kChecks == stage::kCkRoles, "the link's checkpoint ids are by role");
     Check ck[kChecks];                // the end of the last prompt, the position before it, the anchor (the position
                                       // before the end of the first prompt of the run of prompts that each continued
                                       // the last in place: a chat template that drops earlier turns' reasoning at a new
@@ -1959,18 +1974,19 @@ struct Model::Impl {
         }
         ranged = lo > 0 || hi < g.nl || linked();
         if (ranged) {   // (a slot, the drafter, a picture or the prompt path's chunks would need the other layers - a
-                        // remote stage's chunks cross the link as they leave this process's last layer)
-            // (a remote stage's main process keeps the drafter: the worker's reply carries the taps of its layers)
+                        // remote stage's chunks cross the link as they leave this process's last layer, its slots and
+                        // checkpoints are each side's part of them)
+            // (a remote stage's main process keeps the drafter: the worker's reply carries the taps of its layers; its
+            // blocks' rings are this process's layers, in its checkpoints and slots as in one process's)
             const bool d_here = o.remote_stage && o.dspark &&
                                 stage::reply_fits(g.dim, (int) g.d_targets.size(), (int64_t) g.hc * g.dim);
-            std::fprintf(stderr, "ds4: layers [%d, %d) of %d here%s: prompts in %s of %d, %s, no pictures, no "
-                                 "slots%s\n", lo, hi, g.nl,
+            std::fprintf(stderr, "ds4: layers [%d, %d) of %d here%s: prompts in %s of %d, %s, no pictures%s\n", lo, hi, g.nl,
                          o.remote_stage ? " (the rest: the remote stage's worker)" : o.stage_worker ? " (a remote stage's worker)" : "",
                          !linked() || bf16_rows() ? "windows"
                          : d_here ? "chunks over the link (the chunked path's; windows if the drafter loads), or windows"
                                   : "chunks over the link (the chunked path's), or windows",
                          kWin, d_here ? "DSpark as --dspark says (the worker's taps come back with its rows)" : "no DSpark",
-                         linked() ? ", no checkpoints" : "");
+                         ckpt_link_note());
             if (!d_here) o.dspark = false;
             o.vision = false;
         }
@@ -4869,7 +4885,7 @@ struct Model::Impl {
     // the state at pos into checkpoint `slot` (the window rings and the compressors' partial groups: the rest of the
     // state is indexed by position, and what lies past a restored position is written again)
     void checkpoint(int slot) {
-        if (linked()) return;   // (a remote stage: the worker's layers would need theirs too - none, restore() goes nowhere)
+        if (!ckpt_ok()) return;   // (a remote stage: the worker's layers would need theirs too - none, restore() goes nowhere)
         Check& c = ck[slot & (kChecks - 1)];
         c.pos = pos;
         c.win.resize(L.size());
@@ -4893,6 +4909,18 @@ struct Model::Impl {
             cudaSetDevice(d.id);
             cudaStreamSynchronize(d.st);
         }
+        // (a remote stage's main process: the worker takes its layers' checkpoint of this role, at this position; one it
+        // did not keep is none - and a worker out of step fails the next window, as a failed hop does)
+        if (o.remote_stage && !stage_lost) {
+            bool stored = false;
+            std::string e;
+            if (!stage_ck.save(stage::kCkRole0 + (slot & (kChecks - 1)), pos, stored, e) || !stored) {
+                c.pos = -1;
+                stage_lost = true;
+                stage_err = e.empty() ? "the worker did not keep its checkpoint" : e;
+            }
+        } else if (o.remote_stage)
+            c.pos = -1;
     }
 
     // the checkpoint at or before position limit (the state's tokens agree with a new prompt up to there), or -1
@@ -4909,7 +4937,18 @@ struct Model::Impl {
 
     // checkpoint 1 (the position before the last prompt's end) becomes the anchor too
     void pin() {
-        if (ck[1].pos > 0) ck[2] = ck[1];
+        if (!ckpt_ok() || ck[1].pos <= 0) return;
+        ck[2] = ck[1];
+        if (!o.remote_stage) return;
+        bool stored = false;   // (the worker does as well, at its own position)
+        std::string e;
+        if (stage_lost || !stage_ck.save(stage::kCkPin, pos, stored, e) || !stored) {
+            ck[2].pos = -1;
+            if (!stage_lost) {
+                stage_lost = true;
+                stage_err = e.empty() ? "the worker did not pin its checkpoint" : e;
+            }
+        }
     }
     // the checkpoints the state can go back to (what a slot of it keeps), latest first
     std::vector<int64_t> check_positions() const {
@@ -4930,14 +4969,27 @@ struct Model::Impl {
     }
     size_t check_bytes() const {
         size_t n = 16;
-        for (const Layer& l : L) n += (size_t) g.win * win_rb() + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
+        for (const Layer& l : L)
+            if (!elsewhere(l)) n += (size_t) g.win * win_rb() + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
         return n;
     }
 
     bool restore(int64_t limit) {
-        const int b = linked() ? -1 : best_check(limit);   // (a remote stage keeps no checkpoints)
+        const int b = ckpt_ok() ? best_check(limit) : -1;   // (a remote stage keeps none, unless it was asked to)
         if (b < 0) return false;
         const Check& c = ck[b];
+        if (o.remote_stage) {   // the worker goes back to the same position first; it does not hold it: nothing changes
+            if (stage_lost) return false;
+            bool missing = false;
+            std::string e;
+            if (!stage_ck.restore(stage::kCkAt, c.pos, missing, e)) {
+                if (!missing) {   // (its session is lost: both sides start again)
+                    std::fprintf(stderr, "ds4: remote stage: going back to token %lld failed (%s)\n", (long long) c.pos, e.c_str());
+                    reset();
+                }
+                return false;
+            }
+        }
         for (size_t i = 0; i < L.size(); ++i)
             for (int m = 0; m < L[i].nm && !elsewhere(L[i]); ++m) {   // (a group's members hold the same state: the lead's copy)
                 Layer& l = member(L[i], m);
@@ -4978,15 +5030,20 @@ struct Model::Impl {
     // the slot's bytes: the header, the tokens, every layer's ring and partial group, every source's rows, the end
     size_t slot_bytes() const {
         size_t n = 8 + 8 + slot_identity().size() + 8 + (size_t) pos * 4;
-        for (const Layer& l : L) n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
+        for (const Layer& l : L)
+            if (!elsewhere(l)) n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
         for (const Src& s : srcs) n += 8 + (size_t) src_rows(s) * (ckv_rb() + ik_rb());
         n += 8 + slot_checks().size() * check_bytes();   // (the checkpoints: what the slot can be taken back at)
         return n + 8;
     }
 
-    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err) {
-        if (ranged) {
+    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err, int64_t remote_id = 0) {
+        if (!slot_ok()) {
             err = "this process holds only layers [" + std::to_string(lo) + ", " + std::to_string(hi) + ")";
+            return 0;
+        }
+        if (linked() && !o.stage_worker && remote_id == 0) {   // (a state of only this side would be the wrong half)
+            err = "a remote stage's conversation is set aside under a slot id";
             return 0;
         }
         if (slot_held) {
@@ -5004,6 +5061,22 @@ struct Model::Impl {
         if (!imgs.empty()) {
             err = "it holds pictures";
             return 0;
+        }
+        if (remote_id != 0) {   // the worker's layers' part first, under the main process's id, where it is now
+            if (!o.remote_stage || stage_lost || !stage_ck.save) {
+                err = stage_lost ? "remote stage: " + stage_err : std::string("remote stage: no link");
+                return 0;
+            }
+            bool stored = false;
+            if (!stage_ck.save(remote_id, pos, stored, err)) {   // (its session is lost: both sides start again)
+                std::fprintf(stderr, "ds4: remote stage: setting the worker's part aside failed (%s)\n", err.c_str());
+                reset();
+                return 0;
+            }
+            if (!stored) {
+                err = "the worker did not keep its part";
+                return 0;
+            }
         }
         const std::string id = slot_identity();
         out.assign(slot_bytes(), 0);
@@ -5025,6 +5098,7 @@ struct Model::Impl {
         }
         for (size_t i = 0; i < L.size(); ++i) {
             const Layer& l = L[i];
+            if (elsewhere(l)) continue;   // (another process's layer: its part is that process's slot)
             const Dev& d = devs[(size_t) l.dev];
             cudaSetDevice(d.id);
             const uint64_t wb = (uint64_t) g.win * win_rb();
@@ -5076,6 +5150,7 @@ struct Model::Impl {
                 put(&role, 8);
                 put(&cp, 8);
                 for (size_t i = 0; i < L.size(); ++i) {
+                    if (elsewhere(L[i])) continue;
                     put(c.win[i].data(), (size_t) g.win * win_rb());
                     if (L[i].c_kv) {
                         put(c.comp[2 * i].data(), (size_t) L[i].ratio * g.hd * 4);
@@ -5093,9 +5168,13 @@ struct Model::Impl {
         return (uint64_t) off;
     }
 
-    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
-        if (ranged) {
+    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err, int64_t remote_id = 0) {
+        if (!slot_ok()) {
             err = "this process holds only layers [" + std::to_string(lo) + ", " + std::to_string(hi) + ")";
+            return false;
+        }
+        if (linked() && !o.stage_worker && remote_id == 0) {
+            err = "a remote stage's conversation is taken back under a slot id";
             return false;
         }
         size_t off = 0;
@@ -5145,12 +5224,29 @@ struct Model::Impl {
         std::vector<int32_t> toks_in((size_t) n);
         std::memcpy(toks_in.data(), data + off, (size_t) n * 4);
         off += (size_t) n * 4;
+        if (remote_id != 0) {   // the worker puts its layers' part back first: it holds the state at n_pos, or nothing changed
+            if (!o.remote_stage || stage_lost || !stage_ck.restore) {
+                err = stage_lost ? "remote stage: " + stage_err : std::string("remote stage: no link");
+                return false;
+            }
+            bool missing = false;
+            if (!stage_ck.restore(remote_id, n_pos, missing, err)) {
+                if (!missing) {   // (its session is lost: both sides start again)
+                    std::fprintf(stderr, "ds4: remote stage: taking the worker's part back failed (%s)\n", err.c_str());
+                    reset();
+                } else
+                    err = "the worker does not hold its part of it";
+                return false;
+            }
+            wrote = true;   // (the conversation on the worker is the slot's now: a failure below resets both sides)
+        }
         for (Dev& d : devs) {   // (their work ends before the state is written over)
             cudaSetDevice(d.id);
             cudaStreamSynchronize(d.st);
         }
         for (size_t i = 0; i < L.size(); ++i) {
             Layer& l = L[i];
+            if (elsewhere(l)) continue;
             const Dev& d = devs[(size_t) l.dev];
             cudaSetDevice(d.id);
             uint64_t wb = 0, cn = 0;
@@ -5260,6 +5356,7 @@ struct Model::Impl {
                 c.win.resize(L.size());
                 c.comp.resize(L.size() * 2);
                 for (size_t i = 0; i < L.size(); ++i) {
+                    if (elsewhere(L[i])) continue;
                     const size_t wb = (size_t) g.win * win_rb(), cb = L[i].c_kv ? (size_t) L[i].ratio * g.hd * 4 : 0;
                     if (!room(wb + 2 * cb)) {
                         err = "the slot is cut short";
@@ -5296,6 +5393,7 @@ struct Model::Impl {
         for (int k = 0; k < kChecks; ++k) ck[k] = std::move(got[k]);   // (the slot's own; the old ones held the state
                                                                // this one replaced)
         slot_held = false;
+        stage_lost = false;   // (a remote stage's main process: both ends hold the slot's state)
         ok = true;
         return true;
     }
@@ -5314,6 +5412,7 @@ struct Model::Impl {
         for (int v : g.kv_src) id << v << ",";
         id << " ix=";
         for (int v : g.ix_src) id << v << ",";
+        if (ranged) id << " layers=" << lo << "-" << hi;   // (a remote stage's two ends: each its own part)
         id << " ds4.txt:" << size_of(pk.dir + "/ds4.txt") << " engram.bin:" << size_of(pk.dir + "/engram.bin")
            << " tensors.txt:" << size_of(pk.dir + "/tensors.txt");
         for (size_t i = 0; i < pk.files.size(); ++i)
@@ -8211,8 +8310,8 @@ struct Model::Impl {
                 return false;
             }
         if (o.remote_stage && !stage_live(err)) return false;
-        // (a remote stage keeps no checkpoints: nor the state before the run's last row - once its worker keeps
-        // checkpoints too, only a remote stage without them)
+        // (a remote stage: no state before the run's last row - the worker's layers would need theirs too; one that keeps
+        // checkpoints takes it between the run and its last row, Model::feed_mark)
         if (linked()) snap_slot = -1;
         // a long prompt's skip: the layers from yoco_layer() on (V4.1: 20-39) read the earlier positions only through
         // that layer's compressed KV and index keys, and each looks back one window (win - 1 positions) more than the
@@ -9601,6 +9700,15 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     p.pm.last = -1;
     p.halted = false;
     const double t0 = now_ms();
+    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.o.remote_stage && p.ckpt_ok()) {
+        // (a remote stage that keeps checkpoints: the worker takes its part of one at the position it is at, so the run
+        // stops short of its last row - its chunks, the checkpoint on both sides, then the last row as a window)
+        const bool ok = (n - 1 >= p.chunk_min ? p.forward_chunks(tokens, n - 1, 0, err)
+                                              : p.feed_windows(tokens, n - 1, 0, err)) &&
+                        (p.checkpoint(slot), p.feed_windows(tokens + n - 1, 1, logits_rows, err));
+        if (ok) p.path_done(now_ms() - t0);
+        return ok;
+    }
     if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && (p.o.remote_stage || p.pick_path(n))) {   // (the last token rides along; its layers
         const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot);   // keep the state before it)
         if (ok) p.path_done(now_ms() - t0);
@@ -9648,12 +9756,16 @@ bool Model::restore(int64_t limit) { return p_->restore(limit); }
 void Model::pin() { p_->pin(); }
 std::vector<int64_t> Model::check_positions() const { return p_->check_positions(); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
-uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err) { return p_->slot_save(out, err); }
-bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
-    return p_->slot_load(data, bytes, n_pos, err);
+uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err, int64_t remote_id) {
+    return p_->slot_save(out, err, remote_id);
+}
+bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err, int64_t remote_id) {
+    return p_->slot_load(data, bytes, n_pos, err, remote_id);
 }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
 bool Model::ranged() const { return p_->ranged; }
+bool Model::stage_ckpt_on() const { return p_->linked() && p_->ckpt_ok(); }
+void Model::set_stage_ckpt(StageCkpt c) { p_->stage_ck = std::move(c); }
 Model::StageGeo Model::stage_geo() const {
     const Impl& p = *p_;
     StageGeo s;

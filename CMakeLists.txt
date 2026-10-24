@@ -896,8 +896,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_include_directories(ds4_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
       target_compile_features(ds4_slot_test PRIVATE cxx_std_17)
       # the remote stage's pack fingerprint, both sides' hello checks, the reply's layout, the compact bf16 rows, the
-      # commits of draft checks and the prompt chunks over a loopback link (ds4_stage.hpp, src/net/stage_link.cpp): no
-      # GPU, no model
+      # commits of draft checks, the prompt chunks and the worker's checkpoint / slot handlers over a loopback link
+      # (ds4_stage.hpp, ds4_partstore.hpp, src/net/stage_link.cpp): no GPU, no model
       add_executable(ds4_stage_test tests/dsv41/stage_test.cpp src/net/stage_link.cpp)
       target_include_directories(ds4_stage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41 ${CMAKE_CURRENT_SOURCE_DIR}/include)
       target_compile_features(ds4_stage_test PRIVATE cxx_std_17)
