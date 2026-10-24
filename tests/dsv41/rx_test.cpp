@@ -314,6 +314,7 @@ int main(int argc, char** argv) {
 
     // ---- the round trip of T = 1 requests, `picks` picks each (the decode shape), and T = 4
     for (int T : {1, 4}) {
+        if (n_rtt <= 0) break;   // (--rtt 0: correctness only)
         std::vector<double> rt, srv;
         make_req(T, picks, rows, xs);
         const int warm = 50;

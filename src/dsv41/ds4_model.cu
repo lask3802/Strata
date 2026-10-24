@@ -1069,7 +1069,7 @@ struct Model::Impl {
     std::unique_ptr<rx::Main> rx_link;
     std::vector<uint8_t> rx_has;
     bool rx_on = false;
-    double rx_timeout_ms = 20.0;
+    double rx_timeout_ms = 2.0;   // (counted from when the lane's own picks are done)
     uint64_t rx_late_bits = 0;   // the last 64 requests: bit set = its reply was late (8 of them: the link given up)
     static_assert(rx::kMaxRows == kWin && rx::kMaxPicks == kPicks, "a request's rows and picks are a window's");
     std::vector<rx::ReqRow> rx_rows;
@@ -6622,7 +6622,7 @@ struct Model::Impl {
         st.rx_upload_bytes = (int64_t) held_b;
         st.rx_upload_ms = now_ms() - t0;
         std::fprintf(stderr, "ds4: remote experts: %lld experts (%.2f GB) in the server's VRAM, uploaded in %.1f s (%.0f MB/s); "
-                             "a reply later than %.2f ms after its request: its picks computed here\n",
+                             "a reply later than %.2f ms after the lane's own picks: its picks computed here\n",
                      (long long) held, (double) held_b / 1e9, st.rx_upload_ms / 1000.0,
                      st.rx_upload_ms > 0 ? (double) held_b / 1e3 / st.rx_upload_ms : 0.0, rx_timeout_ms);
         st.rx_bytes_out = (int64_t) link->bytes_out();   // (the per-token bytes count from here)
@@ -6710,7 +6710,7 @@ struct Model::Impl {
         const uint16_t* y = nullptr;
         int srv_us = 0;
         std::string e;
-        const int got = rx_on ? rx_link->wait_resp(seq, (int) rx_rows.size(), t0 + rx_timeout_ms, &y, srv_us, e) : -1;
+        const int got = rx_on ? rx_link->wait_resp(seq, (int) rx_rows.size(), tw + rx_timeout_ms, &y, srv_us, e) : -1;
         const double t1 = rx::now_ms();
         st.rx_wait_ms += t1 - tw;
         st.rx_bytes_out = (int64_t) rx_link->bytes_out();

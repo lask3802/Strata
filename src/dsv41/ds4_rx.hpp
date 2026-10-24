@@ -12,8 +12,8 @@
 // request of the CPU lane (serve_lane): the picks the server holds go out as soon as the routing is known (T rows of
 // x in bf16, up to 8 picks and weights each), the lane computes the others, then waits for the reply (T rows of
 // sum_i w_i expert_i(x) in bf16) and adds it to the same part before the answer's seq.  A reply later than
-// DS4_RX_TIMEOUT_MS (20) after its send: those picks are computed on the lane (the late reply is skipped when it
-// comes); a lost link, or 8 late replies in a row: the lane computes everything from then on.  Never a hang.
+// DS4_RX_TIMEOUT_MS (2) after the lane's own picks are done: those picks are computed on the lane (the late reply is
+// skipped when it comes); a lost link, or 8 late replies of the last 64: the lane computes everything from then on.  Never a hang.
 //
 // The wire: a 32-byte header (magic, type, seq, a, b, c, payload bytes), then the payload; TCP_NODELAY, rows bf16.
 #pragma once
