@@ -891,6 +891,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       if(STRATA_ENABLE_HIP)
         target_compile_options(ds4_iq_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
       endif()
+      # expert parallelism's n_ff slices on the CPU lane (gg::iq_cpu_slice, ds4_ffslice.hpp): the slices of an expert read
+      # in place sum to the whole one, in place == copied out, blob -> slices -> blob; no GPU (--pack: a pack's experts, read only)
+      add_executable(ds4_ep_slice_test tests/dsv41/ep_slice_test.cpp src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp
+                     src/dsv41/ds4_tq_cpu.cpp)
+      target_include_directories(ds4_ep_slice_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
+      target_link_libraries(ds4_ep_slice_test PRIVATE strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(ds4_ep_slice_test PRIVATE STRATA_DSV41_TQ_CPU=1)
       # the kept conversations' .meta file and prefix matching (ds4_slotmeta.hpp): no GPU, no model
       add_executable(ds4_slot_test tests/dsv41/slot_test.cpp)
       target_include_directories(ds4_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)

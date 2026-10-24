@@ -200,7 +200,7 @@ int main(int argc, char** argv) {
     };
     // gg_cpu_down uses f.td / d_row; here td == tg and the activation has n_embd values: f.d_row would be for n_ff.
     // Use the gate rows through a second IqCpu whose down geometry is the gate's.
-    f.td = f.tg; f.d_row = f.gu_row; f.n_ff = n; f.d_act = f.gu_act; f.h_bytes = f.act_bytes;
+    f.td = f.tg; f.d_row = f.d_stride = f.gu_row; f.n_ff = n; f.d_act = f.gu_act; f.h_bytes = f.act_bytes;
 
     const double t_gg = pass(0, p0.data());
     const double t_own = pass(1, p1.data());
