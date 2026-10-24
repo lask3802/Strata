@@ -182,7 +182,9 @@ class Index(Base):
             lines = f.read().split("\n")
         self.assertEqual(lines[0], "ep-parts 1")
         self.assertEqual(lines[1], "pack_hash %016x" % ep.pack_hash(self.pack_dir))
-        self.assertEqual(lines[2], "geometry %d %d %d %d 256 4096" % (DIM, FF, NL, NE))
+        self.assertEqual(lines[2], "stamp %016x" % ep.stamp_of([x for x in lines if x]))          # (a hash of every other line)
+        self.assertEqual(lines[3], "geometry %d %d %d %d 256 4096" % (DIM, FF, NL, NE))
+        self.assertEqual(lines[4], "covered " + " ".join(str(l) for l in range(NL)))
         files = [x.split() for x in lines if x.startswith("file ")]
         self.assertEqual([f[2] for f in files], ["ep-parts-6-9.bin", "ep-parts-0-6.bin"])
         for f in files:
@@ -203,6 +205,18 @@ class Index(Base):
             self.assertEqual(offs, sorted(offs))
         first = [(int(p[1]), int(p[2])) for p in parts if int(p[5]) == 0 and p[3] == "gate"]
         self.assertEqual(first, allx)
+        self.assertTrue(all(int(p[10]) >= ep.HEADER for p in parts))     # (the first page of a file is its header)
+        for f in files:                                                   # ... which names the run
+            with open(os.path.join(self.out, f[2]), "rb") as fh:
+                self.assertEqual(fh.read(ep.HEADER), ep.file_header(int(lines[2].split()[1], 16), int(f[1]), int(f[3]), int(f[4])))
+
+    def test_the_covered_layers_are_the_written_ones(self):
+        order = ep.heat_order(self.pack, ep.read_profile(os.path.join(self.pack_dir, "expert-profile.bin"), NL, NE), [1, 3])
+        ep.write_parts(self.pack, self.out, [(6, 9, [(l, e) for l, e, _ in order])], order)
+        ix = ep.PartsIndex(self.out)
+        self.addCleanup(ix.close)
+        self.assertEqual(ix.covered, {1, 3})
+        self.assertEqual({k[0] for k in ix.parts}, {1, 3})
 
     def test_parts_index_reads_back_what_was_written(self):
         order = self.order()
@@ -306,6 +320,109 @@ class PackHash(unittest.TestCase):
                 f.write("t x.weight F32 0 0 4 1\n")
             self.assertNotEqual(ep.pack_hash(a), ep.pack_hash(b))
             self.assertEqual(ep.pack_hash(os.path.join(t1, "nowhere")), 0)
+
+
+class Stale(Base):
+    """An index and part files from different runs never open together (the size alone would match)."""
+
+    def two_runs(self):
+        order = self.order()
+        other = self.order("count")                                  # (another heat order: same sizes, other bytes)
+        self.assertNotEqual(order, other)
+        a, b = os.path.join(self.out, "a"), os.path.join(self.out, "b")
+        for d, o in ((a, order), (b, other)):
+            ep.write_parts(self.pack, d, [(6, 9, [(l, e) for l, e, _ in o])], o)
+        return a, b
+
+    def test_files_from_another_run_are_refused(self):
+        a, b = self.two_runs()
+        self.assertEqual(os.path.getsize(os.path.join(a, "ep-parts-6-9.bin")), os.path.getsize(os.path.join(b, "ep-parts-6-9.bin")))
+        ix = ep.PartsIndex(a)
+        ix.close()
+        with open(os.path.join(b, "ep-parts-6-9.bin"), "rb") as f:     # (a run that stopped between the bin and the index)
+            data = f.read()
+        with open(os.path.join(a, "ep-parts-6-9.bin"), "wb") as f:
+            f.write(data)
+        with self.assertRaises(ValueError) as cm:
+            ep.PartsIndex(a)
+        self.assertIn("another run", str(cm.exception))
+        msgs = []
+        self.assertEqual(ep.verify(self.pack, a, set(range(NL)), log=msgs.append), 1)
+        self.assertTrue(any("FAIL" in m for m in msgs))
+
+    def test_an_edited_index_is_refused(self):
+        a, _ = self.two_runs()
+        path = os.path.join(a, "ep-parts.txt")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        heat = [l for l in text.split("\n") if l.startswith("heat ")]
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text.replace(heat[0], heat[1], 1))
+        with self.assertRaises(ValueError):
+            ep.PartsIndex(a)
+
+    def test_a_run_that_fails_leaves_the_old_files_and_no_tmp(self):
+        order = self.order()
+        allx = [(l, e) for l, e, _ in order]
+        ep.write_parts(self.pack, self.out, [(6, 9, allx)], order)
+        before = {}
+        for n in os.listdir(self.out):
+            with open(os.path.join(self.out, n), "rb") as f:
+                before[n] = f.read()
+        real = ep.read_part
+
+        def boom(*a):
+            raise IOError("disk gone")
+        ep.read_part = boom
+        try:
+            with self.assertRaises(IOError):
+                ep.write_parts(self.pack, self.out, [(6, 9, allx[::-1])], order)
+        finally:
+            ep.read_part = real
+        self.assertEqual(sorted(os.listdir(self.out)), sorted(before))        # (no .tmp left)
+        for n, data in before.items():
+            with open(os.path.join(self.out, n), "rb") as f:
+                self.assertEqual(f.read(), data, n)
+
+    @unittest.skipIf(os.name == "nt", "Windows cannot rename over a file that is open (the worker is Linux)")
+    def test_a_rewrite_replaces_the_files_by_rename(self):
+        order = self.order()
+        allx = [(l, e) for l, e, _ in order]
+        ep.write_parts(self.pack, self.out, [(6, 9, allx)], order)
+        path = os.path.join(self.out, "ep-parts-6-9.bin")
+        with open(path, "rb") as held:                  # (a reader's open file: still the old run after the rewrite)
+            old = held.read(ep.HEADER)
+            ep.write_parts(self.pack, self.out, [(6, 9, allx[::-1])], order)
+            held.seek(0)
+            self.assertEqual(held.read(ep.HEADER), old)
+        self.assertEqual([n for n in os.listdir(self.out) if n.endswith(".tmp")], [])
+
+
+class Geometry(Base):
+    def test_a_transposed_matrix_is_refused(self):
+        path = os.path.join(self.pack_dir, "tensors.txt")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        old = "layers.0.ffn.experts.3.w2.weight IQ2_XXS 0"
+        lines = text.split("\n")
+        i = next(n for n, l in enumerate(lines) if l.startswith("t " + old[:-2]))
+        parts = lines[i].split()
+        parts[-2:] = parts[-2:][::-1]                   # [dim][ff] -> [ff][dim], the same bytes
+        lines[i] = " ".join(parts)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines))
+        with self.assertRaises(ValueError) as cm:
+            ep.Pack(self.pack_dir).matrix(0, 2)
+        self.assertIn("shaped", str(cm.exception))
+
+    def test_the_two_sets_must_tile_the_blocks(self):
+        ep.check_complementary((6, 9), (0, 6), 9)
+        ep.check_complementary(None, (0, 6), 9)
+        for tail, pool in (((7, 9), (0, 6)), ((6, 8), (0, 6)), ((6, 9), (1, 6)), ((6, 9), (0, 7))):
+            with self.assertRaises(ValueError):
+                ep.check_complementary(tail, pool, 9)
+        with self.assertRaises(SystemExit):
+            ep.main([self.pack_dir, "--dry-run", "--tail", "7:9"])
 
 
 class Cli(Base):

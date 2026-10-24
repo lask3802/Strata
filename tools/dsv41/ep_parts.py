@@ -9,12 +9,18 @@ this tool cuts them at 256-value blocks and writes the cut pieces as contiguous 
   down       dim rows x n_ff: the slice is blocks [a, b) of every row, strided in the pack; a part holds the
              dim rows, each cut to its blocks [a, b), packed back to back (so the CPU lane streams it)
 
-A parts set is a file `ep-parts-<a>-<b>.bin`: for each listed expert, in heat order, gate | up | down, every matrix
-aligned to 4096.  One index, `ep-parts.txt`, describes all the sets written together (text, one line a part):
+A parts set is a file `ep-parts-<a>-<b>.bin`: a header page (EPPARTS1, the run stamp, the file's number and range),
+then for each listed expert, in heat order, gate | up | down, every matrix aligned to 4096.  One index,
+`ep-parts.txt`, describes all the sets written together (text, one line a part, each line after the lines it needs:
+geometry and the files before the parts):
 
   ep-parts 1
   pack_hash <16 hex>        fnv1a of tensors.txt + ds4.txt as ds4_stage.hpp pack_hash computes it
+  stamp <16 hex>            fnv1a of every other line of this index; also in each file's header page: an index and
+                            files from different runs (a re-cut with another profile, a run that stopped half way)
+                            do not open together
   geometry <dim> <n_ff> <layers> <experts> <unit> <align>
+  covered <layer>...        the layers that have parts (a subset of the pack's: other layers have no view)
   file <i> <name> <a> <b> <bytes>
   heat <layer> <expert> <count>     every listed expert once, hottest first (the order of the files)
   part <layer> <expert> <kind> <type> <file> <a> <b> <rows> <row_bytes> <offset> <bytes>
@@ -37,6 +43,8 @@ UNIT = 256            # n_ff is cut in blocks of 256 values (a superblock of eve
 KINDS = ("gate", "up", "down")
 ROLES = ("w1", "w3", "w2")
 INDEX_NAME = "ep-parts.txt"
+MAGIC = b"EPPARTS1"    # a part file starts with a header page: MAGIC, the run stamp (u64), file index, a, b (u32 each)
+HEADER = ALIGN
 GB = 1e9
 
 # ggml type name -> (type id, values a block, bytes a block); the ids are ggml's (ds4_iq.cuh)
@@ -78,7 +86,8 @@ def pack_hash(pack_dir):
             continue
         h = fnv1a(f.encode(), h if h != 0 else 1469598103934665603)
         geometry = f == "/ds4.txt"
-        for line in body.splitlines(keepends=True):
+        chunks = body.split(b"\n")     # (not splitlines: it also breaks at a lone '\r', which the C++ side keeps inside its line)
+        for line in [c + b"\n" for c in chunks[:-1]] + ([chunks[-1]] if chunks[-1] else []):
             if geometry and line.startswith(b"model_dir "):
                 continue
             h = fnv1a(line.replace(b"\r", b""), h)
@@ -123,6 +132,7 @@ class Pack:
         self.model_dir = model_dir or self.kv.get("model_dir", "")
         self.files = {}
         self.tensors = {}
+        self.shapes = {}                           # name -> the dims tensors.txt lists after the size
         with open(os.path.join(pack_dir, "tensors.txt"), "r", encoding="utf-8") as f:
             for line in f:
                 p = line.split()
@@ -132,6 +142,7 @@ class Pack:
                     self.files[int(p[1])] = p[2]
                 elif p[0] == "t" and len(p) >= 6:
                     self.tensors[p[1]] = (p[2], int(p[3]), int(p[4]), int(p[5]))
+                    self.shapes[p[1]] = tuple(int(x) for x in p[6:])
         self.dim = int(self.kv["hidden_size"])
         self.ff = int(self.kv["moe_intermediate_size"])
         self.nl = int(self.kv["num_hidden_layers"])
@@ -153,11 +164,16 @@ class Pack:
             dtype, _, _, nbytes = self.tensor(layer, 0, kind)
             rows, k = (self.ff, self.dim) if kind < 2 else (self.dim, self.ff)
             m = Matrix(layer, kind, dtype, rows, k, nbytes)
-            for e in range(1, self.ne):
+            for e in range(self.ne):
                 t = self.tensor(layer, e, kind)
                 if t[0] != dtype or t[3] != nbytes:
                     raise ValueError("layer %d %s: expert %d is %s %d bytes, expert 0 is %s %d" %
                                      (layer, KINDS[kind], e, t[0], t[3], dtype, nbytes))
+                # (the size alone passes a transposed matrix: [out][in] is what the cut assumes)
+                shape = self.shapes["layers.%d.ffn.experts.%d.%s.weight" % (layer, e, ROLES[kind])]
+                if shape != (rows, k):
+                    raise ValueError("layer %d %s: expert %d is shaped %s in tensors.txt, the cut needs [%d][%d]" %
+                                     (layer, KINDS[kind], e, "x".join(map(str, shape)) or "(none)", rows, k))
             self._mats[key] = m
         return m
 
@@ -256,10 +272,11 @@ class Entry:
 
 
 def plan_set(pack, file, a, b, experts):
-    """Where each part of the set [a, b) lands: ([Entry], file bytes).  The writer and --dry-run share it."""
+    """Where each part of the set [a, b) lands: ([Entry], file bytes).  The first page of a file is its header; the
+    writer and --dry-run share this."""
     if not (0 <= a < b <= pack.nb):
         raise ValueError("a set [%d, %d) is not inside [0, %d)" % (a, b, pack.nb))
-    out, pos = [], 0
+    out, pos = [], HEADER
     for l, e in experts:
         for kind in range(3):
             m = pack.matrix(l, kind)
@@ -271,8 +288,9 @@ def plan_set(pack, file, a, b, experts):
 
 
 def choose_pool(pack, order, a, b, n_experts=None, gb=None):
-    """The heat-order prefix whose [a, b) parts fit `gb` (decimal GB, padding counted), or its first `n_experts`."""
-    chosen, pos = [], 0
+    """The heat-order prefix whose [a, b) parts fit `gb` (decimal GB, header and padding counted), or its first
+    `n_experts`."""
+    chosen, pos = [], HEADER
     for l, e, _ in order:
         if n_experts is not None and len(chosen) >= n_experts:
             break
@@ -288,11 +306,24 @@ def choose_pool(pack, order, a, b, n_experts=None, gb=None):
     return chosen
 
 
+def check_complementary(tail, pool, nb):
+    """The two sets of one parts pack tile [0, nb): the pool [0, k) and the worker's [k, nb).  Anything else leaves an
+    expert that can never be whole (or a double part), so the writer refuses it."""
+    if tail is None or pool is None:
+        return
+    if pool[0] != 0 or pool[1] != tail[0] or tail[1] != nb:
+        raise ValueError("the pool %d:%d and the worker's set %d:%d do not tile 0:%d (the pool must be 0:k and the "
+                         "worker's k:%d)" % (pool + tail + (nb, nb)))
+
+
 # ---------------------------------------------------------------------------------------------------- writing
 
-def write_index(path, pack, phash, sets, entries, order):
+def index_lines(pack, phash, sets, entries, order):
+    """The index as lines, without the stamp.  The stamp (a hash of every other line) is also in each part file's header
+    page, so an index and files from different runs never go together."""
     lines = ["ep-parts 1", "pack_hash %016x" % phash,
-             "geometry %d %d %d %d %d %d" % (pack.dim, pack.ff, pack.nl, pack.ne, UNIT, ALIGN)]
+             "geometry %d %d %d %d %d %d" % (pack.dim, pack.ff, pack.nl, pack.ne, UNIT, ALIGN),
+             "covered " + " ".join(str(l) for l in sorted({en.layer for en in entries}))]
     for i, (name, a, b, size) in enumerate(sets):
         lines.append("file %d %s %d %d %d" % (i, name, a, b, size))
     for l, e, c in order:
@@ -301,44 +332,76 @@ def write_index(path, pack, phash, sets, entries, order):
         lines.append("part %d %d %s %d %d %d %d %d %d %d %d" %
                      (en.layer, en.expert, KINDS[en.kind], en.type_id, en.file, en.a, en.b, en.rows, en.row_bytes,
                       en.offset, en.nbytes))
-    tmp = path + ".tmp"
-    with open(tmp, "w", newline="\n", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    os.replace(tmp, path)
+    return lines
+
+
+def stamp_of(lines):
+    """FNV-1a over the index's lines (each with its '\\n', no '\\r', the stamp line itself left out)."""
+    h = 1469598103934665603
+    for line in lines:
+        if not line.startswith("stamp "):
+            h = fnv1a(line.replace("\r", "").encode("utf-8") + b"\n", h)
+    return h
+
+
+def file_header(stamp, file, a, b):
+    return (MAGIC + stamp.to_bytes(8, "little") + file.to_bytes(4, "little") + a.to_bytes(4, "little") +
+            b.to_bytes(4, "little")).ljust(HEADER, b"\0")
 
 
 def write_parts(pack, out_dir, sets, order, log=None):
-    """sets: [(a, b, [(layer, expert)...])] (each in heat order).  Writes the files, then the index.  Returns the
-    entries."""
+    """sets: [(a, b, [(layer, expert)...])] (each in heat order).  Writes the files and the index; returns the entries.
+    Everything goes to .tmp names first and is renamed at the end, the index last: a reader that has a file mapped keeps
+    the old bytes, and a run that stops half way leaves no index that matches the new files (the stamp says so)."""
     os.makedirs(out_dir, exist_ok=True)
     phash = pack_hash(pack.dir)
     names = [set_file_name(a, b) for a, b, _ in sets]
     if len(set(names)) != len(names):
         raise ValueError("two sets with the same range")
-    all_entries, file_info = [], []
-    t0, done, total = time.time(), 0, sum(len(x[2]) for x in sets)
+    all_entries, file_info, plans = [], [], []
     for fi, (a, b, experts) in enumerate(sets):
         entries, size = plan_set(pack, fi, a, b, experts)
-        path = os.path.join(out_dir, names[fi])
-        with open(path, "wb") as f:
-            pos = 0
-            for en in entries:
-                f.write(b"\0" * (en.offset - pos))
-                buf = read_part(pack, en.layer, en.expert, en.kind, a, b)
-                if len(buf) != en.nbytes:
-                    raise RuntimeError("part size %d, planned %d" % (len(buf), en.nbytes))
-                f.write(buf)
-                pos = en.offset + en.nbytes
-                if en.kind == 2:
-                    done += 1
-                    if log and done % 500 == 0:
-                        log("  %d / %d experts, %.0f s" % (done, total, time.time() - t0))
-            f.write(b"\0" * (size - pos))
+        plans.append((a, b, entries, size))
         all_entries.extend(entries)
         file_info.append((names[fi], a, b, size))
     held = {x for _, _, experts in sets for x in experts}
     listed = [(l, e, c) for l, e, c in order if (l, e) in held]     # the heat lines: every expert of any set
-    write_index(os.path.join(out_dir, INDEX_NAME), pack, phash, file_info, all_entries, listed)
+    lines = index_lines(pack, phash, file_info, all_entries, listed)
+    stamp = stamp_of(lines)
+    lines.insert(2, "stamp %016x" % stamp)
+    tmps = []
+    try:
+        t0, done, total = time.time(), 0, sum(len(x[2]) for x in sets)
+        for fi, (a, b, entries, size) in enumerate(plans):
+            tmp = os.path.join(out_dir, names[fi] + ".tmp")
+            tmps.append(tmp)
+            with open(tmp, "wb") as f:
+                f.write(file_header(stamp, fi, a, b))
+                pos = HEADER
+                for en in entries:
+                    f.write(b"\0" * (en.offset - pos))
+                    buf = read_part(pack, en.layer, en.expert, en.kind, a, b)
+                    if len(buf) != en.nbytes:
+                        raise RuntimeError("part size %d, planned %d" % (len(buf), en.nbytes))
+                    f.write(buf)
+                    pos = en.offset + en.nbytes
+                    if en.kind == 2:
+                        done += 1
+                        if log and done % 500 == 0:
+                            log("  %d / %d experts, %.0f s" % (done, total, time.time() - t0))
+                f.write(b"\0" * (size - pos))
+        index_tmp = os.path.join(out_dir, INDEX_NAME + ".tmp")
+        tmps.append(index_tmp)
+        with open(index_tmp, "w", newline="\n", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        for fi, tmp in enumerate(tmps[:-1]):
+            os.replace(tmp, os.path.join(out_dir, names[fi]))
+        os.replace(index_tmp, os.path.join(out_dir, INDEX_NAME))
+        tmps = []
+    finally:
+        for t in tmps:
+            if os.path.exists(t):
+                os.remove(t)
     return all_entries
 
 
@@ -361,6 +424,10 @@ class PartsIndex:
                 continue
             if p[0] == "pack_hash":
                 self.pack_hash = int(p[1], 16)
+            elif p[0] == "stamp":
+                self.stamp = int(p[1], 16)
+            elif p[0] == "covered":
+                self.covered = {int(x) for x in p[1:]}
             elif p[0] == "geometry":
                 self.dim, self.ff, self.nl, self.ne, self.unit, self.align = map(int, p[1:7])
             elif p[0] == "file":
@@ -378,6 +445,15 @@ class PartsIndex:
         for v in self.parts.values():
             v.sort(key=lambda x: x.a)
         self._fh = {}
+        if stamp_of([x.rstrip("\r") for x in lines if x]) != self.stamp:
+            raise ValueError("%s: its stamp does not match its own lines (edited or damaged)" % INDEX_NAME)
+        for i, (name, a, b, size) in enumerate(self.files):
+            with open(os.path.join(out_dir, name), "rb") as f:
+                head = f.read(HEADER)
+            if len(head) != HEADER or os.path.getsize(os.path.join(out_dir, name)) != size:
+                raise ValueError("%s: not the %d bytes the index lists" % (name, size))
+            if head != file_header(self.stamp, i, a, b):
+                raise ValueError("%s: its header is from another run than %s (stale index or files)" % (name, INDEX_NAME))
 
     def read(self, en):
         fh = self._fh.get(en.file)
@@ -432,7 +508,11 @@ class PartsIndex:
 def verify(pack, out_dir, layers, log=print):
     """Index against the pack: its hash, then every expert of `layers` that has parts - each part equal to the pack's
     own slice, and a whole expert's assembled matrices equal to the pack's bytes.  Returns the problem count."""
-    ix = PartsIndex(out_dir)
+    try:
+        ix = PartsIndex(out_dir)
+    except (ValueError, OSError) as ex:
+        log("FAIL %s" % ex)
+        return 1
     bad, n_parts, n_whole = 0, 0, 0
     try:
         if ix.pack_hash != pack_hash(pack.dir):
@@ -577,6 +657,7 @@ def run(ap, args, pack):
         layers = parse_layers(args.layers, pack.nl)
         tail = None if args.tail == "none" else parse_range(args.tail, pack.nb)
         pool = parse_range(args.pool, pack.nb)
+        check_complementary(tail, pool, pack.nb)
     except (argparse.ArgumentTypeError, ValueError) as ex:
         ap.error(str(ex))
     profile_path = args.profile if args.profile else os.path.join(args.pack, "expert-profile.bin")

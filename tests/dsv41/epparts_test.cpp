@@ -95,23 +95,54 @@ struct SetSpec {
     std::vector<std::pair<int, int>> experts;   // heat order
 };
 
-// writes the files and the index for `sets`; `drop` experts are left out of the first set only
+// FNV-1a over every line but the stamp's own, each '\n' ended (the index's own check)
+uint64_t index_stamp(const std::string& text) {
+    uint64_t h = 1469598103934665603ull;
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t nl = text.find('\n', at);
+        if (nl == std::string::npos) nl = text.size();
+        std::string line = text.substr(at, nl - at);
+        at = nl + 1;
+        while (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line.compare(0, 6, "stamp ") == 0) continue;
+        for (char c : line) h = (h ^ (uint8_t) c) * 1099511628211ull;
+        h = (h ^ (uint8_t) '\n') * 1099511628211ull;
+    }
+    return h;
+}
+std::string hex16(uint64_t v) {
+    char b[32];
+    std::snprintf(b, sizeof b, "%016llx", (unsigned long long) v);
+    return b;
+}
+// the index text with its stamp line made right again (after a test edited a line on purpose)
+std::string restamp(const std::string& text) {
+    const size_t at = text.find("stamp ");
+    const size_t nl = text.find('\n', at);
+    return text.substr(0, at) + "stamp " + hex16(index_stamp(text)) + text.substr(nl);
+}
+void put_le(std::vector<uint8_t>& v, size_t off, uint64_t x, int n) {
+    for (int i = 0; i < n; ++i) v[off + (size_t) i] = (uint8_t) (x >> (8 * i));
+}
+
+// writes the files and the index for `sets` (the naive way: whole files in memory, row by row cuts).  `salt` changes the
+// heat counts, so two runs over the same experts differ in their index (and so their stamp) but not in any size.
 void write_parts(const std::string& dir, const Geo& g, const std::map<std::pair<int, int>, Expert>& ex, const std::vector<SetSpec>& sets,
-                 uint64_t hash) {
+                 uint64_t hash, int salt = 0) {
     fs::create_directories(dir);
-    std::string idx = "ep-parts 1\npack_hash " + [&] {
-        char b[32];
-        std::snprintf(b, sizeof b, "%016llx", (unsigned long long) hash);
-        return std::string(b);
-    }() + "\n";
-    idx += "geometry " + std::to_string(g.dim) + " " + std::to_string(g.ff) + " " + std::to_string(g.nl) + " " + std::to_string(g.ne) + " 256 4096\n";
-    std::string parts, heat;
-    std::set<std::pair<int, int>> heated;
+    std::string head = "ep-parts 1\npack_hash " + hex16(hash) + "\nstamp 0000000000000000\n";
+    head += "geometry " + std::to_string(g.dim) + " " + std::to_string(g.ff) + " " + std::to_string(g.nl) + " " + std::to_string(g.ne) + " 256 4096\n";
+    std::string files_txt, parts, heat;
+    std::set<std::pair<int, int>> heated, layers;
+    std::vector<std::vector<uint8_t>> files;
+    std::vector<std::string> names;
     for (size_t fi = 0; fi < sets.size(); ++fi) {
         const SetSpec& s = sets[fi];
         const std::string name = "ep-parts-" + std::to_string(s.a) + "-" + std::to_string(s.b) + ".bin";
-        std::vector<uint8_t> file;
+        std::vector<uint8_t> file(kAlign, 0);   // the header page, filled in once the stamp is known
         for (auto [l, e] : s.experts) {
+            layers.insert({l, 0});
             for (int kind = 0; kind < 3; ++kind) {
                 file.resize((file.size() + kAlign - 1) / kAlign * kAlign, 0);
                 const std::vector<uint8_t> p = cut(g, l, kind, ex.at({l, e}).m[kind], s.a, s.b);
@@ -122,15 +153,29 @@ void write_parts(const std::string& dir, const Geo& g, const std::map<std::pair<
                          std::to_string(rb) + " " + std::to_string(file.size()) + " " + std::to_string(p.size()) + "\n";
                 file.insert(file.end(), p.begin(), p.end());
             }
-            if (heated.insert({l, e}).second) heat += "heat " + std::to_string(l) + " " + std::to_string(e) + " " + std::to_string(1000 - (int) heated.size()) + "\n";
+            if (heated.insert({l, e}).second)
+                heat += "heat " + std::to_string(l) + " " + std::to_string(e) + " " + std::to_string(1000 - (int) heated.size() + salt) + "\n";
         }
         file.resize((file.size() + kAlign - 1) / kAlign * kAlign, 0);
-        idx += "file " + std::to_string(fi) + " " + name + " " + std::to_string(s.a) + " " + std::to_string(s.b) + " " + std::to_string(file.size()) + "\n";
-        std::ofstream f(dir + "/" + name, std::ios::binary | std::ios::trunc);
-        f.write((const char*) file.data(), (std::streamsize) file.size());
+        files_txt += "file " + std::to_string(fi) + " " + name + " " + std::to_string(s.a) + " " + std::to_string(s.b) + " " + std::to_string(file.size()) + "\n";
+        files.push_back(std::move(file));
+        names.push_back(name);
+    }
+    std::string covered = "covered";
+    for (auto& l : layers) covered += " " + std::to_string(l.first);
+    const std::string idx = restamp(head + covered + "\n" + files_txt + heat + parts);
+    const uint64_t stamp = index_stamp(idx);
+    for (size_t fi = 0; fi < files.size(); ++fi) {
+        std::memcpy(files[fi].data(), "EPPARTS1", 8);
+        put_le(files[fi], 8, stamp, 8);
+        put_le(files[fi], 16, fi, 4);
+        put_le(files[fi], 20, (uint64_t) sets[fi].a, 4);
+        put_le(files[fi], 24, (uint64_t) sets[fi].b, 4);
+        std::ofstream f(dir + "/" + names[fi], std::ios::binary | std::ios::trunc);
+        f.write((const char*) files[fi].data(), (std::streamsize) files[fi].size());
     }
     std::ofstream f(dir + "/ep-parts.txt", std::ios::binary | std::ios::trunc);
-    f << idx << heat << parts;
+    f << idx;
 }
 
 std::vector<std::pair<int, int>> all_experts(const Geo& g) {
@@ -250,6 +295,24 @@ void tiling_tests(const fs::path& root) {
 }
 
 // ---- an index or a file that does not hold together is refused with a reason, never read
+std::string slurp(const std::string& f) {
+    std::ifstream in(f, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+void spit(const std::string& f, const std::string& body) { std::ofstream(f, std::ios::binary | std::ios::trunc) << body; }
+
+// the index text with token `idx` of its last part line replaced (the stamp made right again, so only that field is wrong)
+std::string edit_last_part(const std::string& text, std::vector<std::pair<size_t, std::string>> edits, const std::string& append = "") {
+    const size_t at = text.rfind("part ");
+    std::istringstream in(text.substr(at));
+    std::vector<std::string> tok((size_t) 12);
+    for (auto& t : tok) in >> t;
+    for (auto& [idx, value] : edits) tok[idx] = value;
+    std::string line;
+    for (size_t i = 0; i < tok.size(); ++i) line += (i ? " " : "") + tok[i];
+    return restamp(text.substr(0, at) + line + append + "\n");
+}
+
 void refusal_tests(const fs::path& root) {
     const Geo g;
     const auto ex = make_experts(g);
@@ -258,6 +321,7 @@ void refusal_tests(const fs::path& root) {
     ep::Parts p;
     std::string err;
     CHECK(p.open(dir, err));
+    CHECK(p.stamp() != 0 && p.covers(0) && p.covers(g.nl - 1) && !p.covers(g.nl));
     p.close();
     CHECK(!p.open((root / "nowhere").string(), err) && !err.empty());
     // a file one byte short
@@ -270,29 +334,76 @@ void refusal_tests(const fs::path& root) {
         CHECK(p.open(dir, err));
         p.close();
     }
-    // an index with a part past its file's end, a bad kind, a bad header
-    auto slurp = [&](const std::string& f) {
-        std::ifstream in(f, std::ios::binary);
-        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    };
     const std::string good = slurp(dir + "/ep-parts.txt");
     auto with = [&](const std::string& body) {
-        std::ofstream(dir + "/ep-parts.txt", std::ios::binary | std::ios::trunc) << body;
+        spit(dir + "/ep-parts.txt", body);
         return p.open(dir, err);
     };
-    CHECK(!with("ep-parts 2\n" + good.substr(good.find('\n') + 1)));
-    {   // the last part's offset moved past its file's end
-        const size_t at = good.rfind("part ");
-        std::istringstream in(good.substr(at));
-        std::vector<std::string> tok((size_t) 12);
-        for (auto& t : tok) in >> t;
-        tok[10] = "99999999999";
-        std::string line;
-        for (size_t i = 0; i < tok.size(); ++i) line += (i ? " " : "") + tok[i];
-        CHECK(!with(good.substr(0, at) + line + "\n") && err.find("past") != std::string::npos);
+    // each of these changes one thing, and its stamp is made right again, so the reason is the field's own
+    auto refused = [&](const std::string& body, const char* why) {
+        const bool ok = !with(restamp(body));
+        const bool said = err.find(why) != std::string::npos;
+        if (!said) std::printf("  wanted '%s', got '%s'\n", why, err.c_str());
+        return ok && said;
+    };
+    CHECK(refused("ep-parts 2\n" + good.substr(good.find('\n') + 1), "not an ep-parts 1 index"));
+    CHECK(refused(good + "bogus 1\n", "unknown tag"));
+    CHECK(refused(good.substr(0, good.rfind("part ")) + "part 0 0 down 29 0 6 9 1 1 4096 1\n", "disagrees"));
+    CHECK(refused(edit_last_part(good, {{3, "sideways"}}), "out of range"));            // the kind
+    CHECK(refused(edit_last_part(good, {{10, "17592186044416"}}), "past"));                 // an offset past the file's end
+    CHECK(refused(edit_last_part(good, {{10, "18446744073709547520"}}), "past"));        // ... or one that would wrap offset + bytes
+    CHECK(refused(edit_last_part(good, {{10, "-4096"}}), "bad part line"));              // ... or a negative one
+    CHECK(refused(edit_last_part(good, {{10, "4097"}}), "not aligned"));
+    CHECK(refused(edit_last_part(good, {{10, "0"}}), "header page"));
+    CHECK(refused(edit_last_part(good, {{11, "1"}}), "disagrees"));                      // bytes != rows x row_bytes
+    CHECK(refused(edit_last_part(good, {{9, "199"}}) , "disagrees"));                    // down: row_bytes not a multiple of (b - a)
+    CHECK(refused(edit_last_part(good, {{1, "5"}}), "out of range"));                    // an expert the geometry lacks
+    CHECK(refused(edit_last_part(good, {{0, "part"}}, " extra"), "bad part line"));      // a token too many
+    CHECK(refused(good + "heat 0 0 1 2\n", "bad heat line"));
+    {   // a part of a layer the covered line leaves out
+        std::string t = good;
+        const size_t at = t.find("covered ");
+        t.replace(at, t.find('\n', at) - at, "covered 0 1");
+        CHECK(refused(t, "does not cover"));
     }
-    CHECK(!with(good + "part 0 0 sideways 29 0 6 9 1 1 0 1\n"));
-    CHECK(!with(good + "bogus 1\n"));
+    {   // lines in the wrong order: a part before the geometry
+        const size_t gat = good.find("geometry ");
+        const size_t gend = good.find('\n', gat) + 1;
+        std::string t = good.substr(0, gat) + good.substr(good.rfind("part ")) + good.substr(gat, gend - gat);
+        CHECK(!with(restamp(t)));
+    }
+    // an index edited by hand (the stamp no longer matches), and files and index from different runs
+    {
+        std::string t = good;
+        const size_t at = t.find("heat ");
+        t[t.find(' ', t.find(' ', at + 5) + 1) + 1] = '7';   // the first heat line's count
+        CHECK(!with(t) && err.find("stamp") != std::string::npos);
+        CHECK(with(good));
+        p.close();
+    }
+    {
+        const std::string other = (root / "ref2").string();
+        write_parts(other, g, ex, {{6, 9, all_experts(g)}}, 99, 1);   // another run: same sizes, other heat counts
+        CHECK(fs::file_size(other + "/ep-parts-6-9.bin") == fs::file_size(dir + "/ep-parts-6-9.bin"));
+        CHECK(slurp(other + "/ep-parts.txt") != good);
+        const std::string mine = slurp(dir + "/ep-parts-6-9.bin");
+        spit(dir + "/ep-parts-6-9.bin", slurp(other + "/ep-parts-6-9.bin"));    // the new run's file under the old index
+        CHECK(!p.open(dir, err) && err.find("another run") != std::string::npos);
+        spit(dir + "/ep-parts-6-9.bin", mine);
+        CHECK(p.open(dir, err));
+        p.close();
+        spit(dir + "/ep-parts.txt", slurp(other + "/ep-parts.txt"));            // ... and the other way round
+        CHECK(!p.open(dir, err) && err.find("another run") != std::string::npos);
+        spit(dir + "/ep-parts.txt", good);
+        // a file with no header
+        std::string raw = mine;
+        raw[0] = 'X';
+        spit(dir + "/ep-parts-6-9.bin", raw);
+        CHECK(!p.open(dir, err) && err.find("EPPARTS1") != std::string::npos);
+        spit(dir + "/ep-parts-6-9.bin", mine);
+        CHECK(p.open(dir, err));
+        p.close();
+    }
     // CRLF index (a pack written on Windows): read the same
     {
         std::string crlf;
@@ -302,8 +413,45 @@ void refusal_tests(const fs::path& root) {
         }
         CHECK(with(crlf));
         CHECK(p.pack_hash() == 99);
+        p.close();
     }
     CHECK(with(good));
+    p.close();
+}
+
+// ---- parts that cannot be joined are not: another type in one part, another layer set
+void layout_tests(const fs::path& root) {
+    const Geo g;
+    const auto ex = make_experts(g);
+    // two sets for one expert, the second one's type changed in the index (a layer of another layout cut into the same pack)
+    const std::string dir = (root / "mixed").string();
+    write_parts(dir, g, ex, {{6, 9, all_experts(g)}, {0, 6, {{0, 0}}}}, 5);
+    ep::Parts p;
+    std::string err;
+    CHECK(p.open(dir, err) && p.whole(0, 0) && p.whole(0, 1) == false);
+    p.close();
+    const std::string good = slurp(dir + "/ep-parts.txt");
+    spit(dir + "/ep-parts.txt", edit_last_part(good, {{4, "16"}}));   // the pool's down part now says IQ2_XXS (16); layer 0's down is IQ2_XS... or the same
+    CHECK(p.open(dir, err));
+    const bool same = std::string("16") == std::to_string(kTypes[g.ty[0][2]].id);
+    CHECK(p.whole(0, 0) == same);                                  // a different type: the parts do not join
+    uint8_t buf[8];
+    CHECK(same || !p.assemble(0, 0, ep::kDown, buf));
+    p.close();
+    spit(dir + "/ep-parts.txt", edit_last_part(good, {{9, "199"}}));
+    CHECK(!p.open(dir, err));
+    // a parts pack of one layer: the others have no view, no whole, no assemble
+    const std::string one = (root / "onelayer").string();
+    std::vector<std::pair<int, int>> l1;
+    for (int e = 0; e < g.ne; ++e) l1.push_back({1, e});
+    write_parts(one, g, ex, {{0, 9, l1}}, 5);
+    CHECK(p.open(one, err));
+    CHECK(p.covers(1) && !p.covers(0) && !p.covers(2));
+    ep::View v;
+    CHECK(p.view(1, 0, ep::kGate, 4, v) && !p.view(0, 0, ep::kGate, 4, v) && !p.view(2, 0, ep::kGate, 4, v));
+    CHECK(p.whole(1, 0) && !p.whole(0, 0));
+    CHECK(!p.assemble(0, 0, ep::kGate, buf));
+    p.close();
 }
 
 // ---- the real pack (args)
@@ -420,7 +568,6 @@ int real_pack(const std::string& pack, const std::string& parts, const std::stri
                 }
                 if (!same) std::printf("FAIL layer %d expert %d kind %d view k=%d\n", en.layer, en.expert, kind, k);
                 CHECK(same);
-                break;   // (one view per part is enough: k is the part's first block, the next parts follow)
             }
             if (p.whole_bytes(en.layer, en.expert, kind) != 0) {
                 std::vector<uint8_t> got(orig.size(), 0xCD);
@@ -433,7 +580,7 @@ int real_pack(const std::string& pack, const std::string& parts, const std::stri
             }
         }
     }
-    std::printf("real pack: %zu experts looked at, %zu part views, %zu whole experts assembled\n", done.size(), n_parts, n_whole);
+    std::printf("real pack: %zu experts looked at, %zu slice views (every k that has a part: the stored start and the in-place k inside it), %zu whole experts assembled\n", done.size(), n_parts, n_whole);
     return fails == 0 ? 0 : 1;
 }
 
@@ -445,11 +592,16 @@ int main(int argc, char** argv) {
         std::printf("%s\n", rc == 0 ? "ds4_epparts_test (real pack): all passed" : "ds4_epparts_test (real pack): FAILED");
         return rc;
     }
-    const fs::path root = fs::temp_directory_path() / ("ds4_epparts_test_" + std::to_string((unsigned long long) std::time(nullptr)));
-    fs::create_directories(root);
+    // (a folder of its own: the clock in nanoseconds, and a taken name is skipped - two runs in one second do not meet)
+    fs::path root;
+    for (unsigned long long n = (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();; ++n) {
+        root = fs::temp_directory_path() / ("ds4_epparts_test_" + std::to_string(n));
+        if (fs::create_directories(root)) break;
+    }
     roundtrip_tests(root);
     tiling_tests(root);
     refusal_tests(root);
+    layout_tests(root);
     std::error_code ec;
     fs::remove_all(root, ec);
     std::printf("%s\n", fails == 0 ? "ds4_epparts_test: all passed" : "ds4_epparts_test: FAILED");
