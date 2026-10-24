@@ -42,6 +42,9 @@ int main(int argc, char** argv) {
     const int got = a.recv(h, q, rx::now_ms() + 1000.0, e);
     const double r1 = rx::now_ms(), a1 = a.arrival_ms();
     check(got == 1 && h.seq == 1 && q.size() == p.size(), "the message came whole");
+#if defined(__linux__)
+    check(a1 >= 0, "Linux: the kernel gave the read its arrival time (SO_TIMESTAMPNS)");
+#endif
     if (a1 < 0) {
         std::printf("no kernel arrival time here (not Linux): arrival_ms -1, the engine times the read\n");
     } else {
@@ -55,7 +58,8 @@ int main(int argc, char** argv) {
         const double s3 = rx::now_ms();
         b.send(rx::Ping, 3, 0, 0, 0, p.data(), p.size(), e);
         sleep_ms(30);
-        a.recv(h, q, rx::now_ms() + 1000.0, e);
+        const int g2 = a.recv(h, q, rx::now_ms() + 1000.0, e);
+        check(g2 == 1 && h.seq == 2, "the first of the two came first");
         const double a2 = a.arrival_ms();
         const int g3 = a.recv(h, q, rx::now_ms() + 1000.0, e);
         const double a3 = a.arrival_ms();

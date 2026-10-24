@@ -6724,7 +6724,7 @@ struct Model::Impl {
         const int got = rx_on ? rx_link->wait_resp(seq, rows, deadline, &y, srv_us, e) : -1;
         const double t1 = rx::now_ms();
         const double ta = got == 1 ? rx_link->arrival_ms() : -1.0;   // (the kernel's time the reply came in: Linux)
-        if (ta >= t0) rx_gate.rtt_seen(rows, ta - t0);
+        if (ta >= t0 && ta <= t1) rx_gate.rtt_seen(rows, ta - t0);   // (outside: the realtime clock stepped)
         else if (got >= 0) rx_gate.rtt_seen(rows, t1 - t0, t1 - tw > 0.05);   // (read within 50 us of the lane's part: there already)
         st.rx_wait_ms += t1 - tw;
         st.rx_bytes_out = (int64_t) rx_link->bytes_out();
@@ -6734,7 +6734,7 @@ struct Model::Impl {
             if (rx_rtt.size() < (size_t(1) << 22)) {   // (4M requests: the percentiles are of the first ones after)
                 rx_rtt.push_back(got == 1 ? (float) (t1 - t0) : -1.0f);
                 rx_wait.push_back((float) (t1 - tw));
-                rx_arr.push_back(ta >= t0 ? (float) (ta - t0) : -1.0f);
+                rx_arr.push_back(ta >= t0 && ta <= t1 ? (float) (ta - t0) : -1.0f);
             }
         }
         if (got == 1) {
