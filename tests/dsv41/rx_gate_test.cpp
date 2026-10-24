@@ -68,6 +68,22 @@ int main() {
         g.rtt_seen(1, 2.0, true);
         check(g.rtt[1] > 1.1, "a reply the lane waited 2 ms for raises it");
     }
+    {
+        // one 27 ms reply (the 1 GbE T=4 max) among 0.8 ms ones: the gate's next windows go out as before
+        rx::Gate g;
+        g.pick_seen(1, 0.27);
+        for (int i = 0; i < 10; ++i) g.rtt_seen(1, 0.8);
+        check(g.send(1, 1, 1, 4), "0.8 ms learned: a T=1 window with 1 remote pick and 4 own goes out (1.35 ms)");
+        g.rtt_seen(1, 27.0);
+        check(g.rtt[1] < 0.8 * 1.25, "a 27 ms spike counts as 3 x 0.8 ms: the estimate 0.96, not 3.42");
+        bool all = true;
+        for (int i = 0; i < 8; ++i) all = all && g.send(1, 1, 1, 4);
+        check(all, "and the next windows still go out");
+        rx::Gate f;   // (before 4 samples: no clamp - the first ones set the scale)
+        f.rtt_seen(1, 0.8);
+        f.rtt_seen(1, 27.0);
+        check(near(f.rtt[1], 0.9 * 0.8 + 2.7), "the second sample is taken as it is");
+    }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;
 }
