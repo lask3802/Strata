@@ -2184,6 +2184,7 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     if (ckv_fmt == kKvFp4 && a.gen == 0 && T >= 1 && T <= kSplitMaxT && heads % kSplitG == 0 && split_flag()) {
         int total_max = 0;
         for (int t = 0; t < T; ++t) total_max = std::max(total_max, a.nwin[t] + a.nsel[t]);
+        static std::atomic<bool> told{false};   // (the first fallback is said, once)
         if (total_max > 0 && total_max <= kSplitCap * kSplitR) {
             const attnsplit::AttnSplitScratch sc = split_scratch(s, heads);
             if (sc.part != nullptr) {
@@ -2192,6 +2193,12 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
                                                                sel_stride, a, sink, heads, T, scale, out, sc, total_max, s);
                 return;
             }
+            if (!told.exchange(true))
+                std::fprintf(stderr, "ds4 attn split: its scratch (%zu MB) could not be allocated - the old kernel instead\n",
+                             (size_t) kSplitMaxT * heads * kSplitCap * 514 * sizeof(float) >> 20);
+        } else if (total_max > 0 && !told.exchange(true)) {
+            std::fprintf(stderr, "ds4 attn split: %d rows a query, above its %d - the old kernel instead\n", total_max,
+                         kSplitCap * kSplitR);
         }
     }
     // a few queries (a decode step, a short window): their selected rows decoded once a query into the scratch, then

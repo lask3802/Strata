@@ -2059,11 +2059,6 @@ struct Model::Impl {
                 return false;
             }
             CK(cudaMemGetInfo(&d.free0, &d.total));
-            if (u9::on(u9::kHc)) {   // (after free0: the plan's free VRAM is the old path's)
-                CK(cudaStreamCreateWithFlags(&d.st2, cudaStreamNonBlocking));
-                CK(cudaEventCreateWithFlags(&d.ev_fork, cudaEventDisableTiming));
-                CK(cudaEventCreateWithFlags(&d.ev_join, cudaEventDisableTiming));
-            }
         }
         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
@@ -3048,6 +3043,15 @@ struct Model::Impl {
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
+        // U9 hc's side stream and events, made last: the plan, the read-ahead, the placement and the load's report all
+        // read the free VRAM before them, as the old path's do
+        if (u9::on(u9::kHc))
+            for (Dev& d : devs) {
+                CK(cudaSetDevice(d.id));
+                CK(cudaStreamCreateWithFlags(&d.st2, cudaStreamNonBlocking));
+                CK(cudaEventCreateWithFlags(&d.ev_fork, cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&d.ev_join, cudaEventDisableTiming));
+            }
         reset();
         return true;
     }
