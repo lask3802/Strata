@@ -27,7 +27,8 @@
 #        sequence: the chunks' check below); FLOOR_VRAM (with LONG: the noise floor - one process once more, every
 #        row's logits, the same chunks, with --vram-experts FLOOR_VRAM, another placement; the split's rule is then
 #        the floor's: mean KL <= max(KL_MAX, FLOOR_X (1.5) x the floor's), top-1 >= the floor's less FLOOR_TOP (0.05)
-#        of the positions, in place of TOP1_MIN); PYTHON (python3)
+#        of the positions, in place of TOP1_MIN); LONG_LOGITS (1; 0: with LONG, the prompts' speeds only - no every-row
+#        logits runs, no floor, no comparison); PYTHON (python3)
 #
 # Both processes read the experts in place (--mmap-experts on: the files' page cache, shared by both, no copies in
 # RAM), with no SSD store, a fixed placement (--no-expert-cache, and an expert profile file of each process's own in
@@ -66,7 +67,7 @@
 # through to both split processes (debugging only - nothing here sets it).
 set -u
 if [ $# -lt 3 ]; then
-    sed -n '2,66p' "$0"
+    sed -n '2,67p' "$0"
     exit 2
 fi
 exe=$1
@@ -81,6 +82,7 @@ vram=${VRAM_EXPERTS:-0.3}
 thr=${CPU_THREADS:-$(( $(nproc) / 2 > 0 ? $(nproc) / 2 : 1 ))}
 eg_mb=${ENGRAM_MB:-64}
 chunk=${CHUNK:-1024}
+long_logits=${LONG_LOGITS:-1}
 py=${PYTHON:-python3}
 mkdir -p "$out"
 export STRATA_STAGE_TOKEN=${STRATA_STAGE_TOKEN:-loopback-$$-$RANDOM$RANDOM}
@@ -243,9 +245,11 @@ if [ -n "${IDS:-}" ]; then
 fi
 if [ -n "$long" ]; then
     echo "== a long prompt ($nlong tokens) in chunks of $chunk: the split, then one process"
-    "$main" --max-context "$ctx" --dspark none --n 16 --ids "@$long" --window "$nlong" --dump-logits "$out/split-long.f32" \
-        > "$out/split-long.out" 2> "$out/split-long.err"
-    s=$?; echo "split (every row's logits) rc=$s"; [ $s -eq 0 ] || rc=1
+    if [ "$long_logits" != 0 ]; then
+        "$main" --max-context "$ctx" --dspark none --n 16 --ids "@$long" --window "$nlong" --dump-logits "$out/split-long.f32" \
+            > "$out/split-long.out" 2> "$out/split-long.err"
+        s=$?; echo "split (every row's logits) rc=$s"; [ $s -eq 0 ] || rc=1
+    fi
     "$main" --max-context "$ctx" --dspark none --n 16 --ids "@$long" > "$out/split-speed.out" 2> "$out/split-speed.err"
     s=$?; echo "split (the prompt's speed) rc=$s"; [ $s -eq 0 ] || rc=1
     grep -h 'chunks of\|remote stage 127' "$out/split-speed.err" | head -2 | sed 's/^/  /'
@@ -299,14 +303,18 @@ if [ -n "${IDS:-}" ]; then
     same split single
     compare "$out/split.f32" "$out/single.f32" 0 || rc=1
 fi
-if [ -n "$long" ]; then
+if [ -n "$long" ] && [ "$long_logits" != 0 ]; then
     DS4_YOCO=0 DS4_PATH_PICK=0 "$exe" "${common[@]}" --expert-profile "$(prof single-long)" --max-context "$ctx" \
         --prefill-chunk "$chunk" --dspark none --n 16 --ids "@$long" --window "$nlong" --dump-logits "$out/single-long.f32" \
         > "$out/single-long.out" 2> "$out/single-long.err"
     s=$?; echo "single (every row's logits) rc=$s"; [ $s -eq 0 ] || rc=1
+fi
+if [ -n "$long" ]; then
     DS4_YOCO=0 DS4_PATH_PICK=0 "$exe" "${common[@]}" --expert-profile "$(prof single-speed)" --max-context "$ctx" \
         --prefill-chunk "$chunk" --dspark none --n 16 --ids "@$long" > "$out/single-speed.out" 2> "$out/single-speed.err"
     s=$?; echo "single (the prompt's speed) rc=$s"; [ $s -eq 0 ] || rc=1
+fi
+if [ -n "$long" ] && [ "$long_logits" != 0 ]; then
     floor=
     if [ -n "${FLOOR_VRAM:-}" ]; then   # the noise floor: one process at another placement, the same chunks
         DS4_YOCO=0 DS4_PATH_PICK=0 "$exe" "${common[@]}" --vram-experts "$FLOOR_VRAM" --expert-profile "$(prof floor-long)" \
@@ -320,6 +328,8 @@ if [ -n "$long" ]; then
     done
     same split-long single-long
     compare "$out/split-long.f32" "$out/single-long.f32" "$nlong" $floor || rc=1
+fi
+if [ -n "$long" ]; then
     echo "  tokens after the prompt (speed runs): $(cmp -s <(grep -h '^[0-9]' "$out/split-speed.out") \
         <(grep -h '^[0-9]' "$out/single-speed.out") && echo IDENTICAL || echo DIFFER)"
     echo "  split:  $(speed split-speed)"
