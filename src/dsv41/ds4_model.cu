@@ -464,6 +464,9 @@ struct Dev {
     // U9 hc: a sublayer's hc_mix / hc_split beside st (forked after the residual is final, joined before its hc_post)
     cudaStream_t st2 = nullptr;
     cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
+    // U9 route: the bytes the F32 router copies would have taken beyond the BF16 rows, still charged to the experts'
+    // VRAM budget (the same placement as the F32 path: the A/B compares the kernels, not a different expert split)
+    size_t u9_held = 0;
     size_t free0 = 0, total = 0, weights = 0, experts = 0, caches = 0, scratch = 0;
     std::vector<void*> allocs;
     // a window's scratch, rows of up to kWin tokens (the routed experts' rows: kWin * kPicks)
@@ -1689,6 +1692,7 @@ struct Model::Impl {
             return false;
         }
         if (!dalloc(d, l.gate_bf, want, err, acct)) return false;
+        d.u9_held += align256(want * 4) - align256(want * 2);
         cudaSetDevice(d.id);
         CK(cudaMemcpy(l.gate_bf, raw.data(), t->bytes, cudaMemcpyHostToDevice));
         return true;
@@ -2049,9 +2053,11 @@ struct Model::Impl {
             CK(cudaSetDevice(d.id));
             CK(cudaStreamCreateWithFlags(&d.st, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming));
-            CK(cudaStreamCreateWithFlags(&d.st2, cudaStreamNonBlocking));
-            CK(cudaEventCreateWithFlags(&d.ev_fork, cudaEventDisableTiming));
-            CK(cudaEventCreateWithFlags(&d.ev_join, cudaEventDisableTiming));
+            if (u9::on(u9::kHc)) {
+                CK(cudaStreamCreateWithFlags(&d.st2, cudaStreamNonBlocking));
+                CK(cudaEventCreateWithFlags(&d.ev_fork, cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&d.ev_join, cudaEventDisableTiming));
+            }
             if (!x3::prepare(d.st) || (pk.gguf && !gg::prepare(d.st))) {
                 err = "exl3 scratch on CUDA" + std::to_string(d.id);
                 return false;
@@ -2867,6 +2873,7 @@ struct Model::Impl {
                 cudaSetDevice(d.id);
                 size_t fr = 0, tot = 0;
                 CK(cudaMemGetInfo(&fr, &tot));
+                fr -= std::min(fr, d.u9_held);   // (U9 route: the F32 path's room)
                 room += std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
             }
             for (const Layer& l : L) all += (double) l.blob * l.n_exp;
@@ -4083,6 +4090,7 @@ struct Model::Impl {
                 cudaSetDevice(devs[(size_t) m].id);
                 size_t fr = 0, tot = 0;
                 CK(cudaMemGetInfo(&fr, &tot));
+                fr -= std::min(fr, devs[(size_t) m].u9_held);
                 budget = std::min(budget, std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20))) *
                                               o.vram_experts);
                 charged = charged || commit_charged(devs[(size_t) m]);
@@ -9198,7 +9206,7 @@ struct Model::Impl {
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
         // U9 hc: a sublayer's hc_mix / hc_split on st2, beside its other kernels (the pre-norm reads the previous
         // sublayer's pre, so only hc_post needs them: it waits for ev_join)
-        const bool hc2 = nm == 1 && u9::on(u9::kHc);
+        const bool hc2 = nm == 1 && d.st2 != nullptr;   // (made when kHc is on)
         cudaStream_t sx = hc2 ? d.st2 : s;
         prof_mark(d, 0);
         // Engram

@@ -161,7 +161,7 @@ float* xbuf(size_t n) {
 void test_quant(cudaStream_t s) {
     const int D = 4096, Q = 1024, HD = 512, HQ = 8 * 4096, OL = 1024, FF = 2048;
     M wq_a(gg::kFmtQ8_0, D, Q), wkv(gg::kFmtQ8_0, D, HD), cw(gg::kFmtBF16, D, HD);
-    M s1(gg::kFmtGG, D, FF), s3(gg::kFmtGG, D, FF), wq_b(gg::kFmtGG, Q, 768);
+    M s1(gg::kFmtGG, D, FF), s3(gg::kFmtGG, D, FF), wq_b(gg::kFmtGG, Q, 768), q8b(gg::kFmtQ8_0, Q, 768);
     std::vector<M*> wo;
     for (int g = 0; g < 8; ++g) wo.push_back(new M(gg::kFmtGG, HQ / 8, OL));
     for (int T : {1, 3}) {
@@ -205,6 +205,15 @@ void test_quant(cudaStream_t s) {
                               job(wq_b, xs + 3 * Q, sg, T, cs, FF),
                               job(wq_b, xs, su, T, cs, FF)};
             gg::mv(j, 6, s);
+        }, s);
+        // Q8_0 jobs whose x follow at a stride (one launch; the Q8_0 kernel reads the scales in pairs) and a repeat
+        std::snprintf(what, sizeof(what), "quant: Q8_0 slices at a stride and a repeat (T %d)", T);
+        ab(what, u9::kQuant, out, [&] {
+            const size_t cs = (size_t) 8 * Q;
+            x3::MvJob j[4] = {job(q8b, xs, q2, T, cs, 4 * 768), job(q8b, xs + 2 * Q, q2 + 768, T, cs, 4 * 768),
+                              job(q8b, xs + 4 * Q, q2 + 2 * 768, T, cs, 4 * 768),
+                              job(q8b, xs + 2 * Q, q2 + 3 * 768, T, cs, 4 * 768)};
+            gg::mv(j, 4, s);
         }, s);
         for (auto& b : out.b) CU(cudaFree(b.first));
         CU(cudaFree(x));

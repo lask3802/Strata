@@ -29,6 +29,9 @@ inline unsigned& mask() {   // (a test sets it to compare both paths in one proc
         for (const auto& it : items) v |= it.bit;
         const char* all = std::getenv("DS4_U9");
         if (all != nullptr && std::atoi(all) == 0) v = 0;
+#if defined(STRATA_USE_HIP)
+        if (all == nullptr || std::atoi(all) != 1) v = 0;   // (measured on CUDA only: HIP keeps the old path unless DS4_U9=1)
+#endif
         const char* off = std::getenv("DS4_U9_OFF");
         for (const char* p = off; p != nullptr && *p != '\0';) {
             const char* e = std::strchr(p, ',');

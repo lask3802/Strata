@@ -1967,7 +1967,13 @@ void route_fused(const float* logits, const float* bias, int n, int k, int T, fl
         cudaGetDevice(&dev);
         std::lock_guard<std::mutex> lk(mu);
         unsigned*& c = cnts[{dev, s}];
-        if (c == nullptr && cudaMalloc((void**) &c, sizeof(unsigned)) == cudaSuccess) cudaMemsetAsync(c, 0, sizeof(unsigned), s);
+        if (c == nullptr) {
+            if (cudaMalloc((void**) &c, sizeof(unsigned)) == cudaSuccess) cudaMemsetAsync(c, 0, sizeof(unsigned), s);
+            else {
+                cudaGetLastError();   // (no counter: the separate launches below; the error not left for a check)
+                c = nullptr;
+            }
+        }
         cnt = c;
     }
     if (req != nullptr && cnt == nullptr) {   // (no counter: the separate launches)
