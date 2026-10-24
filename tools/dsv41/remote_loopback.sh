@@ -28,7 +28,8 @@
 #        row's logits, the same chunks, with --vram-experts FLOOR_VRAM, another placement; the split's rule is then
 #        the floor's: mean KL <= max(KL_MAX, FLOOR_X (1.5) x the floor's), top-1 >= the floor's less FLOOR_TOP (0.05)
 #        of the positions, in place of TOP1_MIN); LONG_LOGITS (1; 0: with LONG, the prompts' speeds only - no every-row
-#        logits runs, no floor, no comparison); PYTHON (python3)
+#        logits runs, no floor, no comparison, and the single process's speed run with the engine's defaults, not
+#        DS4_YOCO=0 DS4_PATH_PICK=0); PYTHON (python3)
 #
 # Both processes read the experts in place (--mmap-experts on: the files' page cache, shared by both, no copies in
 # RAM), with no SSD store, a fixed placement (--no-expert-cache, and an expert profile file of each process's own in
@@ -67,7 +68,7 @@
 # through to both split processes (debugging only - nothing here sets it).
 set -u
 if [ $# -lt 3 ]; then
-    sed -n '2,67p' "$0"
+    sed -n '2,68p' "$0"
     exit 2
 fi
 exe=$1
@@ -310,7 +311,10 @@ if [ -n "$long" ] && [ "$long_logits" != 0 ]; then
     s=$?; echo "single (every row's logits) rc=$s"; [ $s -eq 0 ] || rc=1
 fi
 if [ -n "$long" ]; then
-    DS4_YOCO=0 DS4_PATH_PICK=0 "$exe" "${common[@]}" --expert-profile "$(prof single-speed)" --max-context "$ctx" \
+    # (LONG_LOGITS=0, speed only: one process as the engine runs it by default - its skip and its own path pick)
+    pin=(DS4_YOCO=0 DS4_PATH_PICK=0)
+    [ "$long_logits" != 0 ] || pin=()
+    env ${pin[@]+"${pin[@]}"} "$exe" "${common[@]}" --expert-profile "$(prof single-speed)" --max-context "$ctx" \
         --prefill-chunk "$chunk" --dspark none --n 16 --ids "@$long" > "$out/single-speed.out" 2> "$out/single-speed.err"
     s=$?; echo "single (the prompt's speed) rc=$s"; [ $s -eq 0 ] || rc=1
 fi
