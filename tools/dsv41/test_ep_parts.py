@@ -17,9 +17,10 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import ep_parts as ep  # noqa: E402
 
-DIM, FF, NL, NE = 512, 2304, 3, 6
+DIM, FF, NL, NE = 512, 2304, 4, 6
 # per layer: gate / up / down ggml types (a mix, so every type and a mixed layer are in the pack)
-TYPES = (("IQ1_M", "IQ1_M", "IQ2_XXS"), ("IQ2_XXS", "IQ2_XXS", "IQ2_XS"), ("IQ2_XS", "IQ2_XS", "IQ1_M"))
+TYPES = (("IQ1_M", "IQ1_M", "IQ2_XXS"), ("IQ2_XXS", "IQ2_XXS", "IQ2_XS"), ("IQ2_XS", "IQ2_XS", "IQ1_M"),
+         ("MXFP4", "MXFP4", "MXFP4"))
 
 
 def make_pack(root, seed=1, crlf=False):
@@ -41,7 +42,7 @@ def make_pack(root, seed=1, crlf=False):
         for l in range(NL):
             for kind in (0, 2, 1):                  # (the real pack lists w1, w2, w3: per matrix, all experts in a row)
                 m = ep.Matrix(l, kind, TYPES[l][kind], FF if kind < 2 else DIM, DIM if kind < 2 else FF,
-                              (FF if kind < 2 else DIM) * ((DIM if kind < 2 else FF) // 256) * ep.TYPES[TYPES[l][kind]][2])
+                              (FF if kind < 2 else DIM) * ((DIM if kind < 2 else FF) // ep.TYPES[TYPES[l][kind]][1]) * ep.TYPES[TYPES[l][kind]][2])
                 for e in range(NE):
                     buf = rng.randbytes(m.nbytes)
                     orig[(l, e, kind)] = buf

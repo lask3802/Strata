@@ -42,7 +42,7 @@ struct Ty {
     const char* name;
     int id, bytes;   // a 256-value block's bytes
 };
-const Ty kTypes[] = {{"IQ1_M", 29, 56}, {"IQ2_XXS", 16, 66}, {"IQ2_XS", 17, 74}};
+const Ty kTypes[] = {{"IQ1_M", 29, 56}, {"IQ2_XXS", 16, 66}, {"IQ2_XS", 17, 74}, {"MXFP4", 39, 136}};
 
 uint64_t rng_state = 0x9e3779b97f4a7c15ull;
 uint8_t rnd() {
@@ -62,9 +62,9 @@ struct Expert {
     std::vector<uint8_t> m[3];
 };
 struct Geo {
-    int dim = 512, ff = 2304, nl = 3, ne = 5;
+    int dim = 512, ff = 2304, nl = 4, ne = 5;
     int nb() const { return ff / kUnit; }
-    int ty[3][3] = {{0, 0, 1}, {1, 1, 2}, {2, 2, 0}};   // per layer: gate, up, down -> kTypes index
+    int ty[4][3] = {{0, 0, 1}, {1, 1, 2}, {2, 2, 0}, {3, 3, 3}};   // per layer: gate, up, down -> kTypes index
     size_t row_bytes(int l, int kind) const { return (size_t) (kind == 2 ? ff : dim) / kUnit * kTypes[ty[l][kind]].bytes; }
     size_t rows(int kind) const { return (size_t) (kind == 2 ? dim : ff); }
 };
