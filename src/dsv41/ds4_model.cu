@@ -7376,6 +7376,11 @@ struct Model::Impl {
         const int T = run.T[(size_t) k];
         return logits_all ? 0 : k + 1 == (int) run.T.size() ? T - n_logits : T;
     }
+    // where chunk k's row 0 sits in the main process's buffer of replies (rx): the run's rows with every row's logits,
+    // else one chunk's - only the last chunk's reply has rows then, and every other's writes none
+    size_t link_rx_row(const Run& run, int k) const {
+        return logits_all ? (size_t) (run.p0[(size_t) k] - run.p0[0]) : 0;
+    }
     // chunk k through this process's last layer (device d, its chunk state c).  The worker: its rows from stage_skip on
     // into stage_out, row by row (streams, then pre).  The main process: its rows into slot k % 2 - the send two chunks
     // back is out (the one before this one waited for it) - and to the worker on the link's thread, once the chunk
@@ -7415,9 +7420,10 @@ struct Model::Impl {
         link_cv.notify_all();
         return true;
     }
-    // (the main process) the head over the worker's rows of the run - rx: the run's rows from its first, row by row -
-    // as the head group's device runs it after the last layer (chunk by chunk, 16 rows at a time, with every row's
-    // logits; else the last chunk's last n_logits rows)
+    // (the main process) the head over the worker's rows of the run - rx, row by row: with every row's logits the
+    // run's rows from its first, else the last chunk's from its first (link_rx_row) - as the head group's device runs
+    // it after the last layer (chunk by chunk, 16 rows at a time, with every row's logits; else the last chunk's last
+    // n_logits rows)
     bool link_head(const Run& run, const float* rx, std::string& err) {
         Dev& d = devs[(size_t) head_dev];
         Chunk& c = *chunks[(size_t) head_dev];
@@ -7446,7 +7452,7 @@ struct Model::Impl {
                 }
             }
         } else if (n_logits > 0) {
-            if (!rows(run.p0.back() + run.T.back() - n_logits - run.p0[0], n_logits)) return false;
+            if (!rows(run.T.back() - n_logits, n_logits)) return false;
             hc_pre_norm(c.h, c.pre, d.norm_w, D, H, n_logits, g.eps, d.x, s);
             if (!head_share(d, d.mi, d.x, n_logits, err)) return false;
         }
@@ -8229,14 +8235,16 @@ struct Model::Impl {
             }
         } lm_end_{this, lm};
         // (a remote stage's main process) the worker's replies on a thread of their own, each once its chunk is out,
-        // into rx: the run's rows from its first, row by row (committed only where a reply writes).  Every way out of a
-        // run that did not take them all shuts the link - the worker's state is then unknown (stage_lost)
+        // into rx, row by row (link_rx_row: the run's rows with every row's logits, else the longest chunk's).  A reply
+        // that fails ends the devices' run (failed, as a Stop does); every way out of a run that did not take them all
+        // shuts the link - the worker's state is then unknown (stage_lost)
         struct LinkRx {
             Impl* p;
             float* rx = nullptr;
             size_t bytes = 0;
             std::thread th;
             std::atomic<int> got{0};
+            std::atomic<bool> failed{false};   // (set once err is: the thread then returns)
             bool ok = true, open = false;
             std::string err, why;
             ~LinkRx() {
@@ -8259,7 +8267,9 @@ struct Model::Impl {
                 err = "remote stage: no link for prompt chunks";
                 return false;
             }
-            lrx.bytes = (size_t) n * (size_t) handoff_floats() * 4;
+            int rows = 0;
+            for (const int T : run.T) rows = std::max(rows, T);
+            lrx.bytes = (size_t) (logits_all ? n : rows) * (size_t) handoff_floats() * 4;
             lrx.rx = (float*) os::anon_alloc(lrx.bytes, -1, 1);
             if (lrx.rx == nullptr) {
                 err = "remote stage: " + std::to_string(lrx.bytes >> 20) + " MiB of memory for the worker's replies";
@@ -8281,12 +8291,14 @@ struct Model::Impl {
                         if (link_sent <= (int) k) {
                             lrx.ok = false;
                             lrx.err = "remote stage: the run ended before its chunk " + std::to_string(k) + " was sent";
+                            lrx.failed.store(true, std::memory_order_release);
                             return;
                         }
                     }
-                    if (!stage_chunks.recv(lrx.rx + (size_t) (run.p0[k] - run.p0[0]) * W, run.T[k], link_skip(run, (int) k),
+                    if (!stage_chunks.recv(lrx.rx + link_rx_row(run, (int) k) * W, run.T[k], link_skip(run, (int) k),
                                            lrx.err)) {
                         lrx.ok = false;
+                        lrx.failed.store(true, std::memory_order_release);
                         return;
                     }
                     lrx.got.store((int) k + 1, std::memory_order_release);
@@ -8311,7 +8323,8 @@ struct Model::Impl {
         for (;;) {
             bool all = true;
             for (auto& w : workers) all = all && w->idle();
-            if (!all && !halting && cancel && cancel()) {   // a Stop: the devices end the run early
+            if (!all && !halting && ((cancel && cancel()) || lrx.failed.load(std::memory_order_acquire))) {
+                // a Stop, or a worker's reply that failed: the devices end the run early
                 halting = true;
                 std::lock_guard<std::mutex> lk(halt_mu);
                 halt_k = halt_seen + 1;
@@ -8338,7 +8351,7 @@ struct Model::Impl {
             for (const std::string& e : errs) fine = fine && e.empty();
             std::string e;
             if (fine && !stage_chunks.wait(e)) fine = false;
-            if (fine) {
+            if (fine || lrx.failed.load(std::memory_order_acquire)) {   // (a failed reply: its thread is returning)
                 lrx.th.join();
                 if (!lrx.ok) {
                     fine = false;
@@ -8346,12 +8359,15 @@ struct Model::Impl {
                 }
             }
             if (fine) lrx.open = false;
-            else if (!e.empty()) {
+            else {   // (the link is shut on the way out: ~LinkRx) a device's own failure first, then a Stop's early end
                 lrx.why = e;
-                bool dev_err = false;
-                for (const std::string& x : errs) dev_err = dev_err || !x.empty();
-                if (!dev_err) {
-                    err = e;
+                bool dev_err = false, stop = false;
+                for (const std::string& x : errs) {
+                    dev_err = dev_err || (!x.empty() && x != kHalted);
+                    stop = stop || x == kHalted;
+                }
+                if (!dev_err && (!stop || lrx.failed.load(std::memory_order_acquire))) {
+                    err = e.empty() ? "remote stage: a run of prompt chunks failed" : e;
                     return false;
                 }
             }

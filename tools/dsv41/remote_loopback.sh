@@ -72,7 +72,13 @@ print(",".join(str(x) for x in [0] + [1000 + (i * 7919) % 50000 for i in range(n
 ' "$LONG_N" > "$long" || exit 1
 fi
 nlong=0
-[ -n "$long" ] && nlong=$(tr ',' '\n' < "$long" | grep -c '[0-9]')
+if [ -n "$long" ]; then
+    nlong=$(tr ',' '\n' < "$long" | grep -c '[0-9]')
+    if [ "$nlong" -lt 2 ]; then
+        echo "no long prompt's ids in $long"
+        exit 2
+    fi
+fi
 
 # the worker, in the background until this script ends (or the single-process runs need its GPU)
 "$exe" "${common[@]}" --max-context "$ctx" --prefill-chunk "$chunk" --stage-worker "$port" --stage-bind 127.0.0.1 \
