@@ -74,6 +74,31 @@ struct ReqRow {           // a request's row: the window's token t, n picks (exp
 static_assert(sizeof(Hdr) == 32, "the header's size");
 static_assert(sizeof(HelloMsg) == 128, "the hello's size");
 
+/// The main's send gate and a reply's deadline, from EWMAs (0: none yet) of the round trip at a request's rows and of
+/// the CPU lane's time a pick at the window's T.  A window's remote picks go out only when the round trip is expected
+/// to end no later than the lane computing them with its own (none learned yet: out; every 32nd window kept in a row
+/// at a T: out anyway, a probe that keeps the estimate current).  The deadline: timeout_ms after the lane's own part,
+/// but not before 1.5 x the round trip expected at those rows.
+struct Gate {
+    double rtt[kMaxRows + 1] = {}, pick[kMaxRows + 1] = {};
+    int run[kMaxRows + 1] = {};
+    static void ew(double& a, double v) { a = a > 0.0 ? 0.9 * a + 0.1 * v : v; }
+    void rtt_seen(int rows, double ms) { ew(rtt[rows], ms); }          // (a late reply: the time waited, a lower bound)
+    void pick_seen(int T, double ms_a_pick) { ew(pick[T], ms_a_pick); }
+    bool send(int T, int rows, size_t n_remote, size_t n_local) {
+        const double rt = rtt[rows], c = pick[T];
+        if (rt <= 0.0 || c <= 0.0 || rt <= c * (double) (n_remote + n_local) || ++run[T] >= 32) {
+            run[T] = 0;
+            return true;
+        }
+        return false;
+    }
+    double deadline(double sent, double lane_done, double timeout_ms, int rows) const {
+        const double a = lane_done + timeout_ms, b = sent + 1.5 * rtt[rows];
+        return a > b ? a : b;
+    }
+};
+
 uint16_t f2bf(float f);   // round to nearest even (NaN kept a NaN)
 float bf2f(uint16_t h);
 double now_ms();          // steady clock

@@ -140,11 +140,11 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     if (!c.send(BlobsOk, 0, (int32_t) ok.size(), 0, 0, ok.data(), ok.size(), err)) return 0;
     std::fprintf(stderr, "expert server: %zu blobs (%.2f GB) in VRAM in %.1f s; serving\n", ss.blobs.size(),
                  (double) ss.used / 1e9, (now_ms() - t0) / 1000.0);
-    // the requests.  Diagnostics (env, read at each session; without them the path is the plain one):
+    // the requests: the rows' plan, weights and x packed, one copy in (DS4_RX_COPY=one, the default: 0.02-0.05 ms less a
+    // request than base's two on the 3070).  Diagnostics (env, read at each session):
     //   DS4_RX_NULL=1    a reply of zeros at once: no prep, no CUDA call (the link and both ends' sockets alone)
-    //   DS4_RX_COPY=nr   the plan and weights of the request's rows only, packed, then x: two copies (the plain path
-    //                    copies all kMaxRows rows' plan and weights)
-    //               one  the plan, weights and x packed: one copy
+    //   DS4_RX_COPY=base all kMaxRows rows' plan and weights, then x: two copies (the PoC's first path)
+    //               nr   the plan and weights of the request's rows only, packed, then x: two copies
     //               map  the plan and weights packed (one copy); x read and y written by the kernels in mapped host
     //                    memory (no x or y copy)
     //   DS4_RX_EVENTS=1  cudaEvents between the GPU parts (plan in, x in, gate_up, down, y out), printed with the host
@@ -153,11 +153,11 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     const char* nv = std::getenv("DS4_RX_NULL");
     const bool null_reply = nv != nullptr && *nv == '1';
     const char* cv = std::getenv("DS4_RX_COPY");
-    const std::string cm = cv != nullptr && *cv != '\0' ? cv : "base";
-    const Copy cp = cm == "nr" ? Copy::Nr : cm == "one" ? Copy::One : cm == "map" ? Copy::Map : Copy::Base;
+    const std::string cm = cv != nullptr && *cv != '\0' ? cv : "one";
+    const Copy cp = cm == "nr" ? Copy::Nr : cm == "base" ? Copy::Base : cm == "map" ? Copy::Map : Copy::One;
     const char* ev = std::getenv("DS4_RX_EVENTS");
     const bool evs = ev != nullptr && *ev == '1';
-    const bool diag = null_reply || evs || cp != Copy::Base;
+    const bool diag = null_reply || evs || cp != Copy::One;
     if (diag)
         std::fprintf(stderr, "expert server: diagnostics: %s, copies %s, events %s\n", null_reply ? "NULL replies" : "replies",
                      cm.c_str(), evs ? "on" : "off");

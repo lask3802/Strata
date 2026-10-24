@@ -1071,6 +1071,7 @@ struct Model::Impl {
     bool rx_on = false;
     double rx_timeout_ms = 2.0;   // (counted from when the lane's own picks are done)
     uint64_t rx_late_bits = 0;   // the last 64 requests: bit set = its reply was late (8 of them: the link given up)
+    rx::Gate rx_gate;   // the send gate and the deadline's floor (ds4_rx.hpp)
     static_assert(rx::kMaxRows == kWin && rx::kMaxPicks == kPicks, "a request's rows and picks are a window's");
     std::vector<rx::ReqRow> rx_rows;
     mutable std::mutex rx_mu;
@@ -6639,6 +6640,11 @@ struct Model::Impl {
         if (rx_link) rx_link->close();
         std::fprintf(stderr, "ds4: remote experts: %s - the CPU lane computes all its experts from now on\n", why.c_str());
     }
+    static int rx_nrows(const std::vector<std::pair<int, int>>& rpk) {   // (the tokens with a remote pick)
+        unsigned m = 0;
+        for (const auto& q : rpk) m |= 1u << (q.second / kPicks);
+        return (int) std::bitset<32>(m).count();
+    }
     // request seq's picks the server holds ((expert, t * kPicks + i), in token order) as rows of r's tokens
     bool rx_send(unsigned seq, int li, int T, const Req& r, const std::vector<std::pair<int, int>>& rpk) {
         rx_rows.clear();
@@ -6665,6 +6671,7 @@ struct Model::Impl {
             return false;
         }
         ++st.rx_reqs;
+        ++st.rx_req_t[T];
         return true;
     }
     // picks (expert, t * kPicks + i) of request r computed on the lane and added to rp's parts
@@ -6703,15 +6710,19 @@ struct Model::Impl {
             }
         st.cpu_experts += nslots;
     }
-    // the reply to request seq (sent at t0) into rp's parts; late or no link: those picks computed here
+    // the reply to request seq (sent at t0) into rp's parts; late or no link: those picks computed here.  The deadline:
+    // DS4_RX_TIMEOUT_MS after the lane's own picks, but not before 1.5 x the round trip expected at these rows
     void rx_finish(const Layer& l, const Req& r, Resp& rp, int T, unsigned seq, double t0,
                    const std::vector<std::pair<int, int>>& rpk) {
         const double tw = rx::now_ms();
+        const int rows = (int) rx_rows.size();
+        const double deadline = rx_gate.deadline(t0, tw, rx_timeout_ms, rows);
         const uint16_t* y = nullptr;
         int srv_us = 0;
         std::string e;
-        const int got = rx_on ? rx_link->wait_resp(seq, (int) rx_rows.size(), tw + rx_timeout_ms, &y, srv_us, e) : -1;
+        const int got = rx_on ? rx_link->wait_resp(seq, rows, deadline, &y, srv_us, e) : -1;
         const double t1 = rx::now_ms();
+        if (got >= 0) rx_gate.rtt_seen(rows, t1 - t0);
         st.rx_wait_ms += t1 - tw;
         st.rx_bytes_out = (int64_t) rx_link->bytes_out();
         st.rx_bytes_in = (int64_t) rx_link->bytes_in();
@@ -6742,11 +6753,13 @@ struct Model::Impl {
             return;
         }
         if (got == 0) {
+            ++st.rx_late_t[T];
             if (++st.rx_late == 1)
-                std::fprintf(stderr, "ds4: remote experts: a reply later than %.2f ms (layer %d): its %zu picks computed "
-                                     "here (said once; the count is in the stats)\n", rx_timeout_ms, l.il, rpk.size());
+                std::fprintf(stderr, "ds4: remote experts: a reply past its deadline (%.2f ms after the lane's part, %.2f ms "
+                                     "after its send; layer %d): its %zu picks computed here (said once; the count is in "
+                                     "the stats)\n", rx_timeout_ms, deadline - t0, l.il, rpk.size());
             rx_late_bits = rx_late_bits << 1 | 1u;
-            if (std::bitset<64>(rx_late_bits).count() >= 8) rx_lost("8 of the last 64 replies later than DS4_RX_TIMEOUT_MS");
+            if (std::bitset<64>(rx_late_bits).count() >= 8) rx_lost("8 of the last 64 replies past their deadline");
         } else {
             rx_lost(e.empty() ? "the link failed" : e);
         }
@@ -6799,7 +6812,18 @@ struct Model::Impl {
                       (st.rx_fallback_ms - s0.rx_fallback_ms) / nt,
                       (double) (st.rx_bytes_out - s0.rx_bytes_out) / 1e3 / nt, (double) (st.rx_bytes_in - s0.rx_bytes_in) / 1e3 / nt,
                       (long long) st.rx_held, (double) st.rx_upload_bytes / 1e9, st.rx_upload_ms / 1000.0);
-        return b;
+        std::string out = b;
+        out += "remote experts by T (requests / late / kept here by the send gate):";
+        for (int t = 1; t <= kWin; ++t) {
+            const long long q = st.rx_req_t[t] - s0.rx_req_t[t], la = st.rx_late_t[t] - s0.rx_late_t[t],
+                            sk = st.rx_skip_t[t] - s0.rx_skip_t[t];
+            if (q == 0 && sk == 0) continue;
+            std::snprintf(b, sizeof b, " T=%d %lld / %lld / %lld (EWMA: the round trip at %d rows %.3f ms, the lane %.3f "
+                          "ms a pick);", t, q, la, sk, t, rx_gate.rtt[t], rx_gate.pick[t]);
+            out += b;
+        }
+        out += "\n";
+        return out;
     }
 
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
@@ -6919,6 +6943,11 @@ struct Model::Impl {
                 }
                 if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
                 double rx_t0 = 0.0;
+                if (!rpicks.empty() && !rx_gate.send(T, rx_nrows(rpicks), rpicks.size(), picks.size())) {
+                    picks.insert(picks.end(), rpicks.begin(), rpicks.end());   // (the round trip would cost more)
+                    ++st.rx_skip_t[T];
+                    rpicks.clear();
+                }
                 if (!rpicks.empty()) {
                     rx_t0 = rx::now_ms();
                     if (!rx_send(next, li, T, r, rpicks)) {   // (no link: the lane computes them as it did before)
@@ -6978,6 +7007,7 @@ struct Model::Impl {
                     }
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
+                    if (rx_on) rx_gate.pick_seen(T, (now_ms() - tc) / nslots);
                 }
                 if (!rpicks.empty()) rx_finish(l, r, rp, T, next, rx_t0, rpicks);
             }

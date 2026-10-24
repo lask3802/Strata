@@ -132,6 +132,9 @@ struct Stats {
     int64_t rx_bytes_out = 0, rx_bytes_in = 0;
     int64_t rx_held = 0, rx_upload_bytes = 0;
     double rx_upload_ms = 0.0;
+    // by the window's T (1..16): requests sent, late replies, and windows the send gate kept here (the server's round
+    // trip at that T expected to cost more than the lane computing its picks)
+    int64_t rx_req_t[17] = {}, rx_late_t[17] = {}, rx_skip_t[17] = {};
 };
 
 class Model {
