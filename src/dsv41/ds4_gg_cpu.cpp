@@ -64,7 +64,7 @@ bool gg_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err
     f.gu_act = (int) a->vec_dot_type;
     f.d_act = (int) b->vec_dot_type;
     f.gu_row = row_size(tg, n_embd);
-    f.d_row = row_size(td, n_ff);
+    f.d_row = f.d_stride = row_size(td, n_ff);
     f.act_bytes = row_size(f.gu_act, n_embd);
     f.h_bytes = row_size(f.d_act, n_ff);
     return true;
@@ -257,7 +257,7 @@ void gg_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, cons
 }
 
 void gg_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1) {
-    dots(f.td, down, f.d_row, f.n_ff, hq, nt, out, r0, r1);
+    dots(f.td, down, f.d_stride, f.n_ff, hq, nt, out, r0, r1);
 }
 
 // a row of any ggml block type -> BF16 on the host (the embedding table's reader; Q5_K / Q4_K / Q6_K / Q8_0 rows of a
