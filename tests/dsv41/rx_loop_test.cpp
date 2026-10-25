@@ -443,7 +443,7 @@ int main(int argc, char** argv) {
 
     std::mt19937_64 rng(7);
     std::uniform_real_distribution<float> ux(-1.0f, 1.0f), uw(0.05f, 0.4f);
-    double worst_ratio = 0;
+    double worst_ratio = 0, worst_whole = 0;   // (|diff| over the server's part; over the layer's whole output)
     bool bits = true, all_in = true;
     int nreq = 0;
     uint32_t seq = 100;
@@ -509,15 +509,16 @@ int main(int argc, char** argv) {
                 diff[(size_t) c] = here[(size_t) c] + part[(size_t) c] - ref[(size_t) c];
             }
             worst_ratio = std::max(worst_ratio, norm(diff) / std::max(1e-30, norm(part)));
+            worst_whole = std::max(worst_whole, norm(diff) / std::max(1e-30, norm(ref)));
         }
     }
     check(all_in && nreq == 12, "12 requests (T = 1 and 4, both layers) answered");
     check(bits, "each reply is the CPU lane's sum of the server's picks for x in bf16, rounded to bf16, bit for bit");
-    char b[160];
+    char b[200];
     // (x in bf16 moves some of the int8 activations by one step, here and again in h: a few % of the server's part;
     // a wrong pick, weight or row is ~1)
     std::snprintf(b, sizeof b, "the split sum is the all-here one within the server's roundings (|diff| / |its part| "
-                  "%.2e < 0.10)", worst_ratio);
+                  "%.2e < 0.10; / |the layer's output| %.2e)", worst_ratio, worst_whole);
     check(worst_ratio < 0.10, b);
 
     // a late reply: 0 by its deadline; the next request has its own; the late one in take_late
