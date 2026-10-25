@@ -187,9 +187,9 @@ struct Fills {
 };
 
 // one Fill (h, its payload p) into the session's table: 0 loaded, else why not (1 malformed, 2 `out` not held or `in`
-// already, 3 no part for in's [k, nb), 4 a CUDA error)
+// already, 3 no part for in's [k, nb), 4 a CUDA error); `chunk`: the copy's bytes at a time (0: the blob in one)
 uint16_t fill_one(const Session& ss, Fills& f, const SliceServer& sl, const net::ep::EpHdr& h, const std::vector<uint8_t>& p,
-                  uint8_t* stg, cudaStream_t fs) {
+                  uint8_t* stg, cudaStream_t fs, size_t chunk) {
     const GeoMsg& g = ss.geo;
     const int li = h.layer, k = h.T, in = (int) h.aux, out = (int) h.epoch;
     if (li >= g.n_layers || ss.layers[(size_t) li].K[0] == 0 || in < 0 || in >= kTabExp || out < 0 || out >= kTabExp ||
@@ -233,17 +233,25 @@ uint16_t fill_one(const Session& ss, Fills& f, const SliceServer& sl, const net:
         }
     }
     while (f.req_done.load() < s0 && !f.stop.load()) std::this_thread::yield();   // (the requests that read the slot)
-    if (cudaMemcpyAsync(slot, stg, (size_t) fg.blob, cudaMemcpyHostToDevice, fs) != cudaSuccess ||
-        cudaStreamSynchronize(fs) != cudaSuccess) {
-        cudaGetLastError();
-        return 4;   // (the slot's bytes unknown: neither expert's any more)
+    // the copy in chunks, each once no request is in flight: the H2D copy engine is shared, so a request's copy in
+    // queues behind one chunk at most, not the whole blob (chunk 0: the blob in one copy)
+    const size_t ch = chunk > 0 ? chunk : (size_t) fg.blob;
+    for (size_t o = 0; o < (size_t) fg.blob; o += ch) {
+        if (chunk > 0)
+            while (f.req_done.load() != f.req_started.load() && !f.stop.load()) relax();
+        if (cudaMemcpyAsync((uint8_t*) slot + o, stg + o, std::min(ch, (size_t) fg.blob - o), cudaMemcpyHostToDevice,
+                            fs) != cudaSuccess ||
+            cudaStreamSynchronize(fs) != cudaSuccess) {
+            cudaGetLastError();
+            return 4;   // (the slot's bytes unknown: neither expert's any more)
+        }
     }
     f.tab[(size_t) li * kTabExp + (size_t) in].store(slot, std::memory_order_release);
     return 0;
 }
 
 // the fill thread: Fills in, FillOks out, until the main closes the socket or the session ends
-void fill_loop(const Session& ss, Fills& f, const SliceServer& sl, int dev) {
+void fill_loop(const Session& ss, Fills& f, const SliceServer& sl, int dev, size_t chunk) {
     cudaSetDevice(dev);
     uint64_t mx = 0;
     for (const GeoLayer& G : ss.layers) mx = std::max(mx, G.blob);
@@ -268,7 +276,7 @@ void fill_loop(const Session& ss, Fills& f, const SliceServer& sl, int dev) {
         }
         if (got == 0 || h.type != net::ep::Fill) continue;
         const double t0 = now_ms();
-        const uint16_t st = fill_one(ss, f, sl, h, p, stg, fs);
+        const uint16_t st = fill_one(ss, f, sl, h, p, stg, fs, chunk);
         f.load_ms += now_ms() - t0;
         if (st == 0) {
             ++f.loaded;
@@ -551,9 +559,13 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
             } else {
                 fl.c.cancel = &fl.stop;
                 const int fc = fill_cpu();
-                fl.th = std::thread([&ss, &fl, &sl, dev] { fill_loop(ss, fl, sl, dev); });
+                const char* chv = std::getenv("DS4_RX_FILL_CHUNK");   // (KB a copy; 0: the blob in one)
+                const size_t chunk = (size_t) std::max(0, chv != nullptr && *chv != '\0' ? std::atoi(chv) : 256) << 10;
+                fl.th = std::thread([&ss, &fl, &sl, dev, chunk] { fill_loop(ss, fl, sl, dev, chunk); });
                 if (fc >= 0) os::pin_thread(fl.th, fc);
-                std::fprintf(stderr, "expert server: fills: on (port %d; the fill thread on CPU %d)\n", h.a, fc);
+                std::fprintf(stderr, "expert server: fills: on (port %d; the fill thread on CPU %d; its copies %s)\n", h.a,
+                             fc, chunk > 0 ? (std::to_string(chunk >> 10) + " KB at a time, between requests").c_str()
+                                           : "a blob at a time (DS4_RX_FILL_CHUNK=0)");
             }
             continue;
         }

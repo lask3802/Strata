@@ -480,6 +480,17 @@ inline void anon_free(void* p, size_t bytes) {
 #endif
 }
 
+#if !defined(_WIN32)
+/// The calling thread's mask from before its first pin_self (saved: it pinned itself and has not gone back since)
+struct PinSaved {
+    bool saved = false;
+    cpu_set_t before;
+};
+inline PinSaved& pin_saved() {
+    thread_local PinSaved s;
+    return s;
+}
+#endif
 /// The calling thread, or `t`, on logical CPU `cpu` (Windows: the first 64 CPUs, processor group 0).  pin_self(-1):
 /// the calling thread's mask from before its first pin_self again (nothing if it was not pinned since).
 inline void pin_self(int cpu) {
@@ -493,8 +504,8 @@ inline void pin_self(int cpu) {
         before = 0;
     }
 #else
-    thread_local bool saved = false;
-    thread_local cpu_set_t before;
+    bool& saved = pin_saved().saved;
+    cpu_set_t& before = pin_saved().before;
     if (cpu >= 0) {
         if (!saved) saved = sched_getaffinity(0, sizeof before, &before) == 0;
         cpu_set_t set;
@@ -507,12 +518,14 @@ inline void pin_self(int cpu) {
     }
 #endif
 }
-/// Whether the calling thread may run on `cpu` (Linux: its mask - a container's cpuset is in it; Windows: the process's)
+/// Whether the calling thread may run on `cpu` (Linux: its mask - a container's cpuset is in it -, from before its
+/// pin_self if it pinned itself, so a pinned thread still sees the others; Windows: the process's)
 inline bool cpu_allowed(int cpu) {
 #if defined(_WIN32)
     DWORD_PTR proc = 0, sys = 0;
     return cpu >= 0 && cpu < 64 && GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) && ((proc >> cpu) & 1);
 #else
+    if (pin_saved().saved) return cpu >= 0 && cpu < CPU_SETSIZE && CPU_ISSET(cpu, &pin_saved().before);
     cpu_set_t s;
     return cpu >= 0 && cpu < CPU_SETSIZE && sched_getaffinity(0, sizeof s, &s) == 0 && CPU_ISSET(cpu, &s);
 #endif

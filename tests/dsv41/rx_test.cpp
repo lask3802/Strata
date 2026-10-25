@@ -20,7 +20,10 @@
 //               (no --parts-k against a server with parts: the Geo's k 9, pack_hash 0 - taken, the server warns; U4)
 //               [--fills N (EP U5b: then N fills - experts --experts .. + N - 1, of their own bytes, each into a held
 //                one's slot; with --parts-k only their [0, K) shipped, the server's parts the rest (a --write-parts with
-//                the same --fills).  A request naming an evicted one: Stale; the filled ones' replies against the CPU lane)]
+//                the same --fills).  A request naming an evicted one: Stale; then --fill-rounds R (10, even) rounds
+//                of the N swapped back and forth while requests of the other experts go, their server time against
+//                as many requests with no fill going (a fill's copy must not hold them up); the filled ones' replies
+//                against the CPU lane)]
 //   (STRATA_STAGE_TOKEN: the same as the server's)
 // Exit 0 all good, 1 a failure, 3 the server refused the blobs with an Error (the engine drops it at load).  Two cases
 // of the server's load: a full room (the server with DS4_RX_TEST_VRAM_MIB=600 --expert-server-reserve-mib 0, this
@@ -87,7 +90,7 @@ struct Layer {
 int main(int argc, char** argv) {
     std::string at = "7861", layers_s = "29/29,16/16,17/17,16/17";
     int n_exp = 8, n_req = 200, n_rtt = 1000, picks = 6, n_ref = 24, rtt_only = 0, n_ping = 0, fill = 0, bad_geo = 0,
-        early = 0, parts_a = 8, parts_k = 0, parts_reqs = 60, fills = 0;
+        early = 0, parts_a = 8, parts_k = 0, parts_reqs = 60, fills = 0, fill_rounds = 10;
     std::string parts_dir;
     uint64_t parts_hash = 0x5eed00000000abcdull;
     for (int i = 1; i + 1 < argc; i += 2) {
@@ -109,6 +112,7 @@ int main(int argc, char** argv) {
         else if (a == "--parts-reqs") parts_reqs = std::atoi(v.c_str());
         else if (a == "--parts-hash") parts_hash = std::strtoull(v.c_str(), nullptr, 16);
         else if (a == "--fills") fills = std::max(0, std::atoi(v.c_str()));
+        else if (a == "--fill-rounds") fill_rounds = std::max(0, std::atoi(v.c_str())) / 2 * 2;
         else if (a == "--picks") picks = std::max(1, std::min(rx::kMaxPicks, std::atoi(v.c_str())));
         else { std::printf("unknown option %s\n", a.c_str()); return 2; }
     }
@@ -607,6 +611,81 @@ int main(int argc, char** argv) {
                     gs == 0 ? (m.last_stale() ? "Stale" : "no reply") : gs == 1 ? "answered" : err.c_str(),
                     stale_ok ? "ok" : "FAIL");
         if (!stale_ok) return 1;
+        // fills while requests go: --fill-rounds rounds of the N swapped back (the evicted one in, the filled one out)
+        // and forth, and meanwhile requests of the other experts 0.2 ms apart (the engine's work between them); their
+        // server time (the reply's) against as many requests with no fill going.  An even number of rounds: the filled
+        // ones held again at the end, for the check after this
+        if (fill_rounds > 0) {
+            const std::vector<std::vector<int>> held = ids_of;
+            for (const auto& fe : filled) {   // (no request names a swapped expert: it would be Stale mid-swap)
+                std::vector<int>& id = ids_of[(size_t) fe.first];
+                id.erase(std::find(id.begin(), id.end(), fe.second));
+            }
+            int n_q = 0;
+            auto one = [&](std::vector<double>& v) -> bool {   // (one request, its server us into v)
+                const int li = n_q % (int) L.size(), T = 1 + n_q % 4;
+                ++n_q;
+                make_req(li, T, picks, rows, xs);
+                if (!m.send_req(seq, li, T, rows.data(), ptrs(xs), err)) { std::printf("FAILED: %s\n", err.c_str()); return false; }
+                const int got = m.wait_resp(seq, T, rx::now_ms() + 5000.0, &y, us, err);
+                ++seq;
+                if (got != 1) {
+                    std::printf("FAILED: fills: a request while fills go: %s\n",
+                                got == 0 ? (m.last_stale() ? "Stale" : "no reply") : err.c_str());
+                    return false;
+                }
+                v.push_back((double) us);
+                for (const double t = rx::now_ms(); rx::now_ms() - t < 0.2;) rx::relax();
+                return true;
+            };
+            std::vector<double> before, with, after;
+            for (int i = 0; i < 400; ++i)   // (no fill going, before and after: the GPU's clocks and the like either way)
+                if (!one(before)) return 1;
+            const double tl = rx::now_ms();
+            const int n_fl = fill_rounds * (int) filled.size();
+            for (int r = 0; r < fill_rounds; ++r)
+                for (size_t i = 0; i < filled.size(); ++i) {
+                    const Layer& l = L[(size_t) filled[i].first];
+                    const uint64_t rb[3] = {(uint64_t) l.fm.gu_row, (uint64_t) l.fm.gu_row, (uint64_t) l.fm.d_row};
+                    rx::FillLink::Job jb;
+                    jb.seq = (uint32_t) (1000 + r * (int) filled.size() + (int) i);
+                    jb.layer = filled[i].first;
+                    jb.in = r % 2 == 0 ? evicted[i].second : filled[i].second;
+                    jb.out = r % 2 == 0 ? filled[i].second : evicted[i].second;
+                    jb.k = parts_k;
+                    jb.geo = rx::FillGeo(l.geo, E, FF, rb);
+                    for (int q = 0; q < 3; ++q) jb.src[q] = blob_of(l, jb.in) + l.geo.off[q];
+                    fl.queue(jb);
+                }
+            int got_fl = 0, bad_fl = 0;
+            while (got_fl < n_fl && fl.up() && rx::now_ms() - tl < 30000.0) {
+                if (!one(with)) return 1;
+                for (const auto& d : fl.take()) {
+                    ++got_fl;
+                    bad_fl += d.status != 0;
+                }
+            }
+            const double t_load = rx::now_ms() - tl;
+            for (int i = 0; i < 400; ++i)
+                if (!one(after)) return 1;
+            auto stat = [](std::vector<double> v) {   // (mean p50 p99 over 2 ms)
+                double s = 0;
+                int over = 0;
+                for (double x : v) s += x, over += x > 2000.0;
+                std::sort(v.begin(), v.end());
+                char b[128];
+                std::snprintf(b, sizeof b, "mean %.0f p50 %.0f p99 %.0f us, %d over 2 ms", v.empty() ? 0.0 : s / (double) v.size(),
+                              v.empty() ? 0.0 : v[v.size() / 2], v.empty() ? 0.0 : v[(size_t) ((double) (v.size() - 1) * 0.99)], over);
+                return std::string(b);
+            };
+            const bool load_ok = got_fl == n_fl && bad_fl == 0;
+            std::printf("fills: %d swaps (%d not loaded) in %.1f ms while %zu requests went: their server time %s; with "
+                        "no fill going, %zu before: %s, %zu after: %s -> %s\n", got_fl, bad_fl, t_load, with.size(),
+                        stat(with).c_str(), before.size(), stat(before).c_str(), after.size(), stat(after).c_str(),
+                        load_ok ? "ok" : "FAIL");
+            if (!load_ok) return 1;
+            ids_of = held;
+        }
         // the filled experts' replies: each filled one first in a row's picks, T 1 .. 4
         double fworst = 0;
         int fbad = 0, frows = 0;
