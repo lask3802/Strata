@@ -248,6 +248,14 @@ struct LateBook {
     }
 };
 
+/// Whether a window of T rows has its remote picks served (the expert server is reached only from serve_lane, the
+/// async windows': plan_window's rule - threads mode, or no DS4_SYNC and T <= async_max_t).  T 0: the settle after a
+/// prompt and the tick after a chunked one, for the decode that follows (T 1).  Where not, the CPU lane computes the server's experts as its own, and the
+/// expert cache takes them as any (cache_in's remote: null).
+inline bool lane_serves(int T, bool par, bool sync_decode, int async_max_t) {
+    return par || (!sync_decode && (T == 0 ? 1 : T) <= async_max_t);
+}
+
 /// The expert cache's next expert into VRAM from a layer's CPU-lane hits: the hottest not in VRAM (slot < 0) and not one
 /// the expert server holds (remote[e] != 0; null: none) - those cost the CPU lane nothing, so a VRAM slot there would
 /// save no lane work - except a zero-copy one of the RAM store (zc[e] != 0; null: none), which the decode computes on this
@@ -271,14 +279,17 @@ inline const char* slice_refusal(bool remote, int ff0, int ffn, int n_ff) {
 }
 
 /// A served layer's blob layout from the geometry, checked by a server at the Geo (before any blob): each role r
-/// (gate, up, down) of bytes[r] (its rows' bytes there: 0 = a type it has no layout for) at off[r], 256-aligned,
+/// (gate, up, down) of bytes[r] (its rows' bytes there: 0 = a type it has no layout for, or rows not whole blocks of
+/// it) at off[r], 256-aligned,
 /// inside the blob and over no other role.  An overrun would read past the blob (the GPU server's arena: the next
 /// one's).  "" or why not.
 inline std::string blob_refusal(int li, const GeoLayer& g, const uint64_t bytes[3]) {
     static const char* const role[3] = {"gate", "up", "down"};
     const std::string at = "layer " + std::to_string(li) + "'s ";
     for (int r = 0; r < 3; ++r) {
-        if (bytes[r] == 0) return at + role[r] + ": a type this server has no layout for (" + std::to_string(g.K[r]) + ")";
+        if (bytes[r] == 0)
+            return at + role[r] + ": type " + std::to_string(g.K[r]) +
+                   " has no layout here, or its rows are not whole blocks of it (no row bytes)";
         if (g.off[r] % 256 != 0) return at + role[r] + ": its offset " + std::to_string(g.off[r]) + " not 256-aligned";
         if (g.off[r] > g.blob || bytes[r] > g.blob - g.off[r])
             return at + role[r] + ": " + std::to_string(bytes[r]) + " bytes at " + std::to_string(g.off[r]) +

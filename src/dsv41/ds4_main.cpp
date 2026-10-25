@@ -1594,7 +1594,8 @@ int main(int argc, char** argv) {
     int worker_port = 0;
     bool worker_mode = false;
     std::string rx_at;          // (--expert-server-connect: the main process's HOST:PORT)
-    int64_t rx_reserve = 1024;  // (its VRAM left free, MiB)
+    int64_t rx_reserve = 512;   // (its VRAM left free, MiB: the arena slot's 512 held 1106 blobs on the 3080)
+    const char* rx_flag = nullptr;   // (an expert server's flag given: it needs --expert-server-connect)
     bool rx_once = false;
     bool rx_cpu = false;        // (--expert-server-cpu, tests: the CPU lane's arithmetic, no GPU)
     int enc_w = 0, enc_h = 0;
@@ -1674,10 +1675,16 @@ int main(int argc, char** argv) {
         else if (a == "--stage-bind") stage_bind = val("--stage-bind");
         else if (a == "--remote-experts") o.remote_experts = val("--remote-experts");
         else if (a == "--expert-server-connect") rx_at = val("--expert-server-connect");
-        else if (a == "--expert-server-reserve-mib") rx_reserve = std::atoll(val("--expert-server-reserve-mib").c_str());
-        else if (a == "--expert-server-once") rx_once = true;
-        else if (a == "--expert-server-cpu") rx_cpu = true;
-        else if (a == "--help" || a == "-h") {
+        else if (a == "--expert-server-reserve-mib") {
+            rx_reserve = std::atoll(val("--expert-server-reserve-mib").c_str());
+            rx_flag = "--expert-server-reserve-mib";
+        } else if (a == "--expert-server-once") {
+            rx_once = true;
+            rx_flag = "--expert-server-once";
+        } else if (a == "--expert-server-cpu") {
+            rx_cpu = true;
+            rx_flag = "--expert-server-cpu";
+        } else if (a == "--help" || a == "-h") {
             usage();
             return 0;
         } else {
@@ -1685,6 +1692,11 @@ int main(int argc, char** argv) {
             usage();
             return 2;
         }
+    }
+    if (rx_flag != nullptr && rx_at.empty()) {   // (not silently a main process: a server's flag, its address left out)
+        std::fprintf(stderr, "%s is an expert server's flag: it needs --expert-server-connect HOST:PORT\n", rx_flag);
+        usage();
+        return 2;
     }
     if (!rx_at.empty()) {   // the expert server (ds4_rx.hpp): no pack, the main process sends what it computes
         std::string token;
@@ -2040,6 +2052,39 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "ep defer: %lld layers' CPU-lane parts added a layer late (%.1f a token; DS4_PROF's wait for "
                              "the CPU lane is then the next layer's)\n", (long long) (s.ep_late - s0.ep_late),
                      (double) (s.ep_late - s0.ep_late) / (double) std::max<size_t>(1, out.size()));
+    if (s.ep_verify_n > s0.ep_verify_n) {   // DS4_EP_DEFER_VERIFY
+        // float order (estimated: a few ulp of the terms; the slot measures it); any layer above it is a wiring bug or
+        // a non-finite value (inf) - and under VERIFY=2 (the wrong comb) the check must see layers above it
+        const float bound = 1e-5f;
+        int last = -1, worst = -1, above = 0, seen = 0;
+        for (int i = 0; i < 64; ++i)
+            if (s.ep_verify[i] != 0.0f) {
+                last = i;
+                ++seen;
+                if (worst < 0 || s.ep_verify[i] > s.ep_verify[worst]) worst = i;
+                if (!(s.ep_verify[i] <= bound)) ++above;
+            }
+        // (VERIFY=2: every layer's add but the head's takes the wrong comb, so all of them but the last must be above)
+        const char* verdict = s.ep_verify_wrong ? (above > 0 && above + 1 >= seen ? "the wrong comb seen: the check works"
+                                                   : above > 0 ? "the wrong comb seen in some layers only: partly blind, "
+                                                                 "unless the others had no CPU-lane part in the run"
+                                                               : "the wrong comb NOT seen: the check is blind")
+                              : above  ? "MISMATCH (wiring, or inf)"
+                              : seen   ? "ok"
+                                       : "ok (no layer differed at all: exact, or not checked)";
+        std::string ln;
+        for (int i = 0; i <= last; ++i) {
+            char b[32];
+            std::snprintf(b, sizeof b, " %d:%.1e", i, s.ep_verify[i]);
+            ln += b;
+        }
+        std::fprintf(stderr, "ep defer verify: %lld checks of the deferred streams against the exact ones (the same "
+                             "attention: float order only); the largest |d| / (1 + |exact|) by the layer whose part it "
+                             "was (the last: before the head; since the load):%s; worst %.2e at layer %d; bound %.0e: "
+                             "%d of the %d layers that differed above it - %s%s\n",
+                     (long long) (s.ep_verify_n - s0.ep_verify_n), ln.c_str(), worst >= 0 ? s.ep_verify[worst] : 0.0f,
+                     worst, (double) bound, above, seen, s.ep_verify_wrong ? "DS4_EP_DEFER_VERIFY=2: " : "", verdict);
+    }
     if (s.prof_tokens > s0.prof_tokens) {   // DS4_PROF
         const double pt = (double) (s.prof_tokens - s0.prof_tokens);
         double sum = 0;

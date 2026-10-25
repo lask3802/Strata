@@ -151,6 +151,11 @@ struct Stats {
     // serve_lane napping (its 20 us sleeps: after 2 ms idle, kSpinMs while the link is up)
     int64_t rx_wakes = 0, lane_nap_reqs = 0;
     int64_t ep_late = 0;   // DS4_EP_DEFER: the layers whose mailbox part the next layer (or the head) added
+    // DS4_EP_DEFER_VERIFY: the checks made (a layer's deferred streams against the exact ones), and by the layer whose
+    // part it was the largest relative difference since the load (the last layer's: before the head)
+    int64_t ep_verify_n = 0;
+    float ep_verify[64] = {};
+    bool ep_verify_wrong = false;   // DS4_EP_DEFER_VERIFY=2: the wrong comb on purpose (the check must see it)
 };
 
 class Model {

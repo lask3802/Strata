@@ -310,6 +310,16 @@ int main() {
         check(rx::cache_in(hits, slot, heat, held3, none) == 5, "3 on the server, no zero-copy one: 5");
         slot[5] = 0;
         check(rx::cache_in(hits, slot, heat, held3, nullptr) == 7, "5 in VRAM already, 3 on the server: 7");
+        // which windows' hits skip the server's experts (the review of a5770802: a window past async_max_t goes sync,
+        // never to the server - its lane computed them, so the cache may take them)
+        check(rx::lane_serves(1, false, false, 8) && rx::lane_serves(8, false, false, 8),
+              "T 1 and 8 at async_max_t 8: served (async)");
+        check(!rx::lane_serves(9, false, false, 8) && !rx::lane_serves(16, false, false, 8),
+              "T 9 and 16 at async_max_t 8: not served (sync windows: the DSpark verify, a window prompt)");
+        check(rx::lane_serves(0, false, false, 8) && !rx::lane_serves(0, false, false, 0),
+              "the settle (T 0): as the decode's T 1 (DS4_ASYNC_T=0: not)");
+        check(!rx::lane_serves(1, false, true, 8) && !rx::lane_serves(0, false, true, 8), "DS4_SYNC: none served");
+        check(rx::lane_serves(16, true, false, 8) && rx::lane_serves(1, true, true, 8), "threads mode: every window async");
     }
     {
         // a server's check of a served layer's blob layout at the Geo (lead 2026-10-25: an overrun read the next blob)
@@ -334,7 +344,8 @@ int main() {
         t = g;
         t.off[1] = 768;
         check(has(rx::blob_refusal(0, t, b), "up over its gate"), "up over gate");
-        check(has(rx::blob_refusal(3, g, b0), "layer 3's up: a type this server has no layout for"), "a type with no layout");
+        check(has(rx::blob_refusal(3, g, b0), "layer 3's up: type 16 has no layout here, or its rows are not whole blocks"),
+              "a type with no layout");
     }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;

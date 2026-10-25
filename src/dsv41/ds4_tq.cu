@@ -484,7 +484,8 @@ bool bad(const char* what) {
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
     const bool w = use_words();
     (void) ne_max;
-    if (a.n_embd % 128 != 0 || a.n_ff % (kWaves * kTileRows) != 0) return bad("gate_up: geometry not covered");
+    // (not covered: false, printed by the caller - ds4_gguf's no_token, the first of a type; once a token here)
+    if (a.n_embd % 128 != 0 || a.n_ff % (kWaves * kTileRows) != 0) return false;
     const dim3 grid((unsigned) (a.n_ff / (kWaves * kTileRows)), (unsigned) groups);
 #define GU_(K, C) { if (w) gate_up_kernel<K, C, true><<<grid, kThreads, 0, s>>>(a); else gate_up_kernel<K, C, false><<<grid, kThreads, 0, s>>>(a); }
     DS4_TQ_SWITCH(a.tg, GU_)
@@ -495,7 +496,7 @@ bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
 bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
     const bool w = use_words();
     (void) ne_max;
-    if (a.n_ff % 128 != 0 || a.n_embd % (kWaves * kTileRows) != 0) return bad("down: geometry not covered");
+    if (a.n_ff % 128 != 0 || a.n_embd % (kWaves * kTileRows) != 0) return false;   // (as gate_up's)
     const dim3 grid((unsigned) (a.n_embd / (kWaves * kTileRows)), (unsigned) groups);
 #define DN_(K, C) { if (w) down_kernel<K, C, true><<<grid, kThreads, 0, s>>>(a); else down_kernel<K, C, false><<<grid, kThreads, 0, s>>>(a); }
     DS4_TQ_SWITCH(a.td, DN_)
@@ -514,7 +515,10 @@ bool load_moe_kernels() {
                        cudaFuncGetAttributes(&fa, down_kernel<K, C, false>) == cudaSuccess
         DS4_TQ_SWITCH(t, LK_)
 #undef LK_
-        if (!ok) return false;
+        if (!ok) {
+            std::fprintf(stderr, "ds4 tq: the %s token kernels did not load (%s)\n", name(t), cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
     }
 #endif
     return true;

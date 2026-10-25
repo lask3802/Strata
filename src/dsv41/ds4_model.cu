@@ -535,6 +535,9 @@ struct Dev {
           *ed = nullptr;
     float* glog_a = nullptr;   // lookahead: the next two layers' gate logits on this layer's FFN input (rows 1024 apart)
     float* late_post = nullptr;   // DS4_EP_DEFER: the FFN post of the layer whose mailbox part is still out (rows 8 apart)
+    // DS4_EP_DEFER_VERIFY: the deferred path beside the exact one - its FFN output without the part, its streams after
+    // that FFN, and after the next attention
+    float *v_moe = nullptr, *v_h = nullptr, *v_h2 = nullptr;
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *tok = nullptr;
     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
     uint8_t* eg_rows = nullptr;
@@ -1180,6 +1183,19 @@ struct Model::Impl {
     bool ep_defer = false;
     int late_slot = -1;
     unsigned late_seq = 0;
+    // DS4_EP_DEFER_FROM=L: only layers L and later deferred (nl - 1: the last alone, whose add before the head is exact).
+    // DS4_EP_DEFER_VERIFY=1: a wiring check, not a speed mode - every layer waits and adds its part in place as without
+    // the deferral, and beside it the deferred streams are built from the same attention outputs and hc coefficients
+    // (Dev::v_*: hc_post without the part, the next attention's hc_post, late_flush's add) and compared with the exact
+    // streams after that attention (or before the head): up to the float sums' order they are the same, so a larger
+    // difference is a wiring bug.  An Engram layer's in-place add to the exact streams (its gates from them) goes onto
+    // the deferred ones too (add_diff).  v_err[il]: the largest relative difference for layer il's part (device; Stats
+    // gets a copy after each window)
+    int defer_from = 0, late_il = -1;
+    bool ep_verify = false;
+    bool v_wrong = false;   // DS4_EP_DEFER_VERIFY=2: the check's own check - the deferred side given a wrong comb (layer
+                            // l's FFN one) on purpose, which the comparison must show; decode stays exact
+    float* v_err = nullptr;
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
     // lookahead: while layer L runs, the device guesses the next layer's picks (its gate on L's FFN input, the same
     // choice) and publishes them with L's routing; the CPU lane asks for the guessed experts it will read from the files
@@ -6496,8 +6512,8 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: expert cache: %lld swaps after the prompt (%.0f ms)\n", (long long) (st.swaps - s0),
                          now_ms() - t0);
     }
-    void cache_tick(int T) {
-        cache_tick_swaps(T);
+    void cache_tick(int T, int serve_T = -1) {
+        cache_tick_swaps(T, serve_T);
         store_sync();
         store_watch();
     }
@@ -6513,7 +6529,10 @@ struct Model::Impl {
         const size_t n = store->shrink_chunks(chunks);
         if (n > 0) std::fprintf(stderr, "ds4: RAM store: %.1f GB free: gave back %zu chunks (%zu slots left)\n", avail / 1e9, n, store->slots_allocated());
     }
-    void cache_tick_swaps(int T) {
+    // (T: the tokens the hits came from; serve_T: the window whose rows rx_row asks about - T, or 0 after a chunked
+    // prompt: the decode's)
+    void cache_tick_swaps(int T, int serve_T = -1) {
+        if (serve_T < 0) serve_T = T;
         if (!o.expert_cache || cache_ths.empty()) return;
         std::vector<Swap> ready;
         std::vector<RamSwap> rready;
@@ -6603,10 +6622,12 @@ struct Model::Impl {
             if (l.cpu_hits.empty()) continue;
             std::vector<int> hits;
             hits.swap(l.cpu_hits);
-            // (the expert server's experts never in: there they cost the lane nothing, so the slot would be lost - the
-            // prompt's hits and the settle after it list them, the decode's serve_lane does not; a zero-copy one is this
-            // GPU's work, so it may)
-            int best = rx::cache_in(hits, l.slot.data(), l.heat.data(), rx_row(l), l.zc.empty() ? nullptr : l.zc.data()),
+            // (the expert server's experts not in after a window it serves, nor at the settle or after a chunked prompt
+            // (serve_T 0, for the decode): there they cost the lane nothing, so the slot would be lost - serve_lane
+            // lists none of them, the settle and a chunked prompt's do.  After a window it does not serve (DS4_SYNC, T
+            // past async_max_t: rx_row null) the lane computed them, so they may; a zero-copy one is this GPU's work,
+            // so it may)
+            int best = rx::cache_in(hits, l.slot.data(), l.heat.data(), rx_row(l, serve_T), l.zc.empty() ? nullptr : l.zc.data()),
                 vin = -1;
             if (best >= 0 && l.spare_vram >= 0 && !l.swap_pending && sw_inflight < c_inflight) {   // VRAM: the hottest in
                 int cold = -1;
@@ -6934,10 +6955,13 @@ struct Model::Impl {
         rx_wait.reserve(1 << 20);
         rx_arr.reserve(1 << 20);
     }
-    // layer l's experts the expert server holds ([n_exp]; null: none, or the link given up - the lane's again - or
-    // DS4_SYNC, whose decode computes them all here)
-    const uint8_t* rx_row(const Layer& l) const {
-        return rx_on && !sync_decode && !l.mtp && l.n_exp == g.n_exp && (size_t) (l.il + 1) * g.n_exp <= rx_has.size()
+    // layer l's experts the expert server holds, for the hits of a window of T rows (0: the settle, or the tick after a
+    // chunked prompt - the decode's) ([n_exp]; null:
+    // none, the link given up - the lane's again -, or a window the server does not serve: DS4_SYNC, T past
+    // async_max_t - rx::lane_serves - whose CPU lane computed them itself)
+    const uint8_t* rx_row(const Layer& l, int T) const {
+        return rx_on && rx::lane_serves(T, par, sync_decode, async_max_t) && !l.mtp && l.n_exp == g.n_exp &&
+                       (size_t) (l.il + 1) * g.n_exp <= rx_has.size()
                    ? rx_has.data() + (size_t) l.il * g.n_exp
                    : nullptr;
     }
@@ -7206,8 +7230,8 @@ struct Model::Impl {
               "in the kernel %s ms), the lane's wait after its part %s ms\n"
               "remote experts per token: the lane's own part %.2f ms + its wait %.2f ms + the late ones %.2f ms; the "
               "link %.1f KB out, %.1f KB in; the upload %lld experts, %.2f GB in %.1f s, %lld of them in this "
-              "GPU's VRAM too now (the cache's: none but zero-copy ones, after the link was given up, or with "
-              "DS4_SYNC)\n",
+              "GPU's VRAM too now (the cache's: none but zero-copy ones, after the link was given up, or after "
+              "windows the server does not serve: DS4_SYNC, T past DS4_ASYNC_T)\n",
               local + served > 0 ? 100.0 * served / (local + served) : 0.0, served / nt, (local + served) / nt,
               (double) (st.rx_fallback - s0.rx_fallback) / nt, (long long) (st.rx_late - s0.rx_late),
               (long long) (st.rx_late_link - s0.rx_late_link), (long long) (st.rx_backoffs - s0.rx_backoffs),
@@ -9518,7 +9542,8 @@ struct Model::Impl {
         if (logits_all) n_logits = (T_last - 1) % kWin + 1;   // (sample() takes the last row of d.logits)
         pos += n;
         st.tokens += n;
-        cache_tick(n);
+        cache_tick(n, 0);   // (the server's experts as at the settle: the chunks streamed them to the GPU as any - the
+                            // decode that follows is what the server serves)
         if (lm_end_.on) {   // (the layer cache's RAM back before the store and the swaps want it)
             lm_end();
             lm_end_.on = false;
@@ -9561,8 +9586,16 @@ struct Model::Impl {
     // mode), the async decode path through moe_gate_up / moe_down, no DSpark drafter (its verify windows would wait in
     // place; loaded, it turns the deferral off for the run)
     bool defer_setup(std::string& err) {
-        const char* v = std::getenv("DS4_EP_DEFER");
-        if (v == nullptr || *v == '\0' || std::atoi(v) == 0) return true;
+        auto on = [](const char* n) {
+            const char* v = std::getenv(n);
+            return v != nullptr && *v != '\0' && std::atoi(v) != 0;
+        };
+        ep_verify = on("DS4_EP_DEFER_VERIFY");
+        v_wrong = ep_verify && std::atoi(std::getenv("DS4_EP_DEFER_VERIFY")) == 2;
+        if (!on("DS4_EP_DEFER") && !ep_verify) return true;
+        const char* nv = v_wrong ? "DS4_EP_DEFER_VERIFY=2" : ep_verify ? "DS4_EP_DEFER_VERIFY=1" : "DS4_EP_DEFER=1";
+        if (const char* f = std::getenv("DS4_EP_DEFER_FROM"); f != nullptr && *f != '\0')
+            defer_from = std::max(0, std::min(g.nl - 1, std::atoi(f)));
         const char* why = nullptr;
         if (g.n_mtp > 0) why = "the DSpark drafter is loaded (--dspark none runs without it)";
         else if (par) why = "threads mode";
@@ -9572,25 +9605,54 @@ struct Model::Impl {
         for (int il = lo; il < hi && why == nullptr; ++il)
             if (L[(size_t) il].nm != 1 || L[(size_t) il].dev != L[(size_t) lo].dev) why = "the layers on more than one GPU";
         if (why != nullptr) {
-            std::fprintf(stderr, "ds4: DS4_EP_DEFER=1: off for this run - %s\n", why);
+            std::fprintf(stderr, "ds4: %s: off for this run - %s\n", nv, why);
+            ep_verify = v_wrong = false;
             return true;
         }
         Dev& d = devs[(size_t) L[(size_t) lo].dev];
         if (!dalloc(d, d.late_post, (size_t) kWin * 8, err)) return false;
+        if (ep_verify) {
+            const size_t W = kWin, D = (size_t) g.dim, H = (size_t) g.hc;
+            if (!dalloc(d, d.v_moe, W * D, err) || !dalloc(d, d.v_h, W * H * D, err) || !dalloc(d, d.v_h2, W * H * D, err) ||
+                !dalloc(d, v_err, (size_t) kMaxL, err))
+                return false;
+        }
         ep_defer = true;
-        std::fprintf(stderr, "ds4: DS4_EP_DEFER=1: in decode each layer's CPU-lane part (with the remote experts') is added "
-                             "a layer late, after the next layer's attention - an approximation (the last layer's add, "
-                             "before the head, is exact)\n");
+        if (ep_verify)
+            std::fprintf(stderr, "ds4: DS4_EP_DEFER_VERIFY=%d: decode stays exact (each layer waits for its part); the "
+                                 "deferred streams of layers %d-%d are built beside it from the same attention and "
+                                 "compared (a wiring check, slower)%s\n", v_wrong ? 2 : 1, defer_from, g.nl - 1,
+                         v_wrong ? " - with a wrong comb on purpose in the layers' adds (not the head's): the comparison "
+                                   "must show it there" : "");
+        else
+            std::fprintf(stderr, "ds4: DS4_EP_DEFER=1: in decode each layer's CPU-lane part (with the remote experts') of "
+                                 "layers %d-%d is added a layer late, after the next layer's attention - an approximation "
+                                 "(the last layer's add, before the head, is exact)\n", defer_from, g.nl - 1);
         return true;
     }
     // DS4_EP_DEFER: the part still out (late_slot) into d.h once the service thread answered it - comb: the attention
     // hc_post's that ran since (null: none, the head); DS4_PROF counts the wait as the decode's wait for the CPU lane
+    // DS4_EP_DEFER_VERIFY: the same add into the deferred streams (v_h after the next attention's hc_post from the same
+    // ao / a_post / comb, or v_h itself before the head), then compared with d.h, the exact ones
     void late_flush(Dev& d, const float* comb, int T) {
         if (late_slot < 0) return;
         Resp& rp = resps[late_slot];
         wait_seq(&rp.seq, late_seq, d.st);
         prof_mark(d, 4);
-        hc_late_add(d.h, &rp.part[0][0], (size_t) kMaxDim, rp.cpu, d.late_post, comb, g.dim, g.hc, T, d.st);
+        float* h = d.h;
+        if (ep_verify) {
+            h = d.v_h;
+            if (comb != nullptr) {   // (the exact side's attention hc_post, on the deferred streams; the add's comb is the
+                                     //  caller's, the thing checked)
+                hc_post(d.ao, d.v_h, d.a_post, d.a_comb, g.dim, g.hc, T, d.v_h2, d.st);
+                h = d.v_h2;
+            }
+        }
+        hc_late_add(h, &rp.part[0][0], (size_t) kMaxDim, rp.cpu, d.late_post, comb, g.dim, g.hc, T, d.st);
+        if (ep_verify) {
+            max_rel_diff(d.h, h, (size_t) T * g.hc * g.dim, v_err + late_il, d.st);
+            ++st.ep_verify_n;
+        }
         late_slot = -1;
     }
 
@@ -9786,6 +9848,10 @@ struct Model::Impl {
         const double th = now_ms();
         CK(cudaStreamSynchronize(d.st));
         st.head_ms += now_ms() - th;
+        if (ep_verify) {   // (the window's checks are in: its stream is done)
+            CK(cudaMemcpy(st.ep_verify, v_err, sizeof(float) * (size_t) std::min(g.nl, 64), cudaMemcpyDeviceToHost));
+            st.ep_verify_wrong = v_wrong;
+        }
         prof_collect();
         pos += T;
         st.tokens += T;
@@ -10075,7 +10141,11 @@ struct Model::Impl {
                                    (size_t) cols * (ehd / 32), cudaMemcpyHostToDevice, s));
             engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, (int) eg_fmt[(size_t) l.eg]);
             if (!mv(d, {job(l.eg_wkv, d.eg_x, d.eg_kv, T, (size_t) cols * ehd, (size_t) (H + 1) * D)}, err)) return false;
+            const bool vg = ep_verify && late_slot >= 0;   // (DS4_EP_DEFER_VERIFY: the same add onto the deferred streams)
+            const size_t nh = (size_t) T * H * D;
+            if (vg) CK(cudaMemcpyAsync(d.v_h2, d.h, nh * 4, cudaMemcpyDeviceToDevice, s));
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
+            if (vg) add_diff(d.v_h, d.h, d.v_h2, nh, s);
         }
         // attention
         if (hc2) {
@@ -10306,7 +10376,8 @@ struct Model::Impl {
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
         prof_mark(d, 1);
-        late_flush(d, d.a_comb, T);   // (DS4_EP_DEFER: the layer before's part, through this attention's comb)
+        late_flush(d, v_wrong ? d.f_comb : d.a_comb, T);   // (DS4_EP_DEFER: the layer before's part, through this
+                                                           //  attention's comb)
         // the MoE
         if (hc2) {
             CK(cudaEventRecord(d.ev_fork, s));
@@ -10323,8 +10394,10 @@ struct Model::Impl {
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0;
-            // DS4_EP_DEFER: the mailbox part neither waited for nor added here - the next layer's late_flush adds it
-            const bool late = wp.defer && lead && !l.mtp && T == 1 && moe_token_path;
+            // DS4_EP_DEFER: the mailbox part neither waited for nor added here (skip) - the next layer's late_flush adds
+            // it; DS4_EP_DEFER_VERIFY: waited for and added here, and the deferred path built beside it (Dev::v_*)
+            const bool late = wp.defer && lead && !l.mtp && T == 1 && moe_token_path && l.il >= defer_from;
+            const bool skip = late && !ep_verify;
             int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
             if (u9::on(u9::kRoute)) {   // U9 route: the gates in one GEMV, the lookahead and the routing in one launch
                 const Layer* nx[2] = {nullptr, nullptr};
@@ -10392,8 +10465,8 @@ struct Model::Impl {
                 x3::MoeArgs ma;
                 ma.plan_ptr = d.plan_ptr;
                 ma.plan_w = d.rw;
-                ma.cpu_part = lead && !late ? resps[slot].part[0] : nullptr;
-                ma.cpu_flag = lead && !late ? &resps[slot].cpu[0] : nullptr;
+                ma.cpu_part = lead && !skip ? resps[slot].part[0] : nullptr;
+                ma.cpu_flag = lead && !skip ? &resps[slot].cpu[0] : nullptr;
                 ma.lay = lay;
                 ma.k = l.k_exp;
                 ma.n_embd = D;
@@ -10409,12 +10482,20 @@ struct Model::Impl {
                 const bool early = mx && u9::on(u9::kTail);
                 const bool down_ok = early && gg::moe_down_experts(ma, d.xg, s);   // (false: printed, as moe_down)
                 prof_mark(d, 3);
-                if (lead && !late) wait_seq(&resps[slot].seq, sq, s);
+                if (lead && !skip) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
                 if (early) {
                     if (down_ok) gg::moe_down_combine(ma, d.sh_out, d.moe_out, s);
                 } else if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                if (late && ep_verify) {   // (the deferred path's FFN output: the same call without the part - a GGUF's
+                    x3::MoeArgs mv = ma;   //  combine of the partials the down above left, an EXL3's down again)
+                    mv.cpu_part = nullptr;
+                    mv.cpu_flag = nullptr;
+                    if (mx) {
+                        if (!early || down_ok) gg::moe_down_combine(mv, d.sh_out, d.v_moe, s);
+                    } else x3::moe_down(mv, d.xg, d.sh_out, d.v_moe, s);
+                }
             } else {   // each distinct expert read once for the window's tokens
                 gf::MoeWin mw;
                 mw.plan_ptr = d.plan_ptr;
@@ -10458,6 +10539,7 @@ struct Model::Impl {
             if (lead) st.experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
             if (hc2) CK(cudaStreamWaitEvent(s, d.ev_join, 0));
+            if (late && ep_verify) hc_post(d.v_moe, d.h, d.f_post, d.f_comb, D, H, T, d.v_h, s);   // (the deferred streams)
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
@@ -10466,7 +10548,8 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(d.late_post, d.f_post, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
                 late_slot = slot;
                 late_seq = sq;
-                ++st.ep_late;
+                late_il = l.il;
+                if (!ep_verify) ++st.ep_late;
             }
             prof_mark(d, 5);
             return true;

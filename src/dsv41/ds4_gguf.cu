@@ -17,8 +17,10 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 namespace strata::ds4::gguf {
 namespace {
@@ -1057,6 +1059,41 @@ bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq:
     }
     return true;
 }
+// iq::gate_up / down refusing a token's or a window's experts (who 0: gate / up, 1: down): h / part not written, a
+// launch error each time, but every layer of the type fails every token - so the first of a (who, type) is printed,
+// with why, and the count at exit (MoeArgs carries no layer: the line is the first such layer's)
+struct NoToken {
+    std::mutex mu;
+    std::map<std::pair<int, int>, long> n;   // (who, type) -> refusals
+};
+NoToken& no_tokens() {   // (never destroyed: a launch on another thread at exit still finds it)
+    static NoToken* t = new NoToken;
+    return *t;
+}
+void no_token_counts() {   // (atexit)
+    NoToken& t = no_tokens();
+    std::lock_guard<std::mutex> lk(t.mu);
+    for (const auto& e : t.n)
+        if (e.second > 1)
+            std::fprintf(stderr, "ds4 gguf %s: %s experts refused %ld times (the first printed)\n",
+                         e.first.first == 0 ? "gate_up" : "down", type_name(e.first.second), e.second);
+}
+void no_token(int who, int type, int n_embd, int n_ff) {
+    g_errors.fetch_add(1, std::memory_order_relaxed);
+    {
+        NoToken& t = no_tokens();
+        std::lock_guard<std::mutex> lk(t.mu);
+        if (t.n.empty()) std::atexit(no_token_counts);
+        if (++t.n[{who, type}] > 1) return;
+    }
+    const char* w = who == 0 ? "gate_up" : "down";
+    if (!iq::token_kernel(type))   // (Q5_K / Q6_K: the device takes them for the dense GEMVs, not as token experts)
+        std::fprintf(stderr, "ds4 gguf %s: %s experts have no token kernel (%s not written; later ones counted)\n", w,
+                     type_name(type), who == 0 ? "h" : "part");
+    else
+        std::fprintf(stderr, "ds4 gguf %s: the %s token kernel does not cover n_embd %d, n_ff %d (later ones counted)\n",
+                     w, type_name(type), n_embd, n_ff);
+}
 template <int NC>
 void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
@@ -1295,7 +1332,7 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
         ia.xd = sc->xd;
         q8_quant(x, (size_t) a.n_embd, 1, a.n_embd, sc->xq, sc->xd, s);
         if (!iq::gate_up(ia, a.k, 1, s)) {   // (Q5_K / Q6_K: supported, but no token kernel; h was left as it was)
-            fail("moe_gate_up: the experts' type has no token kernel");
+            no_token(0, ia.tg, a.n_embd, a.n_ff);
             return;
         }
         check("moe_gate_up");
@@ -1335,7 +1372,7 @@ bool moe_down_experts(const x3::MoeArgs& a, const float* h, cudaStream_t s) {
         ia.hq = sc->hq;
         ia.hd = sc->hd;
         if (!iq::down(ia, a.k, 1, s)) {
-            fail("moe_down: the experts' type has no token kernel");
+            no_token(1, ia.td, a.n_embd, a.n_ff);
             return false;
         }
     } else {
@@ -1402,10 +1439,10 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     }
     q8_quant(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
     if (mx) launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
-    else iq::gate_up(ia, groups, a.T, s);
+    else if (!iq::gate_up(ia, groups, a.T, s)) no_token(0, ia.tg, a.n_embd, a.n_ff);
     q8_quant(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);   // (rows of picks not on the device: unused)
     if (mx) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
-    else iq::down(ia, groups, a.T, s);
+    else if (!iq::down(ia, groups, a.T, s)) no_token(1, ia.td, a.n_embd, a.n_ff);
     if (a.wait_ptr != nullptr) mx_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val);
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
