@@ -487,10 +487,9 @@ bool Main::wake(std::string& err) {
 
 int link_cpu() {
     const char* v = std::getenv("DS4_EP_CPU");
-    if (v != nullptr && (std::strcmp(v, "off") == 0 || std::strcmp(v, "none") == 0)) return -1;
     char* end = nullptr;
     const long cpu = v != nullptr && *v != '\0' ? std::strtol(v, &end, 10) : 2;
-    if (end != nullptr && *end != '\0') return -1;   // (not a number)
+    if (end != nullptr && *end != '\0') return -1;   // (not a number: off and none too)
     return cpu >= 0 && cpu < 4096 && os::cpu_allowed((int) cpu) ? (int) cpu : -1;   // (cpu_allowed: this PC has it too)
 }
 
