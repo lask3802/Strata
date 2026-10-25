@@ -3,9 +3,10 @@
 // request sent or not x the reply on time, late or lost x every k, each of a layer's n_ff blocks added exactly once.  The
 // harness holds the lanes to what they can do, not to what pick_lane says: the main's GPU computes its picks whole
 // whatever their lane, the server computes a whole pick only of the experts it holds and a slice only where the layer is
-// sliced, a request not sent has no reply and no fallback.  Then the checks around it: a server's of a request row
-// (rx::row_refusal: the slice bits, k, the parts) and the load's of a tagged slice (ep_slice_refusal, rx::slice_refusal:
-// with H' a VRAM tier or zc slots are no reason, the rest still are).
+// sliced, a request not sent has no reply and no fallback.  serve_lane's own flow the same way (rx::split_plan: what of
+// a layer's request goes tagged, the lane's range, the fallback's - the engine's choices).  Then the checks around it:
+// a server's of a request row (rx::row_refusal: the slice bits, k, the parts) and the load's of a tagged slice
+// (ep_slice_refusal, rx::slice_refusal: with H' a VRAM tier or zc slots are no reason, the rest still are).
 //   ds4_rx_split_test     exit 0: all passed
 #include "../../src/dsv41/ds4_ffslice.hpp"
 #include "../../src/dsv41/ds4_rx.hpp"
@@ -57,6 +58,60 @@ static void case_checks() {
           "rx::slice_refusal: a slice beside the remote experts refused untagged (U4), taken tagged (H')");
 }
 
+// serve_lane's flow over rx::split_plan, as the engine runs it: the plan as if the request goes (its tagged picks go on
+// the wire), the send, the plan again if it failed; a CPU-lane pick computed by the lane over sp.here, and with the
+// reply its [k, nb) when it went tagged, or late or lost sp.late_slice; a pick of the server's set sent whole (the
+// reply its [0, nb), late or lost sp.late_whole), or not sent: one of the lane's picks (sp.here).  Every block once
+static int case_flow(int NB) {
+    int bad = 0, cases = 0;
+    const char* reply_name[2] = {"on time", "late or lost"};
+    for (int k = 1; k < NB; ++k)
+        for (int m = 0; m < 8; ++m)
+            for (int reply = 0; reply < 2; ++reply) {
+                const bool spl = m & 1, out = m & 2, ok = m & 4;
+                const bool wire = rx::split_plan(spl, out, true, k, NB).tagged;   // (the picks rx_send carries tagged)
+                const rx::SplitPlan sp = rx::split_plan(spl, out, ok, k, NB);
+                const bool sent = out && ok;
+                bool wrong = sent != sp.sent || (sp.sent && sp.tagged != wire);
+                for (int kind = 0; kind < 2; ++kind) {   // 0: a CPU-lane pick, 1: one of the server's set
+                    int times[16] = {};
+                    auto add = [&](rx::BlockRange r) {
+                        for (int b = r.b0; b < r.b1; ++b) ++times[b];
+                    };
+                    if (kind == 0) {
+                        add(sp.here);
+                        if (sent && wire) add(reply == 0 ? rx::BlockRange{k, NB} : sp.late_slice);
+                    } else if (sent) {
+                        add(reply == 0 ? rx::BlockRange{0, NB} : sp.late_whole);
+                    } else {
+                        add(sp.here);
+                    }
+                    for (int b = 0; b < NB; ++b) wrong = wrong || times[b] != 1;
+                }
+                ++cases;
+                if (wrong && ++bad <= 8)
+                    std::printf("  split_plan k %d, %s, %s, %s, reply %s: tagged %d sent %d here [%d, %d) late [%d, %d) / [%d, %d)  FAIL\n",
+                                k, spl ? "the layer splits" : "no split", out ? "out" : "kept here", ok ? "sent" : "send failed",
+                                reply_name[reply], (int) sp.tagged, (int) sp.sent, sp.here.b0, sp.here.b1, sp.late_whole.b0,
+                                sp.late_whole.b1, sp.late_slice.b0, sp.late_slice.b1);
+            }
+    // the ranges as cpu_experts' values: [0, k) and [k, nb) of n_ff 2304 meet and end at n_ff; no blocks (rx off): whole
+    bool ff = true;
+    for (int k = 1; k < NB; ++k) {
+        int a0, an, b0, bn;
+        rx::ff_range({0, k}, NB, 2304, a0, an);
+        rx::ff_range({k, NB}, NB, 2304, b0, bn);
+        ff = ff && a0 == 0 && an == 256 * k && b0 == 256 * k && b0 + bn == 2304;
+    }
+    int w0, wn, e0, en;
+    rx::ff_range({0, 1}, 1, 2304, w0, wn);
+    rx::ff_range({0, 0}, NB, 2304, e0, en);
+    ff = ff && w0 == 0 && wn == 2304 && en == 0;
+    std::printf("split_plan: %d cases (k 1..8 x the layer splits x out x the send x the reply), %d wrong; ff_range %s\n", cases,
+                bad, ff ? "ok" : "WRONG");
+    return bad + (ff ? 0 : 1);
+}
+
 int main() {
     constexpr int NB = 9;
     int cases = 0, bad = 0;
@@ -105,8 +160,9 @@ int main() {
             rx::main_range(rx::PickLane::kServerWhole, 8, NB).empty() && rx::server_range(rx::PickLane::kMainWhole, 8, NB).empty();
     std::printf("pick_lane: %d cases (k 1..8 x on the main's GPU, the server's set, layer sliced, sent x the reply), %d wrong; "
                 "the plan's table %s\n", cases, bad, table ? "ok" : "WRONG");
+    const int flow_bad = case_flow(NB);
     case_checks();
-    const bool ok = bad == 0 && table && checks_bad == 0;
+    const bool ok = bad == 0 && table && checks_bad == 0 && flow_bad == 0;
     std::printf("%s\n", ok ? "ALL OK" : "FAILED");
     return ok ? 0 : 1;
 }

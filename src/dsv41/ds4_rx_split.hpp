@@ -53,4 +53,33 @@ inline BlockRange server_range(PickLane p, int k, int nb) {
 /// the blocks the main adds when the reply is late or lost: exactly the server's share (the late reply is dropped)
 inline BlockRange fallback_range(PickLane p, int k, int nb) { return server_range(p, k, nb); }
 
+/// serve_lane's H' choices for one layer's request, the engine's and rx_split_test's (so the wiring is the one tested):
+/// spl - the layer splits (k < nb, an EP window, a layer rx_split took); out - the request goes out (the gate and the
+/// link allowing); ok - it did (rx_send).  tagged: the CPU-lane picks go with it tagged slice (decided before the send:
+/// split_plan(spl, out, true, ..)); sent: a reply to wait for; here: the lane's range for its own picks before the
+/// reply; late_whole / late_slice: what the lane adds for the server's whole picks and for the tagged ones when the
+/// reply is late or lost.  A request that did not go: nothing tagged, the lane's picks whole (the server's whole picks
+/// among them), no fallback
+struct SplitPlan {
+    bool tagged = false, sent = false;
+    BlockRange here, late_whole, late_slice;
+};
+inline SplitPlan split_plan(bool spl, bool out, bool ok, int k, int nb) {
+    SplitPlan s;
+    s.sent = out && ok;
+    s.tagged = spl && s.sent;
+    s.here = main_range(pick_lane(false, false, spl, s.tagged), k, nb);
+    if (s.sent) {
+        s.late_whole = fallback_range(PickLane::kServerWhole, k, nb);
+        if (s.tagged) s.late_slice = fallback_range(PickLane::kSplit, k, nb);
+    }
+    return s;
+}
+/// blocks [b0, b1) as cpu_experts' n_ff values [ff0, ff0 + ffn) of n_ff (the last of nb blocks runs to n_ff)
+inline void ff_range(BlockRange br, int nb, int n_ff, int& ff0, int& ffn) {
+    ff0 = 256 * br.b0 < n_ff ? 256 * br.b0 : n_ff;
+    const int ff1 = br.b1 >= nb ? n_ff : 256 * br.b1;
+    ffn = ff1 > ff0 ? ff1 - ff0 : 0;
+}
+
 }  // namespace strata::ds4::rx

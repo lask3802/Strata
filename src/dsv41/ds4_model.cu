@@ -7126,8 +7126,9 @@ struct Model::Impl {
             }
             ents.push_back(en);
         }
-        const int ff0 = std::min(g.ff, 256 * br.b0), ff1 = br.b1 >= rx_nb ? g.ff : 256 * br.b1;   // (the last block: to n_ff)
-        cpu_experts(l, x, ents, (size_t) kMaxDim, nullptr, ff0, ff1 - ff0);
+        int ff0, ffn;
+        rx::ff_range(br, rx_nb, g.ff, ff0, ffn);   // (the last block: to n_ff)
+        cpu_experts(l, x, ents, (size_t) kMaxDim, nullptr, ff0, ffn);
         const int D = g.dim;
         for (int t = 0; t < T; ++t)
             for (int sl = 0; sl < nslots; ++sl) {
@@ -7185,9 +7186,10 @@ struct Model::Impl {
     // the reply to request seq (sent at t0) into rp's parts; late or no link: those picks computed here.  The deadline:
     // after the lane's own picks, as long as the lane would take for these (rx::Gate::wait_ms), but not before 1.5 x the
     // round trip expected at these rows; the link's lateness (rx::Backoff) against the fixed wait's (rx::Gate::deadlines)
-    // (spk: the request's slice picks - the reply holds their [k, nb), and so does the fallback)
+    // (spk: the request's slice picks - the reply holds their [k, nb), and so does the fallback: sp's late ranges)
     void rx_finish(const Layer& l, const Req& r, Resp& rp, int T, unsigned seq, double t0,
-                   const std::vector<std::pair<int, int>>& rpk, const std::vector<std::pair<int, int>>& spk) {
+                   const std::vector<std::pair<int, int>>& rpk, const std::vector<std::pair<int, int>>& spk,
+                   const rx::SplitPlan& sp) {
         const double tw = rx::now_ms();
         const int rows = (int) rx_rows.size();
         const size_t n_srv = rx_npicks(rpk.size(), spk.size());   // (the lane's picks' worth the server computes)
@@ -7283,8 +7285,8 @@ struct Model::Impl {
         rx_here_note(l, rpk);
         const double tf = rx::now_ms();
         // exactly the server's share (the late reply is dropped when it comes): its experts whole, the slice picks' [k, nb)
-        lane_add(l, r, rp, T, rpk, rx::fallback_range(rx::PickLane::kServerWhole, rx_k, rx_nb));
-        lane_add(l, r, rp, T, spk, rx::fallback_range(rx::PickLane::kSplit, rx_k, rx_nb));
+        lane_add(l, r, rp, T, rpk, sp.late_whole);
+        lane_add(l, r, rp, T, spk, sp.late_slice);
         st.rx_fallback += (int64_t) rpk.size();
         st.rx_split_fallback += (int64_t) spk.size();
         st.rx_fallback_ms += rx::now_ms() - tf;
@@ -7617,11 +7619,12 @@ struct Model::Impl {
                     rpicks.clear();
                     want = false;
                 }
-                // the slice picks: every CPU-lane pick of the request (not one on this GPU: picks holds none)
+                // the slice picks: every CPU-lane pick of the request (not one on this GPU: picks holds none) - which go
+                // tagged, the lane's range for them and the fallback's: rx::split_plan (ds4_rx_split.hpp)
                 std::vector<std::pair<int, int>> spicks;
-                bool sent = false;
+                rx::SplitPlan sp = rx::split_plan(spl, want, true, rx_k, rx_nb);
                 if (want) {
-                    if (spl) spicks = picks;
+                    if (sp.tagged) spicks = picks;
                     rx_t0 = rx::now_ms();
                     if (!rx_send(next, li, T, r, rpicks, spicks)) {   // (no link: the lane computes them as it did before)
                         rx_here_note(l, rpicks);
@@ -7629,13 +7632,11 @@ struct Model::Impl {
                         st.rx_fallback += (int64_t) rpicks.size();
                         rpicks.clear();
                         spicks.clear();
-                    } else {
-                        sent = true;
+                        sp = rx::split_plan(spl, want, false, rx_k, rx_nb);
                     }
                 }
                 // the lane's n_ff range for its picks: [0, k) of the slice picks just sent, else whole
-                const rx::BlockRange mr =
-                    rx::main_range(rx::pick_lane(false, false, spl, sent && !spicks.empty()), rx_k, rx_nb);
+                const rx::BlockRange mr = sp.here;
                 std::sort(picks.begin(), picks.end());
                 for (size_t a = 0; a < picks.size();) {
                     Ent en;
@@ -7670,8 +7671,9 @@ struct Model::Impl {
                 }
                 if (!ents.empty()) {
                     const double tc = now_ms();
-                    const int ff0 = std::min(g.ff, 256 * mr.b0), ff1 = mr.b1 >= rx_nb ? g.ff : 256 * mr.b1;
-                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, ff0, ff1 - ff0);
+                    int ff0, ffn;
+                    rx::ff_range(mr, rx_nb, g.ff, ff0, ffn);
+                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, ff0, ffn);
                     const int D = g.dim;
                     for (int t = 0; t < T; ++t) {
                         bool any = false;
@@ -7688,12 +7690,12 @@ struct Model::Impl {
                     }
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
-                    st.lane_bytes += (double) ents.size() * (double) l.blob * (double) (ff1 - ff0) / (double) g.ff;
+                    st.lane_bytes += (double) ents.size() * (double) l.blob * (double) ffn / (double) g.ff;
                     // (a pick's time whole: the slices computed [0, k) of nb blocks)
                     const double whole = (double) nslots * (double) (mr.b1 - mr.b0) / (double) std::max(1, rx_nb);
                     if (rx_on && whole > 0) rx_gate.pick_seen(T, (now_ms() - tc) / whole);
                 }
-                if (sent) rx_finish(l, r, rp, T, next, rx_t0, rpicks, spicks);
+                if (sp.sent) rx_finish(l, r, rp, T, next, rx_t0, rpicks, spicks, sp);
             }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;

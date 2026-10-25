@@ -17,6 +17,14 @@ constexpr int kSumCols = 512;   // the weighted sums' columns a job
 double lane_ms_now() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+// the lowest k a matrix's parts take as run() looks it up (view(k): the first part that holds block k), every k from
+// it to nb in a part that runs to nb (overlapping parts: the first one found for k may end before nb); nb: none
+int run_lo(const ep::Parts& parts, int l, int e, int kind, int nb) {
+    int k = nb;
+    ep::View v;
+    while (k > 0 && parts.view(l, e, kind, k - 1, v) && v.b == nb) --k;
+    return k;
+}
 }  // namespace
 
 bool SliceLane::init(const ep::Parts& parts, const std::vector<Types>& types, int n_embd, int n_ff, float limit, int threads,
@@ -76,7 +84,7 @@ bool SliceLane::init_(const ep::Parts& parts, const std::vector<Types>& types, i
                     err = me + ": type " + std::to_string(v.type) + " or layout not the layer's (type " + std::to_string(want) + ")";
                     return false;
                 }
-                lo_ = std::max(lo_, v.a);
+                lo_ = std::max(lo_, run_lo(parts, (int) l, e, kind, nb_));
             }
         f.cap = gg::tq_cpu_type(ty.tg) || gg::tq_cpu_type(ty.td) ? 8 : kLaneMaxRows;   // (the trellis rows: 8 tokens a call, tq_cpu.hpp kTqMaxTokens - the main's ent_cap)
         f.on = true;
@@ -237,7 +245,7 @@ bool SliceServer::open(const std::string& dir, int link, std::string& err) {
                     parts_.close();
                     return false;
                 }
-                lo_ = std::max(lo_, v.a);
+                lo_ = std::max(lo_, run_lo(parts_, l, e, kind, nb));
             }
     }
     if (!any || lo_ < 1) {

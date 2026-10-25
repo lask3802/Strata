@@ -354,15 +354,16 @@ int main() {
     std::printf("lane against the slice in place: %d requests, max %.2e of max|y|; main [0,k) + lane against whole: max %.2e\n",
                 cases, worst_slice, worst_whole);
     // ---- gate / up parts that overlap, [3, 6) and [5, 9), the down's [5, 9) alone (Parts::open takes them; a view of block
-    // 5 is the first part, [3, 6)): k 5 refused rather than the slice's gate / up rows read past that part's end; k 6 from
-    // [5, 9) alone, the slice's values
+    // 5 is the first part, [3, 6)): the lo 6 (the lowest k a view takes to nb: the hello's - not the [5, 9) part's 5, which a
+    // main would then send and lose the server for), k 5 refused rather than the slice's gate / up rows read past that
+    // part's end; k 6 from [5, 9) alone, the slice's values
     {
         write_parts((root / "ov").string(), ex, {{3, 6}, {5, 9}}, {0, 1, 2}, -1, {3, 7});
         ep::Parts p;
         std::string err;
         CHECK(p.open((root / "ov").string(), err));
         rx::SliceLane lane;
-        CHECK(lane.init(p, types, E, FF, kLim, 0, {}, 50, err) && lane.lo() == 5);
+        CHECK(lane.init(p, types, E, FF, kLim, 0, {}, 50, err) && lane.lo() == 6);
         const Req q = make_req(rng, 1);
         std::vector<float> y((size_t) E, 7.0f);
         CHECK(!lane.run(0, 5, q.picks.data(), (int) q.picks.size(), 1, q.x.data(), E, y.data(), E, true, err));
