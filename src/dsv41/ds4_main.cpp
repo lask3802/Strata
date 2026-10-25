@@ -32,6 +32,7 @@
 // `pin=N` on a GEN marks the first N prompt tokens as a start other requests share (a system prompt and its tools): the
 // read stops there for a checkpoint, so a request behind the same start - another agent - goes back to it instead of
 // reading it again (also without slots).  STRATA_DS4_REUSE=0 turns every reuse off (each request reads its whole prompt).
+#include "ds4_force.hpp"
 #include "ds4_model.hpp"
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
@@ -1839,6 +1840,15 @@ int main(int argc, char** argv) {
         ids_s = ss.str();
     }
     const std::vector<int> ids = parse_ids(ids_s);
+    strata::ds4::ForcedTokens forced;   // (DS4_FORCE_TOKENS: the decode emits a file's ids - ds4_force.hpp)
+    if (const char* ff = std::getenv("DS4_FORCE_TOKENS"); ff != nullptr && *ff != 0 && n > 0) {
+        if (!forced.load(ff, n, err)) {
+            std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "forced tokens: the decode emits the first %d of the %zu ids in %s (plain decode, no "
+                             "drafts)\n", n, forced.ids.size(), ff);
+    }
     if (!images.empty()) {   // --images: a GENI file's pictures, for the prompt's spans
         std::vector<Pic> pics;
         if (!read_pics(images, pics, err)) {
@@ -1890,6 +1900,7 @@ int main(int argc, char** argv) {
     bool cool = false;
     if (n > 0) {
         int tok = m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++);
+        if (forced.on()) tok = forced.take(0, tok);
         std::vector<int> got;
         for (;;) {
             out.push_back(tok);
@@ -1903,7 +1914,7 @@ int main(int argc, char** argv) {
             if ((tok == 1 && std::getenv("DS4_NO_EOS") == nullptr) || (int) out.size() >= n) break;   // (DS4_NO_EOS: decode n tokens whatever)
             if (got.empty()) {
                 int off = 0, acc = 0;
-                const bool try_spec = spec && !cool;
+                const bool try_spec = spec && !cool && !forced.on();
                 if (!round(m, tok, n - (int) out.size(), try_spec, o.dspark_conf, temp, 1.0f, temp > 0 ? 64 : 1, 0.0f,
                            cli_seed, counter, got, off, acc, err)) {
                     std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
@@ -1917,8 +1928,12 @@ int main(int argc, char** argv) {
             }
             tok = got.back();
             got.pop_back();
+            if (forced.on()) tok = forced.take(out.size(), tok);
         }
         std::printf("\n");
+        if (forced.on())
+            std::fprintf(stderr, "forced tokens: %lld of the decode's %zu own picks were not the file's (the first at "
+                                 "position %lld)\n", forced.differed, out.size(), forced.first);
         if (df != nullptr && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
     }
     if (spec && rounds > 0) {

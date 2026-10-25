@@ -913,6 +913,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       if(WIN32)
         target_link_libraries(ds4_rx_link_test PRIVATE ws2_32)
       endif()
+      # DS4_FORCE_TOKENS (ds4_force.hpp): the decode emits a file's ids, for speed A/Bs on one token path; no GPU
+      add_executable(ds4_force_test tests/dsv41/force_tokens_test.cpp)
+      target_compile_features(ds4_force_test PRIVATE cxx_std_17)
       # the kept conversations' .meta file and prefix matching (ds4_slotmeta.hpp): no GPU, no model
       add_executable(ds4_slot_test tests/dsv41/slot_test.cpp)
       target_include_directories(ds4_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
