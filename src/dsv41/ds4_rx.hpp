@@ -14,7 +14,8 @@
 // sum_i w_i expert_i(x) in bf16) and adds it to the same part before the answer's seq.  A reply later than
 // DS4_RX_TIMEOUT_MS (2) after the lane's own picks are done: those picks are computed on the lane (the late reply is
 // skipped when it comes); 8 late replies of the last 64: the lane computes everything for the next DS4_RX_BACKOFF (256)
-// requests, then the link is tried again with a clean count; a lost link: the lane computes everything from then on.
+// requests, then the link is tried again with a clean count; a lost link, or no reply at all from one such idle spell
+// to the next: the lane computes everything from then on.
 // Never a hang.
 //
 // The wire: a 32-byte header (magic, type, seq, a, b, c, payload bytes), then the payload; TCP_NODELAY, rows bf16.
@@ -144,25 +145,33 @@ struct LateBook {
 };
 
 /// The late replies of the main's last 64 requests: 8 of them idle the link for the next `hold` requests (the lane
-/// computes their picks), then it is tried again with a clean count - never given up for good on lateness alone
+/// computes their picks), then it is tried again with a clean count.  Given up for good only when no reply at all
+/// (late or not) came from one idle spell to the next: a server that stopped answering on a link still open
 struct Backoff {
+    enum { On = 0, Idle = 1, Silent = 2 };
     uint64_t bits = 0;
     int hold = 256, left = 0;
+    bool spell = false, heard = false;   // (an idle spell before, a reply read since it)
     /// once a request that has remote picks: true = keep them here (the link idle)
     bool idle() {
         if (left <= 0) return false;
         --left;
         return true;
     }
-    /// a sent request's reply: on time or late.  true = this late one began an idle spell
-    bool seen(bool late) {
+    void reply() { heard = true; }   // (a reply read: on time, or a late one that came after all)
+    /// a sent request's reply on time or late: Idle = this late one began an idle spell, Silent = and none came since
+    /// the last one (give the link up)
+    int seen(bool late) {
         bits = bits << 1 | (late ? 1u : 0u);
         int n = 0;
         for (uint64_t b = bits; b != 0; b &= b - 1) ++n;
-        if (n < 8) return false;
+        if (n < 8) return On;
+        const bool silent = spell && !heard;
         bits = 0;
         left = hold;
-        return true;
+        spell = true;
+        heard = false;
+        return silent ? Silent : Idle;
     }
 };
 

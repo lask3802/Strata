@@ -6728,7 +6728,10 @@ struct Model::Impl {
         const int got = rx_on ? rx_link->wait_resp(seq, rows, deadline, &y, srv_us, e) : -1;
         const double t1 = rx::now_ms();
         const double ta = got == 1 ? rx_link->arrival_ms() : -1.0;   // (the kernel's time the reply came in: Linux)
-        const auto late = rx_link->take_late();   // (earlier late requests' replies, skipped here: their round trips)
+        // earlier late requests' replies, skipped here: their round trips.  A stamp is a read's last skb: one equal to
+        // the next reply's is that reply's; one read with only the next reply's head still over-states by that head
+        const auto late = rx_link->take_late();
+        if (!late.empty()) rx_back.reply();
         for (size_t i = 0; i < late.size(); ++i) {
             const double la = late[i].second;
             double ts;
@@ -6737,13 +6740,13 @@ struct Model::Impl {
             if (!rx_late_book.take(late[i].first, ts, rw, &ly)) continue;
             ++st.rx_late_came;
             if (la < ts || la > t1) continue;   // (no kernel time, or the realtime clock stepped)
-            if (la == ta || (i + 1 < late.size() && late[i + 1].second == la)) {   // (one read with a later reply: the
-                ++st.rx_late_shared;                                             // stamp is the later one's)
+            if (la == ta || (i + 1 < late.size() && late[i + 1].second == la)) {
+                ++st.rx_late_shared;
                 continue;
             }
             rx_gate.rtt_seen(rw, la - ts);
-            ++st.rx_late_timed;
             std::lock_guard<std::mutex> lk(rx_mu);
+            ++st.rx_late_timed;
             if (rx_late_arr.size() < (size_t(1) << 20)) rx_late_arr.push_back({(float) (la - ts), ly});
         }
         if (ta >= 0) rx_kts = true;
@@ -6778,6 +6781,7 @@ struct Model::Impl {
             st.rx_picks += (int64_t) rpk.size();
             st.rx_rtt_ms += t1 - t0;
             st.rx_srv_ms += srv_us / 1000.0;
+            rx_back.reply();
             rx_back.seen(false);
             return;
         }
@@ -6788,7 +6792,11 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4: remote experts: a reply past its deadline (%.2f ms after the lane's part, %.2f ms "
                                      "after its send; layer %d): its %zu picks computed here (said once; the count is in "
                                      "the stats)\n", rx_timeout_ms, deadline - t0, l.il, rpk.size());
-            if (rx_back.seen(true) && ++st.rx_backoffs == 1)
+            const int bk = rx_back.seen(true);
+            if (bk == rx::Backoff::Silent)
+                rx_lost("8 of the last 64 replies past their deadline again, and no reply at all since the link was "
+                        "last idle");
+            else if (bk == rx::Backoff::Idle && ++st.rx_backoffs == 1)
                 std::fprintf(stderr, "ds4: remote experts: 8 of the last 64 replies past their deadline - the CPU lane "
                                      "computes all its experts for the next %d requests, then the link is tried again "
                                      "(said once; the count is in the stats)\n", rx_back.hold);
@@ -6860,10 +6868,12 @@ struct Model::Impl {
                       (long long) st.rx_held, (double) st.rx_upload_bytes / 1e9, st.rx_upload_ms / 1000.0);
         std::string out = b;
         std::snprintf(b, sizeof b,
-                      "remote experts' late replies that came after all: %lld of %lld (%lld read with a later reply: no "
-                      "time of their own); send to their arrival in the kernel %s ms",
-                      (long long) (st.rx_late_came - s0.rx_late_came), (long long) (st.rx_late - s0.rx_late),
-                      (long long) (st.rx_late_shared - s0.rx_late_shared), lts.c_str());
+                      "remote experts' late replies that came after all: %lld (%lld read with a later reply, %lld with no "
+                      "kernel time: no time of their own); send to their arrival in the kernel %s ms",
+                      (long long) (st.rx_late_came - s0.rx_late_came), (long long) (st.rx_late_shared - s0.rx_late_shared),
+                      (long long) (st.rx_late_came - s0.rx_late_came - (st.rx_late_shared - s0.rx_late_shared) -
+                                   (st.rx_late_timed - s0.rx_late_timed)),
+                      lts.c_str());
         out += b;
         if (lt_layer >= 0) {
             std::snprintf(b, sizeof b, " (the slowest %.3f ms at layer %d)", lt_max, lt_layer);

@@ -121,23 +121,38 @@ int main() {
     }
     {
         // 8 late of the last 64 (lead 2026-10-25): the link idle for `hold` requests, then tried again with a clean count
-        rx::Backoff k;
+        using B = rx::Backoff;
+        B k;
         k.hold = 3;
         bool trip = false;
-        for (int i = 0; i < 7; ++i) trip = trip || k.seen(true);
+        for (int i = 0; i < 7; ++i) trip = trip || k.seen(true) != B::On;
         check(!trip && !k.idle(), "7 late: the link stays on");
-        for (int i = 0; i < 64; ++i) trip = trip || k.seen(false);
-        trip = trip || k.seen(true);
-        check(!trip && !k.idle(), "7 late, 64 on time, 1 late: the 7 are out of the last 64, on");
-        for (int i = 0; i < 6; ++i) trip = trip || k.seen(true);
+        for (int i = 0; i < 57; ++i) trip = trip || k.seen(false) != B::On;
+        trip = trip || k.seen(true) != B::On;
+        check(!trip && !k.idle(), "7 late, 57 on time, 1 late: the oldest late one is out of the last 64 (7), on");
+        for (int i = 0; i < 6; ++i) trip = trip || k.seen(true) != B::On;
         check(!trip, "7 late in the last 64 again: on");
-        check(k.seen(true), "the 8th late in the last 64: idle");
+        k.reply();
+        check(k.seen(true) == B::Idle, "the 8th late in the last 64: idle");
         const bool i1 = k.idle(), i2 = k.idle(), i3 = k.idle(), i4 = k.idle();
         check(i1 && i2 && i3 && !i4, "idle for the next 3 requests (hold), then the link is tried again");
         trip = false;
-        for (int i = 0; i < 7; ++i) trip = trip || k.seen(true);
+        for (int i = 0; i < 7; ++i) trip = trip || k.seen(true) != B::On;
         check(!trip && !k.idle(), "a clean count after: 7 late do not idle it");
-        check(k.seen(true) && k.idle(), "and an 8th does, again: never given up for good");
+        k.reply();   // (a late reply came after all)
+        check(k.seen(true) == B::Idle && k.idle(), "and an 8th does, again, after a reply came: idle, not given up");
+        B w;   // (the oldest of the 64 still counts)
+        for (int i = 0; i < 7; ++i) w.seen(true);
+        for (int i = 0; i < 56; ++i) w.seen(false);
+        check(w.seen(true) == B::Idle, "7 late, 56 on time, 1 late: 8 in the last 64, idle");
+        B s;   // (a server that stopped answering on a link still open)
+        s.hold = 2;
+        for (int i = 0; i < 7; ++i) s.seen(true);
+        check(s.seen(true) == B::Idle, "the first idle spell: never given up at once");
+        s.idle();
+        s.idle();
+        for (int i = 0; i < 7; ++i) s.seen(true);
+        check(s.seen(true) == B::Silent, "8 late again and no reply at all since the spell: given up");
     }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;
