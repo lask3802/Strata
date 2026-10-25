@@ -2047,9 +2047,14 @@ int main(int argc, char** argv) {
                 if (worst < 0 || s.ep_verify[i] > s.ep_verify[worst]) worst = i;
                 if (!(s.ep_verify[i] <= bound)) ++above;
             }
-        const char* verdict = s.ep_verify_wrong ? (above ? "the wrong comb seen: the check works"
-                                                         : "the wrong comb NOT seen: the check is blind")
-                                                : (above ? "MISMATCH (wiring, or inf)" : "ok");
+        // (VERIFY=2: every layer's add but the head's takes the wrong comb, so all of them but the last must be above)
+        const char* verdict = s.ep_verify_wrong ? (above > 0 && above + 1 >= seen ? "the wrong comb seen: the check works"
+                                                   : above > 0 ? "the wrong comb seen in some layers only: partly blind, "
+                                                                 "unless the others had no CPU-lane part in the run"
+                                                               : "the wrong comb NOT seen: the check is blind")
+                              : above  ? "MISMATCH (wiring, or inf)"
+                              : seen   ? "ok"
+                                       : "ok (no layer differed at all: exact, or not checked)";
         std::string ln;
         for (int i = 0; i <= last; ++i) {
             char b[32];
