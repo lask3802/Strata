@@ -159,6 +159,10 @@ struct Stats {
     // after all (a reply late or lost)
     int64_t rx_split_picks = 0, rx_split_reqs = 0, rx_split_fallback = 0;
     double rx_srv_lane_ms = 0.0;
+    // DS4_RX_FILL=1 (EP U5b): fills queued, loaded by the server, refused; their bytes sent and the time in the paced
+    // sends; the requests the server answered Stale (an expert mid-fill)
+    int64_t rx_fills = 0, rx_fill_ok = 0, rx_fill_fail = 0, rx_fill_bytes = 0, rx_stale = 0;
+    double rx_fill_ms = 0.0;
     // DS4_EP_SPLIT_VERIFY: the rows checked (a reply's slice sum against this lane's), the largest |d| / |ref| by layer
     // since the load; =2: the server's slice wrong on purpose (the check must see it)
     int64_t rx_split_n = 0;

@@ -23,6 +23,7 @@
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
 #include "ds4_rx_fill.hpp"
+#include "ds4_rx_fill_link.hpp"
 #include "ds4_rx.hpp"
 #include "ds4_rx_split.hpp"
 #include "ds4_stage.hpp"
@@ -1176,6 +1177,17 @@ struct Model::Impl {
     int rx_verify = 0;
     bool rx_tagged = false;   // (H' on: a layer's slice computed only for picks sent tagged - ep_slices_ok)
     std::vector<float> rx_vx, rx_vy;   // (the verify's x in bf16 and its sums: kWin rows)
+    // the server's set following the heat (DS4_RX_FILL=1, EP U5b: ds4_rx_fill.hpp, ds4_rx_fill_link.hpp): the fills'
+    // socket, their budget (R a token, Q pending; the socket paces the bytes), each layer's blob as a fill ships it, the
+    // VRAM expert a layer's swap under way takes out (rx_vout: no duplicate kept on the server), a tick's layers
+    std::unique_ptr<rx::FillLink> rx_fill;
+    std::unique_ptr<rx::FillBook> rx_book;
+    std::vector<rx::FillGeo> rx_fgeo;
+    std::vector<int> rx_vout;
+    std::vector<std::vector<int>> rx_thits;
+    std::vector<rx::TierLayer> rx_tier;
+    double rx_fill_max = 0.0;
+    uint32_t rx_fill_seq = 0;
     mutable std::mutex rx_mu;
     std::vector<float> rx_rtt, rx_wait, rx_arr;
     std::vector<std::pair<float, int>> rx_late_arr;   // the late replies that came: send to arrival in the kernel, layer
@@ -6634,6 +6646,7 @@ struct Model::Impl {
                 l.spare_host = old_parts;
             }
             l.spare_vram = old_slot;
+            if (!rx_vout.empty()) rx_vout[(size_t) sw.layer] = -1;   // (out has left VRAM: the remote tier's dup rule again)
             for (int m = 0; m < l.nm; ++m) {
                 Layer& x = member(l, m);
                 const Dev& dm = devs[(size_t) x.dev];
@@ -6647,6 +6660,7 @@ struct Model::Impl {
             --sw_inflight;
             ++st.swaps;
         }
+        if (rx_fill) rx_fill_in();
         decay_tokens += T;
         if (decay_tokens >= 256) {   // older use counts less: x0.9 every 256 tokens
             decay_tokens = 0;
@@ -6675,11 +6689,13 @@ struct Model::Impl {
                     vin = best;
                     Swap sw{l.il, best, cold};
                     if (copy_mode && l.ram[(size_t) best] >= 0) sw.ram = copy_spare[(size_t) l.il];   // (-1: none)
+                    if (!rx_vout.empty()) rx_vout[(size_t) l.il] = cold;
                     std::lock_guard<std::mutex> lk(sw_mu);
                     sw_queue.push_back(sw);
                     queued = true;
                 }
             }
+            if (rx_fill) rx_tier_add(l, hits, vin);
             if (l.ram.empty() || ram_free.empty() || ram_inflight >= kMaxSwaps) continue;
             // RAM: the hottest read from the file, in place of the layer's coldest held (or a free slot) - not one the
             // expert server holds (the lane does not compute it where the server serves: rx_row, as the VRAM tier)
@@ -6701,6 +6717,7 @@ struct Model::Impl {
             ram_queue.push_back(rs);
             rqueued = true;
         }
+        if (rx_fill) rx_fill_out();
         if (queued) sw_cv.notify_all();
         if (rqueued) ram_cv.notify_one();
     }
@@ -7050,9 +7067,106 @@ struct Model::Impl {
         st.rx_bytes_in = (int64_t) link->bytes_in();
         rx_link = std::move(link);
         rx_on = held > 0 || rx_k < rx_nb;   // (H': the slice picks need no blob held)
+        if (const char* fv = std::getenv("DS4_RX_FILL"); fv != nullptr && *fv == '1' && held > 0) rx_fill_open(token, gl);
         rx_rtt.reserve(1 << 20);
         rx_wait.reserve(1 << 20);
         rx_arr.reserve(1 << 20);
+    }
+    // (DS4_RX_FILL=1) the fills' socket after the upload: DS4_RX_FILL_PACE GB/s (0.6), DS4_RX_FILL_R fills a token (6),
+    // DS4_RX_FILL_Q pending (2), DS4_RX_FILL_PORT (the rx port + 1).  A server that takes none: the set stays the load's
+    void rx_fill_open(const std::string& token, const std::vector<rx::GeoLayer>& gl) {
+        const double pace = (double) env_f("DS4_RX_FILL_PACE", 0.6f) * 1e9;
+        const int R = std::max(1, (int) env_f("DS4_RX_FILL_R", 6.0f)), Q = std::max(1, (int) env_f("DS4_RX_FILL_Q", 2.0f));
+        const int port = (int) env_f("DS4_RX_FILL_PORT", 0.0f);
+        rx_fgeo.assign(gl.size(), rx::FillGeo());
+        rx_fill_max = 0.0;
+        for (size_t li = 0; li < gl.size(); ++li) {
+            if (gl[li].blob == 0) continue;
+            const Layer& l = L[li];
+            const uint64_t rb[3] = {mx_row_b(l, 0), mx_row_b(l, 1), mx_row_b(l, 2)};
+            rx_fgeo[li] = rx::FillGeo(gl[li], g.dim, g.ff, rb);
+            rx_fill_max = std::max(rx_fill_max, (double) gl[li].blob);   // (the largest fill: a whole blob)
+        }
+        auto fl = std::make_unique<rx::FillLink>();
+        std::string e;
+        const int cpu = rx::fill_cpu();
+        if (!fl->open(*rx_link, o.remote_experts, port, token, pace, cpu, 3000, e)) {
+            std::fprintf(stderr, "ds4: remote experts: no fills (%s) - the server keeps the load's experts\n", e.c_str());
+            return;
+        }
+        rx_book = std::make_unique<rx::FillBook>(R, Q, 0.0, 0.0, rx_fill_max);
+        rx_vout.assign(L.size(), -1);
+        rx_thits.assign(L.size(), {});
+        std::fprintf(stderr, "ds4: remote experts: fills on (port %d, %.2f GB/s, %d a token, %d pending, %s; the fill "
+                             "thread on CPU %d)\n", fl->port(), pace / 1e9, R, Q,
+                     rx_k < rx_nb ? ("the main's [0, " + std::to_string(rx_k) + ") of a split layer").c_str()
+                                  : "whole blobs", cpu);
+        rx_fill = std::move(fl);
+    }
+    // (a token boundary, cache_tick_swaps) the fills the server loaded since the last one: theirs from now; the link
+    // gone: those under way back to the lane, no more fills
+    void rx_fill_in() {
+        for (const rx::FillLink::Done& d : rx_fill->take()) {
+            rx_book->done();
+            if (d.layer >= 0 && (size_t) (d.layer + 1) * g.n_exp <= rx_has.size() && d.in >= 0 && d.in < g.n_exp)
+                rx::fill_landed(rx_has.data() + (size_t) d.layer * g.n_exp, d.in, d.status == 0);
+            ++(d.status == 0 ? st.rx_fill_ok : st.rx_fill_fail);
+        }
+        st.rx_fill_bytes = (int64_t) rx_fill->bytes.load();
+        st.rx_fill_ms = (double) rx_fill->send_us.load() / 1000.0;
+        if (rx_fill->up() && rx_on) return;
+        const std::string why = rx_fill->up() ? "the link given up" : rx_fill->why();
+        rx_fill->close();
+        for (uint8_t& h : rx_has)
+            if (h == rx::kFilling) h = 0;
+        std::fprintf(stderr, "ds4: remote experts: fills off (%s)\n", why.c_str());
+        rx_fill.reset();
+    }
+    // (cache_tick_swaps, a layer's hits) the layer as the remote tier sees it this tick
+    void rx_tier_add(const Layer& l, const std::vector<int>& hits, int vin) {
+        if (l.mtp || l.n_exp != g.n_exp || (size_t) l.il >= rx_fgeo.size() || rx_fgeo[(size_t) l.il].blob == 0 ||
+            (size_t) (l.il + 1) * g.n_exp > rx_has.size())
+            return;
+        rx_thits[(size_t) l.il] = hits;
+        rx::TierLayer t;
+        t.layer = l.il;
+        t.hits = &rx_thits[(size_t) l.il];
+        t.slot = l.slot.data();
+        t.ram = l.ram.empty() ? nullptr : l.ram.data();
+        t.zc = l.zc.empty() ? nullptr : l.zc.data();
+        t.heat = l.heat.data();
+        t.has = rx_has.data() + (size_t) l.il * g.n_exp;
+        t.n_exp = l.n_exp;
+        t.vin = vin;
+        t.vout = rx_vout[(size_t) l.il];
+        const bool spl = rx_k < rx_nb && (size_t) l.il < rx_split_l.size() && rx_split_l[(size_t) l.il];
+        t.bytes = (double) rx_fgeo[(size_t) l.il].ship_bytes(spl ? rx_k : 0);
+        if (t.bytes > rx_fill_max) {   // (the book's burst is sized by the largest fill)
+            std::fprintf(stderr, "ds4: remote experts: layer %d's fill (%.0f bytes) past the largest (%.0f)\n", l.il,
+                         t.bytes, rx_fill_max);
+            std::abort();
+        }
+        rx_tier.push_back(t);
+    }
+    // (cache_tick_swaps, after the layers) this tick's fills: chosen (out off the server's list, in kFilling), queued
+    void rx_fill_out() {
+        rx_book->tick(now_ms(), rx_back.left > 0);
+        for (const rx::Fill& f : rx::remote_choose(rx_tier, *rx_book, c_margin, c_bonus)) {
+            const Layer& l = L[(size_t) f.layer];
+            rx::FillLink::Job j;
+            j.seq = ++rx_fill_seq;
+            j.layer = f.layer;
+            j.in = f.in;
+            j.out = f.out;
+            const bool spl = rx_k < rx_nb && (size_t) l.il < rx_split_l.size() && rx_split_l[(size_t) l.il];
+            j.k = spl ? rx_k : 0;
+            j.geo = rx_fgeo[(size_t) f.layer];
+            for (int r = 0; r < 3; ++r)   // (the file's: `in` is in neither VRAM nor RAM, and the mapping outlives the link)
+                j.src[r] = pk.at(l.mx_file[r], l.mx_off[r] + (uint64_t) f.in * l.mx_stride[r]);
+            rx_fill->queue(j);
+            ++st.rx_fills;
+        }
+        rx_tier.clear();
     }
     // layer l's experts the expert server holds, for the hits of a window of T rows (0: the settle, the tick after a
     // chunked prompt or a window prompt's ticks - the decode's) ([n_exp]; null:
@@ -7228,6 +7342,7 @@ struct Model::Impl {
         const int got = rx_on ? rx_link->wait_resp(seq, rows, deadline, &y, srv_us, e, sets, &lane_us) : -1;
         const double t1 = rx::now_ms();
         const double ta = got == 1 ? rx_link->arrival_ms() : -1.0;   // (the kernel's time the reply came in: Linux)
+        const bool stale = got == 0 && rx_link->last_stale();   // (a fill took a slot it named: no reply will come)
         // earlier late requests' replies, skipped here: their round trips.  A stamp is a read's last skb: one equal to
         // the next reply's is that reply's; one read with only the next reply's head still over-states by that head
         const auto late = rx_link->take_late();
@@ -7255,14 +7370,15 @@ struct Model::Impl {
         }
         if (ta >= 0) rx_kts = true;
         if (ta >= t0 && ta <= t1) rx_seen(rows, ta - t0, true, t0);   // (outside: the realtime clock stepped)
-        else if (got == 1 || (got == 0 && !rx_kts))   // (late, with the kernel's times: its reply, if it comes, says)
-            rx_seen(rows, t1 - t0, t1 - tw > 0.05, t0);   // (read within 50 us of the lane's part: there already)
+        else if (got == 1 || (got == 0 && !stale && !rx_kts))   // (late, with the kernel's times: its reply, if it
+            rx_seen(rows, t1 - t0, t1 - tw > 0.05, t0);   // comes, says) (read within 50 us of the lane's part: there already)
         for (int n = rx_late_book.expire(t1); n > 0; --n) rx_back_seen(true);   // (past the link's bound, not in)
-        if (got == 0)   // (late for the lane's wait; for the link only past the fixed wait's deadline)
+        if (got == 0 && !stale)   // (late for the lane's wait; for the link only past the fixed wait's deadline)
             for (int n = rx_late_book.add_late(seq, t0, rows, l.il, deadline, bound); n > 0; --n) rx_back_seen(true);
         st.rx_wait_ms += t1 - tw;
         st.rx_bytes_out = (int64_t) rx_link->bytes_out();
         st.rx_bytes_in = (int64_t) rx_link->bytes_in();
+        st.rx_stale = (int64_t) rx_link->stales;
         {
             std::lock_guard<std::mutex> lk(rx_mu);
             if (rx_rtt.size() < (size_t(1) << 22)) {   // (4M requests: the percentiles are of the first ones after)
@@ -7468,6 +7584,16 @@ struct Model::Impl {
                   "ms a pick);", t, q, la, sk, t, rx_gate.rtt[t], rx_gate.pick[t]);
         }
         out += "\n";
+        if (rx_book) {   // (DS4_RX_FILL=1 and the fills' socket came up)
+            int64_t held = 0;
+            for (uint8_t h : rx_has) held += h == rx::kHeld;
+            add_f(out, "remote experts' fills: %lld queued (%.2f a token), %lld loaded, %lld refused, %.1f MB a token "
+                       "sent (%.2f s in the paced sends), %lld requests Stale; the server holds %lld experts now%s\n",
+                  (long long) (st.rx_fills - s0.rx_fills), (double) (st.rx_fills - s0.rx_fills) / nt,
+                  (long long) (st.rx_fill_ok - s0.rx_fill_ok), (long long) (st.rx_fill_fail - s0.rx_fill_fail),
+                  (double) (st.rx_fill_bytes - s0.rx_fill_bytes) / 1e6 / nt, (st.rx_fill_ms - s0.rx_fill_ms) / 1000.0,
+                  (long long) (st.rx_stale - s0.rx_stale), (long long) held, rx_fill ? "" : " (the fills' link gone)");
+        }
         out += ep_line(s0, nt);
         return out;
     }
@@ -7596,10 +7722,10 @@ struct Model::Impl {
                         }
                         if (l.slot[(size_t) e] < 0) {
                             const bool zc = T == 1 && !l.zc.empty() && l.zc[(size_t) e];
-                            if (!zc && rxl && rx_has[(size_t) li * g.n_exp + e]) {   // (the expert server's: not a swap
-                                rpicks.push_back({e, t * kPicks + i});              // candidate; one the device computes
-                                continue;                                           // from the store stays the device's)
-                            }
+                            if (!zc && rxl && rx_has[(size_t) li * g.n_exp + e] == rx::kHeld) {   // (the server's,
+                                rpicks.push_back({e, t * kPicks + i});   // not one it is filling: not a swap candidate;
+                                continue;                                // one the device computes from the store stays
+                            }                                            // the device's)
                             l.cpu_hits.push_back(e);
                             if (zc) {   // the device computed it from the store's slot
                                 store->touch(li, e);

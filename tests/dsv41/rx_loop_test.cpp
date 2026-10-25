@@ -558,6 +558,22 @@ static void case_rules() {
     check(os::cpu_list("2,18") == std::vector<int>{2, 18} && os::cpu_list("2-3") == std::vector<int>{2, 3} &&
               os::cpu_list("0-1,8-9\n") == std::vector<int>{0, 1, 8, 9} && os::cpu_list("").empty(),
           "cpu_list: 2,18 / 2-3 / 0-1,8-9 / nothing");
+    // a thread pinned by pin_self still sees the CPUs it had: the expert server's link thread picks the fill thread's
+    // CPU (rx::fill_cpu: the link core's sibling) after serve_loop pinned it (U5b's slot: -1, the fill thread unpinned)
+    {
+        std::vector<int> had;
+        for (int a = 0; a < std::min(hw, 64); ++a)
+            if (os::cpu_allowed(a)) had.push_back(a);
+        bool same = !had.empty();
+        if (same) {
+            os::pin_self(had.back());
+            for (int a = 0; a < std::min(hw, 64); ++a)
+                same = same && os::cpu_allowed(a) == (std::find(had.begin(), had.end(), a) != had.end());
+            os::pin_self(-1);
+        }
+        check(same, "cpu_allowed: pinned to CPU " + std::to_string(had.empty() ? -1 : had.back()) + " by pin_self, the " +
+                        std::to_string(had.size()) + " CPUs it had before, no fewer");
+    }
     // the siblings: each CPU among its own, the relation symmetric; Linux: as many as the kernel lists
     bool own = true, sym = true;
     for (int a = 0; a < std::min(hw, 64); ++a) {
