@@ -36,7 +36,7 @@ class Pool {
 public:
     explicit Pool(int n, const std::vector<int>& cpus = {}, int spin_us = 200) : spin_us_(spin_us) {
         for (int i = 0; i < n; ++i) {
-            th_.emplace_back([this] { loop(); });
+            th_.emplace_back([this] { loop(0); });   // (generation 0: a batch started before the thread runs is still its)
             if (!cpus.empty()) os::pin_thread(th_.back(), cpus[(size_t) i % cpus.size()]);
         }
     }
@@ -93,8 +93,7 @@ private:
             done_.fetch_add(1, std::memory_order_acq_rel);
         }
     }
-    void loop() {
-        uint64_t seen = gen_.load();
+    void loop(uint64_t seen) {
         for (;;) {
             const auto t0 = std::chrono::steady_clock::now();
             uint64_t g;

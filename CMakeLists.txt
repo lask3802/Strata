@@ -899,6 +899,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                                  ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
       target_link_libraries(ds4_ep_slice_test PRIVATE strata_kernels_cpu Threads::Threads)
       target_compile_definitions(ds4_ep_slice_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+      # the expert server's CPU lane over the parts pack's n_ff slices (rx::SliceLane, ds4_rx_lane.hpp): its sums against
+      # the slice computed in place on the whole expert, and with the main's [0, k) against the whole; no GPU
+      add_executable(ds4_rx_lane_test tests/dsv41/rx_lane_test.cpp src/dsv41/ds4_rx_lane.cpp src/dsv41/ds4_iq_cpu.cpp
+                     src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_tq_cpu.cpp)
+      target_include_directories(ds4_rx_lane_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
+      target_compile_features(ds4_rx_lane_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_rx_lane_test PRIVATE strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(ds4_rx_lane_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+      # which lane computes which n_ff blocks of a pick under H' (ds4_rx_split.hpp): each block added once; no GPU, no model
+      add_executable(ds4_rx_split_test tests/dsv41/rx_split_test.cpp)
+      target_compile_features(ds4_rx_split_test PRIVATE cxx_std_17)
       if(STRATA_ENABLE_CUDA)
         # the decode GPU-part changes (ds4_u9.hpp) against the path they replace, bit for bit; needs a GPU, no model
         add_executable(ds4_u9_test tests/dsv41/u9_bits_test.cu src/dsv41/ds4_gguf.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq.cu

@@ -1,0 +1,56 @@
+// src/dsv41/ds4_rx_split.hpp - which lane computes which n_ff blocks of a routed pick under expert parallelism H'
+// (ep-design.md 1.2, ep-u6-plan.md 0 and 3a): the main process's CPU lane [0, k) of a slice pick, the expert server's
+// CPU lane [k, nb) of it, the server's GPU (the experts it holds) a pick whole, the main's own GPU and every pick of a
+// request not sent whole on the main.  The invariant that keeps a pick from being added twice or not at all: the main
+// computes only [0, k) when the slice tag went out in the same request; a pick on the main's GPU (a VRAM tier, a store
+// slot the GPU reads, a drafter layer, a CPU lane that cannot slice) is never tagged, since its kernels compute it whole.
+// A reply late or lost: the main adds what the server would have (fallback_range).  Pure functions, no state.
+#pragma once
+
+namespace strata::ds4::rx {
+
+enum class PickLane : int {
+    kMain = 0,         // the main process's GPU or a CPU lane that cannot slice: whole, not sent
+    kServerWhole = 1,  // the server's GPU holds it: sent whole, computed there whole
+    kSplit = 2,        // sent tagged slice: the main [0, k), the server's CPU lane [k, nb)
+    kMainWhole = 3,    // a CPU-lane pick of a request not sent (kept local, a backoff, no link): whole on the main
+};
+
+/// A range of n_ff blocks [b0, b1) (b0 == b1: none).
+struct BlockRange {
+    int b0 = 0, b1 = 0;
+    bool empty() const { return b1 <= b0; }
+};
+
+/// on_main: the pick is computed by the main's GPU (l.slot[e] >= 0, a zc slot, l.mtp) or a CPU lane that has no slice
+/// (not the i-quant one); server_has: the server's GPU holds the expert (rx_has); split_ok: the layer is sliced (k < nb:
+/// DS4_EP_K, the server's lo <= k, the layer's experts the i-quant CPU lane's); sent: this request goes to the server.
+inline PickLane pick_lane(bool on_main, bool server_has, bool split_ok, bool sent) {
+    if (on_main) return PickLane::kMain;
+    if (!sent) return PickLane::kMainWhole;
+    if (server_has) return PickLane::kServerWhole;
+    return split_ok ? PickLane::kSplit : PickLane::kMainWhole;
+}
+/// whether the pick goes in the request, and whether tagged slice
+inline bool pick_sent(PickLane p) { return p == PickLane::kServerWhole || p == PickLane::kSplit; }
+inline bool pick_slice(PickLane p) { return p == PickLane::kSplit; }
+/// the blocks the main computes before the reply (nb: the layer's n_ff blocks, k the slice's start)
+inline BlockRange main_range(PickLane p, int k, int nb) {
+    switch (p) {
+        case PickLane::kSplit: return {0, k};
+        case PickLane::kServerWhole: return {0, 0};
+        default: return {0, nb};
+    }
+}
+/// the blocks the server's reply holds for the pick
+inline BlockRange server_range(PickLane p, int k, int nb) {
+    switch (p) {
+        case PickLane::kSplit: return {k, nb};
+        case PickLane::kServerWhole: return {0, nb};
+        default: return {0, 0};
+    }
+}
+/// the blocks the main adds when the reply is late or lost: exactly the server's share (the late reply is dropped)
+inline BlockRange fallback_range(PickLane p, int k, int nb) { return server_range(p, k, nb); }
+
+}  // namespace strata::ds4::rx
