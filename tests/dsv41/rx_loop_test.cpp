@@ -569,14 +569,16 @@ int main(int argc, char** argv) {
                 }
             return false;
         };
+        const double tp = rx::now_ms();
         const bool a0 = m.ping(10, 56, rx::now_ms() + 5000.0, e, p0) == 1;
         const double t0 = t = rx::now_ms();
-        const bool early = m.wake(e);   // (just sent: not quiet for kWakeQuietMs)
+        const bool early = m.wake(e);   // (just sent: not quiet for kWakeQuietMs - unless the pong took that long)
         const bool w1 = wake_quiet(), w2 = wake_quiet(), w3 = wake_quiet();
         const double span = rx::now_ms() - t0;
         const bool a1 = m.ping(11, 56, rx::now_ms() + 5000.0, e, p1) == 1;
-        check(!early, "no Wake right after a send (kWakeQuietMs)");
-        check(a0 && a1 && w1 && w2 && w3 && p1[0] == p0[0] + 3,
+        check(!early || t0 - tp >= rx::kWakeQuietMs, "no Wake right after a send (kWakeQuietMs; the ping's round trip " +
+                                                         std::to_string((int) (t0 - tp)) + " ms)");
+        check(a0 && a1 && w1 && w2 && w3 && p1[0] == p0[0] + 3 + (early ? 1 : 0),
               "three Wakes, each as kWakeQuietMs passed (" + std::to_string((int) gap) + " ms apart at most), sent and taken (" +
                   std::to_string(p1[0] - p0[0]) + ")");
         check(a0 && a1 && p1[1] == p0[1], "with them the server's receive kept spinning for ~" + std::to_string((int) span) +

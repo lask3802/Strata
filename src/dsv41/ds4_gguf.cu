@@ -1059,27 +1059,34 @@ bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq:
     }
     return true;
 }
-// iq::gate_up / down refusing a token's experts (who 0: gate / up, 1: down): h / part not written, a launch error each
-// time, but every layer of the type fails every token - so the first of a (who, type) is printed, with why, and the
-// count at exit (MoeArgs carries no layer: the line is the first such layer's)
+// iq::gate_up / down refusing a token's or a window's experts (who 0: gate / up, 1: down): h / part not written, a
+// launch error each time, but every layer of the type fails every token - so the first of a (who, type) is printed,
+// with why, and the count at exit (MoeArgs carries no layer: the line is the first such layer's)
 struct NoToken {
     std::mutex mu;
     std::map<std::pair<int, int>, long> n;   // (who, type) -> refusals
-    ~NoToken() {
-        for (const auto& e : n)
-            if (e.second > 1)
-                std::fprintf(stderr, "ds4 gguf %s: %s experts refused %ld times (the first printed)\n",
-                             e.first.first == 0 ? "moe_gate_up" : "moe_down", type_name(e.first.second), e.second);
-    }
 };
-NoToken g_no_token;
+NoToken& no_tokens() {   // (never destroyed: a launch on another thread at exit still finds it)
+    static NoToken* t = new NoToken;
+    return *t;
+}
+void no_token_counts() {   // (atexit)
+    NoToken& t = no_tokens();
+    std::lock_guard<std::mutex> lk(t.mu);
+    for (const auto& e : t.n)
+        if (e.second > 1)
+            std::fprintf(stderr, "ds4 gguf %s: %s experts refused %ld times (the first printed)\n",
+                         e.first.first == 0 ? "gate_up" : "down", type_name(e.first.second), e.second);
+}
 void no_token(int who, int type, int n_embd, int n_ff) {
     g_errors.fetch_add(1, std::memory_order_relaxed);
     {
-        std::lock_guard<std::mutex> lk(g_no_token.mu);
-        if (++g_no_token.n[{who, type}] > 1) return;
+        NoToken& t = no_tokens();
+        std::lock_guard<std::mutex> lk(t.mu);
+        if (t.n.empty()) std::atexit(no_token_counts);
+        if (++t.n[{who, type}] > 1) return;
     }
-    const char* w = who == 0 ? "moe_gate_up" : "moe_down";
+    const char* w = who == 0 ? "gate_up" : "down";
     if (!iq::token_kernel(type))   // (Q5_K / Q6_K: the device takes them for the dense GEMVs, not as token experts)
         std::fprintf(stderr, "ds4 gguf %s: %s experts have no token kernel (%s not written; later ones counted)\n", w,
                      type_name(type), who == 0 ? "h" : "part");
@@ -1432,10 +1439,10 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     }
     q8_quant(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
     if (mx) launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
-    else iq::gate_up(ia, groups, a.T, s);
+    else if (!iq::gate_up(ia, groups, a.T, s)) no_token(0, ia.tg, a.n_embd, a.n_ff);
     q8_quant(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);   // (rows of picks not on the device: unused)
     if (mx) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
-    else iq::down(ia, groups, a.T, s);
+    else if (!iq::down(ia, groups, a.T, s)) no_token(1, ia.td, a.n_embd, a.n_ff);
     if (a.wait_ptr != nullptr) mx_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val);
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;

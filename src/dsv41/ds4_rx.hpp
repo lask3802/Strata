@@ -250,7 +250,7 @@ struct LateBook {
 
 /// Whether a window of T rows has its remote picks served (the expert server is reached only from serve_lane, the
 /// async windows': plan_window's rule - threads mode, or no DS4_SYNC and T <= async_max_t).  T 0: the settle after a
-/// prompt, for the decode that follows (T 1).  Where not, the CPU lane computes the server's experts as its own, and the
+/// prompt and the tick after a chunked one, for the decode that follows (T 1).  Where not, the CPU lane computes the server's experts as its own, and the
 /// expert cache takes them as any (cache_in's remote: null).
 inline bool lane_serves(int T, bool par, bool sync_decode, int async_max_t) {
     return par || (!sync_decode && (T == 0 ? 1 : T) <= async_max_t);

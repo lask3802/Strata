@@ -6512,8 +6512,8 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: expert cache: %lld swaps after the prompt (%.0f ms)\n", (long long) (st.swaps - s0),
                          now_ms() - t0);
     }
-    void cache_tick(int T) {
-        cache_tick_swaps(T);
+    void cache_tick(int T, int serve_T = -1) {
+        cache_tick_swaps(T, serve_T);
         store_sync();
         store_watch();
     }
@@ -6529,7 +6529,10 @@ struct Model::Impl {
         const size_t n = store->shrink_chunks(chunks);
         if (n > 0) std::fprintf(stderr, "ds4: RAM store: %.1f GB free: gave back %zu chunks (%zu slots left)\n", avail / 1e9, n, store->slots_allocated());
     }
-    void cache_tick_swaps(int T) {
+    // (T: the tokens the hits came from; serve_T: the window whose rows rx_row asks about - T, or 0 after a chunked
+    // prompt: the decode's)
+    void cache_tick_swaps(int T, int serve_T = -1) {
+        if (serve_T < 0) serve_T = T;
         if (!o.expert_cache || cache_ths.empty()) return;
         std::vector<Swap> ready;
         std::vector<RamSwap> rready;
@@ -6619,11 +6622,12 @@ struct Model::Impl {
             if (l.cpu_hits.empty()) continue;
             std::vector<int> hits;
             hits.swap(l.cpu_hits);
-            // (the expert server's experts not in after a window it serves, nor at the settle (T 0, for the decode):
-            // there they cost the lane nothing, so the slot would be lost - serve_lane lists none of them, the settle
-            // and a chunked prompt's do.  After a window it does not serve (DS4_SYNC, T past async_max_t: rx_row null)
-            // the lane computed them, so they may; a zero-copy one is this GPU's work, so it may)
-            int best = rx::cache_in(hits, l.slot.data(), l.heat.data(), rx_row(l, T), l.zc.empty() ? nullptr : l.zc.data()),
+            // (the expert server's experts not in after a window it serves, nor at the settle or after a chunked prompt
+            // (serve_T 0, for the decode): there they cost the lane nothing, so the slot would be lost - serve_lane
+            // lists none of them, the settle and a chunked prompt's do.  After a window it does not serve (DS4_SYNC, T
+            // past async_max_t: rx_row null) the lane computed them, so they may; a zero-copy one is this GPU's work,
+            // so it may)
+            int best = rx::cache_in(hits, l.slot.data(), l.heat.data(), rx_row(l, serve_T), l.zc.empty() ? nullptr : l.zc.data()),
                 vin = -1;
             if (best >= 0 && l.spare_vram >= 0 && !l.swap_pending && sw_inflight < c_inflight) {   // VRAM: the hottest in
                 int cold = -1;
@@ -6951,7 +6955,8 @@ struct Model::Impl {
         rx_wait.reserve(1 << 20);
         rx_arr.reserve(1 << 20);
     }
-    // layer l's experts the expert server holds, for the hits of a window of T rows (0: the settle) ([n_exp]; null:
+    // layer l's experts the expert server holds, for the hits of a window of T rows (0: the settle, or the tick after a
+    // chunked prompt - the decode's) ([n_exp]; null:
     // none, the link given up - the lane's again -, or a window the server does not serve: DS4_SYNC, T past
     // async_max_t - rx::lane_serves - whose CPU lane computed them itself)
     const uint8_t* rx_row(const Layer& l, int T) const {
@@ -9537,7 +9542,8 @@ struct Model::Impl {
         if (logits_all) n_logits = (T_last - 1) % kWin + 1;   // (sample() takes the last row of d.logits)
         pos += n;
         st.tokens += n;
-        cache_tick(n);
+        cache_tick(n, 0);   // (the server's experts as at the settle: the chunks streamed them to the GPU as any - the
+                            // decode that follows is what the server serves)
         if (lm_end_.on) {   // (the layer cache's RAM back before the store and the swaps want it)
             lm_end();
             lm_end_.on = false;
