@@ -22,6 +22,7 @@
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
+#include "ds4_rx_fill.hpp"
 #include "ds4_rx.hpp"
 #include "ds4_stage.hpp"
 #include "ds4_store.hpp"
@@ -1197,6 +1198,7 @@ struct Model::Impl {
                             // l's FFN one) on purpose, which the comparison must show; decode stays exact
     float* v_err = nullptr;
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
+    bool win_prompt = false;   // (feed_windows: a prompt's windows - their cache ticks are the decode's, serve_T 0)
     // lookahead: while layer L runs, the device guesses the next layer's picks (its gate on L's FFN input, the same
     // choice) and publishes them with L's routing; the CPU lane asks for the guessed experts it will read from the files
     // at once (a thread of its own, os::prefetch), so the SSD reads them while L computes instead of on the next
@@ -3154,6 +3156,14 @@ struct Model::Impl {
         }
         if (!rx_slices_ok(err)) return false;
         rx_setup();   // (--remote-experts: the expert server's blobs, before the service thread takes the link)
+        if (!rx_on && ep_cpu >= 0) {   // (no server after all: the link core and its sibling back to the CPU lane - the
+                                       // pools are idle until the service thread starts, below)
+            std::fprintf(stderr, "ds4: remote experts: none held - the link core (CPU %d) goes back to the CPU lane\n", ep_cpu);
+            ep_cpu = -1;
+            ep_sibs.clear();
+            pools.clear();
+            make_pools();
+        }
         if (!defer_setup(err)) return false;
         {
             void* m = nullptr;
@@ -5024,8 +5034,10 @@ struct Model::Impl {
         for (const Layer& l : L) {
             if (l.il >= g.nl) continue;
             const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+            const uint8_t* srv = rx_row(l, 0);   // (the expert server's, sent at rx_setup: the decode's lane does not read them)
             for (int e = 0; e < l.n_exp; ++e)
-                if (l.slot[(size_t) e] < 0 && p[e] > 0) cand.push_back({(double) p[e] / (double) l.blob, {l.il, e}});
+                if (l.slot[(size_t) e] < 0 && (srv == nullptr || srv[e] == 0) && p[e] > 0)
+                    cand.push_back({(double) p[e] / (double) l.blob, {l.il, e}});
         }
         std::stable_sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         std::vector<std::pair<int, int>> list;
@@ -6495,8 +6507,10 @@ struct Model::Impl {
             std::vector<std::pair<float, std::pair<int, int>>> hot;
             for (const Layer& l : L) {
                 if (l.mtp) continue;
+                const uint8_t* srv = rx_row(l, 0);   // (the expert server's: the decode's lane does not read them)
                 for (int e = 0; e < l.n_exp; ++e)
-                    if (l.slot[(size_t) e] < 0 && l.heat[(size_t) e] >= 4.0f) hot.push_back({l.heat[(size_t) e], {l.il, e}});
+                    if (l.slot[(size_t) e] < 0 && (srv == nullptr || srv[e] == 0) && l.heat[(size_t) e] >= 4.0f)
+                        hot.push_back({l.heat[(size_t) e], {l.il, e}});
             }
             std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             std::vector<std::pair<int, int>> list;
@@ -6645,11 +6659,9 @@ struct Model::Impl {
                 }
             }
             if (l.ram.empty() || ram_free.empty() || ram_inflight >= kMaxSwaps) continue;
-            int rb = -1;   // RAM: the hottest read from the file, in place of the layer's coldest held (or a free slot)
-            for (int e : hits)
-                if (e != vin && l.slot[(size_t) e] < 0 && l.ram[(size_t) e] < 0 &&
-                    (rb < 0 || l.heat[(size_t) e] > l.heat[(size_t) rb]))
-                    rb = e;
+            // RAM: the hottest read from the file, in place of the layer's coldest held (or a free slot) - not one the
+            // expert server holds (the lane does not compute it where the server serves: rx_row, as the VRAM tier)
+            const int rb = rx::ram_in(hits, l.slot.data(), l.ram.data(), l.heat.data(), rx_row(l, serve_T), vin);
             if (rb < 0) continue;
             int rc = -1;
             for (int e = 0; e < l.n_exp; ++e)
@@ -9077,10 +9089,19 @@ struct Model::Impl {
     // n tokens through windows of 16, the last one's logits_rows rows of logits
     bool feed_windows(const int* tokens, int n, int logits_rows, std::string& err) {
         logits_all = false;
+        win_prompt = true;   // (its ticks as the chunked prompt's: for the decode that follows)
         for (int a = 0; a < n; a += kWin) {
             const int T = std::min(kWin, n - a);
-            if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, false, err)) return false;   // (a prompt's: whole)
+            if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, false, err)) {   // (a prompt's: whole)
+                win_prompt = false;
+                return false;
+            }
         }
+        win_prompt = false;
+        // with the expert server: the settle, as after a chunked prompt - the windows past async_max_t computed its
+        // experts on the lane, so their ticks could not tell them from the lane's (no settle, server experts in this
+        // GPU's VRAM: slot 1243Z's ep2).  Without it as before
+        if (rx_on && (!o.stage_worker || stage_last)) cache_settle();
         return true;
     }
     // the picked path took ms: the flow's predictions for the prompt's size class scaled by what it really takes (taken
@@ -9855,7 +9876,7 @@ struct Model::Impl {
         prof_collect();
         pos += T;
         st.tokens += T;
-        cache_tick(T);
+        cache_tick(T, win_prompt ? 0 : -1);   // (a window prompt's: the server's experts as the decode's, rx_row(.., 0))
         if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err)) return false;
         return true;
     }
