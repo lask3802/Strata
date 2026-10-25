@@ -249,11 +249,15 @@ struct LateBook {
 
 /// The expert cache's next expert into VRAM from a layer's CPU-lane hits: the hottest not in VRAM (slot < 0) and not one
 /// the expert server holds (remote[e] != 0; null: none) - those cost the CPU lane nothing, so a VRAM slot there would
-/// save no lane work.  -1: none.
-inline int cache_in(const std::vector<int>& hits, const int* slot, const float* heat, const uint8_t* remote) {
+/// save no lane work - except a zero-copy one of the RAM store (zc[e] != 0; null: none), which the decode computes on this
+/// GPU over the bus and never sends.  -1: none.
+inline int cache_in(const std::vector<int>& hits, const int* slot, const float* heat, const uint8_t* remote,
+                    const uint8_t* zc) {
     int best = -1;
     for (int e : hits)
-        if (slot[e] < 0 && (remote == nullptr || remote[e] == 0) && (best < 0 || heat[e] > heat[best])) best = e;
+        if (slot[e] < 0 && (remote == nullptr || remote[e] == 0 || (zc != nullptr && zc[e] != 0)) &&
+            (best < 0 || heat[e] > heat[best]))
+            best = e;
     return best;
 }
 
