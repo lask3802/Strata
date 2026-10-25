@@ -215,18 +215,20 @@ int main() {
               "two held and two ins in one layer, R=4: one fill (3 for 0); the other pair waits for the next tick");
     }
     {
-        // a window prompt's settle, once a prompt (rx::PromptSettle), over the feeds the engine sees
-        auto run = [](rx::PromptSettle& ps, bool rx_on, const std::vector<int>& feeds) {
-            std::vector<int> at;   // (the feeds that settled; feeds: a window feed's logits rows; -1: a chunked run,
-                                   // which settles; -2: a decode window)
-            for (int i = 0; i < (int)feeds.size(); ++i) {
-                const int lr = feeds[i];
-                if (lr == -1) {
+        // a window prompt's settle, once a prompt (rx::PromptSettle), over the events the engine sees: a window feed's
+        // logits rows (>= 0); -1 a chunked run, which settles; -2 a decode window; -3 the end of a public feed
+        // (Model::feed / feed_mark) that asked for logits; -4 reset or restore
+        auto run = [](bool rx_on, const std::vector<int>& ev) {
+            rx::PromptSettle ps;
+            std::vector<int> at;   // (the events that settled)
+            for (int i = 0; i < (int)ev.size(); ++i) {
+                const int e = ev[i];
+                if (e == -1) {
                     ps.settled();
                     at.push_back(i);
-                } else if (lr == -2) {
-                    ps.decoded();
-                } else if (ps.after_feed(rx_on, lr)) {
+                } else if (e <= -2) {
+                    ps.next();
+                } else if (ps.after_feed(rx_on, e)) {
                     ps.settled();
                     at.push_back(i);
                 }
@@ -234,16 +236,20 @@ int main() {
             return at;
         };
         using V = std::vector<int>;
-        rx::PromptSettle ps;
-        std::vector<int> unit16(256, 0);   // (--prefill-chunk 0: a 4K prompt in 16-token feeds, the last with logits)
-        unit16.back() = 1;
-        check(run(ps, true, unit16) == V{255}, "a 4K prompt in 256 feeds of 16 tokens: one settle, at the last");
-        check(run(ps, true, {-2, 0, 1}) == V{2}, "a decode, then feed_mark's windows (n - 1 rows, then the last): one settle, at the last");
-        check(run(ps, true, {-2, -1, 1}) == V{1}, "a decode, then a chunked run and its last window: the chunked run's settle only");
-        check(run(ps, true, {-2, 1, -2, 1}) == (V{1, 3}), "two prompts with a decode between: two");
-        check(run(ps, true, {-2, 4, 4, 4}) == V{1}, "scoring windows (logits each) after a decode: one, at the first");
-        rx::PromptSettle off;
-        check(run(off, false, {1, -2, 1}).empty(), "no expert server: none");
+        std::vector<int> unit16(255, 0);   // (--prefill-chunk 0: a 4K prompt in 16-token feeds; the last is feed_mark's:
+        unit16.insert(unit16.end(), {0, 1, -3});   //  its 15 rows, then the last token with logits)
+        check(run(true, unit16) == V{256}, "a 4K prompt in 256 feeds of 16 tokens: one settle, at the last");
+        check(run(true, {-4, 0, 1, -3}) == V{2}, "feed_mark's windows (n - 1 rows, then the last): one settle, at the last");
+        check(run(true, {-1, 1, -3}) == V{0}, "a chunked run and its last window (remote_stage + ckpt): the chunked run's settle only");
+        check(run(true, {1, -3, -2, 1, -3}) == (V{0, 3}), "two prompts with a decode between: two");
+        check(run(true, {1, -3, 1, -3}) == (V{0, 2}),
+              "two prompts with no decode between (the first's first token ended it): two");
+        check(run(true, {-1, -3, 1, -3}) == (V{0, 2}), "a chunked prompt, then a window prompt with no decode between: two");
+        check(run(true, {-1, -4, 0, 1, -3}) == (V{0, 3}),
+              "a chunked run stopped mid-prompt (no logits), restored, then a window prompt: its own settle");
+        check(run(true, {-4, 4, -3, 4, -3, -4, 4, -3}) == (V{1, 3, 6}),
+              "scoring windows (each a feed with logits) and a reset between segments: one a window, as the chunked path's");
+        check(run(false, {1, -3, -2, 1, -3}).empty(), "no expert server: none");
     }
     {
         // a tick over the layers: the most hits first, one a layer, the list's states set at once

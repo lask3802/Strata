@@ -182,14 +182,15 @@ inline bool fill_landed(uint8_t* has, int in, bool ok) {
 
 /// The cache settle after a prompt that ends on windows (feed_windows), with the expert server on: once a prompt.
 /// A prompt comes in several feeds (the server's 16-token units with --prefill-chunk 0, feed_mark's run then its last
-/// token, a chunked run then a last window); only the one that asks for logits ends it, and a settle already made
-/// since the last decode token (the chunked path's own) counts.  settled(): any cache_settle; decoded(): a decode window
+/// token, a chunked run then a last window); only the window feed that asks for logits ends it, and a settle already
+/// made in the prompt (the chunked path's own) counts.  settled(): any cache_settle; next(): the next feed is another
+/// prompt's - after a decode window, a public feed (Model::feed / feed_mark) that asked for logits, reset or restore
 struct PromptSettle {
     bool done = false;
     /// at a window feed's end: settle now?
     bool after_feed(bool rx_on, int logits_rows) const { return rx_on && logits_rows > 0 && !done; }
     void settled() { done = true; }
-    void decoded() { done = false; }
+    void next() { done = false; }
 };
 
 }  // namespace strata::ds4::rx

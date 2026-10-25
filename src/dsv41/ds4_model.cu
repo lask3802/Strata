@@ -5129,6 +5129,7 @@ struct Model::Impl {
     }
 
     void reset() {
+        psettle.next();   // (another prompt from here)
         pos = 0;
         toks.clear();
         ctoks.clear();
@@ -5244,6 +5245,7 @@ struct Model::Impl {
     }
 
     bool restore(int64_t limit) {
+        psettle.next();   // (another prompt from here)
         const int b = ckpt_ok() ? best_check(limit) : -1;   // (a remote stage keeps none, unless it was asked to)
         if (b < 0) return false;
         const Check& c = ck[b];
@@ -9105,11 +9107,11 @@ struct Model::Impl {
                 if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, false, err)) return false;   // (a prompt's: whole)
             }
         }
-        // with the expert server: the settle, as after a chunked prompt, once a prompt (rx::PromptSettle: the feed that
-        // asks for logits, unless the prompt's chunked part settled already).  Without it the windows' ticks put the
-        // server's experts into this GPU's VRAM: the windows past async_max_t compute them on the lane, and nothing
-        // settled after them (slot 20261025T1243Z's ep2 arm: no settle line, 9 server experts in VRAM).  Without the
-        // server as before
+        // with the expert server: the settle, as after a chunked prompt - the cache's swaps for the decode that follows -,
+        // once a prompt (rx::PromptSettle: the feed that asks for logits, unless the prompt's chunked part settled
+        // already).  Before U5a nothing settled after a window prompt, and its ticks (serve_T = T: past async_max_t
+        // the lane's) put the server's experts into this GPU's VRAM (slot 20261025T1243Z's ep2 arm: no settle line, 9
+        // server experts in VRAM); win_prompt keeps them the server's now.  Without the server as before
         if (psettle.after_feed(rx_on, logits_rows) && (!o.stage_worker || stage_last)) cache_settle();
         return true;
     }
@@ -9886,7 +9888,7 @@ struct Model::Impl {
         pos += T;
         st.tokens += T;
         cache_tick(T, win_prompt ? 0 : -1);   // (a window prompt's: the server's experts as the decode's, rx_row(.., 0))
-        if (ep) psettle.decoded();   // (a decode window: the next prompt settles again)
+        if (ep) psettle.next();   // (a decode window: the next prompt settles again)
         if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err)) return false;
         return true;
     }
@@ -10824,9 +10826,12 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
                             ? p.forward_chunks(tokens, n, logits_rows, err)
                             : p.feed_windows(tokens, n, logits_rows, err);
         if (ok) p.path_done(now_ms() - t0);
+        if (logits_rows > 0) p.psettle.next();   // (a feed that asks for logits ends a prompt: the next is another's)
         return ok;
     }
-    return p.feed_windows(tokens, n, logits_rows, err);
+    const bool ok = p.feed_windows(tokens, n, logits_rows, err);
+    if (logits_rows > 0) p.psettle.next();
+    return ok;
 }
 bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
     Impl& p = *p_;
@@ -10840,17 +10845,20 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
                                               : p.feed_windows(tokens, n - 1, 0, err)) &&
                         (p.checkpoint(slot), p.feed_windows(tokens + n - 1, 1, logits_rows, err));
         if (ok) p.path_done(now_ms() - t0);
+        if (logits_rows > 0) p.psettle.next();   // (as feed's)
         return ok;
     }
     if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && (p.o.remote_stage || p.pick_path(n))) {   // (the last token rides along; its layers
         const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot);   // keep the state before it)
         if (ok) p.path_done(now_ms() - t0);
+        if (logits_rows > 0) p.psettle.next();
         return ok;
     }
     if (n > 1 && !p.feed_windows(tokens, n - 1, 0, err)) return false;
     p.checkpoint(slot);
     const bool ok = n < 1 || p.feed_windows(tokens + n - 1, 1, logits_rows, err);
     if (ok) p.path_done(now_ms() - t0);   // (windows, when pick_path chose them)
+    if (logits_rows > 0) p.psettle.next();
     return ok;
 }
 int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) p_->o.max_context) : kWin; }
