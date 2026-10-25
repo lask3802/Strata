@@ -455,7 +455,7 @@ void case_closed() {
     p.m.send_req(1, 0, 1, 0, 0, a.picks.data(), a.x.data(), err);
     const double t0 = now_ms();
     const int got = p.m.wait_resp(1, t0 + 3000, r, err);
-    check(got == -1 && has(err, "closed") && !p.m.up() && now_ms() - t0 < 2000,
+    check(got == -1 && has(err, "closed") && !has(err, "mid-frame") && !p.m.up() && now_ms() - t0 < 2000,
           "the worker closes its socket: the link is down at once, not at the deadline (" + err + ")");
     p.end();
 }
