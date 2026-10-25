@@ -14,7 +14,10 @@
 //     request spins after a long gap too;
 //   - the link core: the server's serve loop on DS4_EP_CPU; os::pin_self(-1) restores the mask; os::cpu_siblings;
 //     rx::off_link takes the core's CPUs out; rx::link_cpu's env and its CPU's check; the nap rule (rx::lane_naps);
-//   - Linux: TCP_QUICKACK after each read.
+//   - Linux: TCP_QUICKACK after each read;
+//   - H' (--expert-server-parts): a reply is its whole picks' sum plus its slice picks' [k, 9) from the parts, this end's
+//     [0, k) of them with it the all-whole sum, k from request to request 6 -> 7 -> 8 -> 9; the verify's two sets and
+//     its wrong slice; another pack, a layer the parts do not cover, a k below theirs: refused.
 // What it does not reach: serve_lane's own use of these (the Wake flag, the naps, the pools off the link core, the
 // service thread's pin) - the engine's, checked in the GPU slot (ep-u4-slot.sh: ep against ep-nowake, the stats line).
 // No GPU, no model.
@@ -22,6 +25,7 @@
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_os.hpp"
 #include "../../src/dsv41/ds4_rx.hpp"
+#include "ep_parts_write.hpp"
 
 #include "ggml.h"   // ggml_type_size / ggml_blck_size: the blocks' sizes
 
@@ -31,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <random>
 #include <string>
@@ -86,10 +91,10 @@ struct Child {
 #else
     pid_t pid = -1;
 #endif
-    bool start(int port) {
+    bool start(int port, const std::string& parts = "") {   // (parts: the server's --expert-server-parts)
         const std::string exe = self_path(), p = std::to_string(port);
 #if defined(_WIN32)
-        std::string cmd = "\"" + exe + "\" --child " + p;
+        std::string cmd = "\"" + exe + "\" --child " + p + (parts.empty() ? "" : " \"" + parts + "\"");
         STARTUPINFOA si{};
         si.cb = sizeof si;
         PROCESS_INFORMATION pi{};
@@ -103,7 +108,8 @@ struct Child {
 #if defined(__linux__)
             prctl(PR_SET_PDEATHSIG, SIGKILL);   // (this test gone - killed by a timeout too: the server with it)
 #endif
-            execl(exe.c_str(), exe.c_str(), "--child", p.c_str(), (char*) nullptr);
+            if (parts.empty()) execl(exe.c_str(), exe.c_str(), "--child", p.c_str(), (char*) nullptr);
+            else execl(exe.c_str(), exe.c_str(), "--child", p.c_str(), parts.c_str(), (char*) nullptr);
             _exit(127);
         }
         return pid > 0;
@@ -226,13 +232,14 @@ static double norm(const std::vector<float>& a) {
 // a main process up to the blobs (`unserved` more layers in the geometry with no types: not the server's): false (and
 // why) when it did not get there; `sent`: the blobs that went out
 static bool connect(rx::Main& m, int port, const std::vector<Layer>& L, std::string& err, int unserved = 0,
-                    int* sent = nullptr) {
+                    int* sent = nullptr, uint64_t pack_hash = 0) {
     if (!m.accept("127.0.0.1:" + std::to_string(port), kToken, 30, err)) return false;
     rx::GeoMsg gm;
     gm.n_embd = E;
     gm.n_ff = FF;
     gm.n_layers = (int) L.size() + unserved;
     gm.limit = kLim;
+    gm.pack_hash = pack_hash;
     std::vector<rx::GeoLayer> gl;
     for (const Layer& l : L) gl.push_back(l.geo);
     gl.resize(gl.size() + (size_t) unserved);
@@ -251,6 +258,235 @@ static bool connect(rx::Main& m, int port, const std::vector<Layer>& L, std::str
             return false;
         }
     return true;
+}
+
+// ---------------------------------------------------------------------------------------------------- H' (parts)
+static constexpr int NB = FF / 256;
+// sum_i w_i (expert_i's n_ff blocks [b0, b1))(x) over the picks i of a row with `mask` set, in pick order: the CPU
+// lane's steps on the blob's bytes in place (gg::iq_cpu_slice; the whole n_ff: lane_sum's), into y
+static void slice_sum(const Layer& l, const rx::ReqRow& rw, unsigned mask, int b0, int b1, const float* x, std::vector<float>& y) {
+    y.assign((size_t) E, 0.0f);
+    const int ff0 = 256 * b0, ffn = 256 * (b1 - b0);
+    gg::IqCpu fs;
+    size_t d_off = 0;
+    std::string err;
+    if (!gg::iq_cpu_slice(l.fm, ff0, ffn, fs, d_off, err)) return;
+    std::vector<uint8_t> act(l.fm.act_bytes), hact(l.fm.h_bytes);
+    std::vector<float> h((size_t) FF), yo((size_t) E);
+    gg::iq_cpu_quant(l.fm.gu_act, x, E, act.data());
+    for (int i = 0; i < rw.n; ++i) {
+        if (!((mask >> i) & 1)) continue;
+        const uint8_t* b = l.blobs[(size_t) rw.e[i]].data();
+        const void* ap[1] = {act.data()};
+        float* hp[1] = {h.data()};
+        gg::iq_cpu_gate_up(l.fm, b + l.geo.off[0], b + l.geo.off[1], ap, 1, hp, ff0, ff0 + ffn, kLim);
+        gg::iq_cpu_quant(l.fm.d_act, h.data() + ff0, ffn, hact.data());
+        const void* hq[1] = {hact.data()};
+        float* yp[1] = {yo.data()};
+        gg::iq_cpu_down(fs, b + l.geo.off[2] + d_off, hq, 1, yp, 0, E);
+        for (int c = 0; c < E; ++c) y[(size_t) c] += rw.w[i] * yo[(size_t) c];
+    }
+}
+// the parts pack of `layers` of L (ds4_epparts.hpp's format, one file [a, NB)), cut from the blobs; pack_hash `hash`
+static bool write_parts(const std::string& dir, const std::vector<Layer>& L, int a, const std::vector<int>& layers, uint64_t hash) {
+    ep_test::PartsSrc s;
+    s.dim = E;
+    s.n_ff = FF;
+    s.layers = (int) L.size();
+    s.experts = (int) L[0].blobs.size();
+    s.mat = [&](int l, int e, int kind) { return L[(size_t) l].blobs[(size_t) e].data() + L[(size_t) l].geo.off[kind]; };
+    s.row_bytes = [&](int l, int kind) { return kind < 2 ? L[(size_t) l].fm.gu_row : L[(size_t) l].fm.d_row; };
+    s.type = [&](int l, int kind) { return L[(size_t) l].geo.K[kind]; };
+    return ep_test::write_parts(dir, s, a, layers, hash);
+}
+
+// the CPU expert server with parts (--expert-server-parts): rows of whole picks (the server's blobs) and slice picks
+// (its parts' [k, NB)) - its reply the sum of both, as this test computes them for x in bf16; with this end's [0, k) of
+// the slice picks (x unrounded) the layer's sum of all picks whole; k from request to request 6 -> 7 -> 8 -> 9 (9: no
+// slice picks); the verify's two sets and its wrong slice (kReqWrong); the refusals - another pack, a layer the parts do
+// not cover (both at the Geo), a k below the parts' (the request's Error)
+static void case_parts(int port, const std::vector<Layer>& L) {
+    const std::string root = (std::filesystem::temp_directory_path() / ("ds4_rx_loop_parts_" + std::to_string(rx::now_ms()).substr(0, 9))).string();
+    const uint64_t H = 0x5eed00000000abcdull;
+    check(write_parts(root + "/a6", L, 6, {0, 1}, H) && write_parts(root + "/l0", L, 6, {0}, H) &&
+              write_parts(root + "/a8", L, 8, {0, 1}, H),
+          "parts packs written (blocks [6, 9) and [8, 9) of both layers, [6, 9) of layer 0 alone): " + root);
+    auto stop = [](Child& ch) {
+        const int rc = ch.wait(10000);
+        if (rc < 0) {
+            ch.kill();
+            ch.wait(5000);
+        }
+        return rc;
+    };
+    {
+        Child ch;
+        check(ch.start(port, root + "/a6"), "a CPU expert server with parts [6, 9) started");
+        rx::Main m;
+        std::string err;
+        const bool up = connect(m, port, L, err, 0, nullptr, H);
+        check(up && m.lo() == 6 && m.lane_threads() >= 0, "taken, its hello's lo " + std::to_string(m.lo()) + " (6), " +
+                                                              std::to_string(m.lane_threads()) + " lane workers (" + err + ")");
+        std::mt19937_64 rng(11);
+        std::uniform_real_distribution<float> ux(-1.0f, 1.0f), uw(0.05f, 0.4f);
+        double worst_srv = 0, worst_split = 0;   // (the reply against this test's; the split sum against the all-whole one)
+        int nreq = 0, nslice = 0;
+        bool all_in = up;
+        uint32_t seq = 1000;
+        const int ks[8] = {6, 7, 8, 9, 8, 7, 6, 9};
+        for (int it = 0; up && it < 16 && all_in; ++it) {
+            const int li = it % 2, T = it % 3 == 0 ? 4 : 1, k = ks[it % 8];
+            std::vector<rx::ReqRow> all((size_t) T), req((size_t) T);
+            std::vector<std::vector<float>> x((size_t) T, std::vector<float>((size_t) E)), xb = x;
+            std::vector<const float*> xp((size_t) T);
+            for (int t = 0; t < T; ++t) {
+                int ord[5] = {0, 1, 2, 3, 4};
+                std::shuffle(ord, ord + 5, rng);
+                rx::ReqRow& a = all[(size_t) t];
+                a.t = (uint8_t) t;
+                a.n = 5;
+                for (int i = 0; i < 5; ++i) {
+                    a.e[i] = (int16_t) ord[i];
+                    a.w[i] = uw(rng);
+                }
+                // (the request: experts 0, 1, 2 whole - the server's blobs -, 3 and 4 slice; at k 9 the server's alone)
+                rx::ReqRow& r = req[(size_t) t];
+                r.t = (uint8_t) t;
+                r.n = 0;
+                for (int i = 0; i < 5; ++i)
+                    if (a.e[i] < 3 || k < NB) {
+                        if (a.e[i] >= 3) r.slice |= (uint16_t) (1u << r.n);
+                        r.e[r.n] = a.e[i];
+                        r.w[r.n++] = a.w[i];
+                    }
+                for (int c = 0; c < E; ++c) {
+                    x[(size_t) t][(size_t) c] = ux(rng);
+                    xb[(size_t) t][(size_t) c] = rx::bf2f(rx::f2bf(x[(size_t) t][(size_t) c]));
+                }
+                xp[(size_t) t] = x[(size_t) t].data();
+            }
+            if (!m.send_req(++seq, li, T, req.data(), xp.data(), err, k < NB ? k : 0)) {
+                check(false, "a request sent (" + err + ")");
+                break;
+            }
+            const uint16_t* y = nullptr;
+            int srv_us = 0;
+            const int got = m.wait_resp(seq, T, rx::now_ms() + 20000.0, &y, srv_us, err);
+            all_in = all_in && got == 1;
+            if (got != 1) break;
+            ++nreq;
+            nslice += k < NB;
+            const Layer& l = L[(size_t) li];
+            for (int t = 0; t < T; ++t) {
+                const rx::ReqRow& r = req[(size_t) t];
+                std::vector<float> w0, w1, here, ref;
+                slice_sum(l, r, ~(unsigned) r.slice, 0, NB, xb[(size_t) t].data(), w0);   // (the server's: x in bf16)
+                slice_sum(l, r, r.slice, k, NB, xb[(size_t) t].data(), w1);
+                std::vector<float> d0((size_t) E), want((size_t) E), part((size_t) E), d1((size_t) E);
+                for (int c = 0; c < E; ++c) {
+                    want[(size_t) c] = w0[(size_t) c] + w1[(size_t) c];
+                    part[(size_t) c] = rx::bf2f(y[(size_t) t * E + c]);
+                    d0[(size_t) c] = part[(size_t) c] - want[(size_t) c];
+                }
+                worst_srv = std::max(worst_srv, norm(d0) / std::max(1e-30, norm(want)));
+                // this end: [0, k) of the slice picks (x unrounded); with the reply the layer's all-whole sum
+                rx::ReqRow loc = r;
+                if (k == NB) {   // (no slice picks: this end computes experts 3 and 4 whole)
+                    loc = all[(size_t) t];
+                    unsigned m3 = 0;
+                    for (int i = 0; i < loc.n; ++i) m3 |= (loc.e[i] >= 3 ? 1u : 0u) << i;
+                    slice_sum(l, loc, m3, 0, NB, x[(size_t) t].data(), here);
+                } else {
+                    slice_sum(l, loc, r.slice, 0, k, x[(size_t) t].data(), here);
+                }
+                lane_sum(l, all[(size_t) t], 0, 5, x[(size_t) t].data(), ref);
+                for (int c = 0; c < E; ++c) d1[(size_t) c] = here[(size_t) c] + part[(size_t) c] - ref[(size_t) c];
+                worst_split = std::max(worst_split, norm(d1) / std::max(1e-30, norm(part)));
+            }
+        }
+        check(all_in && nreq == 16 && nslice == 12, "16 requests (k 6, 7, 8, 9 in turn; T 1 and 4; both layers) answered, " +
+                                                        std::to_string(nslice) + " with slice picks");
+        char b[240];
+        std::snprintf(b, sizeof b, "each reply is the server's whole picks' sum plus its slice picks' [k, 9), x in bf16, "
+                      "within bf16 (|d| / |it| %.2e < 1e-2)", worst_srv);
+        check(worst_srv < 1e-2, b);
+        std::snprintf(b, sizeof b, "this end's [0, k) of the slice picks plus the reply is the layer's sum of all five whole, "
+                      "within the server's roundings (|d| / |its part| %.2e < 0.10)", worst_split);
+        check(worst_split < 0.10, b);
+
+        // the verify's two sets (kReqSets): the whole picks' sum, then the slice picks'; kReqWrong: the slice wrong
+        for (int pass = 0; up && pass < 3; ++pass) {
+            const int k = pass == 2 ? 6 : 7;   // (wrong at 7: [6, 9); wrong at 6: the parts hold no block 5 - twice)
+            rx::ReqRow r;
+            r.n = 3;
+            r.e[0] = 0, r.e[1] = 3, r.e[2] = 4;
+            r.w[0] = 0.3f, r.w[1] = 0.2f, r.w[2] = 0.25f;
+            r.slice = 0x6;
+            std::vector<float> x((size_t) E);
+            for (int c = 0; c < E; ++c) x[(size_t) c] = rx::bf2f(rx::f2bf(ux(rng)));
+            const float* xp[1] = {x.data()};
+            const int32_t c = k | rx::kReqSets | (pass > 0 ? rx::kReqWrong : 0);
+            const uint16_t* y = nullptr;
+            int us = 0, lane_us = -1;
+            const bool ok = m.send_req(++seq, 1, 1, &r, xp, err, c) &&
+                            m.wait_resp(seq, 1, rx::now_ms() + 20000.0, &y, us, err, 2, &lane_us) == 1;
+            std::vector<float> w0, w1;
+            slice_sum(L[1], r, 0x1, 0, NB, x.data(), w0);
+            slice_sum(L[1], r, 0x6, pass == 1 ? k - 1 : k, NB, x.data(), w1);
+            if (pass == 2)
+                for (float& v : w1) v *= 2.0f;
+            double e0 = 0, e1 = 0, n0 = 0, n1 = 0;
+            for (int i = 0; ok && i < E; ++i) {
+                const double a0 = rx::bf2f(y[i]) - w0[(size_t) i], a1 = rx::bf2f(y[E + i]) - w1[(size_t) i];
+                e0 += a0 * a0, e1 += a1 * a1;
+                n0 += (double) w0[(size_t) i] * w0[(size_t) i], n1 += (double) w1[(size_t) i] * w1[(size_t) i];
+            }
+            static const char* const what[3] = {"kReqSets: the reply's two sets, the whole picks' sum then the slice picks' [k, 9)",
+                                                "kReqWrong at k 7: the slice set is [6, 9) (the parts hold block 6)",
+                                                "kReqWrong at k 6: the slice set is [6, 9) twice (the parts hold no block 5)"};
+            std::snprintf(b, sizeof b, "%s (|d| / |it| %.1e, %.1e; the server's lane %d us)", what[pass],
+                          std::sqrt(e0 / std::max(1e-30, n0)), std::sqrt(e1 / std::max(1e-30, n1)), lane_us);
+            check(ok && std::sqrt(e0 / std::max(1e-30, n0)) < 1e-2 && std::sqrt(e1 / std::max(1e-30, n1)) < 1e-2 && lane_us >= 0, b);
+        }
+        m.close();
+        check(stop(ch) == 0, "and it exited 0");
+    }
+    // a k below the parts' (lo 8, k 7): the request's Error names what the parts hold
+    {
+        Child ch;
+        check(ch.start(port, root + "/a8"), "a CPU expert server with parts [8, 9) started");
+        rx::Main m;
+        std::string err;
+        const bool up = connect(m, port, L, err, 0, nullptr, H);
+        check(up && m.lo() == 8, "taken, lo " + std::to_string(m.lo()) + " (8)");
+        rx::ReqRow r;
+        r.n = 1;
+        r.e[0] = 3;
+        r.w[0] = 1.0f;
+        r.slice = 0x1;
+        std::vector<float> x((size_t) E, 0.25f);
+        const float* xp[1] = {x.data()};
+        const uint16_t* y = nullptr;
+        int us = 0;
+        const int g = up && m.send_req(1, 0, 1, &r, xp, err, 7) ? m.wait_resp(1, 1, rx::now_ms() + 10000.0, &y, us, err) : -2;
+        check(g == -1 && err.find("hold [8, 9)") != std::string::npos, "slice picks at k 7: refused (" + err + ")");
+        check(stop(ch) == 0, "and it exited 0");
+    }
+    // the Geo's refusals: another pack (pack_hash), a served layer the parts do not cover
+    for (int c = 0; c < 2; ++c) {
+        Child ch;
+        check(ch.start(port, root + (c == 0 ? "/a6" : "/l0")), std::string("a CPU expert server with parts ") +
+                                                                    (c == 0 ? "[6, 9)" : "of layer 0 alone") + " started");
+        rx::Main m;
+        std::string err;
+        const bool up = connect(m, port, L, err, 0, nullptr, c == 0 ? H ^ 1 : H);
+        check(!up && err.rfind("expert server: ", 0) == 0 &&
+                  err.find(c == 0 ? "another pack" : "layer 1: not in the parts") != std::string::npos,
+              std::string(c == 0 ? "another pack's main" : "a geometry serving layer 1") + ": refused at the Geo (" + err + ")");
+        check(stop(ch) == 0, "and it exited 0");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
 }
 
 // ---------------------------------------------------------------------------------------------------- the cases
@@ -409,17 +645,17 @@ static void case_quickack(int port) {
 #endif
 }
 
-int child_main(int port) {
+int child_main(int port, const std::string& parts) {
     std::thread([] {   // (a test that died before it took this server: the server does not dial for ever)
         std::this_thread::sleep_for(std::chrono::seconds(300));
         std::_Exit(3);
     }).detach();
     const char* tv = std::getenv("STRATA_STAGE_TOKEN");
-    return rx::serve_cpu("127.0.0.1:" + std::to_string(port), tv != nullptr ? tv : "", true);
+    return rx::serve_cpu("127.0.0.1:" + std::to_string(port), tv != nullptr ? tv : "", true, parts);
 }
 
 int main(int argc, char** argv) {
-    if (argc >= 3 && std::string(argv[1]) == "--child") return child_main(std::atoi(argv[2]));
+    if (argc >= 3 && std::string(argv[1]) == "--child") return child_main(std::atoi(argv[2]), argc >= 4 ? argv[3] : "");
     const int port = argc > 1 ? std::atoi(argv[1]) : 27893;
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     case_rules();
@@ -704,6 +940,8 @@ int main(int argc, char** argv) {
             c4.wait(5000);
         }
     }
+    // ---- H': the server with parts (--expert-server-parts)
+    case_parts(port + 1, L);
     if (fails == 0) std::printf("ALL OK\n");
     else std::printf("%d FAILED\n", fails);
     return fails == 0 ? 0 : 1;
