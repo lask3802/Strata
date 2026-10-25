@@ -435,7 +435,10 @@ int Main::wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y
             return -1;
         }
         if (h.type != Resp) continue;
-        if (h.seq != seq) continue;   // (an earlier request's, late: its picks were computed here)
+        if (h.seq != seq) {   // (an earlier request's, late: its picks were computed here; take_late has its arrival)
+            if (late_.size() < 256) late_.push_back({h.seq, c_.arrival_ms()});
+            continue;
+        }
         if (h.a != nrows || rx_.size() != (size_t) nrows * (size_t) n_embd_ * 2) {
             err = "a reply of the wrong size";
             c_.close();

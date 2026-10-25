@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::ds4::rx {
@@ -81,19 +82,28 @@ static_assert(sizeof(HelloMsg) == 128, "the hello's size");
 /// but not before 1.5 x the round trip expected at those rows.
 struct Gate {
     double rtt[kMaxRows + 1] = {}, pick[kMaxRows + 1] = {};
-    int run[kMaxRows + 1] = {}, seen[kMaxRows + 1] = {};
+    int run[kMaxRows + 1] = {}, seen[kMaxRows + 1] = {}, over[kMaxRows + 1] = {};
     static void ew(double& a, double v) { a = a > 0.0 ? 0.9 * a + 0.1 * v : v; }
-    // a reply's round trip: from the kernel's arrival time where there is one (Linux), else a reply the lane waited for
-    // (a late one: the time waited, a lower bound).  Without it, one already there when the lane finished its own part
-    // says only that the round trip was at most that long - the time is the lane's, not
-    // the link's -: it may lower the estimate, never raise it.  After 4 samples a sample counts as 3 x the estimate at
-    // most (one spike moves it by 20%; the late count is the reply's own time)
+    // a reply's round trip: from the kernel's arrival time where there is one (Linux; a late reply's too, when it
+    // comes), else a reply the lane waited for (a late one: the time waited, a lower bound).  Without it, one already
+    // there when the lane finished its own part says only that the round trip was at most that long - the time is the
+    // lane's, not the link's -: it may lower the estimate, never raise it.  After 4 samples a sample counts as 3 x the
+    // estimate at most (one spike moves it by 20%; the late count is the reply's own time), but not after 4 in a row
+    // were: then the link did get slower, and the sample counts as it is (before 8 of 64 late shut the link)
     void rtt_seen(int rows, double ms, bool waited = true) {
-        if (seen[rows] >= 4 && ms > 3.0 * rtt[rows]) ms = 3.0 * rtt[rows];
-        if (waited || rtt[rows] <= 0.0 || ms < rtt[rows]) {
-            ew(rtt[rows], ms);
-            ++seen[rows];
+        if (!waited && rtt[rows] > 0.0 && ms >= rtt[rows]) return;
+        if (seen[rows] >= 4 && ms > 3.0 * rtt[rows]) {
+            if (over[rows] < 4) {
+                ms = 3.0 * rtt[rows];
+                ++over[rows];
+            } else {
+                over[rows] = 0;
+            }
+        } else {
+            over[rows] = 0;
         }
+        ew(rtt[rows], ms);
+        ++seen[rows];
     }
     void pick_seen(int T, double ms_a_pick) { ew(pick[T], ms_a_pick); }
     bool send(int T, int rows, size_t n_remote, size_t n_local) {
@@ -107,6 +117,26 @@ struct Gate {
     double deadline(double sent, double lane_done, double timeout_ms, int rows) const {
         const double a = lane_done + timeout_ms, b = sent + 1.5 * rtt[rows];
         return a > b ? a : b;
+    }
+};
+
+/// The main's late requests (the last 64 by seq): a reply that comes after all gives the gate the round trip it had
+struct LateBook {
+    struct E {
+        uint32_t seq = 0;
+        double sent = -1;
+        int rows = 0;
+    };
+    E e[64];
+    void add(uint32_t seq, double sent, int rows) { e[seq % 64] = {seq, sent, rows}; }
+    /// seq's send time and rows (false: not a late request here, or taken already)
+    bool take(uint32_t seq, double& sent, int& rows) {
+        E& x = e[seq % 64];
+        if (x.sent < 0 || x.seq != seq) return false;
+        sent = x.sent;
+        rows = x.rows;
+        x.sent = -1;
+        return true;
     }
 };
 
@@ -168,6 +198,13 @@ public:
     int wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y, int& srv_us, std::string& err);
     /// the last reply's arrival in the kernel (Conn::arrival_ms: steady ms, -1 unknown)
     double arrival_ms() const { return c_.arrival_ms(); }
+    /// the replies wait_resp skipped since the last call (late ones, their picks computed here): seq and the kernel's
+    /// arrival time (steady ms, -1 unknown), for the round trip they had
+    std::vector<std::pair<uint32_t, double>> take_late() {
+        std::vector<std::pair<uint32_t, double>> v;
+        v.swap(late_);
+        return v;
+    }
     /// tests: a Ping of `bytes` payload and its Pong (1; 0 none by the deadline; -1 the link failed)
     int ping(uint32_t seq, size_t bytes, double deadline, std::string& err);
     void close() { c_.close(); }
@@ -185,6 +222,7 @@ private:
     HelloMsg peer_hello_;
     int n_embd_ = 0;
     std::vector<uint8_t> tx_, rx_;
+    std::vector<std::pair<uint32_t, double>> late_;   // (take_late)
     std::vector<uint16_t> xb_;
 };
 

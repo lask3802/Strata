@@ -84,6 +84,38 @@ int main() {
         f.rtt_seen(1, 27.0);
         check(near(f.rtt[1], 0.9 * 0.8 + 2.7), "the second sample is taken as it is");
     }
+    {
+        // the link gets slower for good (0.8 -> 8 ms): 4 samples in a row clamped, then the 5th counts as it is
+        rx::Gate g;
+        for (int i = 0; i < 10; ++i) g.rtt_seen(1, 0.8);
+        for (int i = 0; i < 4; ++i) g.rtt_seen(1, 8.0);
+        const double four = 0.8 * 1.2 * 1.2 * 1.2 * 1.2;
+        check(std::fabs(g.rtt[1] - four) < 1e-9, "4 slow samples in a row: each clamped, the estimate 0.8 x 1.2^4");
+        g.rtt_seen(1, 8.0);
+        check(std::fabs(g.rtt[1] - (0.9 * four + 0.8)) < 1e-9, "the 5th in a row counts as it is: the link did get slower");
+        g.rtt_seen(1, 30.0);
+        check(g.rtt[1] < 0.9 * (0.9 * four + 0.8) + 0.3 * (0.9 * four + 0.8) + 1e-9, "and the run starts again: clamped");
+        rx::Gate h;   // (a sample within 3 x between ends the run)
+        for (int i = 0; i < 10; ++i) h.rtt_seen(1, 0.8);
+        for (int i = 0; i < 3; ++i) h.rtt_seen(1, 8.0);
+        h.rtt_seen(1, 0.8);
+        const double r = h.rtt[1];
+        h.rtt_seen(1, 8.0);
+        check(std::fabs(h.rtt[1] - 1.2 * r) < 1e-9, "3 slow, one fast, one slow: the slow one is clamped again");
+    }
+    {
+        // a late request's reply that comes after all (lead's Q3): the book gives its send and rows once
+        rx::LateBook b;
+        double s = 0;
+        int rows = 0;
+        b.add(70, 100.0, 4);
+        check(!b.take(71, s, rows), "a request that did not go late: none");
+        check(b.take(70, s, rows) && near(s, 100.0) && rows == 4, "the late one: its send time and rows");
+        check(!b.take(70, s, rows), "once only");
+        b.add(5, 1.0, 1);
+        b.add(69, 2.0, 2);   // (5 + 64: the same entry, a newer late request)
+        check(!b.take(5, s, rows) && b.take(69, s, rows) && near(s, 2.0), "64 later: the newer one has the entry");
+    }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;
 }

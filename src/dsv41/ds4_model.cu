@@ -1072,6 +1072,8 @@ struct Model::Impl {
     double rx_timeout_ms = 2.0;   // (counted from when the lane's own picks are done)
     uint64_t rx_late_bits = 0;   // the last 64 requests: bit set = its reply was late (8 of them: the link given up)
     rx::Gate rx_gate;   // the send gate and the deadline's floor (ds4_rx.hpp)
+    rx::LateBook rx_late_book;   // the late requests, for their replies' round trips if they come
+    bool rx_kts = false;         // the link has given a kernel arrival time (then a late request waits for its reply's)
     static_assert(rx::kMaxRows == kWin && rx::kMaxPicks == kPicks, "a request's rows and picks are a window's");
     std::vector<rx::ReqRow> rx_rows;
     mutable std::mutex rx_mu;
@@ -6724,8 +6726,17 @@ struct Model::Impl {
         const int got = rx_on ? rx_link->wait_resp(seq, rows, deadline, &y, srv_us, e) : -1;
         const double t1 = rx::now_ms();
         const double ta = got == 1 ? rx_link->arrival_ms() : -1.0;   // (the kernel's time the reply came in: Linux)
+        for (const auto& lt : rx_link->take_late()) {   // (earlier late requests' replies, skipped here: their round trips)
+            double ts;
+            int rw;
+            if (lt.second >= 0) rx_kts = true;
+            if (rx_late_book.take(lt.first, ts, rw) && lt.second >= ts && lt.second <= t1) rx_gate.rtt_seen(rw, lt.second - ts);
+        }
+        if (ta >= 0) rx_kts = true;
         if (ta >= t0 && ta <= t1) rx_gate.rtt_seen(rows, ta - t0);   // (outside: the realtime clock stepped)
-        else if (got >= 0) rx_gate.rtt_seen(rows, t1 - t0, t1 - tw > 0.05);   // (read within 50 us of the lane's part: there already)
+        else if (got == 1 || (got == 0 && !rx_kts))   // (late, with the kernel's times: its reply, if it comes, says)
+            rx_gate.rtt_seen(rows, t1 - t0, t1 - tw > 0.05);   // (read within 50 us of the lane's part: there already)
+        if (got == 0) rx_late_book.add(seq, t0, rows);
         st.rx_wait_ms += t1 - tw;
         st.rx_bytes_out = (int64_t) rx_link->bytes_out();
         st.rx_bytes_in = (int64_t) rx_link->bytes_in();

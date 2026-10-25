@@ -67,6 +67,43 @@ int main(int argc, char** argv) {
         check(g3 == 1 && h.seq == 3 && a3 >= s3 - 0.5 && a3 <= s3 + 5.0, "the second's arrival is its own send");
         check(a2 >= s2 - 0.5 && a2 <= s3 + 5.0, "the first's is no earlier than its send (one read: the later one's)");
     }
+    {
+        // rx::Main against a stand-in server: a late request's reply (seq 7), read and skipped while the main waits for
+        // seq 8, is in take_late with its arrival - the gate's round trip for the late one
+        rx::Main m;
+        rx::Conn s;
+        std::string em, es;
+        bool lm = false;
+        const std::string p2 = std::to_string(std::atoi(port.c_str()) + 1);
+        std::thread tm([&] { lm = m.accept("127.0.0.1:" + p2, "tok", 10, em); });
+        sleep_ms(200);
+        rx::HelloMsg hm;
+        std::snprintf(hm.token, sizeof hm.token, "tok");
+        bool ls = s.dial("127.0.0.1:" + p2, 5, es) && s.send(rx::Hello, 0, 0, 0, 0, &hm, sizeof hm, es);
+        tm.join();
+        ls = ls && s.recv(h, q, rx::now_ms() + 1000.0, es) == 1 && h.type == rx::Hello;
+        rx::GeoMsg g;
+        g.n_embd = 8;
+        ls = ls && lm && m.send_geo(g, {}, em) && s.recv(h, q, rx::now_ms() + 1000.0, es) == 1 && h.type == rx::Geo;
+        check(ls, ("a main and a stand-in server (" + em + es + ")").c_str());
+        std::vector<uint8_t> y(2 * 8, 0);
+        const uint16_t* yy = nullptr;
+        int su = 0;
+        const double s7 = rx::now_ms();
+        s.send(rx::Resp, 7, 1, 0, 0, y.data(), y.size(), es);
+        sleep_ms(20);
+        const int w0 = m.wait_resp(8, 1, rx::now_ms() + 5.0, &yy, su, em);   // (reads 7, skips it, times out)
+        s.send(rx::Resp, 8, 1, 0, 0, y.data(), y.size(), es);
+        const int w1 = m.wait_resp(8, 1, rx::now_ms() + 1000.0, &yy, su, em);
+        const auto lt = m.take_late();
+        check(w0 == 0 && w1 == 1, "seq 8's reply: none by the first deadline, then it");
+        check(lt.size() == 1 && lt[0].first == 7, "take_late: the skipped seq 7");
+        check(m.take_late().empty(), "and only once");
+#if defined(__linux__)
+        if (!lt.empty()) std::printf("seq 7: in the kernel %.3f ms after its send\n", lt[0].second - s7);
+        check(!lt.empty() && lt[0].second >= s7 - 0.5 && lt[0].second <= s7 + 5.0, "Linux: its arrival is its send's");
+#endif
+    }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;
 }
