@@ -201,8 +201,8 @@ std::string rx_mem_note() {
         std::string k;
         long long v = 0;
         while (st >> k >> v) {
-            if (k == "anon") an = v >> 20;
-            if (k == "file") fi = v >> 20;
+            if (k == "anon") an = v / 1000000;
+            if (k == "file") fi = v / 1000000;
         }
     }
     {
@@ -210,8 +210,8 @@ std::string rx_mem_note() {
         std::string k;
         long long kb = 0;
         while (st >> k) {
-            if (k == "RssAnon:" && st >> kb) ra = kb >> 10;
-            else if (k == "RssFile:" && st >> kb) rf = kb >> 10;
+            if (k == "RssAnon:" && st >> kb) ra = kb * 1024 / 1000000;
+            else if (k == "RssFile:" && st >> kb) rf = kb * 1024 / 1000000;
             st.ignore(256, '\n');
         }
     }
@@ -6536,6 +6536,14 @@ struct Model::Impl {
                     if (a == 1 && (rk[e] == 0 || rk[e] > i + 1)) rk[e] = (uint8_t) (i + 1);
                     if ((fl[e] & 8) || !file_read(n, e)) continue;
                     fl[e] |= 8;
+#if defined(__linux__)
+                    if (!store && !rx_has.empty() && rx_has[(size_t) j * g.n_exp + e]) {   // (the server's: diagnostics)
+                        ++st.rx_ahead;
+                        bool res = true;
+                        for (int q = 0; q < 3 && res; ++q) res = os::resident_sampled(mx_mat(n, e, q), mx_part_bytes(n, q), 4);
+                        st.rx_ahead_cold += res ? 0 : 1;
+                    }
+#endif
                     if (store) store->prefetch(j, e);
                     else
                         for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});

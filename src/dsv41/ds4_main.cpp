@@ -1963,11 +1963,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "decode reads from the disk: %.1f MB a token\n", (double) (io1 - io0) / 1e6 / nt);
 #if defined(__linux__)
     if (io0 >= 0 && io1 >= 0 && s.rx_held > 0) {   // (--remote-experts: the server's experts the lane read, the rest)
-        const double all = (double) (io1 - io0) / 1e6 / nt,
-                     held = (double) (s.rx_here_cold - s0.rx_here_cold) * ((double) s.rx_upload_bytes / s.rx_held) / 1e6 / nt;
-        std::fprintf(stderr, "decode reads from the disk, split: the server's experts the lane computed after all, not in "
-                             "the page cache then, %.1f MB a token (each whole: at most); all the others %.1f MB a token\n",
-                     held, all > held ? all - held : 0.0);
+        const double eb = (double) s.rx_upload_bytes / (double) s.rx_held / 1e6, all = (double) (io1 - io0) / 1e6 / nt,
+                     here = (double) (s.rx_here_cold - s0.rx_here_cold) * eb / nt,
+                     ahead = (double) (s.rx_ahead_cold - s0.rx_ahead_cold) * eb / nt;
+        std::fprintf(stderr, "decode reads from the disk, split (estimates: a whole %.1f MB expert each one sampled out of "
+                             "the page cache): the server's experts the lane computed after all %.1f MB a token, the "
+                             "server's experts the lookahead asked for early %.1f MB a token (%.1f asked a token), all the "
+                             "others %.1f MB a token\n",
+                     eb, here, ahead, (double) (s.rx_ahead - s0.rx_ahead) / nt,
+                     all > here + ahead ? all - here - ahead : 0.0);
     }
 #endif
     if (s.skipped > s0.skipped)   // STRATA_DS4_DISK_SKIP_W
