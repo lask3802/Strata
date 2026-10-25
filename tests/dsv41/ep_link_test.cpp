@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -136,6 +137,27 @@ std::string self_path() {
 #endif
 }
 
+std::mutex g_kids_mu;
+std::vector<std::intptr_t> g_kids;   // (the children alive: a watchdog that ends the run ends them first)
+void kids_add(std::intptr_t id) {
+    std::lock_guard<std::mutex> g(g_kids_mu);
+    g_kids.push_back(id);
+}
+void kids_del(std::intptr_t id) {
+    std::lock_guard<std::mutex> g(g_kids_mu);
+    g_kids.erase(std::remove(g_kids.begin(), g_kids.end(), id), g_kids.end());
+}
+void kids_kill() {
+    std::lock_guard<std::mutex> g(g_kids_mu);
+    for (std::intptr_t id : g_kids) {
+#if defined(_WIN32)
+        TerminateProcess((HANDLE) id, 9);
+#else
+        ::kill((pid_t) id, SIGKILL);
+#endif
+    }
+}
+
 struct Child {
 #if defined(_WIN32)
     HANDLE h = nullptr;
@@ -152,6 +174,7 @@ struct Child {
         if (!CreateProcessA(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) return false;
         CloseHandle(pi.hThread);
         h = pi.hProcess;
+        kids_add((std::intptr_t) h);
         return true;
 #else
         pid = fork();
@@ -159,6 +182,7 @@ struct Child {
             execl(exe.c_str(), exe.c_str(), "--child", mode.c_str(), p.c_str(), (char*) nullptr);
             _exit(127);
         }
+        if (pid > 0) kids_add((std::intptr_t) pid);
         return pid > 0;
 #endif
     }
@@ -168,6 +192,7 @@ struct Child {
         if (h == nullptr || WaitForSingleObject(h, (DWORD) ms) != WAIT_OBJECT_0) return -1;
         DWORD code = 0;
         GetExitCodeProcess(h, &code);
+        kids_del((std::intptr_t) h);
         CloseHandle(h);
         h = nullptr;
         return (int) code;
@@ -175,6 +200,7 @@ struct Child {
         for (int i = 0; pid > 0 && i <= ms; ++i) {
             int st = 0;
             if (waitpid(pid, &st, WNOHANG) == pid) {
+                kids_del((std::intptr_t) pid);
                 pid = -1;
                 return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
             }
@@ -415,10 +441,15 @@ int child(const std::string& mode, int port) {
     std::thread bulk_th;
     std::atomic<int> gate_bad{0};   // gate: a fill loaded before the request that frees its slots was read
     std::string bulk_end;           // why the bulk thread ended
-    if (mode == "fill" || mode == "bulk-session" || mode == "fill-drop" || mode == "bulk-silent" || mode == "gate" || mode == "gate-stuck" ||
-        mode == "fill-stall") {   // the bulk socket on a thread of its own
+    if (mode == "fill" || mode == "bulk-session" || mode == "fill-drop" || mode == "bulk-silent" || mode == "bulk-rst" || mode == "gate" ||
+        mode == "gate-stuck" || mode == "fill-stall") {   // the bulk socket on a thread of its own
         if (mode == "bulk-silent") {   // a connection that says nothing, before the worker's own bulk socket
             if (!quiet.dial(at, 5000, err)) return 23;
+            sleep_ms(100);
+        }
+        if (mode == "bulk-rst") {   // a connection reset before the main takes it, then the worker's own bulk socket
+            if (!quiet.dial(at, 5000, err)) return 23;
+            quiet.reset();
             sleep_ms(100);
         }
         if (!w.bulk.dial(at, 5000, err) || !bulk_worker(w.bulk, me, m.hello.session, err)) return 21;
@@ -569,6 +600,13 @@ void case_pure() {
     const bool bare = split_host_port("7870", h, pt) && h.empty() && pt == "7870";
     check(v6 && v4 && bare && !split_host_port("::1:7870", h, pt) && !split_host_port("[::1]7870", h, pt),
           "pure: [V6]:PORT, HOST:PORT and PORT parse; a bare IPv6 address does not");
+    // Listener::accept goes on after an accept() the peer's reset ended (a reset stranger is not a failed listener), not after any
+#if defined(_WIN32)
+    const bool again = accept_retry(10035) && accept_retry(10054) && !accept_retry(10061) && !accept_retry(10038);   // WOULDBLOCK, CONNRESET; CONNREFUSED, NOTSOCK
+#else
+    const bool again = accept_retry(EAGAIN) && accept_retry(ECONNABORTED) && accept_retry(EPROTO) && !accept_retry(EBADF) && !accept_retry(EMFILE);
+#endif
+    check(again, "pure: accept goes on after a connection that was reset or taken by another thread, not after a failed listener");
     // the worker's batches: one epoch, i of n in order, acked only when every fill of it loaded
     FillBatch b;
     const bool two = b.take(1, 0, 2, 0, 3).empty() && !b.done(true) && b.take(1, 1, 2, 0, 4).empty() && b.done(true);
@@ -671,25 +709,43 @@ void case_sessions_and_listeners() {
         const int rc2 = c2.wait(10000);
         check(p.end() == 0 && rc2 == 0, "... both workers end at their bye");
     }
-    {   // one worker per listener: a second one is told so
+    {   // one worker per listener: a second one is told so (after accept_bulk, on its thread)
         Pair p;
-        p.open("good");
+        p.open("fill");
+        std::string err;
+        const bool bulk = p.m.accept_bulk(p.ls, 5000, err);
         Child c2;
-        const bool started = c2.start("extra", p.ls.port());
-        const bool refused = started && MainLink::refuse_extra(p.ls, p.me, 10000);
+        const bool started = bulk && c2.start("extra", p.ls.port());
+        const int refused = started ? p.m.refuse_extra(p.ls, 10000, err) : -9;
         const int rc2 = c2.wait(10000);
-        check(refused && rc2 == 0 && p.m.up(), "one worker per listener: a second worker hears \"a worker is already connected\"");
+        check(refused == 1 && rc2 == 0 && p.m.up(), "one worker per listener: a second worker hears \"a worker is already connected\" (" + err + ")");
         p.m.bye();
         p.end();
     }
     {   // a second worker without the token is not told a worker is here
         Pair p;
-        p.open("good");
+        p.open("fill");
+        std::string err;
+        const bool bulk = p.m.accept_bulk(p.ls, 5000, err);
         Child c2;
-        const bool started = c2.start("extra-token", p.ls.port());
-        const bool refused = started && MainLink::refuse_extra(p.ls, p.me, 10000);
+        const bool started = bulk && c2.start("extra-token", p.ls.port());
+        const int refused = started ? p.m.refuse_extra(p.ls, 10000, err) : -9;
         const int rc2 = c2.wait(10000);
-        check(refused && rc2 == 0 && p.m.up(), "a second worker without the token hears \"wrong token\", not \"a worker is already connected\"");
+        check(refused == 1 && rc2 == 0 && p.m.up(), "a second worker without the token hears \"wrong token\", not \"a worker is already connected\"");
+        p.m.bye();
+        p.end();
+    }
+    {   // refuse_extra is for the thread accept_bulk ran on, after it returned true: before it, it would take the worker's own connection
+        Pair p;
+        p.open("fill");
+        std::string e1, e2, e3;
+        const int before = p.m.refuse_extra(p.ls, 200, e1);
+        const bool bulk = p.m.accept_bulk(p.ls, 5000, e2);
+        int other = 9;
+        std::thread t([&] { other = p.m.refuse_extra(p.ls, 200, e3); });
+        t.join();
+        check(before == -1 && has(e1, "before accept_bulk") && bulk && other == -1 && has(e3, "another thread"),
+              "refuse_extra before accept_bulk returned, or on another thread: refused (" + e1 + " / " + e3 + ")");
         p.m.bye();
         p.end();
     }
@@ -890,13 +946,16 @@ void case_late_reply() {
         std::string e;
         Reply r2;
         ReqData c(1, 1), d(1, 2);
-        const double t0 = now_ms();
         const int s3 = q.m.send_req(1, 0, 1, 0, 0, c.picks.data(), c.x.data(), e);
         const int w3 = s3 == 1 ? q.m.wait_resp(1, now_ms() + 50.0, r2, e) : 9;   // (dropped at its deadline)
-        sleep_ms(t0 + 1300.0 - now_ms());   // (the reply came at 1.1 s: past the 1 s since the drop, unread)
+        const double td = now_ms();   // (the drop)
+        uint8_t first;
+        std::string pe;
+        const bool in = q.m.req.peek(&first, 1, td + 5000.0, pe) == 1;   // (the reply is in the socket, however late the worker is; not taken as a frame)
+        sleep_ms(td + 1100.0 - now_ms());   // (and the drop is over a second old)
         const int s4 = q.m.send_req(2, 0, 1, 0, 0, d.picks.data(), d.x.data(), e);
         const int w4 = s4 == 1 ? q.m.wait_resp(2, now_ms() + 2000, r2, e) : 9;
-        check(s3 == 1 && w3 == 0 && s4 == 1 && w4 == 1 && d.is_doubled(r2, 1) && q.m.up() && q.m.st.downs == 0,
+        check(s3 == 1 && w3 == 0 && in && s4 == 1 && w4 == 1 && d.is_doubled(r2, 1) && q.m.up() && q.m.st.downs == 0,
               "a dropped request's reply that came after the 1 s mark and is unread: taken first, the link stays up (" + e + ")");
         q.m.bye();
         q.end();
@@ -1214,6 +1273,75 @@ void case_fill_gate() {
 }
 
 // ending a link does not wait for a send to a peer that is not reading (a full buffer was waited on for 30 s)
+// a WorkerLink in this process with a raw main on its bulk socket
+struct Loop {
+    Listener ls;
+    WorkerLink w;
+    Conn raw;
+    EpHello me = hello_of(1);
+    bool open() {
+        std::string e;
+        if (!ls.open("127.0.0.1:0", e) || !w.bulk.dial("127.0.0.1:" + std::to_string(ls.port()), 5000, e)) return false;
+        w.start(me);
+        return ls.accept(raw, 5000, e);
+    }
+};
+
+void case_worker_gate() {
+    const WorkerLink::Loader load = [](int, int, int, uint32_t, const uint8_t*, size_t) -> uint16_t { return 0; };
+    {   // the main closes the bulk socket while a fill waits for its request: the wait ends then, not a second later
+        Loop l;
+        const bool up = l.open();
+        std::string e1, e2, err, what;
+        int r1 = 9, r2 = 9;
+        double ms = 0.0;
+        std::thread t([&] {
+            r1 = l.w.serve_fill(now_ms() + 5000, load, e1);
+            const double t0 = now_ms();
+            r2 = l.w.serve_fill(now_ms() + 5000, load, e2);
+            ms = now_ms() - t0;
+        });
+        const bool a = up && raw_fill(l.raw, 3, 1, 17, 0, 1, err) && raw_fill_ok(l.raw, 3000, what) == 0;
+        const bool b = a && raw_fill(l.raw, 4, 2, 18, 0, 1, err);   // (epoch 2 waits for a request tagged 1: none comes)
+        sleep_ms(150);
+        l.raw.close();
+        t.join();
+        check(b && r1 == 1 && r2 == -1 && ms < 700.0 && has(e2, "closed"),
+              "a fill that waits for its request ends when the main closes the bulk socket (" + std::to_string((int) ms) + " ms, " + e2 + ")");
+    }
+    {   // the caller's deadline is shorter than the wait: the wait ends at it
+        Loop l;
+        const bool up = l.open();
+        std::string e1, e2, err, what;
+        int r1 = 9, r2 = 9;
+        double ms = 0.0;
+        std::thread t([&] {
+            r1 = l.w.serve_fill(now_ms() + 5000, load, e1);
+            const double t0 = now_ms();
+            r2 = l.w.serve_fill(t0 + 500.0, load, e2);
+            ms = now_ms() - t0;
+        });
+        const bool a = up && raw_fill(l.raw, 3, 1, 17, 0, 1, err) && raw_fill_ok(l.raw, 3000, what) == 0;
+        const bool b = a && raw_fill(l.raw, 4, 2, 18, 0, 1, err);
+        t.join();
+        check(b && r1 == 1 && r2 == -1 && ms >= 450.0 && ms < 800.0 && has(e2, "deadline"),
+              "a fill that waits for its request ends at the caller's deadline (" + std::to_string((int) ms) + " ms, " + e2 + ")");
+    }
+    {   // start() while a serve_fill runs: refused, nothing reset; after it, done
+        Loop l;
+        const bool up = l.open();
+        std::string e;
+        int r = 9;
+        std::thread t([&] { r = l.w.serve_fill(now_ms() + 1200, load, e); });
+        sleep_ms(300);
+        l.w.epoch_used.store(7);
+        const bool refused = !l.w.start(l.me) && l.w.epoch_used.load() == 7;
+        t.join();
+        const bool done = l.w.start(l.me) && l.w.epoch_used.load() == 0;
+        check(up && refused && r == 0 && done, "WorkerLink::start() while a serve_fill runs: refused, nothing reset; after it, done");
+    }
+}
+
 void case_fill_stop() {
     {   // 40 MB cannot sit in the buffers
         Pair p;
@@ -1261,6 +1389,8 @@ void case_reconnect() {
     const bool sent = p.m.send_req(1, 0, 1, 0, 0, x.picks.data(), x.x.data(), err) == 1;
     const int w1 = sent ? p.m.wait_resp(1, now_ms() + 3000, r, err) : 9;
     const bool downed = w1 == -1 && has(err, "magic") && !p.m.up();
+    std::string e_dn;
+    const int extra_dn = p.m.refuse_extra(p.ls, 100, e_dn);   // (the link is down: not the time to take a connection)
     const bool bulk_left = p.m.bulk.ok();   // (the bulk socket is the fill thread's: it closes it, in about 20 ms, not down_)
     const bool pending = p.m.fills_pending() == 1;   // (the abandoned fill gets no FillOk: pending until start())
     Peer w2;
@@ -1273,7 +1403,7 @@ void case_reconnect() {
     const bool f = bulk2 && p.m.queue_fill(3, 17, 5, 1, 0, 1, nullptr, 0, err) && wait_until([&] { return p.m.epoch_ready() == 1; }, 3000);
     const bool served = f && p.m.send_req(2, 0, 1, 1, 0, x.picks.data(), x.x.data(), err) == 1 &&
                         p.m.wait_resp(2, now_ms() + 3000, r, err) == 1 && x.is_doubled(r, 1);
-    check(q && downed && bulk_left && pending && again && ms < 2000.0 && clean,
+    check(q && downed && bulk_left && pending && extra_dn == -1 && has(e_dn, "down") && again && ms < 2000.0 && clean,
           "a request-path failure in the middle of a fill: pending until start(), which ends the fill thread (" +
               std::to_string((int) ms) + " ms, " + err + ")");
     check(bulk2 && f && served, "... then accept_bulk, a fill and a request on the new connection work");
@@ -1335,6 +1465,16 @@ void case_bulk_accept() {
         const double ms = now_ms() - t0;
         check(ok && ms >= 150.0 && ms < 2500.0, "a silent connection is closed after 200 ms, the worker's bulk socket behind it taken (" +
                                                    std::to_string((int) ms) + " ms, " + err + ")");
+        p.m.bye();
+        p.end();
+    }
+    {   // a connection reset before it is taken (Windows: accept fails with WSAECONNRESET) is skipped, the worker behind it taken
+        Pair p;
+        p.open("bulk-rst");
+        std::string err;
+        const bool ok = p.m.accept_bulk(p.ls, 5000, err);
+        const bool fill = ok && p.m.queue_fill(3, 17, 5, 1, 0, 1, nullptr, 0, err) && wait_until([&] { return p.m.epoch_ready() == 1; }, 3000);
+        check(ok && fill, "a stranger reset before it was taken: skipped, the worker's bulk socket behind it taken (" + err + ")");
         p.m.bye();
         p.end();
     }
@@ -1706,6 +1846,7 @@ void watchdog() {
         if (c != nullptr && now_ms() - g_case_t0.load() > kCaseMs) {
             std::printf("%s: still running after %d s (hung, or waiting out its deadlines) FAIL\nFAILED\n", c, (int) (kCaseMs / 1000.0));
             std::fflush(stdout);
+            kids_kill();
             std::_Exit(1);
         }
     }
@@ -1758,6 +1899,7 @@ int main(int argc, char** argv) {
     run_case("case_fill", case_fill);
     run_case("case_fill_layers", case_fill_layers);
     run_case("case_fill_gate", case_fill_gate);
+    run_case("case_worker_gate", case_worker_gate);
     run_case("case_fill_stop", case_fill_stop);
     run_case("case_reconnect", case_reconnect);
     run_case("case_fill_drop", case_fill_drop);
