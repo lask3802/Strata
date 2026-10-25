@@ -1161,7 +1161,9 @@ struct Model::Impl {
     // the deferral, and beside it the deferred streams are built from the same attention outputs and hc coefficients
     // (Dev::v_*: hc_post without the part, the next attention's hc_post, late_flush's add) and compared with the exact
     // streams after that attention (or before the head): up to the float sums' order they are the same, so a larger
-    // difference is a wiring bug.  v_err[il]: the largest relative difference for layer il's part (host-mapped)
+    // difference is a wiring bug.  An Engram layer's in-place add to the exact streams (its gates from them) goes onto
+    // the deferred ones too (add_diff).  v_err[il]: the largest relative difference for layer il's part (device; Stats
+    // gets a copy after each window)
     int defer_from = 0, late_il = -1;
     bool ep_verify = false;
     bool v_wrong = false;   // DS4_EP_DEFER_VERIFY=2: the check's own check - the deferred side given a wrong comb (layer
@@ -9514,7 +9516,7 @@ struct Model::Impl {
         ep_verify = on("DS4_EP_DEFER_VERIFY");
         v_wrong = ep_verify && std::atoi(std::getenv("DS4_EP_DEFER_VERIFY")) == 2;
         if (!on("DS4_EP_DEFER") && !ep_verify) return true;
-        const char* nv = ep_verify ? "DS4_EP_DEFER_VERIFY=1" : "DS4_EP_DEFER=1";
+        const char* nv = v_wrong ? "DS4_EP_DEFER_VERIFY=2" : ep_verify ? "DS4_EP_DEFER_VERIFY=1" : "DS4_EP_DEFER=1";
         if (const char* f = std::getenv("DS4_EP_DEFER_FROM"); f != nullptr && *f != '\0')
             defer_from = std::max(0, std::min(g.nl - 1, std::atoi(f)));
         const char* why = nullptr;
@@ -9527,30 +9529,24 @@ struct Model::Impl {
             if (L[(size_t) il].nm != 1 || L[(size_t) il].dev != L[(size_t) lo].dev) why = "the layers on more than one GPU";
         if (why != nullptr) {
             std::fprintf(stderr, "ds4: %s: off for this run - %s\n", nv, why);
-            ep_verify = false;
+            ep_verify = v_wrong = false;
             return true;
         }
         Dev& d = devs[(size_t) L[(size_t) lo].dev];
         if (!dalloc(d, d.late_post, (size_t) kWin * 8, err)) return false;
         if (ep_verify) {
             const size_t W = kWin, D = (size_t) g.dim, H = (size_t) g.hc;
-            if (!dalloc(d, d.v_moe, W * D, err) || !dalloc(d, d.v_h, W * H * D, err) || !dalloc(d, d.v_h2, W * H * D, err))
+            if (!dalloc(d, d.v_moe, W * D, err) || !dalloc(d, d.v_h, W * H * D, err) || !dalloc(d, d.v_h2, W * H * D, err) ||
+                !dalloc(d, v_err, (size_t) kMaxL, err))
                 return false;
-            void* m = nullptr;
-            if (cudaHostAlloc(&m, sizeof(float) * kMaxL, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
-                err = "host-mapped memory for DS4_EP_DEFER_VERIFY";
-                return false;
-            }
-            host_allocs.push_back(m);
-            v_err = (float*) m;
-            std::memset(v_err, 0, sizeof(float) * kMaxL);
         }
         ep_defer = true;
         if (ep_verify)
             std::fprintf(stderr, "ds4: DS4_EP_DEFER_VERIFY=%d: decode stays exact (each layer waits for its part); the "
                                  "deferred streams of layers %d-%d are built beside it from the same attention and "
                                  "compared (a wiring check, slower)%s\n", v_wrong ? 2 : 1, defer_from, g.nl - 1,
-                         v_wrong ? " - with a wrong comb on purpose: the comparison must show it" : "");
+                         v_wrong ? " - with a wrong comb on purpose in the layers' adds (not the head's): the comparison "
+                                   "must show it there" : "");
         else
             std::fprintf(stderr, "ds4: DS4_EP_DEFER=1: in decode each layer's CPU-lane part (with the remote experts') of "
                                  "layers %d-%d is added a layer late, after the next layer's attention - an approximation "
@@ -9774,7 +9770,8 @@ struct Model::Impl {
         const double th = now_ms();
         CK(cudaStreamSynchronize(d.st));
         st.head_ms += now_ms() - th;
-        for (int i = 0; ep_verify && i < g.nl && i < 64; ++i) st.ep_verify[i] = v_err[i];   // (the window's checks are in)
+        if (ep_verify)   // (the window's checks are in: its stream is done)
+            CK(cudaMemcpy(st.ep_verify, v_err, sizeof(float) * (size_t) std::min(g.nl, 64), cudaMemcpyDeviceToHost));
         prof_collect();
         pos += T;
         st.tokens += T;
@@ -10064,7 +10061,11 @@ struct Model::Impl {
                                    (size_t) cols * (ehd / 32), cudaMemcpyHostToDevice, s));
             engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, (int) eg_fmt[(size_t) l.eg]);
             if (!mv(d, {job(l.eg_wkv, d.eg_x, d.eg_kv, T, (size_t) cols * ehd, (size_t) (H + 1) * D)}, err)) return false;
+            const bool vg = ep_verify && late_slot >= 0;   // (DS4_EP_DEFER_VERIFY: the same add onto the deferred streams)
+            const size_t nh = (size_t) T * H * D;
+            if (vg) CK(cudaMemcpyAsync(d.v_h2, d.h, nh * 4, cudaMemcpyDeviceToDevice, s));
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
+            if (vg) add_diff(d.v_h, d.h, d.v_h2, nh, s);
         }
         // attention
         if (hc2) {

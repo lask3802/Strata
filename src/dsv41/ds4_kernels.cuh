@@ -78,8 +78,11 @@ void hc_post_inplace(const float* y, float* h, const float* post, const float* c
 /// comb null: c = post (nothing ran since: the head).
 void hc_late_add(float* h, const float* part, size_t part_stride, const int* flag, const float* post, const float* comb,
                  int dim, int hc, int T, cudaStream_t s);
-/// *out = max(*out, max_i |a[i] - b[i]| / (1 + |a[i]|)) (a NaN counts as inf; *out starts at 0 or a value it wrote).
+/// *out = max(*out, max_i |a[i] - b[i]| / (1 + |a[i]|)) (a NaN counts as inf; *out, device memory, starts at 0 or a
+/// value it wrote).
 void max_rel_diff(const float* a, const float* b, size_t n, float* out, cudaStream_t s);
+/// y[i] += a[i] - b[i] (DS4_EP_DEFER_VERIFY: an in-place change of the exact streams, e.g. Engram's, onto the deferred).
+void add_diff(float* y, const float* a, const float* b, size_t n, cudaStream_t s);
 /// A chunk's hc_mix: the dots of each row with the n_mix weights already in mixes (a GEMM's, rows 32 apart), times
 /// rsqrt(mean(h_row^2) + eps) - hc_mix's value up to the dots' summation order.
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);

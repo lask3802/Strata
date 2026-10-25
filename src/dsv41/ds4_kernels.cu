@@ -1804,12 +1804,23 @@ __global__ void hc_late_add_kernel(float* h, const float* __restrict__ part, siz
     }
 }
 
-// a thread a value: the largest |a - b| / (1 + |a|) into *out (as bits: non-negative floats order as unsigned ints)
+// a thread a value: the largest |a - b| / (1 + |a|) into *out (as bits: non-negative floats order as unsigned ints),
+// the block's largest first, then one atomic a block
 __global__ void max_rel_diff_kernel(const float* __restrict__ a, const float* __restrict__ b, size_t n, unsigned* out) {
+    __shared__ unsigned m;
+    if (threadIdx.x == 0) m = 0u;
+    __syncthreads();
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float v = fabsf(a[i] - b[i]) / (1.0f + fabsf(a[i]));
-    atomicMax(out, __float_as_uint(v == v ? v : __int_as_float(0x7f800000)));   // (a NaN: counted as inf)
+    if (i < n) {
+        const float v = fabsf(a[i] - b[i]) / (1.0f + fabsf(a[i]));
+        atomicMax(&m, __float_as_uint(v == v ? v : __int_as_float(0x7f800000)));   // (a NaN: counted as inf)
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && m != 0u) atomicMax(out, m);
+}
+__global__ void add_diff_kernel(float* __restrict__ y, const float* __restrict__ a, const float* __restrict__ b, size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] += a[i] - b[i];
 }
 
 // a thread a (token, value): every stream's value read before any is written
@@ -2102,6 +2113,10 @@ void hc_late_add(float* h, const float* part, size_t part_stride, const int* fla
 void max_rel_diff(const float* a, const float* b, size_t n, float* out, cudaStream_t s) {
     if (n == 0) return;
     max_rel_diff_kernel<<<(unsigned) ((n + kThreads - 1) / kThreads), kThreads, 0, s>>>(a, b, n, (unsigned*) out);
+}
+void add_diff(float* y, const float* a, const float* b, size_t n, cudaStream_t s) {
+    if (n == 0) return;
+    add_diff_kernel<<<(unsigned) ((n + kThreads - 1) / kThreads), kThreads, 0, s>>>(y, a, b, n);
 }
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
     hc_mix_scale_kernel<<<T, kThreads, 0, s>>>(h, hcdim, n_mix, eps, mixes);
