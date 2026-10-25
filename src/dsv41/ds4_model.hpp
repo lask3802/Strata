@@ -150,6 +150,7 @@ struct Stats {
     // the link's keep-awake (ds4_rx.hpp): Wakes sent at a window's start, and the CPU lane's requests that found
     // serve_lane napping (its 20 us sleeps: after 2 ms idle, kSpinMs while the link is up)
     int64_t rx_wakes = 0, lane_nap_reqs = 0;
+    int64_t ep_late = 0;   // DS4_EP_DEFER: the layers whose mailbox part the next layer (or the head) added
 };
 
 class Model {

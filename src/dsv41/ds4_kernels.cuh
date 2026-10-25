@@ -72,6 +72,12 @@ void hc_post(const float* y, const float* res, const float* post, const float* c
 /// hc_post with out = res (h), the same arithmetic: a chunk keeps one copy of its streams.
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s);
+/// DS4_EP_DEFER (n+1 deferral): a layer's part y that came a layer late (rows part_stride floats apart; token t only
+/// where flag[t] != 0) into the streams: h[t][k][e] += c[t][k] y[t][e], c[t][k] = sum_j comb[t][j][k] post[t][j] - the
+/// term hc_post(y, post) leaves out, carried through the hc_post (comb: the next layer's attention's) that ran since;
+/// comb null: c = post (nothing ran since: the head).
+void hc_late_add(float* h, const float* part, size_t part_stride, const int* flag, const float* post, const float* comb,
+                 int dim, int hc, int T, cudaStream_t s);
 /// A chunk's hc_mix: the dots of each row with the n_mix weights already in mixes (a GEMM's, rows 32 apart), times
 /// rsqrt(mean(h_row^2) + eps) - hc_mix's value up to the dots' summation order.
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);

@@ -2036,6 +2036,10 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "%s\n", rk.c_str());
     }
+    if (s.ep_late > s0.ep_late)   // DS4_EP_DEFER
+        std::fprintf(stderr, "ep defer: %lld layers' CPU-lane parts added a layer late (%.1f a token; DS4_PROF's wait for "
+                             "the CPU lane is then the next layer's)\n", (long long) (s.ep_late - s0.ep_late),
+                     (double) (s.ep_late - s0.ep_late) / (double) std::max<size_t>(1, out.size()));
     if (s.prof_tokens > s0.prof_tokens) {   // DS4_PROF
         const double pt = (double) (s.prof_tokens - s0.prof_tokens);
         double sum = 0;
