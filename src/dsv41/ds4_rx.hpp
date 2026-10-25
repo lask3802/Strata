@@ -14,9 +14,10 @@
 // sum_i w_i expert_i(x) in bf16) and adds it to the same part before the answer's seq.  A reply not in once the lane's
 // own picks are done and as long again as the lane would take for the server's picks (0.1 ms at least; 2 ms until the
 // lane's time a pick is known, or always DS4_RX_TIMEOUT_MS when it is set): those picks are computed on the lane (the
-// late reply is skipped when it comes, its round trip still taken); 8 late replies of the last 64: the lane computes everything for the next DS4_RX_BACKOFF (256)
-// requests, then the link is tried again with a clean count; a lost link, or no reply at all from one such idle spell
-// to the next: the lane computes everything from then on.
+// late reply is skipped when it comes, its round trip still taken; without the kernel's arrival times, Windows: the 2
+// ms always); 8 of the last 64 replies past the link's bound (that fixed wait's deadline, not the lane's): the lane
+// computes everything for the next DS4_RX_BACKOFF (256) requests, then the link is tried again with a clean count; a
+// lost link, or no reply at all from one such idle spell to the next: the lane computes everything from then on.
 // Never a hang.
 //
 // The wire: a 32-byte header (magic, type, seq, a, b, c, payload bytes), then the payload; TCP_NODELAY, rows bf16.
@@ -150,6 +151,15 @@ struct Gate {
         const double a = lane_done + wait, b = sent + 1.5 * rtt[rows];
         return a > b ? a : b;
     }
+    /// a request's two deadlines: the lane's (the wait for its n_remote picks at T) and the link's bound (the fixed
+    /// wait's, what rx::Backoff counts against).  kts = false (no kernel arrival times: a late reply's time is its read,
+    /// in the next request's wait, past any bound): the fixed wait, the bound is the deadline
+    std::pair<double, double> deadlines(int T, size_t n_remote, int rows, double sent, double lane_done, double fixed_ms,
+                                        bool forced, bool kts) const {
+        const double bound = deadline(sent, lane_done, fixed_ms, rows);
+        if (!kts) return {bound, bound};
+        return {deadline(sent, lane_done, wait_ms(T, n_remote, fixed_ms, forced), rows), bound};
+    }
 };
 
 /// The main's late requests (seq mod 64: a later one 64 on takes the slot): a reply that comes after all gives the
@@ -166,6 +176,20 @@ struct LateBook {
     E e[64];
     void add(uint32_t seq, double sent, int rows, int layer = -1, double bound = -1) {
         e[seq % 64] = {seq, sent, bound, rows, layer, bound >= 0};
+    }
+    /// a request late for the lane's `deadline` in: open against its bound, or decided late at once when the deadline
+    /// was the bound already.  Its slot's entry still open (64 sends on, no reply, the bound not passed: a bound far
+    /// out): decided late.  The count decided late here
+    int add_late(uint32_t seq, double sent, int rows, int layer, double deadline, double bound) {
+        const int n = e[seq % 64].open ? 1 : 0;
+        const bool now = deadline >= bound;
+        add(seq, sent, rows, layer, now ? -1.0 : bound);
+        return n + (now ? 1 : 0);
+    }
+    /// a late reply's lateness for the link: its kernel arrival (within its send and the read; a shared stamp is the
+    /// read's last reply's, an upper bound: past the bound counts late), else the time it was read
+    static bool past(double arrival, double sent, double read, double bound) {
+        return arrival >= sent && arrival <= read ? arrival > bound : read > bound;
     }
     /// seq's send time, rows and layer (false: not a late request here, or taken already); *open: its link lateness
     /// still to decide (against *bound)

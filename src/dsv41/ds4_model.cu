@@ -6664,7 +6664,9 @@ struct Model::Impl {
                 int su = 0;
                 const double s = now_ms();
                 if (!link->send_req(0xFFFF0000u + i, pick[hi].li, 1, &wr, wxs, e)) break;
-                if (link->wait_resp(0xFFFF0000u + i, 1, s + 1000.0, &yw, su, e) != 1) continue;
+                const int wg = link->wait_resp(0xFFFF0000u + i, 1, s + 1000.0, &yw, su, e);
+                if (wg < 0) break;
+                if (wg == 0) continue;
                 const double r = now_ms(), a = link->arrival_ms();
                 pr.push_back(a >= s && a <= r ? a - s : r - s);
             }
@@ -6807,13 +6809,13 @@ struct Model::Impl {
     }
     // the reply to request seq (sent at t0) into rp's parts; late or no link: those picks computed here.  The deadline:
     // after the lane's own picks, as long as the lane would take for these (rx::Gate::wait_ms), but not before 1.5 x the
-    // round trip expected at these rows
+    // round trip expected at these rows; the link's lateness (rx::Backoff) against the fixed wait's (rx::Gate::deadlines)
     void rx_finish(const Layer& l, const Req& r, Resp& rp, int T, unsigned seq, double t0,
                    const std::vector<std::pair<int, int>>& rpk) {
         const double tw = rx::now_ms();
         const int rows = (int) rx_rows.size();
-        const double wait = rx_gate.wait_ms(T, rpk.size(), rx_timeout_ms, rx_wait_fixed);
-        const double deadline = rx_gate.deadline(t0, tw, wait, rows);
+        const auto dl = rx_gate.deadlines(T, rpk.size(), rows, t0, tw, rx_timeout_ms, rx_wait_fixed, rx_kts);
+        const double deadline = dl.first, bound = dl.second;   // (the lane's; the link's, rx::Backoff's)
         const uint16_t* y = nullptr;
         int srv_us = 0;
         std::string e;
@@ -6830,10 +6832,10 @@ struct Model::Impl {
             int rw, ly;
             if (la >= 0) rx_kts = true;
             bool open = false;
-            double bound = -1;
-            if (!rx_late_book.take(late[i].first, ts, rw, &ly, &open, &bound)) continue;
+            double lb = -1;
+            if (!rx_late_book.take(late[i].first, ts, rw, &ly, &open, &lb)) continue;
             ++st.rx_late_came;
-            if (open) rx_back_seen(la >= ts && la <= t1 ? la > bound : t1 > bound);   // (the link late: past its bound)
+            if (open) rx_back_seen(rx::LateBook::past(la, ts, t1, lb));   // (the link late: past its bound)
             if (la < ts || la > t1) continue;   // (no kernel time, or the realtime clock stepped)
             if (la == ta || (i + 1 < late.size() && late[i + 1].second == la)) {
                 ++st.rx_late_shared;
@@ -6849,11 +6851,8 @@ struct Model::Impl {
         else if (got == 1 || (got == 0 && !rx_kts))   // (late, with the kernel's times: its reply, if it comes, says)
             rx_seen(rows, t1 - t0, t1 - tw > 0.05, t0);   // (read within 50 us of the lane's part: there already)
         for (int n = rx_late_book.expire(t1); n > 0; --n) rx_back_seen(true);   // (past the link's bound, not in)
-        if (got == 0) {   // (late for the lane's wait; for the link only past the fixed wait's deadline)
-            const double bound = rx_gate.deadline(t0, tw, rx_timeout_ms, rows);
-            rx_late_book.add(seq, t0, rows, l.il, deadline >= bound ? -1.0 : bound);
-            if (deadline >= bound) rx_back_seen(true);
-        }
+        if (got == 0)   // (late for the lane's wait; for the link only past the fixed wait's deadline)
+            for (int n = rx_late_book.add_late(seq, t0, rows, l.il, deadline, bound); n > 0; --n) rx_back_seen(true);
         st.rx_wait_ms += t1 - tw;
         st.rx_bytes_out = (int64_t) rx_link->bytes_out();
         st.rx_bytes_in = (int64_t) rx_link->bytes_in();
@@ -6881,8 +6880,8 @@ struct Model::Impl {
             st.rx_picks += (int64_t) rpk.size();
             st.rx_rtt_ms += t1 - t0;
             st.rx_srv_ms += srv_us / 1000.0;
-            rx_back.reply();
-            rx_back.seen(false);
+            rx_back.reply();   // (a long wait, past the bound: in time for the lane, late for the link)
+            rx_back_seen(deadline > bound && rx::LateBook::past(ta, t0, t1, bound));
             return;
         }
         if (got == 0) {

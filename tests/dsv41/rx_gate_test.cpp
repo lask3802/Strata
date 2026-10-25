@@ -44,6 +44,15 @@ int main() {
         check(near(g.deadline(10.0, 11.0, g.wait_ms(1, 1, 2.0, false), 1), 11.26), "the lane's part + 0.26 ms is the later");
         g.rtt_seen(1, 3.0);   // (0.93 ms: 1.5 x is 1.395 after the send)
         check(near(g.deadline(10.0, 11.0, g.wait_ms(1, 1, 2.0, false), 1), 10.0 + 1.5 * 0.93), "1.5 x the round trip is");
+        // the lane's deadline and the link's bound (rx::Backoff counts against the fixed wait's, not the lane's)
+        const auto d = g.deadlines(1, 1, 1, 10.0, 12.0, 2.0, false, true);
+        check(near(d.first, 12.26) && near(d.second, 14.0), "the lane's deadline 0.26 ms after its part, the bound 2 ms");
+        const auto w = g.deadlines(1, 1, 1, 10.0, 12.0, 2.0, false, false);
+        check(near(w.first, 14.0) && near(w.second, 14.0), "no kernel arrival times: the fixed wait, the bound is it");
+        const auto x = g.deadlines(1, 1, 1, 10.0, 12.0, 2.0, true, true);
+        check(near(x.first, 14.0) && near(x.second, 14.0), "DS4_RX_TIMEOUT_MS set: the bound is the deadline");
+        const auto y = g.deadlines(4, 2, 4, 10.0, 12.0, 2.0, false, true);
+        check(near(y.first, 13.0) && near(y.second, 14.0), "T=4: its own time a pick, the bound still 2 ms");
     }
     {
         // (lead 2026-10-25) the gate's start: the load's pings seed it, and the clamp holds from the first sample (a
@@ -54,7 +63,7 @@ int main() {
         check(near(cold.rtt[1], 178.0), "no seed: a cold first reply is the estimate");
         rx::Gate s;
         s.seed(1, 0.7);
-        check(near(s.rtt[1], 0.7), "seeded: the pings' median is the estimate");
+        check(near(s.rtt[1], 0.7), "seeded: the warm-up requests' median is the estimate");
         s.rtt_seen(1, 178.0, true, 0.0);
         check(near(s.rtt[1], 0.9 * 0.7 + 0.1 * 2.1), "seeded: the cold first reply counts as 3 x the seed");
         s.pick_seen(1, 0.26);
@@ -211,6 +220,20 @@ int main() {
         check(c.take(21, s, rows, nullptr, &op, &bd) && op && near(bd, 14.0), "seq 21's reply: open, against 14 ms");
         check(c.expire(100.0) == 0, "taken: nothing left to expire");
         check(c.take(22, s, rows, nullptr, &op, &bd) && !op, "decided at once: not open");
+        rx::LateBook a;
+        check(a.add_late(30, 10.0, 1, 3, 12.3, 14.0) == 0, "late for the lane's deadline, before the bound: open");
+        check(a.expire(14.0) == 0 && a.expire(14.01) == 1, "decided late only once the bound has passed");
+        check(a.add_late(31, 10.0, 1, 3, 14.0, 14.0) == 1, "the deadline was the bound: decided late at once");
+        check(a.take(31, s, rows, nullptr, &op, &bd) && !op, "and not open");
+        check(a.add_late(32, 10.0, 1, 3, 12.3, 90.0) == 0, "a bound far out: open");
+        check(a.add_late(96, 11.0, 1, 3, 12.3, 14.0) == 1, "64 sends on, its slot still open: decided late");
+        check(a.take(96, s, rows, nullptr, &op, &bd) && op && near(bd, 14.0), "and the newer one open in it");
+        // a late reply that came: its kernel arrival against its bound, else its read time
+        check(!rx::LateBook::past(13.5, 10.0, 16.0, 14.0), "arrived before the bound (read after): not late");
+        check(rx::LateBook::past(14.5, 10.0, 16.0, 14.0), "arrived after the bound: late");
+        check(rx::LateBook::past(-1.0, 10.0, 16.0, 14.0), "no kernel time, read after the bound: late");
+        check(!rx::LateBook::past(-1.0, 10.0, 13.9, 14.0), "no kernel time, read before the bound: not late");
+        check(rx::LateBook::past(9.0, 10.0, 16.0, 14.0), "a stamp before the send (the clock stepped): the read's");
     }
     {
         // 8 late of the last 64 (lead 2026-10-25): the link idle for `hold` requests, then tried again with a clean count
