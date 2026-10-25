@@ -132,6 +132,11 @@ struct Stats {
     int64_t rx_bytes_out = 0, rx_bytes_in = 0;
     int64_t rx_held = 0, rx_upload_bytes = 0;
     double rx_upload_ms = 0.0;
+    // the link's idle spells after 8 late of 64 (DS4_RX_BACKOFF requests each) and the requests they kept here; the
+    // late requests whose replies came after all, those of them read with a later reply (no arrival of their own) and
+    // those with their own (rx_late_arr)
+    int64_t rx_backoffs = 0, rx_idle = 0, rx_late_came = 0, rx_late_shared = 0, rx_late_timed = 0;
+    int64_t rx_late_l[64] = {};   // late replies by layer (the first 64)
     // by the window's T (1..16): requests sent, late replies, and windows the send gate kept here (the server's round
     // trip at that T expected to cost more than the lane computing its picks)
     int64_t rx_req_t[17] = {}, rx_late_t[17] = {}, rx_skip_t[17] = {};

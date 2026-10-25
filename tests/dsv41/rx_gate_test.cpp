@@ -115,6 +115,29 @@ int main() {
         b.add(5, 1.0, 1);
         b.add(69, 2.0, 2);   // (5 + 64: the same entry, a newer late request)
         check(!b.take(5, s, rows) && b.take(69, s, rows) && near(s, 2.0), "64 later: the newer one has the entry");
+        int ly = -2;
+        b.add(9, 3.0, 1, 17);
+        check(b.take(9, s, rows, &ly) && ly == 17, "and its layer");
+    }
+    {
+        // 8 late of the last 64 (lead 2026-10-25): the link idle for `hold` requests, then tried again with a clean count
+        rx::Backoff k;
+        k.hold = 3;
+        bool trip = false;
+        for (int i = 0; i < 7; ++i) trip = trip || k.seen(true);
+        check(!trip && !k.idle(), "7 late: the link stays on");
+        for (int i = 0; i < 64; ++i) trip = trip || k.seen(false);
+        trip = trip || k.seen(true);
+        check(!trip && !k.idle(), "7 late, 64 on time, 1 late: the 7 are out of the last 64, on");
+        for (int i = 0; i < 6; ++i) trip = trip || k.seen(true);
+        check(!trip, "7 late in the last 64 again: on");
+        check(k.seen(true), "the 8th late in the last 64: idle");
+        const bool i1 = k.idle(), i2 = k.idle(), i3 = k.idle(), i4 = k.idle();
+        check(i1 && i2 && i3 && !i4, "idle for the next 3 requests (hold), then the link is tried again");
+        trip = false;
+        for (int i = 0; i < 7; ++i) trip = trip || k.seen(true);
+        check(!trip && !k.idle(), "a clean count after: 7 late do not idle it");
+        check(k.seen(true) && k.idle(), "and an 8th does, again: never given up for good");
     }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;

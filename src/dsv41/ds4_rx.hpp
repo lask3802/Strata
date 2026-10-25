@@ -13,7 +13,9 @@
 // x in bf16, up to 8 picks and weights each), the lane computes the others, then waits for the reply (T rows of
 // sum_i w_i expert_i(x) in bf16) and adds it to the same part before the answer's seq.  A reply later than
 // DS4_RX_TIMEOUT_MS (2) after the lane's own picks are done: those picks are computed on the lane (the late reply is
-// skipped when it comes); a lost link, or 8 late replies of the last 64: the lane computes everything from then on.  Never a hang.
+// skipped when it comes); 8 late replies of the last 64: the lane computes everything for the next DS4_RX_BACKOFF (256)
+// requests, then the link is tried again with a clean count; a lost link: the lane computes everything from then on.
+// Never a hang.
 //
 // The wire: a 32-byte header (magic, type, seq, a, b, c, payload bytes), then the payload; TCP_NODELAY, rows bf16.
 #pragma once
@@ -89,7 +91,7 @@ struct Gate {
     // there when the lane finished its own part says only that the round trip was at most that long - the time is the
     // lane's, not the link's -: it may lower the estimate, never raise it.  After 4 samples a sample counts as 3 x the
     // estimate at most (one spike moves it by 20%; the late count is the reply's own time), but not after 4 in a row
-    // were: then the link did get slower, and the sample counts as it is (before 8 of 64 late shut the link)
+    // were: then the link did get slower, and the sample counts as it is (before 8 of 64 late idle the link)
     void rtt_seen(int rows, double ms, bool waited = true) {
         if (!waited && rtt[rows] > 0.0 && ms >= rtt[rows]) return;
         if (seen[rows] >= 4 && ms > 3.0 * rtt[rows]) {
@@ -125,17 +127,41 @@ struct LateBook {
     struct E {
         uint32_t seq = 0;
         double sent = -1;
-        int rows = 0;
+        int rows = 0, layer = -1;
     };
     E e[64];
-    void add(uint32_t seq, double sent, int rows) { e[seq % 64] = {seq, sent, rows}; }
-    /// seq's send time and rows (false: not a late request here, or taken already)
-    bool take(uint32_t seq, double& sent, int& rows) {
+    void add(uint32_t seq, double sent, int rows, int layer = -1) { e[seq % 64] = {seq, sent, rows, layer}; }
+    /// seq's send time, rows and layer (false: not a late request here, or taken already)
+    bool take(uint32_t seq, double& sent, int& rows, int* layer = nullptr) {
         E& x = e[seq % 64];
         if (x.sent < 0 || x.seq != seq) return false;
         sent = x.sent;
         rows = x.rows;
+        if (layer != nullptr) *layer = x.layer;
         x.sent = -1;
+        return true;
+    }
+};
+
+/// The late replies of the main's last 64 requests: 8 of them idle the link for the next `hold` requests (the lane
+/// computes their picks), then it is tried again with a clean count - never given up for good on lateness alone
+struct Backoff {
+    uint64_t bits = 0;
+    int hold = 256, left = 0;
+    /// once a request that has remote picks: true = keep them here (the link idle)
+    bool idle() {
+        if (left <= 0) return false;
+        --left;
+        return true;
+    }
+    /// a sent request's reply: on time or late.  true = this late one began an idle spell
+    bool seen(bool late) {
+        bits = bits << 1 | (late ? 1u : 0u);
+        int n = 0;
+        for (uint64_t b = bits; b != 0; b &= b - 1) ++n;
+        if (n < 8) return false;
+        bits = 0;
+        left = hold;
         return true;
     }
 };

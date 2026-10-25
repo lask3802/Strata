@@ -1070,7 +1070,7 @@ struct Model::Impl {
     std::vector<uint8_t> rx_has;
     bool rx_on = false;
     double rx_timeout_ms = 2.0;   // (counted from when the lane's own picks are done)
-    uint64_t rx_late_bits = 0;   // the last 64 requests: bit set = its reply was late (8 of them: the link given up)
+    rx::Backoff rx_back;   // the last 64 replies' lateness (8 late: the link idle for DS4_RX_BACKOFF requests)
     rx::Gate rx_gate;   // the send gate and the deadline's floor (ds4_rx.hpp)
     rx::LateBook rx_late_book;   // the late requests, for their replies' round trips if they come
     bool rx_kts = false;         // the link has given a kernel arrival time (then a late request waits for its reply's)
@@ -1078,6 +1078,7 @@ struct Model::Impl {
     std::vector<rx::ReqRow> rx_rows;
     mutable std::mutex rx_mu;
     std::vector<float> rx_rtt, rx_wait, rx_arr;
+    std::vector<std::pair<float, int>> rx_late_arr;   // the late replies that came: send to arrival in the kernel, layer
     bool sync_decode = std::getenv("DS4_SYNC") != nullptr;
     // a window of one through moe_gate_up / moe_down (DS4_MOE_TOKEN=0: win_experts, whose down rows run
     // before the wait for the CPU lane - the same bits, no faster)
@@ -6516,6 +6517,7 @@ struct Model::Impl {
     void rx_setup() {
         if (o.remote_experts.empty()) return;
         if (const char* v = std::getenv("DS4_RX_TIMEOUT_MS"); v != nullptr && *v != '\0') rx_timeout_ms = std::max(0.05, std::atof(v));
+        if (const char* v = std::getenv("DS4_RX_BACKOFF"); v != nullptr && *v != '\0') rx_back.hold = std::max(1, std::atoi(v));
         const char* wv = std::getenv("DS4_RX_WAIT_S");
         const int wait_s = wv != nullptr && *wv != '\0' ? std::max(1, std::atoi(wv)) : 120;
         const char* mv_ = std::getenv("DS4_RX_MAX");   // (tests: at most this many experts)
@@ -6726,18 +6728,29 @@ struct Model::Impl {
         const int got = rx_on ? rx_link->wait_resp(seq, rows, deadline, &y, srv_us, e) : -1;
         const double t1 = rx::now_ms();
         const double ta = got == 1 ? rx_link->arrival_ms() : -1.0;   // (the kernel's time the reply came in: Linux)
-        for (const auto& lt : rx_link->take_late()) {   // (earlier late requests' replies, skipped here: their round trips)
+        const auto late = rx_link->take_late();   // (earlier late requests' replies, skipped here: their round trips)
+        for (size_t i = 0; i < late.size(); ++i) {
+            const double la = late[i].second;
             double ts;
-            int rw;
-            if (lt.second >= 0) rx_kts = true;
-            if (rx_late_book.take(lt.first, ts, rw) && lt.second >= ts && lt.second <= t1 && lt.second != ta)
-                rx_gate.rtt_seen(rw, lt.second - ts);   // (== ta: one read with this reply, the stamp is this one's)
+            int rw, ly;
+            if (la >= 0) rx_kts = true;
+            if (!rx_late_book.take(late[i].first, ts, rw, &ly)) continue;
+            ++st.rx_late_came;
+            if (la < ts || la > t1) continue;   // (no kernel time, or the realtime clock stepped)
+            if (la == ta || (i + 1 < late.size() && late[i + 1].second == la)) {   // (one read with a later reply: the
+                ++st.rx_late_shared;                                             // stamp is the later one's)
+                continue;
+            }
+            rx_gate.rtt_seen(rw, la - ts);
+            ++st.rx_late_timed;
+            std::lock_guard<std::mutex> lk(rx_mu);
+            if (rx_late_arr.size() < (size_t(1) << 20)) rx_late_arr.push_back({(float) (la - ts), ly});
         }
         if (ta >= 0) rx_kts = true;
         if (ta >= t0 && ta <= t1) rx_gate.rtt_seen(rows, ta - t0);   // (outside: the realtime clock stepped)
         else if (got == 1 || (got == 0 && !rx_kts))   // (late, with the kernel's times: its reply, if it comes, says)
             rx_gate.rtt_seen(rows, t1 - t0, t1 - tw > 0.05);   // (read within 50 us of the lane's part: there already)
-        if (got == 0) rx_late_book.add(seq, t0, rows);
+        if (got == 0) rx_late_book.add(seq, t0, rows, l.il);
         st.rx_wait_ms += t1 - tw;
         st.rx_bytes_out = (int64_t) rx_link->bytes_out();
         st.rx_bytes_in = (int64_t) rx_link->bytes_in();
@@ -6765,17 +6778,20 @@ struct Model::Impl {
             st.rx_picks += (int64_t) rpk.size();
             st.rx_rtt_ms += t1 - t0;
             st.rx_srv_ms += srv_us / 1000.0;
-            rx_late_bits <<= 1;
+            rx_back.seen(false);
             return;
         }
         if (got == 0) {
             ++st.rx_late_t[T];
+            if (l.il >= 0 && l.il < 64) ++st.rx_late_l[l.il];
             if (++st.rx_late == 1)
                 std::fprintf(stderr, "ds4: remote experts: a reply past its deadline (%.2f ms after the lane's part, %.2f ms "
                                      "after its send; layer %d): its %zu picks computed here (said once; the count is in "
                                      "the stats)\n", rx_timeout_ms, deadline - t0, l.il, rpk.size());
-            rx_late_bits = rx_late_bits << 1 | 1u;
-            if (std::bitset<64>(rx_late_bits).count() >= 8) rx_lost("8 of the last 64 replies past their deadline");
+            if (rx_back.seen(true) && ++st.rx_backoffs == 1)
+                std::fprintf(stderr, "ds4: remote experts: 8 of the last 64 replies past their deadline - the CPU lane "
+                                     "computes all its experts for the next %d requests, then the link is tried again "
+                                     "(said once; the count is in the stats)\n", rx_back.hold);
         } else {
             rx_lost(e.empty() ? "the link failed" : e);
         }
@@ -6786,13 +6802,22 @@ struct Model::Impl {
     }
     std::string rx_lines(const Stats& s0, double nt) const {
         if (st.rx_held == 0) return "";
-        std::vector<float> rt, wt, at;
+        std::vector<float> rt, wt, at, lt;
+        float lt_max = -1.0f;   // (the slowest late reply's time, its layer)
+        int lt_layer = -1;
         {
             std::lock_guard<std::mutex> lk(rx_mu);
             for (size_t i = (size_t) std::max<int64_t>(0, s0.rx_reqs); i < rx_rtt.size(); ++i) {
                 if (rx_rtt[i] >= 0) rt.push_back(rx_rtt[i]);
                 if (rx_arr[i] >= 0) at.push_back(rx_arr[i]);
                 wt.push_back(rx_wait[i]);
+            }
+            for (size_t i = (size_t) std::max<int64_t>(0, s0.rx_late_timed); i < rx_late_arr.size(); ++i) {
+                lt.push_back(rx_late_arr[i].first);
+                if (rx_late_arr[i].first > lt_max) {
+                    lt_max = rx_late_arr[i].first;
+                    lt_layer = rx_late_arr[i].second;
+                }
             }
         }
         auto pct = [](std::vector<float>& v, std::string& out) {
@@ -6804,26 +6829,29 @@ struct Model::Impl {
             std::sort(v.begin(), v.end());
             double sum = 0;
             for (float x : v) sum += x;
-            std::snprintf(b, sizeof b, "mean %.3f p50 %.3f p99 %.3f", sum / (double) v.size(), v[v.size() / 2],
-                          v[std::min(v.size() - 1, (size_t) ((double) v.size() * 0.99))]);
+            std::snprintf(b, sizeof b, "mean %.3f p50 %.3f p99 %.3f max %.3f", sum / (double) v.size(), v[v.size() / 2],
+                          v[std::min(v.size() - 1, (size_t) ((double) v.size() * 0.99))], v.back());
             out = b;
         };
-        std::string rts, wts, ats;
+        std::string rts, wts, ats, lts;
         pct(rt, rts);
         pct(wt, wts);
         pct(at, ats);
+        pct(lt, lts);
         const double req = (double) (st.rx_reqs - s0.rx_reqs), served = (double) (st.rx_picks - s0.rx_picks);
         const double local = (double) (st.cpu_experts - s0.cpu_experts);
         char b[1024];
         std::snprintf(b, sizeof b,
                       "remote experts: %.1f%% of the CPU lane's picks served by the expert server (%.2f a token of %.2f), "
-                      "%.2f a token computed here after all (%lld late replies%s); %.2f requests a token\n"
+                      "%.2f a token computed here after all (%lld late replies; the link idle %lld times after 8 late of "
+                      "64, %lld requests kept here then%s); %.2f requests a token\n"
                       "remote experts per request: round trip %s ms (the server's own %.3f ms; send to the reply's arrival "
                       "in the kernel %s ms), the lane's wait after its part %s ms\n"
                       "remote experts per token: the lane's own part %.2f ms + its wait %.2f ms + the late ones %.2f ms; the "
                       "link %.1f KB out, %.1f KB in; the upload %lld experts, %.2f GB in %.1f s\n",
                       local + served > 0 ? 100.0 * served / (local + served) : 0.0, served / nt, (local + served) / nt,
                       (double) (st.rx_fallback - s0.rx_fallback) / nt, (long long) (st.rx_late - s0.rx_late),
+                      (long long) (st.rx_backoffs - s0.rx_backoffs), (long long) (st.rx_idle - s0.rx_idle),
                       rx_on ? "" : ", the link given up", req / nt, rts.c_str(),
                       (st.rx_srv_ms - s0.rx_srv_ms) / std::max<double>(1.0, (double) rt.size()), ats.c_str(), wts.c_str(),
                       (st.cpu_ms - s0.cpu_ms) / nt, (st.rx_wait_ms - s0.rx_wait_ms) / nt,
@@ -6831,6 +6859,31 @@ struct Model::Impl {
                       (double) (st.rx_bytes_out - s0.rx_bytes_out) / 1e3 / nt, (double) (st.rx_bytes_in - s0.rx_bytes_in) / 1e3 / nt,
                       (long long) st.rx_held, (double) st.rx_upload_bytes / 1e9, st.rx_upload_ms / 1000.0);
         std::string out = b;
+        std::snprintf(b, sizeof b,
+                      "remote experts' late replies that came after all: %lld of %lld (%lld read with a later reply: no "
+                      "time of their own); send to their arrival in the kernel %s ms",
+                      (long long) (st.rx_late_came - s0.rx_late_came), (long long) (st.rx_late - s0.rx_late),
+                      (long long) (st.rx_late_shared - s0.rx_late_shared), lts.c_str());
+        out += b;
+        if (lt_layer >= 0) {
+            std::snprintf(b, sizeof b, " (the slowest %.3f ms at layer %d)", lt_max, lt_layer);
+            out += b;
+        }
+        out += "; late by layer:";
+        {
+            std::vector<std::pair<long long, int>> bl;   // (the 6 layers with the most)
+            for (int li = 0; li < 64; ++li)
+                if (st.rx_late_l[li] - s0.rx_late_l[li] > 0) bl.push_back({st.rx_late_l[li] - s0.rx_late_l[li], li});
+            std::sort(bl.begin(), bl.end(), [](const auto& x, const auto& y) {
+                return x.first != y.first ? x.first > y.first : x.second < y.second;
+            });
+            for (size_t i = 0; i < bl.size() && i < 6; ++i) {
+                std::snprintf(b, sizeof b, " %d x%lld", bl[i].second, bl[i].first);
+                out += b;
+            }
+            if (bl.empty()) out += " -";
+        }
+        out += "\n";
         out += "remote experts by T (requests / late / kept here by the send gate):";
         for (int t = 1; t <= kWin; ++t) {
             const long long q = st.rx_req_t[t] - s0.rx_req_t[t], la = st.rx_late_t[t] - s0.rx_late_t[t],
@@ -6961,6 +7014,11 @@ struct Model::Impl {
                 }
                 if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
                 double rx_t0 = 0.0;
+                if (!rpicks.empty() && rx_back.idle()) {   // (8 late of 64 a while ago: the link idle for now)
+                    picks.insert(picks.end(), rpicks.begin(), rpicks.end());
+                    ++st.rx_idle;
+                    rpicks.clear();
+                }
                 if (!rpicks.empty() && !rx_gate.send(T, rx_nrows(rpicks), rpicks.size(), picks.size())) {
                     picks.insert(picks.end(), rpicks.begin(), rpicks.end());   // (the round trip would cost more)
                     ++st.rx_skip_t[T];
