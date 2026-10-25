@@ -15,13 +15,17 @@
 //                                     (the CPU lanes); --pin CPU: the link's thread on CPU (both sides), the busy
 //                                     threads off it and its SMT siblings.  Arrival times come from the kernel's
 //                                     rx stamps (SO_TIMESTAMPNS, Linux), never from a read that waits behind other
-//                                     work: wire (send -> the reply in the kernel) apart from each end's wake-up
+//                                     work: wire (send -> the reply in the kernel) apart from each end's wake-up; each
+//                                     row counts its pings that timed out and those that came unstamped
 //
-// The cases: the hello accepted, and refused for the pack, the slice table (a range, a type), the token, the protocol,
-// the geometry, a bulk socket's session; a request's reply (y = 2x, exact in bf16); the seq rules and two outstanding;
-// a reply out of order; a timeout -> the caller's local path, then the late reply dropped; three misses in a row ->
-// down; a peer killed mid-frame; a bad magic; the spin budget's expiry and a Wake; fills and epochs on the bulk socket
-// (a request with an epoch not acked refused).
+// The cases: the hello accepted, and refused (both ways, the reason said to the peer) for the pack, the slice table (a
+// range, a type), the token, the protocol, the geometry, a short or oversized hello; no token: a WARNING on both
+// sides; a new session every hello; one worker per listener, the bulk socket matched by its session; a request's reply
+// (y = 2x, exact in bf16); the seq and epoch rules and two outstanding; a reply out of order; a timeout -> the caller's
+// local path, then the late reply dropped; no room is not a miss; three drops in a row, or the oldest request over a
+// second old -> down; a peer killed mid-frame, closed, reset; a bad magic; the spin budget's expiry and a Wake; the
+// read buffer kept small; fills (an expert-sized one) in batches on the fill thread, the epochs they make ready, the
+// bulk socket's failure taking the link down; the kernel's rx stamps; pin_to's restore.
 // The probe is run between two PCs by scripts/dsv41/ep-u1-probe.sh (strata-winbuild-lab); on one PC do not --pin both
 // ends to the same CPU (they would take turns on it).
 #include "ep_link.hpp"
@@ -34,6 +38,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -102,6 +108,14 @@ void check(bool ok, const std::string& what) {
     if (!ok) ++fails;
 }
 bool has(const std::string& s, const char* sub) { return s.find(sub) != std::string::npos; }
+// the token in s (one too short to tell from other text is not looked for)
+bool leaks(const std::string& s, const char* token) { return std::strlen(token) >= 8 && has(s, token); }
+bool wait_until(const std::function<bool()>& f, double ms) {
+    const double end = now_ms() + ms;
+    while (!f() && now_ms() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return f();
+}
+constexpr size_t kBig = 8648704;   // an expert's blob (the worker's slot_bytes)
 
 void sleep_ms(double ms) { std::this_thread::sleep_for(std::chrono::microseconds((int64_t) (ms * 1000.0))); }
 
@@ -182,6 +196,20 @@ std::vector<uint16_t> doubled(const uint16_t* x, int T) {
     return y;
 }
 
+// a raw hello (no handshake behind it): the main's answer, an Error, is read back; 0 when it says `why`
+int raw_hello(Conn& c, const std::vector<uint8_t>& payload, const char* why) {
+    std::string err;
+    EpHdr h;
+    h.type = Hello;
+    if (!c.send(h, payload.data(), payload.size(), err)) return 40;
+    EpHdr g;
+    std::vector<uint8_t> p;
+    if (c.recv(g, p, now_ms() + 5000, err) != 1 || g.type != Error) return 41;
+    const std::string said(p.begin(), p.end());
+    std::printf("  child: the main said: %s\n", said.c_str());
+    return has(said, why) ? 0 : 42;
+}
+
 int child(const std::string& mode, int port) {
     const std::string at = "127.0.0.1:" + std::to_string(port);
     std::string err;
@@ -194,11 +222,33 @@ int child(const std::string& mode, int port) {
     if (mode == "bad-geo") me.n_ff = 2048;
     if (mode == "bad-slice") table = table_of(7, kBlocks);
     if (mode == "bad-type") table[3].type[2] = 23;
+    if (mode == "no-token") std::memset(me.token, 0, sizeof me.token);
     if (!w.req.dial(at, 5000, err)) return 10;
+    if (mode == "raw-short") {   // a hello of the right magic and protocol, cut short
+        std::vector<uint8_t> p(100, 0);
+        std::memcpy(p.data(), &me, 8);
+        return raw_hello(w.req, p, "short");
+    }
+    if (mode == "raw-proto2") {   // another protocol's hello, its table an odd size: refused for the protocol
+        EpHello h2 = me;
+        h2.proto = 2;
+        std::vector<uint8_t> p(sizeof h2 + 7, 0);
+        std::memcpy(p.data(), &h2, sizeof h2);
+        return raw_hello(w.req, p, "protocol 2");
+    }
+    if (mode == "big-hello") {   // a header that claims a megabyte of hello, and nothing after it
+        EpHdr h;
+        h.type = Hello;
+        h.bytes = 1u << 20;
+        if (!w.req.send_bytes(&h, sizeof h, err)) return 43;
+        sleep_ms(3000);
+        return 0;
+    }
     Peer m;
     const bool ok = hello_worker(w.req, me, table, m, err);
-    if (has(mode, "bad-")) {   // (refused: the main's reason here, the token never in it)
-        const bool why = !ok && has(err, "refused") && !has(err, me.token) && !has(err, kToken);
+    if (has(mode, "bad-") || mode == "refused-here" || mode == "extra") {   // (refused: the reason here, the token never in it)
+        const char* want = mode == "refused-here" ? "pack" : mode == "extra" ? "already connected" : "refused";
+        const bool why = !ok && has(err, "refused") && has(err, want) && !leaks(err, me.token) && !leaks(err, kToken);
         std::printf("  child %s: %s\n", mode.c_str(), err.c_str());
         return why ? 0 : 11;
     }
@@ -206,18 +256,24 @@ int child(const std::string& mode, int port) {
         std::printf("  child %s: hello failed: %s\n", mode.c_str(), err.c_str());
         return 12;
     }
+    if (mode == "no-token" && token_warnings() != 1) return 13;
     w.start(me);
-    if (mode == "bulk-session") {   // (a bulk socket that names another session: refused)
-        Conn b;
-        if (!b.dial(at, 5000, err)) return 13;
-        return !bulk_worker(b, me, m.hello.session ^ 7, err) && has(err, "refused") ? 0 : 14;
+    if (mode == "bulk-check") {   // the main's bulk answers (raw): another session, then another token - both refused
+        Conn b1, b2;
+        std::string e1, e2;
+        const bool r1 = b1.dial(at, 5000, e1) && !bulk_worker(b1, me, m.hello.session, e1) && has(e1, "session");
+        const bool r2 = b2.dial(at, 5000, e2) && !bulk_worker(b2, me, m.hello.session, e2) && has(e2, "token") &&
+                        !leaks(e2, me.token);
+        std::printf("  child bulk-check: %s / %s\n", e1.c_str(), e2.c_str());
+        return r1 && r2 ? 0 : 14;
     }
-    if (mode == "swap" || mode == "badmagic" || mode == "half" || mode == "close") {   // (a worker that breaks the rules: the raw socket)
+    if (mode == "swap" || mode == "badmagic" || mode == "half" || mode == "close" || mode == "reset") {   // (a worker that breaks the rules: the raw socket)
         EpHdr h;
         std::vector<uint8_t> p;
         if (w.req.recv(h, p, now_ms() + 5000, err) != 1 || h.type != Req) return 15;
-        if (mode == "close") {   // an orderly close (FIN, not a reset) with a request out, and no bye
-            w.req.close();
+        if (mode == "close" || mode == "reset") {   // an orderly close (FIN) / a reset (RST) with a request out, no bye
+            if (mode == "close") w.req.close();
+            else w.req.reset();
             sleep_ms(500);
             return 0;
         }
@@ -271,20 +327,41 @@ int child(const std::string& mode, int port) {
         const int got = w.next(f, now_ms() + 10000, err);   // (the Wake, the Ping, then the Bye)
         return got == -1 && has(err, "bye") ? 0 : 19;
     }
-    std::thread bulk_th;
-    if (mode == "fill") {   // the bulk socket on a thread of its own, as the worker will run it
-        if (!w.bulk.dial(at, 5000, err) || !bulk_worker(w.bulk, me, m.hello.session, err)) return 20;
-        bulk_th = std::thread([&w] {
-            std::string e;
-            const WorkerLink::Loader load = [](int, int e_in, int, uint32_t, const uint8_t* blob, size_t n) -> uint16_t {
-                if (e_in == 99) return 1;   // (this one does not load)
-                return n == 0 || (n == 4096 && blob[0] == 0xab) ? 0 : 2;
-            };
-            while (w.serve_fill(now_ms() + 10000, load, e) == 1) {
-            }
-        });
+    if (mode == "bulk-session") {   // before the bulk socket: one naming another session, then a second worker's hello
+        Conn b1, b2;
+        std::string e1, e2;
+        Peer m2;
+        const bool r1 = b1.dial(at, 5000, e1) && !bulk_worker(b1, me, m.hello.session ^ 7, e1) && has(e1, "unknown session");
+        const bool r2 = b2.dial(at, 5000, e2) && !hello_worker(b2, me, table, m2, e2) && has(e2, "already connected");
+        std::printf("  child bulk-session: %s / %s\n", e1.c_str(), e2.c_str());
+        if (!r1 || !r2) return 20;
     }
-    // serve: y = 2x; "slow-first": the first request's reply 150 ms late; "silent": none
+    std::thread bulk_th;
+    if (mode == "fill" || mode == "bulk-session" || mode == "fill-drop") {   // the bulk socket on a thread of its own
+        if (!w.bulk.dial(at, 5000, err) || !bulk_worker(w.bulk, me, m.hello.session, err)) return 21;
+        if (w.bulk.spin_ms != 0.0) return 22;   // (keep-awake is the request socket's)
+        if (mode == "fill-drop") {   // the bulk socket closed under the main's first fill
+            EpHdr h;
+            std::vector<uint8_t> p;
+            (void) w.bulk.recv(h, p, now_ms() + 5000, err);
+            w.bulk.close();
+        } else
+            bulk_th = std::thread([&w] {
+                std::string e;
+                const WorkerLink::Loader load = [](int, int e_in, int, uint32_t, const uint8_t* blob, size_t n) -> uint16_t {
+                    if (e_in == 99) return 1;   // (this one does not load)
+                    if (n == kBig) {            // (an expert's blob, loaded slowly: its batch stays out a while)
+                        sleep_ms(200);
+                        return blob[0] == 0xcd && blob[n - 1] == 0xcd ? 0 : 2;
+                    }
+                    return n == 0 || (n == 4096 && blob[0] == 0xab) ? 0 : 2;
+                };
+                while (w.serve_fill(now_ms() + 10000, load, e) == 1) {
+                }
+            });
+    }
+    // serve: y = 2x; "slow-first": the first request's reply 150 ms late; "slow-all": every reply 60 ms late;
+    // "silent": none
     int served = 0;
     for (;;) {
         WorkerLink::Frame f;
@@ -299,7 +376,7 @@ int child(const std::string& mode, int port) {
             }
             break;
         }
-        if (mode == "slow-first" && served == 0) sleep_ms(150);
+        if ((mode == "slow-first" && served == 0) || mode == "slow-all") sleep_ms(mode == "slow-all" ? 60 : 150);
         const std::vector<uint16_t> y = doubled(f.x, f.T);
         if (!w.send_resp(f.h.seq, (uint16_t) ((1u << f.T) - 1), 0, y.data(), 7, err)) break;
         ++served;
@@ -353,6 +430,8 @@ struct ReqData {
     }
 };
 
+void pin_to(int cpu);
+
 void case_pure() {
     const EpHello m = hello_of(0), w = hello_of(1);
     const auto mt = table_of(0, kBlocks), wt = table_of(6, kBlocks);
@@ -380,9 +459,31 @@ void case_pure() {
     w2 = w;
     w2.token[0] ^= 1;
     const std::string why = worker_check(w2, m);
-    check(has(why, "token") && !has(why, m.token), "pure: the worker refuses the main's token (never printing it)");
+    check(has(why, "token") && !leaks(why, m.token), "pure: the worker refuses the main's token (never printing it)");
     check(f2bf(1.0f) == 0x3f80 && f2bf(1.00390625f) == 0x3f80 && f2bf(1.01171875f) == 0x3f82 && bf2f(0x4000) == 2.0f,
           "pure: bf16 rounds to nearest even");
+    EpHello none = m;
+    std::memset(none.token, 0, sizeof none.token);
+    check(no_token_warning(m).empty() && has(no_token_warning(none), "WARNING") && has(no_token_warning(none), "STRATA_STAGE_TOKEN"),
+          "pure: no token: the hello's WARNING (none with one)");
+    std::string h, pt;
+    const bool v6 = split_host_port("[::1]:7870", h, pt) && h == "::1" && pt == "7870";
+    const bool v4 = split_host_port("10.10.10.2:7870", h, pt) && h == "10.10.10.2" && pt == "7870";
+    const bool bare = split_host_port("7870", h, pt) && h.empty() && pt == "7870";
+    check(v6 && v4 && bare && !split_host_port("::1:7870", h, pt) && !split_host_port("[::1]7870", h, pt),
+          "pure: [V6]:PORT, HOST:PORT and PORT parse; a bare IPv6 address does not");
+    // the worker's batches: one epoch, i of n in order, acked only when every fill of it loaded
+    FillBatch b;
+    const bool two = b.take(1, 0, 2, 0).empty() && !b.done(true) && b.take(1, 1, 2, 0).empty() && b.done(true);
+    check(two, "pure: a batch of two: the epoch acked at the second fill, not the first");
+    FillBatch c;
+    const bool order = c.take(1, 0, 3, 0).empty() && !c.done(true) && has(c.take(1, 2, 3, 0), "order") &&
+                       has(c.take(2, 0, 1, 0), "only 1") && has(c.take(1, 1, 2, 0), "order");
+    check(order, "pure: a fill out of its batch's order, or for an epoch not the next, refused");
+    FillBatch d;
+    const bool bad = d.take(1, 0, 2, 0).empty() && !d.done(false) && d.take(1, 1, 2, 0).empty() && !d.done(true) &&
+                     d.take(1, 0, 1, 0).empty() && d.done(true);
+    check(bad, "pure: a batch with a fill not loaded is not acked; its retry (from 0) is");
 }
 
 void case_refusals() {
@@ -391,13 +492,101 @@ void case_refusals() {
         const char* why;
     };
     const C cs[] = {{"bad-pack", "pack"},       {"bad-token", "token"}, {"bad-proto", "protocol"},
-                    {"bad-geo", "n_ff"},        {"bad-slice", "stores blocks"}, {"bad-type", "type"}};
+                    {"bad-geo", "n_ff"},        {"bad-slice", "stores blocks"}, {"bad-type", "type"},
+                    {"raw-short", "short"},     {"raw-proto2", "protocol 2"}};
     for (const C& c : cs) {
         Pair p;
         const bool opened = p.open(c.mode);
         const int rc = p.end();
         check(opened && !p.hello_ok && has(p.err, c.why) && rc == 0,
               std::string("hello refused: ") + c.mode + " (both sides say why)");
+    }
+    {   // a header that claims more than a hello: refused at once, its payload never waited for
+        Pair p;
+        const double t0 = now_ms();
+        const bool opened = p.open("big-hello");
+        const double ms = now_ms() - t0;
+        p.end();
+        check(opened && !p.hello_ok && has(p.err, "over") && ms < 2000, "hello refused: a hello frame of 1 MB, at once (" + p.err + ")");
+    }
+    {   // the worker refuses the main (a raw main: its HelloOk names another pack) and says why on the wire
+        Listener ls;
+        Child ch;
+        Conn c;
+        std::string err;
+        EpHdr h;
+        std::vector<uint8_t> pl;
+        const bool up = ls.open("127.0.0.1:0", err) && ch.start("refused-here", ls.port()) && ls.accept(c, 10000, err) &&
+                        c.recv(h, pl, now_ms() + 5000, err) == 1 && h.type == Hello;
+        EpHello bad = hello_of(0);
+        bad.pack_hash ^= 1;
+        bad.session = 5;
+        const std::vector<EpSlice> t = table_of(0, kBlocks);
+        EpHdr ok;
+        ok.type = HelloOk;
+        const bool sent = up && c.send(ok, &bad, sizeof bad, err, t.data(), t.size() * sizeof(EpSlice));
+        const bool told = sent && c.recv(h, pl, now_ms() + 5000, err) == 1 && h.type == Error &&
+                          has(std::string(pl.begin(), pl.end()), "pack");
+        const int rc = ch.wait(10000);
+        check(told && rc == 0, "hello refused by the worker: the main reads the reason (\"" + std::string(pl.begin(), pl.end()) + "\")");
+    }
+    {   // no token on either side: the link comes up, each side printing the WARNING once
+        Pair p;
+        std::memset(p.me.token, 0, sizeof p.me.token);
+        const int before = token_warnings();
+        p.open("no-token");
+        check(p.hello_ok && token_warnings() == before + 1, "no token: the hello goes on, with a WARNING here");
+        p.m.bye();
+        check(p.end() == 0, "... and one on the worker");
+    }
+}
+
+void case_sessions_and_listeners() {
+    {   // the same hello reused: each hello_main names a new session
+        Pair p;
+        p.open("good");
+        const uint64_t s1 = p.me.session;
+        Child c2;
+        MainLink m2;
+        Peer w2;
+        std::string e2;
+        const bool ok2 = c2.start("good", p.ls.port()) && p.ls.accept(m2.req, 10000, e2) &&
+                         hello_main(m2.req, p.me, table_of(0, kBlocks), k_of(6), w2, e2);
+        check(p.hello_ok && ok2 && s1 != 0 && p.me.session != s1, "each hello_main names a new session (the same hello reused)");
+        m2.start(p.me);
+        m2.bye();
+        p.m.bye();
+        const int rc2 = c2.wait(10000);
+        check(p.end() == 0 && rc2 == 0, "... both workers end at their bye");
+    }
+    {   // one worker per listener: a second one is told so
+        Pair p;
+        p.open("good");
+        Child c2;
+        const bool started = c2.start("extra", p.ls.port());
+        const bool refused = started && MainLink::refuse_extra(p.ls, 10000);
+        const int rc2 = c2.wait(10000);
+        check(refused && rc2 == 0 && p.m.up(), "one worker per listener: a second worker hears \"a worker is already connected\"");
+        p.m.bye();
+        p.end();
+    }
+    {   // a port another listener holds
+        Listener a, b;
+        std::string ea, eb;
+        const bool first = a.open("127.0.0.1:0", ea);
+        const bool second = first && b.open("127.0.0.1:" + std::to_string(a.port()), eb);
+        check(first && !second, "a second listener on a port in use: refused (" + eb + ")");
+    }
+    {   // IPv6: a bracketed bind, a dial, the peer's name
+        Listener ls;
+        std::string e;
+        if (!ls.open("[::1]:0", e)) {
+            std::printf("  IPv6 on ::1: skipped here (%s)\n", e.c_str());
+        } else {
+            Conn c, s;
+            const bool ok = c.dial("[::1]:" + std::to_string(ls.port()), 5000, e) && ls.accept(s, 5000, e);
+            check(ok && s.peer() == "::1", "IPv6: [::1]:PORT listened on, dialed, the peer named (" + s.peer() + ")");
+        }
     }
 }
 
@@ -447,17 +636,20 @@ void case_order() {
 }
 
 void case_closed() {
-    Pair p;
-    p.open("close");
-    std::string err;
-    Reply r;
-    ReqData a(1, 1);
-    p.m.send_req(1, 0, 1, 0, 0, a.picks.data(), a.x.data(), err);
-    const double t0 = now_ms();
-    const int got = p.m.wait_resp(1, t0 + 3000, r, err);
-    check(got == -1 && has(err, "closed") && !has(err, "mid-frame") && !p.m.up() && now_ms() - t0 < 2000,
-          "the worker closes its socket: the link is down at once, not at the deadline (" + err + ")");
-    p.end();
+    for (const char* mode : {"close", "reset"}) {
+        Pair p;
+        p.open(mode);
+        std::string err;
+        Reply r;
+        ReqData a(1, 1);
+        p.m.send_req(1, 0, 1, 0, 0, a.picks.data(), a.x.data(), err);
+        const double t0 = now_ms();
+        const int got = p.m.wait_resp(1, t0 + 3000, r, err);
+        const bool cls = std::string(mode) == "close" ? has(err, "closed") : !has(err, "closed") && has(err, "recv");
+        check(got == -1 && cls && !has(err, "mid-frame") && !p.m.up() && now_ms() - t0 < 2000,
+              std::string("the worker ") + (mode[0] == 'r' ? "resets" : "closes") + " its socket: the link is down at once, not at the deadline (" + err + ")");
+        p.end();
+    }
 }
 
 void case_timeouts() {
@@ -477,8 +669,27 @@ void case_timeouts() {
         p.m.bye();
         p.end();
     }
-    {   // a worker that never answers: two timeouts, then no room for a third request (both out are late) - that is
-        // the third miss in a row, and the link is down
+    {   // every reply 60 ms late, each deadline 10 ms: the late replies free the slots, the drops count up to three
+        Pair p;
+        p.open("slow-all");
+        std::string err;
+        Reply r;
+        ReqData a(1, 1);
+        int s[3] = {0, 0, 0}, w[3] = {0, 0, 0};
+        bool up = true;
+        for (int i = 0; i < 3; ++i) {
+            s[i] = p.m.send_req((uint32_t) i + 1, 0, 1, 0, 0, a.picks.data(), a.x.data(), err);
+            w[i] = p.m.wait_resp((uint32_t) i + 1, now_ms() + 10, r, err);
+            if (i < 2) up = up && p.m.up();
+            if (i < 2) sleep_ms(100);
+        }
+        check(s[0] == 1 && s[1] == 1 && s[2] == 1 && w[0] == 0 && w[1] == 0 && up && p.m.st.late_dropped >= 1 && w[2] == -1 &&
+                  has(err, "3 requests in a row") && !p.m.up() && p.m.st.downs == 1,
+              "three requests in a row dropped at their deadline: the link is down (" + err + ")");
+        p.end();
+    }
+    {   // a worker that never answers: two drops, then no room - not a miss, the link stays up; then the oldest request
+        // out passes a second: the link is down
         Pair p;
         p.open("silent");
         std::string err;
@@ -488,12 +699,15 @@ void case_timeouts() {
         const int w1 = p.m.wait_resp(1, now_ms() + 10, r, err);
         const int s2 = p.m.send_req(2, 0, 1, 0, 0, a.picks.data(), a.x.data(), err);
         const int w2 = p.m.wait_resp(2, now_ms() + 10, r, err);
-        const bool up2 = p.m.up();
         const int s3 = p.m.send_req(3, 0, 1, 0, 0, a.picks.data(), a.x.data(), err);
-        check(s1 == 1 && w1 == 0 && s2 == 1 && w2 == 0 && up2 && s3 == 0 && !p.m.up() && has(err, "in a row") && p.m.st.downs == 1,
-              "three misses in a row (two timeouts, then no room): the link is down");
+        check(s1 == 1 && w1 == 0 && s2 == 1 && w2 == 0 && s3 == 0 && has(err, "two") && p.m.up() && p.m.st.downs == 0,
+              "two drops, then no room for a third: not a miss, the link stays up");
+        sleep_ms(1100);
         const int s4 = p.m.send_req(4, 0, 1, 0, 0, a.picks.data(), a.x.data(), err);
-        check(s4 == 0 && has(err, "down"), "... and every request after it computed here");
+        check(s4 == 0 && has(err, "1000 ms") && !p.m.up() && p.m.st.downs == 1,
+              "the oldest request out over a second old: the link is down (" + err + ")");
+        const int s5 = p.m.send_req(5, 0, 1, 0, 0, a.picks.data(), a.x.data(), err);
+        check(s5 == 0 && has(err, "down"), "... and every request after it computed here");
         p.end();
     }
 }
@@ -545,8 +759,46 @@ void case_spin_wake() {
     check(p.end() == 0, "the worker ends at the bye");
 }
 
+// the read buffer: frames read one after another, no read ending on a frame's end, keep it small (its consumed bytes
+// are dropped past a megabyte)
+void case_read_buffer() {
+    Listener ls;
+    Conn a, b;
+    std::string err;
+    const bool up = ls.open("127.0.0.1:0", err) && a.dial("127.0.0.1:" + std::to_string(ls.port()), 5000, err) &&
+                    ls.accept(b, 5000, err);
+    constexpr int kFrames = 800;
+    constexpr size_t kPay = 10289;   // (an odd frame size: the reads' ends do not fall on the frames')
+    std::vector<uint8_t> all;
+    for (int i = 0; i <= kFrames; ++i) {
+        EpHdr h;
+        h.type = Ping;
+        h.seq = (uint32_t) i;
+        h.bytes = (uint32_t) kPay;
+        const size_t at = all.size();
+        all.resize(at + sizeof h + (i < kFrames ? kPay : kPay / 2));   // (the last one half a frame)
+        std::memcpy(all.data() + at, &h, sizeof h);
+    }
+    std::thread tx([&] {
+        std::string e;
+        (void) a.send_bytes(all.data(), all.size(), e);
+    });
+    size_t peak = 0;
+    int got = 0;
+    for (; up && got < kFrames; ++got) {
+        EpHdr h;
+        std::vector<uint8_t> p;
+        if (b.recv(h, p, now_ms() + 5000, err) != 1 || h.seq != (uint32_t) got) break;
+        peak = std::max(peak, b.held());
+    }
+    tx.join();
+    check(up && got == kFrames && peak < ((size_t) 3 << 19),
+          "the read buffer: " + std::to_string(got) + " frames read, at most " + std::to_string(peak) + " bytes held (under 1.5 MB)");
+}
+
 // the kernel's rx stamps (the probe's arrival times): each reply's is set, later than the last one's, and between its
-// request's send and the moment wait_resp returned it (Linux; elsewhere skipped with a note)
+// request's send and the moment wait_resp returned it; a read without one leaves none (Linux; elsewhere skipped with a
+// note)
 void case_rx_stamps() {
     Pair p;
     p.open("good");
@@ -589,6 +841,9 @@ void case_rx_stamps() {
         last = rx;
     }
     check(set && rising && within, "the kernel's rx stamps: each reply's set, rising, between its send and its read" + why);
+    p.m.req.drop_stamps = 1000;   // (the reads from here on act as if the kernel gave no stamp)
+    const bool ok = p.m.send_req(s, 0, 1, 0, 0, a.picks.data(), a.x.data(), err) == 1 && p.m.wait_resp(s, now_ms() + 2000, r, err) == 1;
+    check(ok && last > 0 && p.m.req.last_rx_ns() == 0, "the kernel's rx stamps: a reply read without one after a stamped one has none");
     p.m.bye();
     p.end();
 }
@@ -597,55 +852,167 @@ void case_fill() {
     Pair p;
     p.open("fill");
     std::string err;
-    const bool bulk = p.ls.accept(p.m.bulk, 5000, err) && bulk_main(p.m.bulk, p.me, err);
-    check(bulk, "the bulk socket accepted for the session");
+    std::mutex mu;
+    std::vector<std::pair<int, uint16_t>> oks;   // (e_in, status) as the FillOks come
+    uint32_t ready_at_first = 99;
+    p.m.on_fill_ok = [&](int, int e_in, uint32_t, uint16_t status) {
+        std::lock_guard<std::mutex> g(mu);
+        if (oks.empty()) ready_at_first = p.m.epoch_ready();
+        oks.push_back({e_in, status});
+    };
+    auto n_oks = [&] {
+        std::lock_guard<std::mutex> g(mu);
+        return oks.size();
+    };
+    const bool bulk = p.m.accept_bulk(p.ls, 5000, err);
+    check(bulk && p.m.bulk.spin_ms == 0.0, "the bulk socket of this session accepted, the fill thread up; no spin on it");
     std::vector<uint8_t> blob(4096, 0xab);
-    int layer = -1, e = -1;
-    uint32_t ep = 0;
-    uint16_t status = 9;
-    const bool f1 = p.m.send_fill(3, 17, 5, 1, blob.data(), blob.size(), err) && p.m.send_fill(4, 18, -1, 1, nullptr, 0, err);
-    const bool ready_early = p.m.epoch_ready() == 0;
-    const int a = p.m.poll_fill_ok(now_ms() + 2000, layer, e, ep, status, err);
-    const bool first = a == 1 && layer == 3 && e == 17 && ep == 1 && status == 0 && p.m.epoch_ready() == 0;
-    const int b = p.m.poll_fill_ok(now_ms() + 2000, layer, e, ep, status, err);
-    check(f1 && ready_early && first && b == 1 && p.m.epoch_ready() == 1, "two fills for epoch 1: the epoch is ready after both FillOks");
+    const bool f1 = p.m.queue_fill(3, 17, 5, 1, 0, 2, blob.data(), blob.size(), err) && p.m.queue_fill(4, 18, -1, 1, 1, 2, nullptr, 0, err);
+    const bool ok1 = wait_until([&] { return p.m.fills_pending() == 0; }, 3000);
+    check(f1 && ok1 && n_oks() == 2 && ready_at_first == 0 && p.m.epoch_ready() == 1,
+          "a batch of two fills for epoch 1: ready after both FillOks, not after the first");
+    check(!p.m.queue_fill(3, 20, 6, 2, 0, 1, nullptr, 0, err) && has(err, "before a request tagged 1"),
+          "a fill for epoch 2 before a request tagged 1 was sent: refused here");
     Reply r;
     ReqData x(1, 1);
     check(p.m.send_req(1, 0, 1, 1, 0, x.picks.data(), x.x.data(), err) == 1 && p.m.wait_resp(1, now_ms() + 2000, r, err) == 1 &&
               x.is_doubled(r, 1),
           "a request tagged with epoch 1 served");
-    check(!p.m.send_fill(3, 20, 6, 3, nullptr, 0, err) && has(err, "epoch"), "a fill that skips an epoch: refused here");
-    const bool f2 = p.m.send_fill(5, 99, 1, 2, nullptr, 0, err);
-    const int c = p.m.poll_fill_ok(now_ms() + 2000, layer, e, ep, status, err);
-    check(f2 && c == 1 && status == 1 && p.m.epoch_ready() == 1 && p.m.st.fill_fails == 1,
-          "a fill the worker could not load: epoch 2 not ready");
-    check(p.m.send_req(2, 0, 1, 2, 0, x.picks.data(), x.x.data(), err) == 0 && has(err, "epoch"),
-          "a request tagged with epoch 2: not sent");
-    // the same request sent past MainLink's check: the worker refuses it
+    check(p.m.send_req(2, 0, 1, 0, 0, x.picks.data(), x.x.data(), err) == 0 && has(err, "before the last"),
+          "a request tagged with an epoch before the last one sent: not sent");
+    check(!p.m.queue_fill(3, 20, 6, 3, 0, 1, nullptr, 0, err) && has(err, "epoch 3"), "a fill that skips an epoch: refused here");
+    check(!p.m.queue_fill(40, 20, 6, 2, 0, 1, nullptr, 0, err) && has(err, "layer 40"), "a fill for layer 40 of 40: refused here");
+    check(!p.m.queue_fill(5, 20, 6, 2, 1, 2, nullptr, 0, err) && has(err, "order"), "a batch's fill 1 before its fill 0: refused here");
+    // epoch 2: an expert's blob (over the request socket's 4 MB frames), which the worker loads slowly
+    std::vector<uint8_t> big(kBig, 0xcd);
+    const bool b0 = p.m.queue_fill(5, 21, 7, 2, 0, 2, big.data(), big.size(), err);
+    const bool early = !p.m.queue_fill(5, 22, 8, 2, 0, 1, nullptr, 0, err) && has(err, "still to come");
+    const bool b1 = p.m.queue_fill(6, 22, -1, 2, 1, 2, nullptr, 0, err);
+    const bool out = !p.m.queue_fill(5, 22, 8, 2, 0, 1, nullptr, 0, err) && has(err, "fills are out");
+    const bool ok2 = wait_until([&] { return p.m.fills_pending() == 0; }, 5000);
+    bool loaded = false;
+    {
+        std::lock_guard<std::mutex> g(mu);
+        loaded = oks.size() == 4 && oks[2].first == 21 && oks[2].second == 0 && oks[3].second == 0;
+    }
+    check(b0 && b1 && ok2 && loaded && p.m.epoch_ready() == 2 && p.m.up(),
+          "a fill of " + std::to_string(kBig) + " bytes (an expert) loaded on the worker: epoch 2 ready");
+    check(early && out, "a new batch while one's fills are still to come, or out: refused here");
+    check(p.m.send_req(3, 0, 1, 2, 0, x.picks.data(), x.x.data(), err) == 1 && p.m.wait_resp(3, now_ms() + 2000, r, err) == 1,
+          "a request tagged with epoch 2 served");
+    // epoch 3: fill 0 loads, fill 1 does not
+    const bool f3 = p.m.queue_fill(7, 23, -1, 3, 0, 2, nullptr, 0, err) && p.m.queue_fill(8, 99, 1, 3, 1, 2, nullptr, 0, err);
+    const bool ok3 = wait_until([&] { return p.m.fills_pending() == 0; }, 3000);
+    check(f3 && ok3 && p.m.epoch_ready() == 2 && p.m.st.fill_fails == 1, "a batch with a fill the worker could not load: epoch 3 not ready");
+    check(p.m.send_req(4, 0, 1, 3, 0, x.picks.data(), x.x.data(), err) == 0 && has(err, "epoch"),
+          "a request tagged with epoch 3: not sent");
+    // the same request sent past MainLink's check: the worker refuses it (it acks an epoch per batch too)
     EpHdr h;
     h.type = Req;
     h.T = 1;
-    h.seq = 3;
-    h.epoch = 2;
+    h.seq = 100;
+    h.epoch = 3;
     std::string e2;
     (void) p.m.req.send(h, x.picks.data(), x.picks.size() * sizeof(EpPick), e2, x.x.data(), x.x.size() * 2);
     EpHdr g;
     std::vector<uint8_t> pl;
     const int got = p.m.req.recv(g, pl, now_ms() + 2000, e2);
-    check(got == 1 && g.type == Error && has(std::string(pl.begin(), pl.end()), "epoch 2"),
-          "a request with an epoch the worker has not acked: refused by the worker");
+    check(got == 1 && g.type == Error && has(std::string(pl.begin(), pl.end()), "epoch 3"),
+          "a request with an epoch whose batch did not load whole: refused by the worker");
     p.m.bye();
-    p.end();
+    check(p.end() == 0, "the worker's bulk thread ends at the bye");
 }
 
-void case_bulk_session() {
+void case_fill_drop() {
     Pair p;
-    p.open("bulk-session");
+    p.open("fill-drop");
     std::string err;
-    const bool acc = p.ls.accept(p.m.bulk, 5000, err);
-    const bool ok = acc && bulk_main(p.m.bulk, p.me, err);
-    check(acc && !ok && has(err, "session"), "a bulk socket naming another session: refused");
-    check(p.end() == 0, "... and the worker hears why");
+    const bool bulk = p.m.accept_bulk(p.ls, 5000, err);
+    const bool q = bulk && p.m.queue_fill(3, 17, 5, 1, 0, 1, nullptr, 0, err);
+    const bool down = wait_until([&] { return !p.m.up(); }, 3000);
+    Reply r;
+    ReqData x(1, 1);
+    const int s = p.m.send_req(1, 0, 1, 0, 0, x.picks.data(), x.x.data(), err);
+    check(q && down && s == 0 && has(err, "bulk socket") && p.m.st.downs == 1,
+          "the bulk socket closed under a fill: the link is down, the request computed here (" + err + ")");
+    check(p.end() == 0, "... and the worker sees its request socket closed");
+}
+
+void case_bulk_accept() {
+    {   // the bulk sockets that are not this session's: refused (each told why), the wait goes on
+        Pair p;
+        p.open("bulk-session");
+        std::string err;
+        const bool ok = p.m.accept_bulk(p.ls, 5000, err);
+        const bool fill = ok && p.m.queue_fill(3, 17, 5, 1, 0, 1, nullptr, 0, err) && wait_until([&] { return p.m.epoch_ready() == 1; }, 3000);
+        check(ok && fill, "the bulk socket: another session's and a second worker's hello refused, then this session's taken (" + err + ")");
+        p.m.bye();
+        check(p.end() == 0, "... and the worker heard \"unknown session\" and \"a worker is already connected\"");
+    }
+    {   // the worker checks the main's bulk answer: another session, another token (a raw main)
+        Pair p;
+        p.open("bulk-check");
+        bool told = p.hello_ok;
+        std::string said;
+        for (int i = 0; i < 2 && told; ++i) {
+            Conn b;
+            std::string err;
+            EpHdr h;
+            std::vector<uint8_t> pl;
+            told = p.ls.accept(b, 5000, err) && b.recv(h, pl, now_ms() + 5000, err) == 1 && h.type == Hello;
+            EpHello bm = p.me;
+            bm.channel = 1;
+            if (i == 0) bm.session ^= 2;
+            else bm.token[0] ^= 1;
+            EpHdr ok;
+            ok.type = HelloOk;
+            told = told && b.send(ok, &bm, sizeof bm, err) && b.recv(h, pl, now_ms() + 5000, err) == 1 && h.type == Error;
+            said += std::string(pl.begin(), pl.end()) + (i == 0 ? " / " : "");
+        }
+        const int rc = p.end();
+        check(told && rc == 0 && has(said, "session") && has(said, "token"),
+              "the worker refuses a bulk answer naming another session or token, and says why (" + said + ")");
+    }
+}
+
+// pin_to(-1): the thread's affinity before its first pin_to, not every CPU
+void case_pin_restore() {
+    bool ok = false, skipped = false;
+    std::thread([&] {
+#if defined(_WIN32)
+        DWORD_PTR proc = 0, sys = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
+        if ((proc & 7) != 7) {
+            skipped = true;
+            return;
+        }
+        const HANDLE t = GetCurrentThread();
+        SetThreadAffinityMask(t, 3);
+        pin_to(1);
+        const DWORD_PTR pinned = SetThreadAffinityMask(t, 2);   // (it returns the mask it replaces: the same set again)
+        pin_to(-1);
+        const DWORD_PTR after = SetThreadAffinityMask(t, 3);
+        ok = pinned == 2 && after == 3;
+#else
+        cpu_set_t s;
+        CPU_ZERO(&s);
+        CPU_SET(0, &s);
+        CPU_SET(1, &s);
+        if (std::thread::hardware_concurrency() < 3 || sched_setaffinity(0, sizeof s, &s) != 0) {
+            skipped = true;
+            return;
+        }
+        pin_to(1);
+        cpu_set_t g;
+        sched_getaffinity(0, sizeof g, &g);
+        const bool one = CPU_COUNT(&g) == 1 && CPU_ISSET(1, &g);
+        pin_to(-1);
+        sched_getaffinity(0, sizeof g, &g);
+        ok = one && CPU_COUNT(&g) == 2 && CPU_ISSET(0, &g) && CPU_ISSET(1, &g);
+#endif
+    }).join();
+    if (skipped) std::printf("  pin_to's restore: skipped here (fewer than 3 CPUs)\n");
+    else check(ok, "pin_to(-1): the thread's mask before its first pin again ({0, 1}, not every CPU)");
 }
 
 // ---------------------------------------------------------------------------------------------------- the probe
@@ -676,18 +1043,29 @@ std::vector<int> siblings(int cpu) {
 #endif
     return v;
 }
-void pin_to(int cpu) {   // (-1: any CPU again)
+void pin_to(int cpu) {   // the calling thread on CPU (-1: the mask it had before its first pin_to again)
 #if defined(_WIN32)
-    DWORD_PTR proc = 0, sys = 0;
-    GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
-    SetThreadAffinityMask(GetCurrentThread(), cpu >= 0 && cpu < 64 ? (DWORD_PTR) 1 << cpu : proc);
+    thread_local DWORD_PTR before = 0;
+    if (cpu >= 0 && cpu < 64) {
+        const DWORD_PTR was = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << cpu);
+        if (before == 0) before = was;
+    } else if (cpu < 0 && before != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), before);
+        before = 0;
+    }
 #else
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    const int n = (int) std::max(1u, std::thread::hardware_concurrency());
-    for (int c = 0; c < n; ++c)
-        if (cpu < 0 || c == cpu) CPU_SET(c, &set);
-    sched_setaffinity(0, sizeof set, &set);
+    thread_local bool saved = false;
+    thread_local cpu_set_t before;
+    if (cpu >= 0) {
+        if (!saved) saved = sched_getaffinity(0, sizeof before, &before) == 0;
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
+        sched_setaffinity(0, sizeof set, &set);
+    } else if (saved) {
+        sched_setaffinity(0, sizeof before, &before);
+        saved = false;
+    }
 #endif
 }
 
@@ -782,9 +1160,12 @@ int serve(const std::string& at, double for_s) {
 // wire = send -> the Pong's arrival in the kernel here, so it holds no wait of this thread (the far end's wake and
 // held are in it: the network's own share is wire - there - held); here / there = arrival ->
 // the link thread has the frame (the Pong here, the Ping on the far end): the thread's own wake-up, what the busy
-// threads can stretch.  held: the far end's Ping in hand -> its Pong sent.
+// threads can stretch.  held: the far end's Ping in hand -> its Pong sent.  timeouts: pings with no Pong in a second
+// (in no column); unstamped: Pongs without both ends' stamps, with stamps on (in rtt, not in wire / here / there).
 struct Arm {
     std::vector<double> rtt, held, wire, here, there;
+    int timeouts = 0, unstamped = 0;
+    bool stamped = false;   // (both ends' stamps on: the wire columns are due for every Pong)
 };
 void report(const char* name, Arm& a) {
     auto pct = [](std::vector<double> v, double q) {
@@ -793,8 +1174,10 @@ void report(const char* name, Arm& a) {
         return v[std::min(v.size() - 1, (size_t) (q * (double) (v.size() - 1) + 0.5))];
     };
     auto mx = [](const std::vector<double>& v) { return v.empty() ? 0.0 : *std::max_element(v.begin(), v.end()); };
-    std::printf("  %-36s n %4zu  rtt p50 %.3f  p90 %.3f  p99 %.3f  max %.3f ms   far end held p50 %.1f us\n", name, a.rtt.size(),
-                pct(a.rtt, 0.5), pct(a.rtt, 0.9), pct(a.rtt, 0.99), mx(a.rtt), pct(a.held, 0.5));
+    char unst[32] = "-";
+    if (a.stamped) std::snprintf(unst, sizeof unst, "%d", a.unstamped);
+    std::printf("  %-36s n %4zu  rtt p50 %.3f  p90 %.3f  p99 %.3f  max %.3f ms   far end held p50 %.1f us   timeouts %d  unstamped %s\n",
+                name, a.rtt.size(), pct(a.rtt, 0.5), pct(a.rtt, 0.9), pct(a.rtt, 0.99), mx(a.rtt), pct(a.held, 0.5), a.timeouts, unst);
     if (!a.wire.empty())
         std::printf("  %-36s wire p50 %.3f  p99 %.3f  max %.3f ms   wake here p50 %.1f p99 %.1f max %.1f us   there p50 %.1f p99 %.1f max %.1f us\n",
                     "", pct(a.wire, 0.5), pct(a.wire, 0.99), mx(a.wire), pct(a.here, 0.5), pct(a.here, 0.99), mx(a.here),
@@ -829,9 +1212,7 @@ int probe(const std::string& host, int load_n, int pin, int busy_us, int rounds,
     std::printf("  (the reference: ping -A of 10,240 bytes CT 580 -> 10.10.10.2, 0.060 / 0.067 / 0.101 ms; adaptive-rx.txt)\n");
     std::printf("  kernel rx stamps here: %s\n", stamps ? "on (wire / wake columns)" : se.c_str());
     std::vector<uint8_t> buf(kPay);
-    int rc = 0;
     for (const int bp : {0, busy_us}) {
-        if (bp == 0 && busy_us == 0 && rc == 1) break;
         for (const int spin : {1, 0}) {
             ProbeCfg c;
             c.spin = spin;
@@ -852,6 +1233,7 @@ int probe(const std::string& host, int load_n, int pin, int busy_us, int rounds,
                         bp == 0 ? "off" : c.busy_ok ? "set" : c.note, c.cpus, c.stamps_ok ? "on" : "off");
             sleep_ms(200);   // (the far end's busy threads up)
             auto one = [&](Arm& a) {
+                a.stamped = stamps && c.stamps_ok;
                 uint32_t hu = 0;
                 std::fill(buf.begin(), buf.end(), (uint8_t) 0);
                 buf.resize(kPay);
@@ -866,12 +1248,14 @@ int probe(const std::string& host, int load_n, int pin, int busy_us, int rounds,
                     const int64_t rx = m.req.last_rx_ns();
                     int64_t there = -1;
                     if (buf.size() >= sizeof there) std::memcpy(&there, buf.data(), sizeof there);
-                    if (stamps && rx > 0 && c.stamps_ok && there >= 0) {
+                    if (a.stamped && rx > 0 && there >= 0) {
                         a.wire.push_back((double) (rx - w0) / 1.0e6);
                         a.here.push_back((double) (w1 - rx) / 1.0e3);
                         a.there.push_back((double) there / 1.0e3);
-                    }
+                    } else if (a.stamped)
+                        ++a.unstamped;
                 }
+                if (got == 0) ++a.timeouts;
                 return got >= 0;
             };
             auto gap = [&](double ms) {
@@ -910,7 +1294,7 @@ int probe(const std::string& host, int load_n, int pin, int busy_us, int rounds,
     }
     load.stop();
     m.bye();
-    return rc;
+    return 0;
 }
 
 }  // namespace
@@ -946,6 +1330,7 @@ int main(int argc, char** argv) {
     }
     case_pure();
     case_refusals();
+    case_sessions_and_listeners();
     case_accept_and_rules();
     case_order();
     case_closed();
@@ -953,8 +1338,11 @@ int main(int argc, char** argv) {
     case_killed();
     case_badmagic();
     case_spin_wake();
+    case_read_buffer();
     case_fill();
-    case_bulk_session();
+    case_fill_drop();
+    case_bulk_accept();
+    case_pin_restore();
     case_rx_stamps();
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails != 0;

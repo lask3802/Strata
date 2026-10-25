@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -73,6 +74,9 @@ namespace {
 using sock_t = SOCKET;
 constexpr sock_t kBad = INVALID_SOCKET;
 constexpr int kSendFlags = 0, kRecvFlags = 0;   // (the socket itself is non-blocking)
+// Winsock's SO_REUSEADDR binds over a port another process is listening on (either one taking the connection);
+// SO_EXCLUSIVEADDRUSE refuses that, as Linux does (stage_link's kListenOpt)
+constexpr int kListenOpt = SO_EXCLUSIVEADDRUSE;
 bool net_init() {
     static const bool ok = [] {
         WSADATA d;
@@ -97,6 +101,7 @@ constexpr int kSendFlags = MSG_NOSIGNAL;
 constexpr int kSendFlags = 0;
 #endif
 constexpr int kRecvFlags = MSG_DONTWAIT;
+constexpr int kListenOpt = SO_REUSEADDR;   // (a port in TIME_WAIT only; never another listener's)
 bool net_init() { return true; }
 int last_err() { return errno; }
 bool would_block(int e) { return e == EAGAIN || e == EWOULDBLOCK || e == EINTR; }
@@ -107,6 +112,9 @@ bool nonblock(sock_t s) {
     return fl >= 0 && fcntl(s, F_SETFL, fl | O_NONBLOCK) == 0;
 }
 #endif
+
+constexpr size_t kCompactAt = (size_t) 1 << 20;   // a read buffer's consumed bytes kept at most (past them: erased)
+constexpr size_t kMaxHello = sizeof(EpHello) + (size_t) kMaxLayers * sizeof(EpSlice);   // a hello frame's payload at most
 
 std::string err_text(const char* what) { return std::string(what) + " failed (error " + std::to_string(last_err()) + ")"; }
 
@@ -134,14 +142,6 @@ void tune(sock_t s) {
     nonblock(s);
 }
 
-// "HOST:PORT" / "PORT" (host empty)
-bool split(const std::string& at, std::string& host, std::string& port) {
-    const size_t c = at.rfind(':');
-    host = c == std::string::npos ? "" : at.substr(0, c);
-    port = c == std::string::npos ? at : at.substr(c + 1);
-    const int p = std::atoi(port.c_str());
-    return !port.empty() && p >= 0 && p < 65536;
-}
 
 // s readable (rd) or writable within ms (< 0: forever); false: not (timed out or failed)
 bool wait_sock(sock_t s, bool rd, int ms) {
@@ -217,6 +217,62 @@ std::string main_check(const EpHello& mine, const std::vector<EpSlice>& my_table
 
 std::string worker_check(const EpHello& mine, const EpHello& m) { return common_check(mine, m); }
 
+namespace {
+std::atomic<int> g_token_warnings{0};
+void warn_no_token(const EpHello& mine) {
+    const std::string w = no_token_warning(mine);
+    if (w.empty()) return;
+    std::fprintf(stderr, "%s\n", w.c_str());
+    g_token_warnings.fetch_add(1);
+}
+}  // namespace
+
+std::string no_token_warning(const EpHello& mine) {
+    if (mine.token[0] != 0) return "";
+    return mine.role == 0 ? "ep link - WARNING: no STRATA_STAGE_TOKEN, any host that reaches this port can act as the EP worker"
+                          : "ep link - WARNING: no STRATA_STAGE_TOKEN, any host this worker dials can act as the main";
+}
+int token_warnings() { return g_token_warnings.load(); }
+
+bool split_host_port(const std::string& at, std::string& host, std::string& port) {
+    if (!at.empty() && at[0] == '[') {   // [V6]:PORT
+        const size_t e = at.find(']');
+        if (e == std::string::npos || e + 1 >= at.size() || at[e + 1] != ':') return false;
+        host = at.substr(1, e - 1);
+        port = at.substr(e + 2);
+    } else {
+        const size_t c = at.rfind(':');
+        if (c != std::string::npos && at.find(':') != c) return false;   // (a bare IPv6 address: brackets needed)
+        host = c == std::string::npos ? "" : at.substr(0, c);
+        port = c == std::string::npos ? at : at.substr(c + 1);
+    }
+    if (port.empty() || port.find_first_not_of("0123456789") != std::string::npos) return false;
+    const int p = std::atoi(port.c_str());
+    return p >= 0 && p < 65536;
+}
+
+std::string FillBatch::take(uint32_t e, int i, int nn, uint32_t acked) {
+    if (e != acked + 1)
+        return "a fill for epoch " + std::to_string(e) + " (acked " + std::to_string(acked) + ": only " + std::to_string(acked + 1) + " is filled)";
+    if (nn < 1 || i < 0 || i >= nn) return "a fill " + std::to_string(i) + " of " + std::to_string(nn);
+    if (i == 0) {   // (a batch starts: the first, or a retry of one that did not load whole)
+        epoch = e;
+        n = nn;
+        next = 0;
+        bad = false;
+    } else if (e != epoch || nn != n || i != next) {
+        return "fill " + std::to_string(i) + " of " + std::to_string(nn) + " for epoch " + std::to_string(e) + " out of its batch's order (next: " +
+               std::to_string(next) + " of " + std::to_string(n) + " for epoch " + std::to_string(epoch) + ")";
+    }
+    return "";
+}
+
+bool FillBatch::done(bool loaded) {
+    if (!loaded) bad = true;
+    ++next;
+    return next == n && !bad;
+}
+
 // ---------------------------------------------------------------------------------------------------- Conn
 Conn::~Conn() { close(); }
 
@@ -227,6 +283,16 @@ void Conn::close() {
     rd_ = 0;
     stamps_ = false;
     rx_ns_ = last_rx_ns_ = 0;
+}
+
+void Conn::reset() {
+    if (fd_ >= 0) {
+        linger l{};
+        l.l_onoff = 1;
+        l.l_linger = 0;
+        setsockopt((sock_t) fd_, SOL_SOCKET, SO_LINGER, (const char*) &l, sizeof l);
+    }
+    close();
 }
 
 void Conn::adopt(std::intptr_t fd, const std::string& peer) {
@@ -244,7 +310,7 @@ bool Conn::dial(const std::string& host_port, int timeout_ms, std::string& err) 
         return false;
     }
     std::string host, port;
-    if (!split(host_port, host, port) || host.empty() || std::atoi(port.c_str()) == 0) {
+    if (!split_host_port(host_port, host, port) || host.empty() || std::atoi(port.c_str()) == 0) {
         err = "expected HOST:PORT, not " + host_port;
         return false;
     }
@@ -336,7 +402,8 @@ int Conn::read_(uint8_t* p, size_t len) {
         m.msg_controllen = sizeof ctl;
         const int k = (int) ::recvmsg((sock_t) fd_, &m, kRecvFlags);
         if (k > 0) rx_ns_ = 0;   // (a read without a stamp leaves none, never the one before)
-        if (k > 0)
+        if (k > 0 && drop_stamps > 0) --drop_stamps;
+        else if (k > 0)
             for (cmsghdr* c = CMSG_FIRSTHDR(&m); c != nullptr; c = CMSG_NXTHDR(&m, c))
                 if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPNS) {
                     timespec ts;
@@ -431,6 +498,9 @@ int Conn::recv(EpHdr& h, std::vector<uint8_t>& payload, double deadline, std::st
             if (rd_ > 0 && rd_ == rb_.size()) {
                 rb_.clear();
                 rd_ = 0;
+            } else if (rd_ >= kCompactAt) {   // (reads that end inside a frame, one after another: drop what was taken)
+                rb_.erase(rb_.begin(), rb_.begin() + (std::ptrdiff_t) rd_);
+                rd_ = 0;
             }
             rb_.insert(rb_.end(), tmp, tmp + k);
             stat.bytes_in += (uint64_t) k;
@@ -472,12 +542,12 @@ bool Listener::open(const std::string& at, std::string& err) {
         return false;
     }
     std::string host, port;
-    if (!split(at, host, port)) {
+    if (!split_host_port(at, host, port)) {
         err = "expected [BIND:]PORT, not " + at;
         return false;
     }
     addrinfo hints{}, *res = nullptr;
-    hints.ai_family = AF_INET;
+    hints.ai_family = host.find(':') != std::string::npos ? AF_INET6 : AF_INET;   // (no BIND: every IPv4 address)
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
     if (getaddrinfo(host.empty() ? nullptr : host.c_str(), port.c_str(), &hints, &res) != 0 || res == nullptr) {
@@ -490,7 +560,7 @@ bool Listener::open(const std::string& at, std::string& err) {
         err = err_text("socket");
         return false;
     }
-    set_opt<int>(l, SOL_SOCKET, SO_REUSEADDR, 1);
+    set_opt<int>(l, SOL_SOCKET, kListenOpt, 1);
     const bool bound = ::bind(l, res->ai_addr, (int) res->ai_addrlen) == 0 && ::listen(l, 4) == 0;
     freeaddrinfo(res);
     if (!bound) {
@@ -498,10 +568,10 @@ bool Listener::open(const std::string& at, std::string& err) {
         close_sock(l);
         return false;
     }
-    sockaddr_in sa{};
+    sockaddr_storage sa{};
     socklen_t sl = sizeof sa;
     getsockname(l, (sockaddr*) &sa, &sl);
-    port_ = ntohs(sa.sin_port);
+    port_ = ntohs(sa.ss_family == AF_INET6 ? ((sockaddr_in6*) &sa)->sin6_port : ((sockaddr_in*) &sa)->sin_port);
     fd_ = (std::intptr_t) l;
     return true;
 }
@@ -524,6 +594,7 @@ bool Listener::accept(Conn& c, int wait_ms, std::string& err) {
     }
     char hb[64] = {};
     if (sa.ss_family == AF_INET) inet_ntop(AF_INET, &((sockaddr_in*) &sa)->sin_addr, hb, sizeof hb);
+    if (sa.ss_family == AF_INET6) inet_ntop(AF_INET6, &((sockaddr_in6*) &sa)->sin6_addr, hb, sizeof hb);
     c.adopt((std::intptr_t) s, hb);
     return true;
 }
@@ -538,33 +609,50 @@ bool send_error(Conn& c, const std::string& why) {
     return c.send(h, why.data(), why.size(), e);
 }
 
-// a hello frame (type want) into hello and table; false (err) for anything else, an Error's text included
-bool read_hello(Conn& c, uint16_t want, EpHello& hello, std::vector<EpSlice>* table, double timeout_ms, const char* who,
-                std::string& err) {
+// a hello frame (type want) into hello and table: 1; 0 failed with nothing to tell the peer (the link failed, no
+// hello in time, the peer's own Error: err); 2 refused, err to be told to the peer.  The frame may be no larger than
+// a hello (a peer no token admitted yet: its sizes are not trusted); its magic and protocol are judged before its
+// size, so an older or newer peer is refused for its protocol.
+int read_hello(Conn& c, uint16_t want, EpHello& hello, std::vector<EpSlice>* table, double timeout_ms, const char* who,
+               std::string& err) {
     EpHdr h;
     std::vector<uint8_t> p;
+    const size_t cap = c.max_frame;
+    c.max_frame = kMaxHello;
     const int got = c.recv(h, p, now_ms() + timeout_ms, err);
+    c.max_frame = cap;
     if (got == 0) err = std::string("no hello from ") + who + " in " + std::to_string((int) timeout_ms) + " ms";
-    if (got != 1) return false;
+    if (got != 1) return 0;
     if (h.type == Error) {
         err = std::string(who) + " refused: " + std::string(p.begin(), p.end());
-        return false;
+        return 0;
     }
-    if (h.type != want || p.size() < sizeof(EpHello)) {
-        err = std::string("not a hello from ") + who;
-        return false;
-    }
-    std::memcpy(&hello, p.data(), sizeof hello);
-    if (table != nullptr) {
-        const size_t extra = p.size() - sizeof(EpHello);
-        if (extra % sizeof(EpSlice) != 0) {
-            err = std::string("a malformed slice table from ") + who;
-            return false;
+    uint32_t head[2] = {0, 0};   // (magic, proto: an EpHello's first 8 bytes)
+    if (p.size() >= sizeof head) std::memcpy(head, p.data(), sizeof head);
+    if (h.type != want) err = std::string("a frame of type ") + std::to_string(h.type) + " where the hello of " + who + " was due";
+    else if (p.size() < sizeof head || head[0] != kMagic) err = std::string("not an EP link's hello from ") + who;
+    else if (head[1] != kProto) err = "EP protocol " + std::to_string(head[1]) + ", this side speaks " + std::to_string(kProto);
+    else if (p.size() < sizeof(EpHello)) err = std::string("a short hello from ") + who;
+    else if (table != nullptr && (p.size() - sizeof(EpHello)) % sizeof(EpSlice) != 0) err = std::string("a malformed slice table from ") + who;
+    else if (table == nullptr && p.size() != sizeof(EpHello)) err = std::string("a bulk hello with a table from ") + who;
+    else {
+        std::memcpy(&hello, p.data(), sizeof hello);
+        if (table != nullptr) {
+            const size_t extra = p.size() - sizeof(EpHello);
+            table->resize(extra / sizeof(EpSlice));
+            if (extra) std::memcpy(table->data(), p.data() + sizeof(EpHello), extra);
         }
-        table->resize(extra / sizeof(EpSlice));
-        if (extra) std::memcpy(table->data(), p.data() + sizeof(EpHello), extra);
+        return 1;
     }
-    return true;
+    return 2;
+}
+
+// a refusal: said to the peer where the socket takes it, then closed
+bool refuse(Conn& c, const std::string& why, const std::string& what, std::string& err) {
+    (void) send_error(c, why);
+    err = what + why;
+    c.close();
+    return false;
 }
 
 bool send_hello(Conn& c, uint16_t type, const EpHello& hello, const std::vector<EpSlice>* table, std::string& err) {
@@ -578,18 +666,16 @@ bool send_hello(Conn& c, uint16_t type, const EpHello& hello, const std::vector<
 
 bool hello_worker(Conn& c, const EpHello& mine, const std::vector<EpSlice>& table, Peer& main, std::string& err,
                   double timeout_ms) {
+    warn_no_token(mine);
     if (!send_hello(c, Hello, mine, &table, err)) return false;
-    if (!read_hello(c, HelloOk, main.hello, &main.table, timeout_ms, "the main", err)) {
+    const int got = read_hello(c, HelloOk, main.hello, &main.table, timeout_ms, "the main", err);
+    if (got == 2) return refuse(c, err, "the main " + c.peer() + " refused here: ", err);
+    if (got != 1) {
         c.close();
         return false;
     }
     const std::string why = worker_check(mine, main.hello);
-    if (!why.empty()) {
-        (void) send_error(c, why);
-        err = "the main " + c.peer() + " refused here: " + why;
-        c.close();
-        return false;
-    }
+    if (!why.empty()) return refuse(c, why, "the main " + c.peer() + " refused here: ", err);
     EpHdr ok;
     ok.type = HelloOk;
     return c.send(ok, nullptr, 0, err);
@@ -597,25 +683,24 @@ bool hello_worker(Conn& c, const EpHello& mine, const std::vector<EpSlice>& tabl
 
 bool hello_main(Conn& c, EpHello& mine, const std::vector<EpSlice>& table, const std::vector<int>& k, Peer& worker,
                 std::string& err, double timeout_ms) {
-    if (!read_hello(c, Hello, worker.hello, &worker.table, timeout_ms, "the worker", err)) {
+    warn_no_token(mine);
+    const int got = read_hello(c, Hello, worker.hello, &worker.table, timeout_ms, "the worker", err);
+    if (got == 2) return refuse(c, err, "worker " + c.peer() + " refused: ", err);
+    if (got != 1) {
         c.close();
         return false;
     }
     const std::string why = main_check(mine, table, k, worker.hello, worker.table);
-    if (!why.empty()) {
-        (void) send_error(c, why);
-        err = "worker " + c.peer() + " refused: " + why;
-        c.close();
-        return false;
-    }
-    if (mine.session == 0) mine.session = std::random_device{}() | ((uint64_t) std::random_device{}() << 32) | 1u;
+    if (!why.empty()) return refuse(c, why, "worker " + c.peer() + " refused: ", err);
+    // (a fresh session on every connection: a bulk socket left from an earlier one is not this one's)
+    mine.session = std::random_device{}() | ((uint64_t) std::random_device{}() << 32) | 1u;
     if (!send_hello(c, HelloOk, mine, &table, err)) return false;
     EpHdr h;
     std::vector<uint8_t> p;
-    const int got = c.recv(h, p, now_ms() + timeout_ms, err);
-    if (got == 1 && h.type == HelloOk && p.empty()) return true;
-    if (got == 1) err = h.type == Error ? "the worker refused: " + std::string(p.begin(), p.end()) : "no agreement from the worker";
-    else if (got == 0) err = "no agreement from the worker in " + std::to_string((int) timeout_ms) + " ms";
+    const int agreed = c.recv(h, p, now_ms() + timeout_ms, err);
+    if (agreed == 1 && h.type == HelloOk && p.empty()) return true;
+    if (agreed == 1) err = h.type == Error ? "the worker refused: " + std::string(p.begin(), p.end()) : "no agreement from the worker";
+    else if (agreed == 0) err = "no agreement from the worker in " + std::to_string((int) timeout_ms) + " ms";
     c.close();
     return false;
 }
@@ -626,43 +711,113 @@ bool bulk_worker(Conn& c, const EpHello& mine, uint64_t session, std::string& er
     b.session = session;
     if (!send_hello(c, Hello, b, nullptr, err)) return false;
     EpHello m;
-    if (!read_hello(c, HelloOk, m, nullptr, timeout_ms, "the main (bulk)", err)) {
+    const int got = read_hello(c, HelloOk, m, nullptr, timeout_ms, "the main (bulk)", err);
+    if (got == 2) return refuse(c, err, "the main (bulk) refused here: ", err);
+    if (got != 1) {
         c.close();
         return false;
     }
+    std::string why = worker_check(b, m);
+    if (why.empty() && m.session != session) why = "the main's bulk answer names another session";
+    if (!why.empty()) return refuse(c, why, "the main (bulk) refused here: ", err);
+    c.max_frame = kBulkFrame;   // (a fill carries an expert's blob)
+    c.spin_ms = 0.0;            // (keep-awake is for the request socket: a bulk thread waits in poll)
     return true;
 }
 
 bool bulk_main(Conn& c, const EpHello& mine, std::string& err, double timeout_ms) {
     EpHello w;
-    if (!read_hello(c, Hello, w, nullptr, timeout_ms, "the worker (bulk)", err)) {
+    std::vector<EpSlice> t;   // (a request socket's hello carries one: it is told a worker is connected already)
+    const int got = read_hello(c, Hello, w, &t, timeout_ms, "the worker (bulk)", err);
+    if (got == 2) return refuse(c, err, "bulk socket from " + c.peer() + " refused: ", err);
+    if (got != 1) {
         c.close();
         return false;
     }
     EpHello b = mine;
     b.channel = 1;
-    std::string why = common_check(b, w);
-    if (why.empty() && w.session != mine.session) why = "the bulk socket names another session";
-    if (!why.empty()) {
-        (void) send_error(c, why);
-        err = "bulk socket from " + c.peer() + " refused: " + why;
-        c.close();
-        return false;
-    }
-    c.max_frame = (size_t) 1 << 26;   // (a fill carries an expert's blob)
+    std::string why = w.channel == 0 && w.magic == kMagic ? "a worker is already connected" : common_check(b, w);
+    if (why.empty() && w.session != mine.session) why = "unknown session (the bulk socket names another link's)";
+    if (!why.empty()) return refuse(c, why, "bulk socket from " + c.peer() + " refused: ", err);
+    c.max_frame = kBulkFrame;   // (FillOks only come in, but both ends agree)
+    c.spin_ms = 0.0;
     return send_hello(c, HelloOk, b, nullptr, err);
 }
 
 // ---------------------------------------------------------------------------------------------------- the main's end
+MainLink::~MainLink() { stop_fills_(); }
+
+// (mine: the hello hello_main sent, with the session it chose: accept_bulk matches the bulk socket by it)
 void MainLink::start(const EpHello& mine) {
+    stop_fills_();
+    bulk.close();
+    mine_ = mine;
     n_embd_ = mine.n_embd;
     k_ = mine.k_picks;
     n_layers_ = mine.n_layers;
     out_.clear();
     up_ = req.ok();
-    any_sent_ = fill_bad_ = false;
-    last_seq_ = ready_ = filling_ = 0;
-    fills_out_ = in_a_row_ = 0;
+    any_sent_ = false;
+    last_seq_ = last_epoch_ = 0;
+    in_a_row_ = 0;
+    q_epoch_ = 0;
+    q_n_ = q_next_ = 0;
+    jobs_.clear();
+    bulk_why_.clear();
+    stop_ = false;
+    bulk_failed_ = false;
+    ready_ = 0;
+    pending_ = 0;
+}
+
+void MainLink::stop_fills_() {
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    if (fill_th_.joinable()) fill_th_.join();
+}
+
+bool MainLink::accept_bulk(Listener& ls, int wait_ms, std::string& err) {
+    if (!up_) {
+        err = "the link is down";
+        return false;
+    }
+    if (fill_th_.joinable()) {
+        err = "the bulk socket is up already";
+        return false;
+    }
+    const double end = now_ms() + wait_ms;
+    std::string last;
+    for (;;) {
+        const double left = end - now_ms();
+        if (left <= 0.0) {
+            err = "no bulk socket for this link in " + std::to_string(wait_ms) + " ms" + (last.empty() ? "" : " (last: " + last + ")");
+            return false;
+        }
+        if (!ls.accept(bulk, (int) std::ceil(left), err)) {   // (it waited what was left, or the listener failed)
+            if (!last.empty()) err += " (last: " + last + ")";
+            return false;
+        }
+        // (each connection's hello within what is left; a stranger's costs the wait, never the link)
+        if (bulk_main(bulk, mine_, last, std::max(1.0, std::min(10000.0, end - now_ms())))) break;
+    }
+    stop_ = false;
+    fill_th_ = std::thread([this] { fill_loop_(); });
+    return true;
+}
+
+bool MainLink::refuse_extra(Listener& ls, int wait_ms) {
+    Conn c;
+    std::string e;
+    if (!ls.accept(c, wait_ms, e)) return false;
+    EpHello h;
+    std::vector<EpSlice> t;
+    (void) read_hello(c, Hello, h, &t, 1000.0, "another worker", e);   // (read first: closing on unread bytes is a reset)
+    (void) send_error(c, "a worker is already connected");
+    c.close();
+    return true;
 }
 
 void MainLink::down_(const std::string& why, std::string& err) {
@@ -671,7 +826,23 @@ void MainLink::down_(const std::string& why, std::string& err) {
     up_ = false;
     out_.clear();
     req.close();
-    bulk.close();
+    {   // (the fill thread closes the bulk socket itself as it ends)
+        std::lock_guard<std::mutex> g(mu_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+}
+
+bool MainLink::bulk_ok_(std::string& err) {
+    if (!bulk_failed_.load(std::memory_order_acquire)) return true;
+    std::string why;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        why = bulk_why_;
+    }
+    if (up_) down_("the bulk socket: " + why, err);
+    else err = "the link is down";
+    return false;
 }
 
 int MainLink::take_(double deadline, Out& o, Reply& r, std::string& err) {
@@ -729,22 +900,30 @@ int MainLink::drain_(std::string& err) {
 
 int MainLink::send_req(uint32_t seq, int layer, int T, uint32_t epoch, uint32_t flags, const EpPick* picks,
                        const uint16_t* x, std::string& err) {
+    if (up_ && !bulk_ok_(err)) {
+        ++st.not_sent;
+        return 0;
+    }
     if (up_ && drain_(err) < 0) return -1;   // (late replies that came in since: their room back)
+    // (a worker that holds the oldest request this long is gone, FIN or not: no reply will free the slots)
+    if (up_ && !out_.empty() && now_ms() - out_.front().t_sent > kStaleMs) {
+        down_("the oldest request out (seq " + std::to_string(out_.front().seq) + ") is over " + std::to_string((int) kStaleMs) +
+                  " ms old",
+              err);
+        ++st.not_sent;
+        return 0;
+    }
     const bool full = (int) out_.size() >= kOutstanding;
-    const char* why = !up_                          ? "the link is down"
-                      : full                        ? "two requests out already"
-                      : any_sent_ && seq <= last_seq_ ? "a seq not after the last one sent"
+    const char* why = !up_                                                    ? "the link is down"
+                      : full                                                  ? "two requests out already"
+                      : any_sent_ && seq <= last_seq_                         ? "a seq not after the last one sent"
                       : T < 1 || T > kMaxT || layer < 0 || layer >= n_layers_ ? "a layer or T out of range"
-                      : epoch > ready_                ? "an epoch the worker has not loaded"
-                                                      : nullptr;
-    if (why != nullptr) {
+                      : epoch > epoch_ready()                                 ? "an epoch the worker has not loaded"
+                      : epoch < last_epoch_                                   ? "an epoch before the last one sent"
+                                                                              : nullptr;
+    if (why != nullptr) {   // (no room is not a miss: the requests out are, each when its deadline passes)
         err = why;
         ++st.not_sent;
-        // (no room because both requests out missed their deadlines and no reply came since: one more miss)
-        if (full && out_.front().dropped && out_.back().dropped && ++in_a_row_ >= kDownAfter) {
-            down_(std::to_string(kDownAfter) + " replies in a row missed their deadline", err);
-            return 0;
-        }
         return 0;
     }
     EpHdr h;
@@ -758,14 +937,16 @@ int MainLink::send_req(uint32_t seq, int layer, int T, uint32_t epoch, uint32_t 
         down_(err, err);
         return -1;
     }
-    out_.push_back({seq, T, false});
+    out_.push_back({seq, T, false, now_ms()});
     any_sent_ = true;
     last_seq_ = seq;
+    last_epoch_ = epoch;
     ++st.sent;
     return 1;
 }
 
 int MainLink::wait_resp(uint32_t seq, double deadline, Reply& r, std::string& err) {
+    if (up_ && !bulk_ok_(err)) return -1;
     if (!up_) {
         err = "the link is down";
         return -1;
@@ -785,7 +966,7 @@ int MainLink::wait_resp(uint32_t seq, double deadline, Reply& r, std::string& er
                 if (x.seq == seq) x.dropped = true;   // (computed here now; its reply is dropped when it comes)
             ++st.timeouts;
             if (++in_a_row_ >= kDownAfter) {
-                down_(std::to_string(kDownAfter) + " replies in a row missed their deadline", err);
+                down_(std::to_string(kDownAfter) + " requests in a row dropped at their deadline", err);
                 return -1;
             }
             err = "no reply by the deadline";
@@ -799,6 +980,7 @@ int MainLink::wait_resp(uint32_t seq, double deadline, Reply& r, std::string& er
 }
 
 bool MainLink::wake(std::string& err) {
+    if (up_ && !bulk_ok_(err)) return false;
     if (!up_) {
         err = "the link is down";
         return false;
@@ -848,6 +1030,7 @@ int MainLink::ping(uint32_t seq, size_t bytes, double deadline, uint32_t& held_n
 }
 
 void MainLink::bye() {
+    stop_fills_();
     std::string e;
     EpHdr h;
     h.type = Bye;
@@ -858,48 +1041,133 @@ void MainLink::bye() {
     bulk.close();
 }
 
-bool MainLink::send_fill(int layer, int e_in, int e_out, uint32_t epoch, const void* blob, size_t n, std::string& err) {
-    if (epoch != ready_ + 1 || (fills_out_ > 0 && epoch != filling_)) {
-        err = "a fill for epoch " + std::to_string(epoch) + " while " + std::to_string(ready_) + " is loaded";
-        return false;
+bool MainLink::queue_fill(int layer, int e_in, int e_out, uint32_t epoch, int i, int n, const void* blob, size_t bytes,
+                          std::string& err) {
+    if (up_ && !bulk_ok_(err)) return false;
+    const uint32_t ready = epoch_ready();
+    if (!up_) err = "the link is down";
+    else if (!fill_th_.joinable()) err = "no bulk socket";
+    else if (layer < 0 || layer >= n_layers_) err = "a fill for layer " + std::to_string(layer) + " (the link has " + std::to_string(n_layers_) + ")";
+    else if (n < 1 || n > 0xffff || i < 0 || i >= n) err = "a fill " + std::to_string(i) + " of " + std::to_string(n);
+    else if (i > 0 && (q_epoch_ != epoch || q_n_ != n || q_next_ != i))
+        err = "fill " + std::to_string(i) + " of " + std::to_string(n) + " for epoch " + std::to_string(epoch) + " out of its batch's order";
+    else if (i == 0 && q_next_ < q_n_) err = "a new batch while fill " + std::to_string(q_next_) + " of " + std::to_string(q_n_) + " is still to come";
+    else if (i == 0 && fills_pending() > 0) err = "a new batch while the last one's fills are out";
+    else if (i == 0 && epoch != ready + 1)
+        err = "a fill for epoch " + std::to_string(epoch) + " while " + std::to_string(ready) + " is loaded (only " + std::to_string(ready + 1) + " is filled)";
+    else if (i == 0 && epoch > last_epoch_ + 1)
+        err = "a fill for epoch " + std::to_string(epoch) + " before a request tagged " + std::to_string(epoch - 1) +
+              " was sent (the worker frees epoch " + std::to_string(epoch - 2) + "'s slots then)";
+    else {
+        if (i == 0) {
+            q_epoch_ = epoch;
+            q_n_ = n;
+        }
+        q_next_ = i + 1;
+        Job j;
+        j.layer = layer;
+        j.e_in = e_in;
+        j.e_out = e_out;
+        j.i = i;
+        j.n = n;
+        j.epoch = epoch;
+        j.blob = blob;
+        j.bytes = bytes;
+        pending_.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            jobs_.push_back(j);
+        }
+        cv_.notify_all();
+        return true;
     }
-    EpHdr h;
-    h.type = Fill;
-    h.layer = (uint8_t) layer;
-    h.epoch = epoch;
-    h.aux = (uint32_t) e_in;
-    EpFill f;
-    f.e_in = e_in;
-    f.e_out = e_out;
-    if (!bulk.send(h, &f, sizeof f, err, blob, n)) return false;
-    if (fills_out_ == 0) fill_bad_ = false;   // (a new batch for the epoch)
-    filling_ = epoch;
-    ++fills_out_;
-    ++st.fills;
-    return true;
+    return false;
 }
 
-int MainLink::poll_fill_ok(double deadline, int& layer, int& e_in, uint32_t& epoch, uint16_t& status, std::string& err) {
-    EpHdr h;
-    const int got = bulk.recv(h, brx_, deadline, err);
-    if (got <= 0) return got;
-    if (h.type != FillOk || brx_.size() != 2 || fills_out_ == 0 || h.epoch != filling_) {
-        err = h.type == Error ? "the worker (bulk): " + std::string(brx_.begin(), brx_.end()) : "a bulk frame out of step";
-        bulk.close();
-        return -1;
+void MainLink::fail_(const std::string& why) {
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        if (bulk_why_.empty()) bulk_why_ = why;
     }
-    layer = h.layer;
-    e_in = (int) h.aux;
-    epoch = h.epoch;
-    std::memcpy(&status, brx_.data(), 2);
-    if (status != 0) {
-        ++st.fill_fails;
-        fill_bad_ = true;
+    bulk_failed_.store(true, std::memory_order_release);
+}
+
+// The fill thread: the queued fills out on the bulk socket (paced by bulk.pace_bps), two ahead of their FillOks at
+// most; each FillOk in order, the batch's count kept here (one not loaded: the epoch is not ready, the next batch
+// fills it again).  It ends at stop_ or on the first failure (fail_: the decode thread takes the link down), and
+// closes the bulk socket as it ends.
+void MainLink::fill_loop_() {
+    std::deque<Job> out;   // sent, no FillOk yet
+    bool bad = false;      // a fill of the current batch not loaded
+    double last_ok = now_ms();
+    std::string err;
+    for (;;) {
+        Job j;
+        bool have = false;
+        {
+            std::unique_lock<std::mutex> g(mu_);
+            if (out.empty()) cv_.wait_for(g, std::chrono::milliseconds(50), [this] { return stop_.load() || !jobs_.empty(); });
+            if (stop_) break;
+            if (out.size() < 2 && !jobs_.empty()) {
+                j = jobs_.front();
+                jobs_.pop_front();
+                have = true;
+            }
+        }
+        if (have) {
+            EpHdr h;
+            h.type = Fill;
+            h.layer = (uint8_t) j.layer;
+            h.epoch = j.epoch;
+            h.aux = (uint32_t) j.e_in;
+            EpFill f;
+            f.e_in = j.e_in;
+            f.e_out = j.e_out;
+            f.i = (uint16_t) j.i;
+            f.n = (uint16_t) j.n;
+            if (!bulk.send(h, &f, sizeof f, err, j.blob, j.bytes)) {
+                fail_(err);
+                break;
+            }
+            if (out.empty()) last_ok = now_ms();
+            out.push_back(j);
+            st.fills.fetch_add(1);
+            continue;
+        }
+        if (out.empty()) continue;
+        EpHdr h;
+        const int got = bulk.recv(h, brx_, now_ms() + 20.0, err);
+        if (got < 0) {
+            fail_(err);
+            break;
+        }
+        if (got == 0) {
+            if (now_ms() - last_ok > 30000.0) {
+                fail_("no FillOk in 30 s");
+                break;
+            }
+            continue;
+        }
+        const Job& o = out.front();
+        if (h.type != FillOk || brx_.size() != 2 || h.epoch != o.epoch || h.layer != (uint8_t) o.layer || h.aux != (uint32_t) o.e_in) {
+            fail_(h.type == Error ? "the worker: " + std::string(brx_.begin(), brx_.end()) : "a bulk frame out of step");
+            break;
+        }
+        uint16_t status = 0;
+        std::memcpy(&status, brx_.data(), 2);
+        if (o.i == 0) bad = false;
+        if (status != 0) {
+            st.fill_fails.fetch_add(1);
+            bad = true;
+        }
+        if (o.i == o.n - 1 && !bad) ready_.store(o.epoch, std::memory_order_release);   // (the whole batch loaded)
+        const Job done = o;
+        out.pop_front();
+        last_ok = now_ms();
+        pending_.fetch_sub(1);
+        if (on_fill_ok) on_fill_ok(done.layer, done.e_in, done.epoch, status);
     }
-    // (every fill of the batch loaded: the epoch may be used; one not loaded: it may not, and the next batch is for the
-    // same epoch again)
-    if (--fills_out_ == 0 && !fill_bad_) ready_ = filling_;
-    return 1;
+    bulk.close();
 }
 
 // ---------------------------------------------------------------------------------------------------- the worker's end
@@ -909,7 +1177,8 @@ void WorkerLink::start(const EpHello& mine) {
     n_layers_ = mine.n_layers;
     pending_ = any_ = false;
     last_seq_ = 0;
-    epoch_used = 0;
+    batch_ = FillBatch();
+    epoch_used.store(0);
     epoch_acked.store(0);
 }
 
@@ -959,14 +1228,14 @@ int WorkerLink::next(Frame& f, double deadline, std::string& err) {
         if (any_ && h.seq <= last_seq_)
             return refuse_("request seq " + std::to_string(h.seq) + " after " + std::to_string(last_seq_), err);
         if (h.T < 1 || h.T > kMaxT || h.layer >= n_layers_) return refuse_("a request's layer or T out of range", err);
-        const uint32_t acked = epoch_acked.load(std::memory_order_acquire);
-        if (h.epoch < epoch_used || h.epoch > acked)
-            return refuse_("a request tagged with epoch " + std::to_string(h.epoch) + " (in use " + std::to_string(epoch_used) +
+        const uint32_t acked = epoch_acked.load(std::memory_order_acquire), used = epoch_used.load(std::memory_order_relaxed);
+        if (h.epoch < used || h.epoch > acked)
+            return refuse_("a request tagged with epoch " + std::to_string(h.epoch) + " (in use " + std::to_string(used) +
                                ", acked " + std::to_string(acked) + ")",
                            err);
         const size_t np = (size_t) h.T * k_ * sizeof(EpPick), nx = (size_t) h.T * n_embd_ * 2;
         if (rx_.size() != np + nx) return refuse_("a request of the wrong size", err);
-        epoch_used = h.epoch;
+        epoch_used.store(h.epoch, std::memory_order_release);
         any_ = true;
         last_seq_ = h.seq;
         pending_ = true;
@@ -1005,29 +1274,27 @@ int WorkerLink::serve_fill(double deadline, const Loader& load, std::string& err
         bulk.close();
         return -1;
     }
-    const uint32_t acked = epoch_acked.load(std::memory_order_acquire);
+    EpFill fm;
+    if (brx_.size() >= sizeof fm) std::memcpy(&fm, brx_.data(), sizeof fm);
     std::string why;
-    if (h.type != Fill || brx_.size() < sizeof(EpFill)) why = "not a fill on the bulk socket";
-    else if (h.epoch != acked && h.epoch != acked + 1)
-        why = "a fill for epoch " + std::to_string(h.epoch) + " (acked " + std::to_string(acked) + ")";
+    if (h.type != Fill || brx_.size() < sizeof fm) why = "not a fill on the bulk socket";
     else if (h.layer >= n_layers_) why = "a fill for layer " + std::to_string(h.layer);
+    else why = batch_.take(h.epoch, fm.i, fm.n, epoch_acked.load(std::memory_order_acquire));
     if (!why.empty()) {
         err = why;
         (void) send_error(bulk, why);
         bulk.close();
         return -1;
     }
-    EpFill fm;
-    std::memcpy(&fm, brx_.data(), sizeof fm);
     const uint16_t status = load ? load(h.layer, fm.e_in, fm.e_out, h.epoch, brx_.data() + sizeof fm, brx_.size() - sizeof fm) : 1;
     ++st.fills;
-    if (status == 0) epoch_acked.store(h.epoch, std::memory_order_release);
+    if (batch_.done(status == 0)) epoch_acked.store(h.epoch, std::memory_order_release);   // (the whole batch loaded)
     EpHdr ok;
     ok.type = FillOk;
     ok.layer = h.layer;
     ok.epoch = h.epoch;
     ok.aux = (uint32_t) fm.e_in;
-    return bulk.send(ok, &status, sizeof status, err);
+    return bulk.send(ok, &status, sizeof status, err) ? 1 : -1;
 }
 
 }  // namespace strata::net::ep
