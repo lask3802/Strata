@@ -147,6 +147,7 @@ struct Stats {
     // by the window's T (1..16): requests sent, late replies, and windows the send gate kept here (the server's round
     // trip at that T expected to cost more than the lane computing its picks)
     int64_t rx_req_t[17] = {}, rx_late_t[17] = {}, rx_skip_t[17] = {};
+    int64_t ep_late = 0;   // DS4_EP_DEFER: the layers whose mailbox part the next layer (or the head) added
 };
 
 class Model {

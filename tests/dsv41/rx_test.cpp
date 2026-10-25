@@ -284,14 +284,18 @@ int main(int argc, char** argv) {
                 n_ref_done ? ref_s / n_ref_done : 0.0, ref_s_max, n_ref_done ? ref_c / n_ref_done : 0.0, ref_c_max,
                 fails ? "FAIL" : "ok");
 
-    // ---- a late reply is skipped: a request whose deadline has passed, then one that must get its own reply
+    // ---- a late reply is skipped: a request whose deadline has passed, then one that must get its own reply.  Two are
+    // outstanding then (DS4_EP_DEFER's case: layer l's reply judged late and still out when layer l + 1's request
+    // goes): the late one is a whole window (its reply the slower), the next is sent without reading anything, and the
+    // late reply - in first, the server answers in order - must be set aside by its seq (take_late), not taken
     if (!rtt_only) {
-        make_req(1, picks, rows, xs);
+        (void) m.take_late();
+        make_req(rx::kMaxRows, picks, rows, xs);
         const uint32_t late = seq++;
-        if (!m.send_req(late, 0, 1, rows.data(), ptrs(xs), err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
+        if (!m.send_req(late, 0, rx::kMaxRows, rows.data(), ptrs(xs), err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
         const uint16_t* y = nullptr;
         int us = 0;
-        const int g1 = m.wait_resp(late, 1, rx::now_ms() - 1.0, &y, us, err);
+        const int g1 = m.wait_resp(late, rx::kMaxRows, rx::now_ms() - 1.0, &y, us, err);
         std::vector<rx::ReqRow> rows2;
         std::vector<std::vector<float>> xs2;
         make_req(1, picks, rows2, xs2);
@@ -309,11 +313,15 @@ int main(int argc, char** argv) {
             }
         }
         const double rel = std::sqrt(num / std::max(den, 1e-30));
-        const bool good = g1 == 0 && g2 == 1 && rel < 0.15;
-        std::printf("late reply: the first wait %s, the next request's reply %s (relative error %.2e to the lane's) -> %s\n",
+        bool aside = false;   // (the late reply came before the next one's and was set aside by its seq)
+        for (const auto& lt : m.take_late()) aside = aside || lt.first == late;
+        const bool good = g1 == 0 && g2 == 1 && rel < 0.15 && aside;
+        std::printf("late reply (2 outstanding): the first wait %s, the next request's reply %s (relative error %.2e to "
+                    "the lane's), the late one %s -> %s\n",
                     g1 == 0 ? "timed out" : "got it anyway (the server beat a 0 ms deadline)", g2 == 1 ? "came" : "did not come",
-                    rel, good ? "ok" : (g1 == 1 && g2 == 1 && rel < 0.15 ? "ok (not exercised)" : "FAIL"));
-        if (g2 != 1 || !(rel < 0.15)) ++fails;
+                    rel, aside ? "set aside by its seq" : "not seen",
+                    good ? "ok" : (g1 == 1 && g2 == 1 && rel < 0.15 ? "ok (not exercised)" : "FAIL"));
+        if (g2 != 1 || !(rel < 0.15) || (g1 == 0 && !aside)) ++fails;
     }
 
     // ---- the round trip of T = 1 requests, `picks` picks each (the decode shape), and T = 4

@@ -1787,6 +1787,23 @@ __global__ void __launch_bounds__(kThreads) ar_sum_kernel(float* x, int n4, cons
 }
 
 
+// a thread a (token, value); a token without a part (flag 0) is left as it is
+__global__ void hc_late_add_kernel(float* h, const float* __restrict__ part, size_t part_stride,
+                                   const int* __restrict__ flag, const float* __restrict__ post,
+                                   const float* __restrict__ comb, int dim, int hc) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (e >= dim || flag[t] == 0) return;
+    const float yv = part[(size_t) t * part_stride + e];
+    float* r = h + (size_t) t * hc * dim;
+    for (int k = 0; k < hc; ++k) {
+        float c = 0.0f;
+        if (comb == nullptr) c = post[(size_t) t * 8 + k];
+        else
+            for (int j = 0; j < hc; ++j) c += comb[(size_t) t * 64 + j * hc + k] * post[(size_t) t * 8 + j];
+        r[(size_t) k * dim + e] += c * yv;
+    }
+}
+
 // a thread a (token, value): every stream's value read before any is written
 __global__ void hc_post_inplace_kernel(const float* __restrict__ y, float* h, const float* __restrict__ post,
                                        const float* __restrict__ comb, int dim, int hc) {
@@ -2069,6 +2086,10 @@ void hc_post(const float* y, const float* res, const float* post, const float* c
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s) {
     hc_post_inplace_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(y, h, post, comb, dim, hc);
+}
+void hc_late_add(float* h, const float* part, size_t part_stride, const int* flag, const float* post, const float* comb,
+                 int dim, int hc, int T, cudaStream_t s) {
+    hc_late_add_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(h, part, part_stride, flag, post, comb, dim, hc);
 }
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
     hc_mix_scale_kernel<<<T, kThreads, 0, s>>>(h, hcdim, n_mix, eps, mixes);
