@@ -14,6 +14,7 @@
 //   maya-ds4 --pack ... --remote-experts [BIND:]PORT ...              (a proof of concept, ds4_rx.hpp) some of the CPU
 //                                                                     lane's experts on an expert server's GPU
 //   maya-ds4 --expert-server-connect HOST:PORT [--expert-server-reserve-mib N] [--expert-server-once] [--gpus I]
+//            [--expert-server-cpu]                                     (tests: the CPU lane's arithmetic, no GPU)
 //                                                                     that server: no pack, it dials the main process
 //
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
@@ -112,7 +113,8 @@ void usage() {
                  "           | --stage-worker PORT [--stage-bind ADDR] --stage-begin K\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
                  "           | --pack-info)\n"
-                 "maya-ds4 --expert-server-connect HOST:PORT [--expert-server-reserve-mib N] [--expert-server-once] [--gpus I]\n");
+                 "maya-ds4 --expert-server-connect HOST:PORT [--expert-server-reserve-mib N] [--expert-server-once] [--gpus I]\n"
+                 "           [--expert-server-cpu (tests: no GPU)]\n");
 }
 
 // stdin lines on a thread, so a request can see STOP while it decodes
@@ -1592,8 +1594,10 @@ int main(int argc, char** argv) {
     int worker_port = 0;
     bool worker_mode = false;
     std::string rx_at;          // (--expert-server-connect: the main process's HOST:PORT)
-    int64_t rx_reserve = 1024;  // (its VRAM left free, MiB)
+    int64_t rx_reserve = 512;   // (its VRAM left free, MiB: the arena slot's 512 held 1106 blobs on the 3080)
+    const char* rx_flag = nullptr;   // (an expert server's flag given: it needs --expert-server-connect)
     bool rx_once = false;
+    bool rx_cpu = false;        // (--expert-server-cpu, tests: the CPU lane's arithmetic, no GPU)
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1671,9 +1675,16 @@ int main(int argc, char** argv) {
         else if (a == "--stage-bind") stage_bind = val("--stage-bind");
         else if (a == "--remote-experts") o.remote_experts = val("--remote-experts");
         else if (a == "--expert-server-connect") rx_at = val("--expert-server-connect");
-        else if (a == "--expert-server-reserve-mib") rx_reserve = std::atoll(val("--expert-server-reserve-mib").c_str());
-        else if (a == "--expert-server-once") rx_once = true;
-        else if (a == "--help" || a == "-h") {
+        else if (a == "--expert-server-reserve-mib") {
+            rx_reserve = std::atoll(val("--expert-server-reserve-mib").c_str());
+            rx_flag = "--expert-server-reserve-mib";
+        } else if (a == "--expert-server-once") {
+            rx_once = true;
+            rx_flag = "--expert-server-once";
+        } else if (a == "--expert-server-cpu") {
+            rx_cpu = true;
+            rx_flag = "--expert-server-cpu";
+        } else if (a == "--help" || a == "-h") {
             usage();
             return 0;
         } else {
@@ -1682,9 +1693,15 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (rx_flag != nullptr && rx_at.empty()) {   // (not silently a main process: a server's flag, its address left out)
+        std::fprintf(stderr, "%s is an expert server's flag: it needs --expert-server-connect HOST:PORT\n", rx_flag);
+        usage();
+        return 2;
+    }
     if (!rx_at.empty()) {   // the expert server (ds4_rx.hpp): no pack, the main process sends what it computes
         std::string token;
         if (!stage_token(token)) return 1;
+        if (rx_cpu) return strata::ds4::rx::serve_cpu(rx_at, token, rx_once);
         return strata::ds4::rx::serve(rx_at, token, rx_reserve, o.gpus.empty() ? 0 : o.gpus[0], rx_once);
     }
     if (pack_info_mode) {   // the pack's description only: no device, no weights, no lock

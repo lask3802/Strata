@@ -147,6 +147,9 @@ struct Stats {
     // by the window's T (1..16): requests sent, late replies, and windows the send gate kept here (the server's round
     // trip at that T expected to cost more than the lane computing its picks)
     int64_t rx_req_t[17] = {}, rx_late_t[17] = {}, rx_skip_t[17] = {};
+    // the link's keep-awake (ds4_rx.hpp): Wakes sent at a window's start, and the CPU lane's requests that found
+    // serve_lane napping (its 20 us sleeps: after 2 ms idle, kSpinMs while the link is up)
+    int64_t rx_wakes = 0, lane_nap_reqs = 0;
     int64_t ep_late = 0;   // DS4_EP_DEFER: the layers whose mailbox part the next layer (or the head) added
     // DS4_EP_DEFER_VERIFY: the checks made (a layer's deferred streams against the exact ones), and by the layer whose
     // part it was the largest relative difference since the load (the last layer's: before the head)

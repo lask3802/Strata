@@ -19,6 +19,11 @@
 // computes everything for the next DS4_RX_BACKOFF (256) requests, then the link is tried again with a clean count; a
 // lost link, or no reply at all from one such idle spell to the next: the lane computes everything from then on.
 // Never a hang.
+// Keep-awake: each end's receive spins while bytes came in the last kSpinMs; a window's start sends a Wake when the
+// link has been quiet for kWakeQuietMs (the server's spin restarts before the window's first request), and serve_lane
+// does not nap while the link is up and its last request is under kSpinMs old.  Both ends' link threads run on the
+// link core (DS4_EP_CPU, 2), the main's CPU lane workers off it and its SMT sibling.  DS4_EP_WAKE=0: no Wake and the
+// lane's 2 ms naps (A/B).
 //
 // The wire: a 32-byte header (magic, type, seq, a, b, c, payload bytes), then the payload; TCP_NODELAY, rows bf16.
 #pragma once
@@ -41,13 +46,31 @@ enum Msg : uint32_t {
     Geo = 2,        // main -> server: payload GeoMsg, then n_layers x GeoLayer
     Blob = 3,       // main -> server: a = layer, b = expert; payload the blob (GeoLayer's layout)
     BlobsEnd = 4,   // main -> server: a = the blobs sent
-    BlobsOk = 5,    // server -> main: payload uint8 ok[blobs] (1: in its VRAM)
+    BlobsOk = 5,    // server -> main: payload uint8 ok[blobs] (1: in its VRAM); or an Error (its warm-up requests
+                    // failed) and the main drops the server.  A refusal known at the Geo (the geometry, the room's VRAM
+                    // in one piece) is an Error right after it: the main reads it before each blob and stops
     Req = 6,        // main -> server: seq, a = layer, b = rows; payload rows x (ReqRow, then bf16 x[n_embd])
     Resp = 7,       // server -> main: seq, a = rows, c = the server's time (us); payload rows x bf16 y[n_embd]
     Error = 9,      // either way: payload the message
     Ping = 10,      // main -> server (tests: the link alone): seq; the server answers Pong with the same payload at once
-    Pong = 11,
+    Pong = 11,      // (a = the Wakes the server took, b = its waits in poll (the low 31 bits), c = the one CPU its
+                    // serve loop may run on, -1: not pinned)
+    Wake = 12,      // main -> server: no payload, no reply; a window starts (its bytes restart the server's spin)
 };
+
+constexpr double kSpinMs = 200.0;      // a receive spins while bytes came or went this recently, then waits in poll
+constexpr double kWakeQuietMs = 100.0; // a Wake goes out only when the main sent nothing for this long (half the spin)
+
+/// The link core (DS4_EP_CPU, 2 by default; -1, "off" or not a number: none): the logical CPU the thread that drives
+/// the link runs on, on either PC - the main's service thread, the server's serve loop.  -1 also where this PC has no
+/// such CPU, or this process may not run on it (a container's cpuset)
+int link_cpu();
+/// `cores` less the link CPU's core (`link`: its SMT siblings, os::cpu_siblings), in their order: the CPU lane's
+/// workers stay off the core the link thread spins on
+std::vector<int> off_link(const std::vector<int>& cores, const std::vector<int>& link);
+/// serve_lane, with no request in: may it nap (20 us sleeps) after idle_ms without one - after 2 ms, but while the
+/// link is up not before kSpinMs (the server spins as long: a window's first request is not held up by the lane)
+inline bool lane_naps(double idle_ms, bool link_up) { return idle_ms > (link_up ? kSpinMs : 2.0); }
 
 #pragma pack(push, 1)
 struct Hdr {
@@ -225,12 +248,57 @@ struct LateBook {
     }
 };
 
+/// Whether a window of T rows has its remote picks served (the expert server is reached only from serve_lane, the
+/// async windows': plan_window's rule - threads mode, or no DS4_SYNC and T <= async_max_t).  T 0: the settle after a
+/// prompt and the tick after a chunked one, for the decode that follows (T 1).  Where not, the CPU lane computes the server's experts as its own, and the
+/// expert cache takes them as any (cache_in's remote: null).
+inline bool lane_serves(int T, bool par, bool sync_decode, int async_max_t) {
+    return par || (!sync_decode && (T == 0 ? 1 : T) <= async_max_t);
+}
+
+/// The expert cache's next expert into VRAM from a layer's CPU-lane hits: the hottest not in VRAM (slot < 0) and not one
+/// the expert server holds (remote[e] != 0; null: none) - those cost the CPU lane nothing, so a VRAM slot there would
+/// save no lane work - except a zero-copy one of the RAM store (zc[e] != 0; null: none), which the decode computes on this
+/// GPU over the bus and never sends.  -1: none.
+inline int cache_in(const std::vector<int>& hits, const int* slot, const float* heat, const uint8_t* remote,
+                    const uint8_t* zc) {
+    int best = -1;
+    for (int e : hits)
+        if (slot[e] < 0 && (remote == nullptr || remote[e] == 0 || (zc != nullptr && zc[e] != 0)) &&
+            (best < 0 || heat[e] > heat[best]))
+            best = e;
+    return best;
+}
+
 /// The remote experts beside expert parallelism's n_ff slice [ff0, ff0 + ffn) of a layer (Layer::ep_ff0 / ep_ffn; ffn -1:
 /// the whole n_ff): refused - the server computes each expert whole, an EP window's lane a slice of it, and the other
 /// PC's part would add the rest a second time.  The reason, or nullptr
 inline const char* slice_refusal(bool remote, int ff0, int ffn, int n_ff) {
     if (!remote || ffn < 0 || (ff0 == 0 && ffn == n_ff)) return nullptr;
     return "the remote experts (--remote-experts) compute each expert whole";
+}
+
+/// A served layer's blob layout from the geometry, checked by a server at the Geo (before any blob): each role r
+/// (gate, up, down) of bytes[r] (its rows' bytes there: 0 = a type it has no layout for, or rows not whole blocks of
+/// it) at off[r], 256-aligned,
+/// inside the blob and over no other role.  An overrun would read past the blob (the GPU server's arena: the next
+/// one's).  "" or why not.
+inline std::string blob_refusal(int li, const GeoLayer& g, const uint64_t bytes[3]) {
+    static const char* const role[3] = {"gate", "up", "down"};
+    const std::string at = "layer " + std::to_string(li) + "'s ";
+    for (int r = 0; r < 3; ++r) {
+        if (bytes[r] == 0)
+            return at + role[r] + ": type " + std::to_string(g.K[r]) +
+                   " has no layout here, or its rows are not whole blocks of it (no row bytes)";
+        if (g.off[r] % 256 != 0) return at + role[r] + ": its offset " + std::to_string(g.off[r]) + " not 256-aligned";
+        if (g.off[r] > g.blob || bytes[r] > g.blob - g.off[r])
+            return at + role[r] + ": " + std::to_string(bytes[r]) + " bytes at " + std::to_string(g.off[r]) +
+                   " past the blob's " + std::to_string(g.blob);
+        for (int q = 0; q < r; ++q)
+            if (g.off[r] < g.off[q] + bytes[q] && g.off[q] < g.off[r] + bytes[r])
+                return at + role[r] + " over its " + role[q];
+    }
+    return "";
 }
 
 /// The late replies of the main's last 64 requests: 8 of them idle the link for the next `hold` requests (the lane
@@ -270,8 +338,8 @@ double now_ms();          // steady clock
 void relax();             // a spin-wait's pause
 
 /// One TCP connection, either end.  Sends block (a full socket buffer waits for room); receives poll the socket
-/// (non-blocking) until a whole message is in, spinning while bytes came in the last 200 ms (a link that has gone quiet
-/// waits in poll, so an idle server does not burn a core), until a deadline.
+/// (non-blocking) until a whole message is in, spinning while bytes came or went in the last kSpinMs (a link that has
+/// gone quiet waits in poll, so an idle server does not burn a core), until a deadline.
 class Conn {
 public:
     Conn() = default;
@@ -292,7 +360,11 @@ public:
     /// the last message recv gave: when the kernel took in the read that completed it (steady ms; SO_TIMESTAMPNS,
     /// Linux), -1 where the kernel says nothing (Windows)
     double arrival_ms() const { return arrival_; }
+    /// when a message last went out (steady ms; 0: none yet)
+    double last_out_ms() const { return last_out_; }
     uint64_t bytes_out = 0, bytes_in = 0;
+    uint64_t polls = 0;       // receives' waits in poll (quiet past kSpinMs)
+    uint64_t quickacks = 0;   // reads followed by TCP_QUICKACK (Linux: the peer's next send is not held for our ACK)
 
 private:
     bool send_raw_(const void* p, size_t n, std::string& err);
@@ -300,6 +372,7 @@ private:
     std::string peer_;
     std::vector<uint8_t> rb_;   // bytes read, not yet a whole message
     double last_in_ = 0;        // when bytes last came in (steady ms)
+    double last_out_ = 0;       // when a message last went out
     double in_at_ = -1, arrival_ = -1;   // the kernel's time of the last read; of the last message's
 };
 
@@ -312,6 +385,8 @@ public:
     std::string name() const { return std::string(peer_hello_.name, strnlen_(peer_hello_.name, sizeof peer_hello_.name)); }
     std::string peer() const { return c_.peer(); }
     bool send_geo(const GeoMsg& g, const std::vector<GeoLayer>& layers, std::string& err);
+    /// false (err) also when the server refused at the Geo: its Error, looked for before each blob ("expert server:
+    /// " and the reason), or the link it closed then - the blobs stop there, not after all of them
     bool send_blob(int layer, int e, const void* blob, size_t bytes, std::string& err);
     /// the end of the blobs: the server's ok[] (one a blob sent, in order)
     bool end_blobs(int n, std::vector<uint8_t>& ok, double timeout_ms, std::string& err);
@@ -329,12 +404,17 @@ public:
         v.swap(late_);
         return v;
     }
-    /// tests: a Ping of `bytes` payload and its Pong (1; 0 none by the deadline; -1 the link failed)
-    int ping(uint32_t seq, size_t bytes, double deadline, std::string& err);
+    /// tests: a Ping of `bytes` payload and its Pong (1; 0 none by the deadline; -1 the link failed); the Pong's a, b, c
+    /// in pong[0..2] (the server's Wakes taken, waits in poll, pinned CPU) when given
+    int ping(uint32_t seq, size_t bytes, double deadline, std::string& err, int32_t* pong = nullptr);
+    /// a window starts: a Wake when nothing went out for kWakeQuietMs (the server's spin may have run out); true if sent
+    bool wake(std::string& err);
+    uint64_t wakes = 0;   // Wakes sent
     void close() { c_.close(); }
     bool ok() const { return c_.ok(); }
     uint64_t bytes_out() const { return c_.bytes_out; }
     uint64_t bytes_in() const { return c_.bytes_in; }
+    uint64_t polls() const { return c_.polls; }   // (this end's receives' waits in poll)
 
 private:
     static size_t strnlen_(const char* s, size_t n) {
@@ -354,5 +434,20 @@ private:
 /// serves it until it goes away, frees the blobs, dials again (once: return after one main process).  GPU `dev`, VRAM
 /// free less reserve_mib for blobs.  Returns nonzero on a CUDA error.
 int serve(const std::string& host_port, const std::string& token, int64_t reserve_mib, int dev, bool once);
+/// tests (--expert-server-cpu): the same server with the CPU lane's arithmetic (ds4_iq_cpu.cpp, the i-quant types) in
+/// place of a GPU, the blobs in RAM (room: DS4_RX_CPU_ROOM_MIB, 2048)
+int serve_cpu(const std::string& host_port, const std::string& token, bool once);
+
+/// Either server's parts.  serve_loop: dial `host_port` (again each second until a main process takes it), run
+/// `session` on the connection (0: the main went away; < 0: an error, returned as 1), again unless `once`; the calling
+/// thread on link_cpu() meanwhile (its mask restored at the return).  serve_next: the next request (1, in h / p),
+/// answering Pings and taking Wakes on the way (the counts in *wakes); -1: the link went (err)
+int serve_loop(const std::string& host_port, bool once, const char* what, int (*session)(Conn&, void*), void* arg);
+int serve_next(Conn& c, Hdr& h, std::vector<uint8_t>& p, int64_t& pings, int64_t& wakes, std::string& err);
+/// A server's refusal at the Geo: the Error with `why`, then whatever the main still sends read and dropped until it
+/// closes the link (it stops at the Error: Main::send_blob), sends its BlobsEnd (a main that does not look: the Error is
+/// its answer), or is silent for 30 s - closed at once, the unread blobs would reset the link and the main's send
+/// would lose the reason.
+void refuse_at_geo(Conn& c, const std::string& why);
 
 }  // namespace strata::ds4::rx

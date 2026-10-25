@@ -293,6 +293,60 @@ int main() {
         check(rx::slice_refusal(true, 1024, 1280, 2304) != nullptr, "a slice [1024, 2304): refused");
         check(rx::slice_refusal(false, 0, 1024, 2304) == nullptr, "no --remote-experts: the slice is not ours to refuse");
     }
+    {
+        // the expert cache does not take the expert server's experts into VRAM (lead 2026-10-25: the settle after the
+        // prompt moved 67, and the server's share of the lane's picks fell from 20.2% to 16.3%)
+        const std::vector<int> hits = {3, 5, 7, 5};
+        int slot[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+        const float heat[8] = {0, 0, 0, 9.0f, 0, 6.0f, 0, 4.0f};
+        const uint8_t none[8] = {0, 0, 0, 0, 0, 0, 0, 0}, held3[8] = {0, 0, 0, 1, 0, 0, 0, 0},
+                      all[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+        const uint8_t zc3[8] = {0, 0, 0, 1, 0, 0, 0, 0};
+        check(rx::cache_in(hits, slot, heat, nullptr, nullptr) == 3, "no expert server: the hottest hit (3)");
+        check(rx::cache_in(hits, slot, heat, none, nullptr) == 3, "the server holds none of them: the hottest hit (3)");
+        check(rx::cache_in(hits, slot, heat, held3, nullptr) == 5, "the server holds 3: the next hottest (5)");
+        check(rx::cache_in(hits, slot, heat, all, nullptr) == -1, "the server holds all of them: none");
+        check(rx::cache_in(hits, slot, heat, held3, zc3) == 3, "3 on the server but zero-copy (this GPU's work): 3");
+        check(rx::cache_in(hits, slot, heat, held3, none) == 5, "3 on the server, no zero-copy one: 5");
+        slot[5] = 0;
+        check(rx::cache_in(hits, slot, heat, held3, nullptr) == 7, "5 in VRAM already, 3 on the server: 7");
+        // which windows' hits skip the server's experts (the review of a5770802: a window past async_max_t goes sync,
+        // never to the server - its lane computed them, so the cache may take them)
+        check(rx::lane_serves(1, false, false, 8) && rx::lane_serves(8, false, false, 8),
+              "T 1 and 8 at async_max_t 8: served (async)");
+        check(!rx::lane_serves(9, false, false, 8) && !rx::lane_serves(16, false, false, 8),
+              "T 9 and 16 at async_max_t 8: not served (sync windows: the DSpark verify, a window prompt)");
+        check(rx::lane_serves(0, false, false, 8) && !rx::lane_serves(0, false, false, 0),
+              "the settle (T 0): as the decode's T 1 (DS4_ASYNC_T=0: not)");
+        check(!rx::lane_serves(1, false, true, 8) && !rx::lane_serves(0, false, true, 8), "DS4_SYNC: none served");
+        check(rx::lane_serves(16, true, false, 8) && rx::lane_serves(1, true, true, 8), "threads mode: every window async");
+    }
+    {
+        // a server's check of a served layer's blob layout at the Geo (lead 2026-10-25: an overrun read the next blob)
+        rx::GeoLayer g;
+        g.K[0] = g.K[1] = g.K[2] = 16;
+        g.off[0] = 0;
+        g.off[1] = 1024;
+        g.off[2] = 2048;
+        g.blob = 3072;
+        const uint64_t b[3] = {1000, 1000, 1024}, b0[3] = {1000, 0, 1024};
+        check(rx::blob_refusal(0, g, b).empty(), "the engine's layout (each role 256-aligned, in order, inside): taken");
+        auto has = [](const std::string& s, const char* w) { return s.find(w) != std::string::npos; };
+        rx::GeoLayer t = g;
+        t.off[2] = t.blob - 256;
+        check(has(rx::blob_refusal(0, t, b), "down: 1024 bytes at 2816 past the blob's 3072"), "down past the blob's end");
+        t = g;
+        t.off[2] = (uint64_t) -256;
+        check(has(rx::blob_refusal(0, t, b), "past the blob"), "an offset past the blob (no wrap in off + bytes)");
+        t = g;
+        t.off[1] = 1000;
+        check(has(rx::blob_refusal(0, t, b), "not 256-aligned"), "an offset not 256-aligned");
+        t = g;
+        t.off[1] = 768;
+        check(has(rx::blob_refusal(0, t, b), "up over its gate"), "up over gate");
+        check(has(rx::blob_refusal(3, g, b0), "layer 3's up: type 16 has no layout here, or its rows are not whole blocks"),
+              "a type with no layout");
+    }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;
 }

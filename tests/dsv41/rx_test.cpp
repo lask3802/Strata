@@ -8,7 +8,16 @@
 //               [--ref N (rows also checked against the double reference)]
 //               [--rtt-only 1 (no correctness or late-reply checks: a DS4_RX_NULL server's zeros)]
 //               [--ping N (then N pings of 56 B and of 10,320 B each way: the link and both ends' sockets alone)]
+//               [--fill 1 (as many blobs as the server's room holds, as the engine sends them: --experts N contents
+//                each layer, again under more expert ids)]
+//               [--bad-geo 1 (layer 0's down 256 bytes before its blob's end: past it - the server refuses at the Geo)]
+//               [--early 1 (a refusal must come before the last blob: one at the BlobsEnd is a failure)]
 //   (STRATA_STAGE_TOKEN: the same as the server's)
+// Exit 0 all good, 1 a failure, 3 the server refused the blobs with an Error (the engine drops it at load).  Two cases
+// of the server's load: a full room (the server with DS4_RX_TEST_VRAM_MIB=600 --expert-server-reserve-mib 0, this
+// with --fill 1): every blob held and served, exit 0; a type with no token kernel (--layers 16/16,16/13: the second
+// layer's down Q5_K): refused at load, exit 3.  Either way never a failure at a request.  A refusal at the Geo (the
+// room's VRAM, the geometry: --bad-geo 1) stops the blobs at once: --early 1 checks that.
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_iq.cuh"
 #include "../../src/dsv41/ds4_rx.hpp"
@@ -63,7 +72,8 @@ struct Layer {
 
 int main(int argc, char** argv) {
     std::string at = "7861", layers_s = "29/29,16/16,17/17,16/17";
-    int n_exp = 8, n_req = 200, n_rtt = 1000, picks = 6, n_ref = 24, rtt_only = 0, n_ping = 0;
+    int n_exp = 8, n_req = 200, n_rtt = 1000, picks = 6, n_ref = 24, rtt_only = 0, n_ping = 0, fill = 0, bad_geo = 0,
+        early = 0;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--listen") at = v;
@@ -74,6 +84,9 @@ int main(int argc, char** argv) {
         else if (a == "--ref") n_ref = std::atoi(v.c_str());
         else if (a == "--rtt-only") rtt_only = std::atoi(v.c_str());
         else if (a == "--ping") n_ping = std::atoi(v.c_str());
+        else if (a == "--fill") fill = std::atoi(v.c_str());
+        else if (a == "--bad-geo") bad_geo = std::atoi(v.c_str());
+        else if (a == "--early") early = std::atoi(v.c_str());
         else if (a == "--picks") picks = std::max(1, std::min(rx::kMaxPicks, std::atoi(v.c_str())));
         else { std::printf("unknown option %s\n", a.c_str()); return 2; }
     }
@@ -117,9 +130,9 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> blob(off, 0);
             for (int r = 0; r < 3; ++r) fill_blocks(rng, l.geo.K[r], blob.data() + l.geo.off[r], b[r]);
             l.blobs.push_back(std::move(blob));
-            all_b += off;
         }
     }
+    std::vector<int> sent(L.size(), n_exp);   // (each layer's expert ids 0 .. sent - 1: content id % n_exp)
     const char* tv = std::getenv("STRATA_STAGE_TOKEN");
     rx::Main m;
     std::string err;
@@ -130,27 +143,77 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("server %s (%s), %.2f GB of VRAM for blobs\n", m.peer().c_str(), m.name().c_str(), (double) m.room() / 1e9);
+    if (fill) {   // a blob a layer in turn while the room holds it
+        std::fill(sent.begin(), sent.end(), 0);
+        for (bool more = true; more;) {
+            more = false;
+            for (size_t li = 0; li < L.size(); ++li)
+                if (all_b + L[li].geo.blob <= m.room() && sent[li] < 65536) {
+                    all_b += L[li].geo.blob;
+                    ++sent[li];
+                    more = true;
+                }
+        }
+        for (size_t li = 0; li < L.size(); ++li)
+            if (sent[li] < picks) {
+                std::printf("FAILED: the room holds %d blobs of layer %zu, fewer than %d picks\n", sent[li], li, picks);
+                return 1;
+            }
+    } else {
+        for (const Layer& l : L) all_b += (uint64_t) n_exp * l.geo.blob;
+    }
     if (all_b > m.room()) {
         std::printf("FAILED: %.2f GB of test blobs do not fit\n", (double) all_b / 1e9);
         return 1;
     }
+    if (bad_geo) gl[0].off[2] = gl[0].blob - 256;   // (the blobs keep their real layout: only the geometry lies)
+    int n_all = 0;
+    for (int s : sent) n_all += s;
     const double t0 = rx::now_ms();
     int nb = 0;
+    // the server's Error (the engine drops it at load), after nb of the n_all blobs went out
+    auto refused = [&](bool at_end) {
+        const bool err_msg = err.rfind("expert server: ", 0) == 0;
+        if (!err_msg) {
+            std::printf("FAILED: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("REFUSED at load after %d of %d blobs, %.0f ms after the geometry: %s\n", nb, n_all, rx::now_ms() - t0,
+                    err.c_str());
+        if (early && at_end) {
+            std::printf("FAILED: --early: the refusal came only after every blob\n");
+            return 1;
+        }
+        return 3;
+    };
     if (!m.send_geo(gm, gl, err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
     for (size_t li = 0; li < L.size(); ++li)
-        for (int e = 0; e < n_exp; ++e, ++nb)
-            if (!m.send_blob((int) li, e, L[li].blobs[(size_t) e].data(), L[li].blobs[(size_t) e].size(), err)) {
-                std::printf("FAILED: %s\n", err.c_str());
-                return 1;
-            }
+        for (int e = 0; e < sent[li]; ++e, ++nb) {
+            const std::vector<uint8_t>& bl = L[li].blobs[(size_t) (e % n_exp)];
+            if (!m.send_blob((int) li, e, bl.data(), bl.size(), err)) return refused(false);
+        }
     std::vector<uint8_t> ok;
-    if (!m.end_blobs(nb, ok, 120000.0, err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
+    if (!m.end_blobs(nb, ok, 120000.0, err)) return refused(true);
     const double t_up = rx::now_ms() - t0;
     int held = 0;
     for (uint8_t v : ok) held += v;
     std::printf("upload: %d of %d blobs (%.1f MB) held, %.2f s (%.0f MB/s)\n", held, nb, (double) all_b / 1e6, t_up / 1000.0,
                 (double) all_b / 1e3 / t_up);
-    if (held != nb) { std::printf("FAILED: not every blob held\n"); return 1; }
+    std::vector<std::vector<int>> ids_of(L.size());   // (each layer's held expert ids)
+    for (size_t li = 0, i = 0; li < L.size(); ++li)
+        for (int e = 0; e < sent[li]; ++e, ++i)
+            if (ok[i]) ids_of[li].push_back(e);
+    int fails = 0;
+    if (held != nb) {
+        std::printf("FAILED: not every blob held%s\n", fill ? " (--fill: the requests take the held ones, as the engine's)" : "");
+        if (!fill) return 1;
+        ++fails;
+        for (size_t li = 0; li < L.size(); ++li)
+            if ((int) ids_of[li].size() < picks) {
+                std::printf("FAILED: layer %zu holds %zu blobs, fewer than %d picks\n", li, ids_of[li].size(), picks);
+                return 1;
+            }
+    }
 
     // the CPU lane's sum for a row: sum_i w_i expert_i(x), x as the server gets it (bf16)
     auto cpu_row = [&](const Layer& l, const rx::ReqRow& rw, const std::vector<float>& xb, std::vector<double>& y) {
@@ -159,7 +222,7 @@ int main(int argc, char** argv) {
         gg::iq_cpu_quant(l.fm.gu_act, xb.data(), E, act.data());
         std::vector<float> h(FF), yo(E);
         for (int i = 0; i < rw.n; ++i) {
-            const uint8_t* b = l.blobs[(size_t) rw.e[i]].data();
+            const uint8_t* b = l.blobs[(size_t) (rw.e[i] % n_exp)].data();
             const void* ap[1] = {act.data()};
             float* hp[1] = {h.data()};
             gg::iq_cpu_gate_up(l.fm, b + l.geo.off[0], b + l.geo.off[1], ap, 1, hp, 0, FF, lim);
@@ -178,7 +241,7 @@ int main(int argc, char** argv) {
         std::vector<float> wr((size_t) E);
         std::vector<double> h((size_t) FF);
         for (int i = 0; i < rw.n; ++i) {
-            const uint8_t* b = l.blobs[(size_t) rw.e[i]].data();
+            const uint8_t* b = l.blobs[(size_t) (rw.e[i] % n_exp)].data();
             for (int r = 0; r < FF; ++r) {
                 double gu[2];
                 for (int q = 0; q < 2; ++q) {
@@ -206,15 +269,14 @@ int main(int argc, char** argv) {
         }
         return std::sqrt(num / std::max(den, 1e-30));
     };
-    auto make_req = [&](int T, int k, std::vector<rx::ReqRow>& rows, std::vector<std::vector<float>>& xs) {
+    auto make_req = [&](int li, int T, int k, std::vector<rx::ReqRow>& rows, std::vector<std::vector<float>>& xs) {
         rows.assign((size_t) T, rx::ReqRow{});
         xs.assign((size_t) T, std::vector<float>((size_t) E));
         std::normal_distribution<float> nd(0.0f, 1.0f);
         for (int t = 0; t < T; ++t) {
             rows[(size_t) t].t = (uint8_t) t;
             rows[(size_t) t].n = (uint8_t) k;
-            std::vector<int> ids((size_t) n_exp);
-            for (int e = 0; e < n_exp; ++e) ids[(size_t) e] = e;
+            std::vector<int> ids = ids_of[(size_t) li];
             std::shuffle(ids.begin(), ids.end(), rng);
             for (int i = 0; i < k; ++i) {
                 rows[(size_t) t].e[i] = (int16_t) ids[(size_t) i];
@@ -234,7 +296,6 @@ int main(int argc, char** argv) {
     // main process computes without the server; the two round the activations differently: q8 a 32 values on the
     // device, Q8_K a 256 on the lane), and the first n_ref rows also both against the double reference: the server
     // must be about as close to it as the lane is
-    int fails = 0;
     double worst = 0, sum_rel = 0, ref_s = 0, ref_c = 0, ref_s_max = 0, ref_c_max = 0;
     int nrow = 0, n_ref_done = 0;
     uint32_t seq = 1;
@@ -244,7 +305,7 @@ int main(int argc, char** argv) {
         const int li = (int) (rng() % L.size());
         const int T = q % 4 == 0 ? 1 + (int) (rng() % rx::kMaxRows) : 1;
         const int k = 1 + (int) (rng() % (uint64_t) picks);
-        make_req(T, k, rows, xs);
+        make_req(li, T, k, rows, xs);
         if (!m.send_req(seq, li, T, rows.data(), ptrs(xs), err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
         const uint16_t* y = nullptr;
         int us = 0;
@@ -290,7 +351,7 @@ int main(int argc, char** argv) {
     // late reply - in first, the server answers in order - must be set aside by its seq (take_late), not taken
     if (!rtt_only) {
         (void) m.take_late();
-        make_req(rx::kMaxRows, picks, rows, xs);
+        make_req(0, rx::kMaxRows, picks, rows, xs);
         const uint32_t late = seq++;
         if (!m.send_req(late, 0, rx::kMaxRows, rows.data(), ptrs(xs), err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
         const uint16_t* y = nullptr;
@@ -298,9 +359,9 @@ int main(int argc, char** argv) {
         const int g1 = m.wait_resp(late, rx::kMaxRows, rx::now_ms() - 1.0, &y, us, err);
         std::vector<rx::ReqRow> rows2;
         std::vector<std::vector<float>> xs2;
-        make_req(1, picks, rows2, xs2);
+        make_req((int) (1 % L.size()), 1, picks, rows2, xs2);
         const uint32_t next = seq++;
-        if (!m.send_req(next, 1, 1, rows2.data(), ptrs(xs2), err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
+        if (!m.send_req(next, (int) (1 % L.size()), 1, rows2.data(), ptrs(xs2), err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
         const int g2 = m.wait_resp(next, 1, rx::now_ms() + 5000.0, &y, us, err);
         double num = 0, den = 0;
         if (g2 == 1) {
@@ -335,14 +396,15 @@ int main(int argc, char** argv) {
     for (int T : {1, 4}) {
         if (n_rtt <= 0) break;   // (--rtt 0: correctness only)
         std::vector<double> rt, srv, cs;
-        make_req(T, picks, rows, xs);
+        make_req(0, T, picks, rows, xs);
         const int warm = 50;
         for (int q = 0; q < n_rtt + warm; ++q, ++seq) {
             const double a = rx::now_ms();
-            for (int t = 0; t < T; ++t) rows[(size_t) t].e[0] = (int16_t) (q % n_exp);
             const int li = q % (int) L.size();
+            const std::vector<int>& id = ids_of[(size_t) li];
+            for (int t = 0; t < T; ++t) rows[(size_t) t].e[0] = (int16_t) id[(size_t) q % id.size()];
             for (int t = 0; t < T; ++t)   // (expert ids distinct within the row)
-                for (int i = 1; i < picks; ++i) rows[(size_t) t].e[i] = (int16_t) ((q + i) % n_exp);
+                for (int i = 1; i < picks; ++i) rows[(size_t) t].e[i] = (int16_t) id[(size_t) (q + i) % id.size()];
             if (!m.send_req(seq, li, T, rows.data(), ptrs(xs), err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
             const double a1 = rx::now_ms();
             const uint16_t* y = nullptr;

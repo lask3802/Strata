@@ -69,6 +69,12 @@ struct Args {
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s);
 /// grid (n_embd / 8, groups): part of every entry.
 bool down(const Args& a, int groups, int ne_max, cudaStream_t s);
+/// Whether gate_up / down have a kernel for the type (false: Q5_K / Q6_K, supported() for the dense GEMVs only); a type
+/// they take refuses only a geometry its kernels do not cover.
+bool token_kernel(int type);
+/// Loads gate_up's and down's kernels of every type for ne_max 1 (cudaFuncGetAttributes: CUDA's lazy loading takes
+/// their memory now).  false: one failed.
+bool load_moe_kernels();
 
 /// The prompt path's expert sets (ds4_gguf.cu's SetK): expert i's blob at wbase + i stride owns the sorted rows
 /// [bounds[i], bounds[i + 1]) (local row = sorted row - row0); gate / up: h16[local] = F16 swiglu over x[idx[local]]
@@ -127,6 +133,7 @@ bool dequant_rows(int type, const void* raw, size_t ld, int k, int n, uint16_t* 
 namespace tq {
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s);
 bool down(const Args& a, int groups, int ne_max, cudaStream_t s);
+bool load_moe_kernels();
 bool set_gate_up(const SetArgs& a, cudaStream_t s);
 bool set_down(const SetArgs& a, cudaStream_t s);
 bool mv(const MvJob* jobs, int n, cudaStream_t s);

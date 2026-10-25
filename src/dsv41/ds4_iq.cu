@@ -1552,6 +1552,34 @@ bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
     return true;
 }
 
+bool token_kernel(int t) {
+    if (is_tq(t)) return true;   // (every trellis type is one of DS4_TQ_SWITCH's)
+    bool ok = false;
+#define TK_(T) ok = true
+    DS4_IQ_SWITCH(t, TK_)
+#undef TK_
+    return ok;
+}
+
+bool load_moe_kernels() {
+#if !defined(STRATA_USE_HIP)
+    // (DS4_IQ_SWITCH's types; one missing from this list loads at its first launch)
+    for (int t : {kIQ2_XXS, kIQ2_XS, kIQ2_S, kIQ3_XXS, kIQ3_S, kIQ4_XS, kIQ1_S, kIQ1_M, kIQ4_NL, kQ4_K, kQ2_K, kQ3_K}) {
+        cudaFuncAttributes fa{};
+        bool ok = false;
+#define LK_(T) ok = cudaFuncGetAttributes(&fa, gate_up_kernel<T, 1>) == cudaSuccess && \
+                    cudaFuncGetAttributes(&fa, down_kernel<T, 1>) == cudaSuccess
+        DS4_IQ_SWITCH(t, LK_)
+#undef LK_
+        if (!ok) {
+            std::fprintf(stderr, "ds4 iq: the %s token kernels did not load (%s)\n", name(t), cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
+    }
+#endif
+    return tq::load_moe_kernels();
+}
+
 bool light_gate_up(const SetArgs& a, cudaStream_t s) {
     if (is_tq(a.tg)) return false;   // (the trellis sets take the tiles for every expert)
     if (a.n_exp > kLightMaxExp || !light_on() || a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
