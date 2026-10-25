@@ -9770,8 +9770,10 @@ struct Model::Impl {
         const double th = now_ms();
         CK(cudaStreamSynchronize(d.st));
         st.head_ms += now_ms() - th;
-        if (ep_verify)   // (the window's checks are in: its stream is done)
+        if (ep_verify) {   // (the window's checks are in: its stream is done)
             CK(cudaMemcpy(st.ep_verify, v_err, sizeof(float) * (size_t) std::min(g.nl, 64), cudaMemcpyDeviceToHost));
+            st.ep_verify_wrong = v_wrong;
+        }
         prof_collect();
         pos += T;
         st.tokens += T;

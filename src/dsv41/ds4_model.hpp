@@ -152,6 +152,7 @@ struct Stats {
     // part it was the largest relative difference since the load (the last layer's: before the head)
     int64_t ep_verify_n = 0;
     float ep_verify[64] = {};
+    bool ep_verify_wrong = false;   // DS4_EP_DEFER_VERIFY=2: the wrong comb on purpose (the check must see it)
 };
 
 class Model {

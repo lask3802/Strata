@@ -2036,14 +2036,20 @@ int main(int argc, char** argv) {
                              "the CPU lane is then the next layer's)\n", (long long) (s.ep_late - s0.ep_late),
                      (double) (s.ep_late - s0.ep_late) / (double) std::max<size_t>(1, out.size()));
     if (s.ep_verify_n > s0.ep_verify_n) {   // DS4_EP_DEFER_VERIFY
-        const float bound = 1e-5f;   // float order; any layer above it is a wiring bug (VERIFY=2 must exceed it)
-        int last = -1, worst = -1, above = 0;
+        // float order (estimated: a few ulp of the terms; the slot measures it); any layer above it is a wiring bug or
+        // a non-finite value (inf) - and under VERIFY=2 (the wrong comb) the check must see layers above it
+        const float bound = 1e-5f;
+        int last = -1, worst = -1, above = 0, seen = 0;
         for (int i = 0; i < 64; ++i)
             if (s.ep_verify[i] != 0.0f) {
                 last = i;
+                ++seen;
                 if (worst < 0 || s.ep_verify[i] > s.ep_verify[worst]) worst = i;
                 if (!(s.ep_verify[i] <= bound)) ++above;
             }
+        const char* verdict = s.ep_verify_wrong ? (above ? "the wrong comb seen: the check works"
+                                                         : "the wrong comb NOT seen: the check is blind")
+                                                : (above ? "MISMATCH (wiring, or inf)" : "ok");
         std::string ln;
         for (int i = 0; i <= last; ++i) {
             char b[32];
@@ -2052,10 +2058,10 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "ep defer verify: %lld checks of the deferred streams against the exact ones (the same "
                              "attention: float order only); the largest |d| / (1 + |exact|) by the layer whose part it "
-                             "was (the last: before the head):%s; worst %.2e at layer %d; bound %.0e: %d layers above "
-                             "it - %s\n",
+                             "was (the last: before the head; since the load):%s; worst %.2e at layer %d; bound %.0e: "
+                             "%d of the %d layers that differed above it - %s%s\n",
                      (long long) (s.ep_verify_n - s0.ep_verify_n), ln.c_str(), worst >= 0 ? s.ep_verify[worst] : 0.0f,
-                     worst, (double) bound, above, above ? "MISMATCH (wiring)" : "ok");
+                     worst, (double) bound, above, seen, s.ep_verify_wrong ? "DS4_EP_DEFER_VERIFY=2: " : "", verdict);
     }
     if (s.prof_tokens > s0.prof_tokens) {   // DS4_PROF
         const double pt = (double) (s.prof_tokens - s0.prof_tokens);
