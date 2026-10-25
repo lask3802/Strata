@@ -52,15 +52,18 @@ public:
     /// y[t * ldy + c] += the sum over row t's picks, in their order, of w x (the expert's n_ff slice [k, nb))(x[t]),
     /// for nr rows (<= kLaneMaxRows) of x (n_embd f32 values, ldx apart) and np picks (<= kLaneMaxPicks a row).  help: the
     /// caller works too (otherwise it only waits: the expert server's link thread stays off the lane's DRAM work).
-    /// False (err), y untouched: a layer not served, k outside [lo, nb), a pick out of range.
+    /// False (err), y untouched: a layer not served, k outside [lo, nb), a pick out of range, a row's expert twice.
     bool run(int layer, int k, const SlicePick* picks, int np, int nr, const float* x, size_t ldx, float* y, size_t ldy,
              bool help, std::string& err);
 
+    // (read on the thread that runs: not atomic)
     uint64_t bytes() const { return bytes_; }   // weight bytes the runs read
     double busy_ms() const { return busy_ms_; }   // their time, from the first quantization to the last sum
     int64_t runs() const { return runs_; }
 
 private:
+    bool init_(const ep::Parts& parts, const std::vector<Types>& types, int n_embd, int n_ff, float limit, int threads,
+               const std::vector<int>& cpus, int spin_us, std::string& err);
     struct Fmt {
         bool on = false;
         int cap = kLaneMaxRows;   // rows an entry (a call of the rows) at most

@@ -66,8 +66,10 @@ public:
         total_.store(n, std::memory_order_release);
         done_.store(0, std::memory_order_relaxed);
         ticket_.store(g << 32, std::memory_order_release);
-        gen_.store(g, std::memory_order_release);
-        if (sleeping_.load(std::memory_order_acquire) > 0) {
+        // (seq_cst, both: the other half is a worker's sleeping_ add, then its gen_ read - with release / acquire the store
+        // and the load may pass each other, the worker sleeps through this batch and nobody wakes it)
+        gen_.store(g, std::memory_order_seq_cst);
+        if (sleeping_.load(std::memory_order_seq_cst) > 0) {
             std::lock_guard<std::mutex> lk(mu_);
             cv_.notify_all();
         }

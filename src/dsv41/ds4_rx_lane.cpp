@@ -18,6 +18,13 @@ double now_ms() {
 
 bool SliceLane::init(const ep::Parts& parts, const std::vector<Types>& types, int n_embd, int n_ff, float limit, int threads,
                      const std::vector<int>& cpus, int spin_us, std::string& err) {
+    if (init_(parts, types, n_embd, n_ff, limit, threads, cpus, spin_us, err)) return true;
+    fmt_.clear();   // (refused: no layer served, every run refused)
+    return false;
+}
+
+bool SliceLane::init_(const ep::Parts& parts, const std::vector<Types>& types, int n_embd, int n_ff, float limit, int threads,
+                      const std::vector<int>& cpus, int spin_us, std::string& err) {
     parts_ = &parts;
     dim_ = n_embd;
     ff_ = n_ff;
@@ -98,6 +105,11 @@ bool SliceLane::run(int layer, int k, const SlicePick* picks, int np, int nr, co
         return false;
     }
     if (np == 0) return true;
+    for (int i = 0; i < np; ++i)
+        if (picks[i].t < 0 || picks[i].t >= nr || picks[i].e < 0 || picks[i].e >= parts_->experts()) {
+            err = "a slice pick of row " + std::to_string(picks[i].t) + ", expert " + std::to_string(picks[i].e);
+            return false;
+        }
     const double t0 = now_ms();
     const gg::IqCpu& fm = fmt_[(size_t) layer].fm;
     const int cap = fmt_[(size_t) layer].cap;
@@ -105,25 +117,34 @@ bool SliceLane::run(int layer, int k, const SlicePick* picks, int np, int nr, co
     gg::IqCpu fs;
     size_t d_off = 0;
     if (!gg::iq_cpu_slice(fm, ff0, ffn, fs, d_off, err)) return false;
-    // the entries: the picks by expert (a row picks an expert once; more than cap of one: the next entry)
+    // the entries: the picks by expert, then row (more than cap of one expert: the next entry); a row picks an expert
+    // once and kLaneMaxPicks experts at most
     std::vector<int> ord((size_t) np);
+    int per_row[kLaneMaxRows] = {};
     for (int i = 0; i < np; ++i) {
-        if (picks[i].t < 0 || picks[i].t >= nr || picks[i].e < 0 || picks[i].e >= parts_->experts()) {
-            err = "a slice pick of row " + std::to_string(picks[i].t) + ", expert " + std::to_string(picks[i].e);
+        ord[(size_t) i] = i;
+        if (++per_row[picks[i].t] > kLaneMaxPicks) {
+            err = "row " + std::to_string(picks[i].t) + ": more than " + std::to_string(kLaneMaxPicks) + " slice picks";
             return false;
         }
-        ord[(size_t) i] = i;
     }
-    std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return picks[a].e < picks[b].e; });
+    std::sort(ord.begin(), ord.end(),
+              [&](int a, int b) { return picks[a].e != picks[b].e ? picks[a].e < picks[b].e : picks[a].t < picks[b].t; });
+    for (size_t i = 1; i < ord.size(); ++i)
+        if (picks[ord[i]].e == picks[ord[i - 1]].e && picks[ord[i]].t == picks[ord[i - 1]].t) {
+            err = "row " + std::to_string(picks[ord[i]].t) + " picks expert " + std::to_string(picks[ord[i]].e) + " twice";
+            return false;
+        }
     std::vector<int> slot_of((size_t) np);
     ents_.clear();
     for (size_t a = 0; a < ord.size();) {
         Ent en;
         en.e = picks[ord[a]].e;
         en.slot0 = (int) a;
-        for (int kind = 0; kind < 3; ++kind)
-            if (!parts_->view(layer, en.e, kind, k, en.v[kind]) || (kind == 2 && en.v[2].row_bytes != fs.d_row)) {
-                err = "layer " + std::to_string(layer) + " expert " + std::to_string(en.e) + ": no part holds block " + std::to_string(k);
+        for (int kind = 0; kind < 3; ++kind)   // (a part to nb: two that overlap, the first one found may end before it)
+            if (!parts_->view(layer, en.e, kind, k, en.v[kind]) || en.v[kind].b != nb_ || (kind == 2 && en.v[2].row_bytes != fs.d_row)) {
+                err = "layer " + std::to_string(layer) + " expert " + std::to_string(en.e) + ": no part holds blocks [" + std::to_string(k) +
+                      ", " + std::to_string(nb_) + ")";
                 return false;
             }
         while (a < ord.size() && picks[ord[a]].e == en.e && en.n < cap) {

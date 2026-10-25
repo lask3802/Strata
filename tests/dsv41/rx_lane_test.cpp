@@ -114,44 +114,60 @@ static std::vector<uint8_t> cut(int l, int kind, const std::vector<uint8_t>& who
         out.insert(out.end(), whole.begin() + (long) (r * rb + (size_t) a * ub), whole.begin() + (long) (r * rb + (size_t) b * ub));
     return out;
 }
-// one set [a, NB) of every expert of `layers`; `type_of` the type each part line says (a test of the lane's checks)
-static void write_parts(const std::string& dir, const std::vector<std::vector<Expert>>& ex, int a, const std::vector<int>& layers,
-                        int down_type_override = -1) {
+// a file a set [a, b) of `sets`, each a part of every matrix of every expert of `layers` (in that order: the index's
+// part lines too); `down_type_override` the type each down part line says (a test of the lane's checks); `kinds` a set
+// each the matrices it holds (bit 0 gate, 1 up, 2 down; none given: all three)
+static void write_parts(const std::string& dir, const std::vector<std::vector<Expert>>& ex, const std::vector<std::pair<int, int>>& sets,
+                        const std::vector<int>& layers, int down_type_override = -1, const std::vector<int>& kinds = {}) {
     fs::create_directories(dir);
     std::string head = "ep-parts 1\npack_hash 00000000000000aa\nstamp 0000000000000000\nnonce 0000000000000001\n";
     head += "geometry " + std::to_string(E) + " " + std::to_string(FF) + " " + std::to_string(NL) + " " + std::to_string(NE) + " 256 4096\n";
-    std::string covered = "covered", parts, heat;
+    std::string covered = "covered", files, parts, heat;
     for (int l : layers) covered += " " + std::to_string(l);
-    std::vector<uint8_t> file(4096, 0);
     for (int l : layers)
-        for (int e = 0; e < NE; ++e) {
-            heat += "heat " + std::to_string(l) + " " + std::to_string(e) + " " + std::to_string(100 - e) + "\n";
-            for (int kind = 0; kind < 3; ++kind) {
-                file.resize((file.size() + 4095) / 4096 * 4096, 0);
-                const std::vector<uint8_t> p = cut(l, kind, ex[(size_t) l][(size_t) e].m[kind], a, NB);
-                const size_t rb = kind == 2 ? p.size() / E : mat_rb(l, kind), rows = p.size() / rb;
-                static const char* kn[3] = {"gate", "up", "down"};
-                const int ty = kind < 2 ? kTy[l][0] : (down_type_override >= 0 ? down_type_override : kTy[l][1]);
-                parts += "part " + std::to_string(l) + " " + std::to_string(e) + " " + kn[kind] + " " + std::to_string(ty) + " 0 " +
-                         std::to_string(a) + " " + std::to_string(NB) + " " + std::to_string(rows) + " " + std::to_string(rb) + " " +
-                         std::to_string(file.size()) + " " + std::to_string(p.size()) + "\n";
-                file.insert(file.end(), p.begin(), p.end());
-            }
-        }
-    file.resize((file.size() + 4095) / 4096 * 4096, 0);
-    const std::string name = "ep-parts-" + std::to_string(a) + "-" + std::to_string(NB) + ".bin";
-    std::string idx = head + covered + "\nfile 0 " + name + " " + std::to_string(a) + " " + std::to_string(NB) + " " +
-                      std::to_string(file.size()) + "\n" + heat + parts;
+        for (int e = 0; e < NE; ++e) heat += "heat " + std::to_string(l) + " " + std::to_string(e) + " " + std::to_string(100 - e) + "\n";
+    std::vector<std::vector<uint8_t>> bins;
+    for (size_t fi = 0; fi < sets.size(); ++fi) {
+        const int a = sets[fi].first, b = sets[fi].second;
+        std::vector<uint8_t> file(4096, 0);
+        for (int l : layers)
+            for (int e = 0; e < NE; ++e)
+                for (int kind = 0; kind < 3; ++kind) {
+                    if (!kinds.empty() && !(kinds[fi] & (1 << kind))) continue;
+                    file.resize((file.size() + 4095) / 4096 * 4096, 0);
+                    const std::vector<uint8_t> p = cut(l, kind, ex[(size_t) l][(size_t) e].m[kind], a, b);
+                    const size_t rb = kind == 2 ? p.size() / E : mat_rb(l, kind), rows = p.size() / rb;
+                    static const char* kn[3] = {"gate", "up", "down"};
+                    const int ty = kind < 2 ? kTy[l][0] : (down_type_override >= 0 ? down_type_override : kTy[l][1]);
+                    parts += "part " + std::to_string(l) + " " + std::to_string(e) + " " + kn[kind] + " " + std::to_string(ty) + " " +
+                             std::to_string(fi) + " " + std::to_string(a) + " " + std::to_string(b) + " " + std::to_string(rows) + " " +
+                             std::to_string(rb) + " " + std::to_string(file.size()) + " " + std::to_string(p.size()) + "\n";
+                    file.insert(file.end(), p.begin(), p.end());
+                }
+        file.resize((file.size() + 4095) / 4096 * 4096, 0);
+        files += "file " + std::to_string(fi) + " ep-parts-" + std::to_string(a) + "-" + std::to_string(b) + ".bin " + std::to_string(a) +
+                 " " + std::to_string(b) + " " + std::to_string(file.size()) + "\n";
+        bins.push_back(std::move(file));
+    }
+    std::string idx = head + covered + "\n" + files + heat + parts;
     const uint64_t stamp = index_stamp(idx);
     const size_t at = idx.find("stamp ");
     idx = idx.substr(0, at) + "stamp " + hex16(stamp) + idx.substr(idx.find('\n', at));
-    std::memcpy(file.data(), "EPPARTS1", 8);
-    for (int i = 0; i < 8; ++i) file[8 + (size_t) i] = (uint8_t) (stamp >> (8 * i));
-    const uint32_t hdr[3] = {0u, (uint32_t) a, (uint32_t) NB};
-    for (int j = 0; j < 3; ++j)
-        for (int i = 0; i < 4; ++i) file[16 + (size_t) j * 4 + (size_t) i] = (uint8_t) (hdr[j] >> (8 * i));
-    std::ofstream(dir + "/" + name, std::ios::binary | std::ios::trunc).write((const char*) file.data(), (std::streamsize) file.size());
+    for (size_t fi = 0; fi < sets.size(); ++fi) {
+        std::vector<uint8_t>& file = bins[fi];
+        std::memcpy(file.data(), "EPPARTS1", 8);
+        for (int i = 0; i < 8; ++i) file[8 + (size_t) i] = (uint8_t) (stamp >> (8 * i));
+        const uint32_t hdr[3] = {(uint32_t) fi, (uint32_t) sets[fi].first, (uint32_t) sets[fi].second};
+        for (int j = 0; j < 3; ++j)
+            for (int i = 0; i < 4; ++i) file[16 + (size_t) j * 4 + (size_t) i] = (uint8_t) (hdr[j] >> (8 * i));
+        const std::string name = "ep-parts-" + std::to_string(sets[fi].first) + "-" + std::to_string(sets[fi].second) + ".bin";
+        std::ofstream(dir + "/" + name, std::ios::binary | std::ios::trunc).write((const char*) file.data(), (std::streamsize) file.size());
+    }
     std::ofstream(dir + "/ep-parts.txt", std::ios::binary | std::ios::trunc) << idx;
+}
+static void write_parts(const std::string& dir, const std::vector<std::vector<Expert>>& ex, int a, const std::vector<int>& layers,
+                        int down_type_override = -1) {
+    write_parts(dir, ex, {{a, NB}}, layers, down_type_override);
 }
 
 // ---- the reference: the CPU lane's steps on the whole expert's bytes in place over [ff0, ff0 + ffn) (ep_slice_test's
@@ -240,8 +256,17 @@ int main() {
                 for (int nr : rows)
                     for (int l = 0; l < NL; ++l) {
                         const Req q = make_req(rng, nr);
-                        std::vector<float> y((size_t) nr * E, 0.0f);
-                        CHECK(lane.run(l, k, q.picks.data(), (int) q.picks.size(), nr, q.x.data(), E, y.data(), E, threads == 0, err));
+                        // (x and y rows LD apart on every second request: the lane must not take them E apart)
+                        const size_t LD = (cases & 1) ? (size_t) E + 64 : (size_t) E;
+                        std::vector<float> xl((size_t) nr * LD, 1e30f), yl((size_t) nr * LD, 0.0f), y((size_t) nr * E, 0.0f);
+                        for (int t = 0; t < nr; ++t) std::memcpy(xl.data() + (size_t) t * LD, q.x.data() + (size_t) t * E, (size_t) E * 4);
+                        CHECK(lane.run(l, k, q.picks.data(), (int) q.picks.size(), nr, xl.data(), LD, yl.data(), LD, threads == 0, err));
+                        bool pad_ok = true;   // (the gaps between y's rows untouched)
+                        for (int t = 0; t < nr; ++t) {
+                            std::memcpy(y.data() + (size_t) t * E, yl.data() + (size_t) t * LD, (size_t) E * 4);
+                            for (size_t c = (size_t) E; c < LD; ++c) pad_ok = pad_ok && yl[(size_t) t * LD + c] == 0.0f;
+                        }
+                        CHECK(pad_ok);
                         // the reference: each pick's slice in place, the weighted sum in pick order; and the whole
                         std::vector<double> ys((size_t) nr * E, 0.0), yw((size_t) nr * E, 0.0), ymax((size_t) nr, 1e-30);
                         std::vector<float> ymain((size_t) nr * E, 0.0f);
@@ -312,6 +337,13 @@ int main() {
                 bad[1] = {1, 0, 0.5f};   // (row 1 of a 1-row request)
                 CHECK(!lane.run(0, NB - 1, bad, 2, 1, q.x.data(), E, y.data(), E, true, err));
                 CHECK(!lane.run(0, NB - 1, q.picks.data(), (int) q.picks.size(), 0, q.x.data(), E, y.data(), E, true, err));
+                bad[1] = q.picks[0];   // (row 0 picks the same expert twice)
+                CHECK(!lane.run(0, NB - 1, bad, 2, 1, q.x.data(), E, y.data(), E, true, err) && err.find("twice") != std::string::npos);
+                rx::SlicePick nine[9];
+                for (int i = 0; i < 9; ++i) nine[i] = {0, i % NE, 0.1f};   // (9 of row 0, within np <= nr x 8 of 2 rows)
+                std::vector<float> x2((size_t) 2 * E, 0.5f), y2((size_t) 2 * E, 7.0f);
+                CHECK(!lane.run(0, NB - 1, nine, 9, 2, x2.data(), E, y2.data(), E, true, err) && err.find("more than") != std::string::npos);
+                for (float v : y2) CHECK(v == 7.0f);
                 bool same = true;
                 for (float v : y) same = same && v == 7.0f;
                 CHECK(same);
@@ -321,6 +353,37 @@ int main() {
     }
     std::printf("lane against the slice in place: %d requests, max %.2e of max|y|; main [0,k) + lane against whole: max %.2e\n",
                 cases, worst_slice, worst_whole);
+    // ---- gate / up parts that overlap, [3, 6) and [5, 9), the down's [5, 9) alone (Parts::open takes them; a view of block
+    // 5 is the first part, [3, 6)): k 5 refused rather than the slice's gate / up rows read past that part's end; k 6 from
+    // [5, 9) alone, the slice's values
+    {
+        write_parts((root / "ov").string(), ex, {{3, 6}, {5, 9}}, {0, 1, 2}, -1, {3, 7});
+        ep::Parts p;
+        std::string err;
+        CHECK(p.open((root / "ov").string(), err));
+        rx::SliceLane lane;
+        CHECK(lane.init(p, types, E, FF, kLim, 0, {}, 50, err) && lane.lo() == 5);
+        const Req q = make_req(rng, 1);
+        std::vector<float> y((size_t) E, 7.0f);
+        CHECK(!lane.run(0, 5, q.picks.data(), (int) q.picks.size(), 1, q.x.data(), E, y.data(), E, true, err));
+        bool same = true;
+        for (float v : y) same = same && v == 7.0f;
+        CHECK(same);
+        std::printf("  overlapping parts, k 5: refused (%s)\n", err.c_str());
+        std::fill(y.begin(), y.end(), 0.0f);
+        CHECK(lane.run(0, 6, q.picks.data(), (int) q.picks.size(), 1, q.x.data(), E, y.data(), E, true, err));
+        std::vector<double> ys((size_t) E, 0.0);
+        double ymax = 1e-30, d = 0;
+        for (const rx::SlicePick& pk : q.picks) {
+            std::vector<uint8_t> xa(fm[0].act_bytes);
+            gg::iq_cpu_quant(fm[0].gu_act, q.x.data() + (size_t) pk.t * E, E, xa.data());
+            const std::vector<float> rs = ref_slice(0, ex[0][(size_t) pk.e], fm[0], xa, 6 * 256, FF - 6 * 256);
+            for (int c = 0; c < E && !rs.empty(); ++c) ys[(size_t) c] += (double) pk.w * rs[(size_t) c];
+        }
+        for (int c = 0; c < E; ++c) ymax = std::max(ymax, std::fabs(ys[(size_t) c]));
+        for (int c = 0; c < E; ++c) d = std::max(d, std::fabs((double) y[(size_t) c] - ys[(size_t) c]) / ymax);
+        CHECK(d < 1e-6);
+    }
     // ---- init refusals: a layer the parts do not cover, a down type not the layer's, another geometry
     {
         write_parts((root / "l0").string(), ex, 6, {0});
@@ -332,6 +395,11 @@ int main() {
             rx::SliceLane lane;
             CHECK(!lane.init(p, types, E, FF, kLim, 0, {}, 50, err));   // (layers 1, 2 served, not covered)
             std::printf("  refused, layer 1 not covered: %s\n", err.c_str());
+            {   // (a lane whose init failed serves nothing - not the layers it had looked at before the refusal)
+                std::vector<float> y((size_t) E, 0.0f);
+                const Req q = make_req(rng, 1);
+                CHECK(!lane.run(0, NB - 1, q.picks.data(), (int) q.picks.size(), 1, q.x.data(), E, y.data(), E, true, err));
+            }
             std::vector<rx::SliceLane::Types> only0 = {types[0], {0, 0}, {0, 0}};
             rx::SliceLane lane2;
             CHECK(lane2.init(p, only0, E, FF, kLim, 0, {}, 50, err) && lane2.lo() == 6);
