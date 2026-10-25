@@ -1,10 +1,12 @@
 // src/dsv41/ds4_rx_cpu.cpp - the expert server of ds4_rx.hpp without a GPU, for tests (--expert-server-cpu): the
 // same hello, geometry, blobs and request loop as ds4_rx_server.cu (serve_loop, serve_next), each request's rows through
 // the CPU lane's own arithmetic for the i-quant experts (ds4_iq_cpu.cpp: x quantized as the lane does, the clamped
-// swiglu, the down rows, the weighted sum in pick order), the blobs in RAM.
+// swiglu, the down rows, the weighted sum in pick order), the blobs in RAM; with parts (--expert-server-parts) the slice
+// picks through the same SliceServer as the GPU server's, the row's sum their sum plus the whole picks'.
 #include "ds4_rx.hpp"
 
 #include "ds4_gguf_cpu.hpp"
+#include "ds4_rx_lane.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -19,16 +21,20 @@ namespace {
 
 struct CpuArg {
     const std::string& token;
+    SliceServer& sl;
 };
 
 // one main process: 0 when it went away (or was refused)
 int cpu_session(Conn& c, void* arg) {
     const std::string& token = ((const CpuArg*) arg)->token;
+    SliceServer& sl = ((CpuArg*) arg)->sl;
     std::string err;
     const char* rv = std::getenv("DS4_RX_CPU_ROOM_MIB");
     HelloMsg me;
     std::memcpy(me.token, token.data(), std::min(token.size(), sizeof me.token - 1));
     me.room = (uint64_t) (rv != nullptr && *rv != '\0' ? std::max(0LL, std::atoll(rv)) : 2048LL) << 20;
+    me.lo = sl.lo();
+    me.lane_threads = sl.threads();
     std::snprintf(me.name, sizeof me.name, "CPU (tests)");
     if (!c.send(Hello, 0, 0, 0, 0, &me, sizeof me, err)) return 0;
     Hdr h;
@@ -40,10 +46,10 @@ int cpu_session(Conn& c, void* arg) {
     }
     HelloMsg peer;
     std::memcpy(&peer, p.data(), sizeof peer);
-    if (std::strncmp(peer.token, me.token, sizeof me.token) != 0) {
-        const char why[] = "wrong token (STRATA_STAGE_TOKEN)";
-        (void) c.send(Error, 0, 0, 0, 0, why, sizeof why - 1, err);
-        std::fprintf(stderr, "expert server (CPU): %s: %s\n", c.peer().c_str(), why);
+    if (peer.proto != kProto || std::strncmp(peer.token, me.token, sizeof me.token) != 0) {
+        const std::string why = peer.proto != kProto ? "protocol differs" : "wrong token (STRATA_STAGE_TOKEN)";
+        (void) c.send(Error, 0, 0, 0, 0, why.data(), why.size(), err);
+        std::fprintf(stderr, "expert server (CPU): %s: %s\n", c.peer().c_str(), why.c_str());
         return 0;
     }
     if (c.recv(h, p, -1, err) != 1 || h.type != Geo || p.size() < sizeof(GeoMsg)) {
@@ -74,8 +80,9 @@ int cpu_session(Conn& c, void* arg) {
         const std::string why = blob_refusal((int) li, layers[li], bytes);
         if (!why.empty()) return refuse_now("the geometry: " + why);
     }
-    std::fprintf(stderr, "expert server (CPU): main process %s: %d layers, n_embd %d, n_ff %d; %.2f GB of RAM for blobs\n",
-                 c.peer().c_str(), g.n_layers, g.n_embd, g.n_ff, (double) me.room / 1e9);
+    if (const std::string why = sl.geo(g, layers); !why.empty()) return refuse_now(why);
+    std::fprintf(stderr, "expert server (CPU): main process %s: %d layers, n_embd %d, n_ff %d; %.2f GB of RAM for blobs; %s\n",
+                 c.peer().c_str(), g.n_layers, g.n_embd, g.n_ff, (double) me.room / 1e9, sl.note().c_str());
     std::unordered_map<uint32_t, std::vector<uint8_t>> blobs;   // (layer << 16 | expert)
     uint64_t used = 0;
     std::vector<uint8_t> ok;
@@ -104,9 +111,10 @@ int cpu_session(Conn& c, void* arg) {
     if (!c.send(BlobsOk, 0, (int32_t) ok.size(), 0, 0, ok.data(), ok.size(), err)) return 0;
     std::fprintf(stderr, "expert server (CPU): %zu blobs (%.2f GB) in RAM; serving\n", blobs.size(), (double) used / 1e9);
     const int D = g.n_embd, FF = g.n_ff;
-    std::vector<float> x((size_t) D), hh((size_t) FF), yo((size_t) D), y((size_t) D);
+    std::vector<float> xs((size_t) kMaxRows * D), hh((size_t) FF), yo((size_t) D), y((size_t) D), ys((size_t) kMaxRows * D);
     std::vector<uint8_t> act, hact;
-    std::vector<uint16_t> yb((size_t) kMaxRows * D);
+    std::vector<uint16_t> yb((size_t) 2 * kMaxRows * D);
+    std::vector<ReqRow> rws((size_t) kMaxRows);
     int64_t served = 0, pings = 0, wakes = 0;
     for (;;) {
         if (serve_next(c, h, p, pings, wakes, err) != 1) {
@@ -123,20 +131,26 @@ int cpu_session(Conn& c, void* arg) {
         if (li < 0 || li >= g.n_layers || nr < 1 || nr > kMaxRows || p.size() != (size_t) nr * per) why = "a malformed request";
         else if (!takes[(size_t) li]) why = "layer " + std::to_string(li) + " is not served here";
         for (int j = 0; why.empty() && j < nr; ++j) {
-            ReqRow rw;
+            ReqRow& rw = rws[(size_t) j];
             std::memcpy(&rw, p.data() + (size_t) j * per, sizeof rw);
-            if (rw.n < 1 || rw.n > kMaxPicks) {
-                why = "a request row with " + std::to_string(rw.n) + " picks";
-                break;
-            }
-            const gg::IqCpu& f = fm[(size_t) li];
+            why = row_refusal(rw, h.c, sl.on());
             const uint16_t* xb = (const uint16_t*) (p.data() + (size_t) j * per + sizeof(ReqRow));
-            for (int i = 0; i < D; ++i) x[(size_t) i] = bf2f(xb[i]);
+            for (int i = 0; i < D; ++i) xs[(size_t) j * D + i] = bf2f(xb[i]);
+        }
+        // the slice picks (the lane's, from the parts), then each row's whole ones here, the sum of both
+        if (why.empty() && !sl.run(li, h.c, rws.data(), nr, xs.data(), (size_t) D, ys.data(), (size_t) D, why) && why.empty())
+            why = "the slice picks failed";
+        const bool sets = (h.c & kReqSets) != 0;
+        for (int j = 0; why.empty() && j < nr; ++j) {
+            const ReqRow& rw = rws[(size_t) j];
+            const gg::IqCpu& f = fm[(size_t) li];
+            const float* x = xs.data() + (size_t) j * D;
             act.resize(f.act_bytes);
             hact.resize(f.h_bytes);
-            gg::iq_cpu_quant(f.gu_act, x.data(), D, act.data());
+            gg::iq_cpu_quant(f.gu_act, x, D, act.data());
             std::fill(y.begin(), y.end(), 0.0f);
             for (int i = 0; i < rw.n; ++i) {
+                if ((rw.slice >> i) & 1) continue;   // (a slice pick: the lane's, in ys)
                 auto it = blobs.find((uint32_t) li << 16 | (uint32_t) (uint16_t) rw.e[i]);
                 if (it == blobs.end()) {
                     why = "layer " + std::to_string(li) + " expert " + std::to_string(rw.e[i]) + " is not here";
@@ -153,14 +167,23 @@ int cpu_session(Conn& c, void* arg) {
                 gg::iq_cpu_down(f, b + gl.off[2], hq, 1, yp, 0, D);
                 for (int k = 0; k < D; ++k) y[(size_t) k] += rw.w[i] * yo[(size_t) k];
             }
-            for (int k = 0; k < D; ++k) yb[(size_t) j * D + k] = f2bf(y[(size_t) k]);
+            const float* yl = ys.data() + (size_t) j * D;
+            for (int k = 0; k < D; ++k) {
+                if (sets) {   // (DS4_EP_SPLIT_VERIFY: the whole picks' sum, then the slice picks' after all the rows)
+                    yb[(size_t) j * D + k] = f2bf(y[(size_t) k]);
+                    yb[(size_t) (nr + j) * D + k] = f2bf(yl[k]);
+                } else {
+                    yb[(size_t) j * D + k] = f2bf(rw.slice != 0 ? y[(size_t) k] + yl[k] : y[(size_t) k]);
+                }
+            }
         }
         if (!why.empty()) {
             (void) c.send(Error, h.seq, 0, 0, 0, why.data(), why.size(), err);
             std::fprintf(stderr, "expert server (CPU): %s\n", why.c_str());
             return 0;
         }
-        if (!c.send(Resp, h.seq, nr, 0, (int32_t) ((now_ms() - tr) * 1000.0), yb.data(), (size_t) nr * D * 2, err)) {
+        if (!c.send(Resp, h.seq, nr, (int32_t) (sl.last_ms() * 1000.0), (int32_t) ((now_ms() - tr) * 1000.0), yb.data(),
+                    (size_t) (sets ? 2 : 1) * nr * D * 2, err)) {
             std::fprintf(stderr, "expert server (CPU): reply failed (%s)\n", err.c_str());
             return 0;
         }
@@ -170,9 +193,18 @@ int cpu_session(Conn& c, void* arg) {
 
 }  // namespace
 
-int serve_cpu(const std::string& host_port, const std::string& token, bool once) {
+int serve_cpu(const std::string& host_port, const std::string& token, bool once, const std::string& parts_dir) {
     if (token.empty()) std::fprintf(stderr, "expert server (CPU): WARNING: no STRATA_STAGE_TOKEN\n");
-    CpuArg a{token};
+    SliceServer sl;
+    std::string err;
+    if (!parts_dir.empty()) {
+        if (!sl.open(parts_dir, link_cpu(), err)) {
+            std::fprintf(stderr, "expert server (CPU): %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "expert server (CPU): %s\n", sl.note().c_str());
+    }
+    CpuArg a{token, sl};
     return serve_loop(host_port, once, "expert server (CPU)", cpu_session, &a);
 }
 

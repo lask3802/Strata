@@ -11,6 +11,7 @@
 #include "ds4_epparts.hpp"
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_pool.hpp"
+#include "ds4_rx.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -87,6 +88,43 @@ private:
     uint64_t bytes_ = 0;
     double busy_ms_ = 0.0;
     int64_t runs_ = 0;
+};
+
+/// Either expert server's slice picks (ds4_rx.hpp, H'): the parts pack (--expert-server-parts DIR) opened once a process,
+/// checked at each main process's Geo, then each request's slice picks through a SliceLane whose workers run off the link
+/// core - one a physical core (11 on a 12-core 5900X); DS4_RX_LANE_THREADS=N: N of them, past the physical cores every
+/// logical CPU off the link core (the A/B of SMT).  The link thread does not work in the lane: it only waits.
+class SliceServer {
+public:
+    /// the parts at `dir`; `link`: the link core (rx::link_cpu(), -1: none) the lane stays off.  False (err): parts it
+    /// cannot open, none covered, or an expert's matrix with no part to the last n_ff block.  DS4_RX_PARTS_WARM=1: every
+    /// page of the parts read once here (the first tokens' slices not from the disk)
+    bool open(const std::string& dir, int link, std::string& err);
+    bool on() const { return parts_.is_open(); }
+    int lo() const { return on() ? lo_ : 0; }   // (the hello's: the lowest k every covered layer's parts take; 0: none)
+    int threads() const { return on() ? threads_ : 0; }
+    const std::vector<int>& cpus() const { return cpus_; }
+    /// the parts in a line: the pack, the blocks held, the bytes and how many of them are in the page cache (Linux)
+    std::string note() const;
+    /// a main process's Geo: "" or why these parts do not serve it - another pack (pack_hash), a served layer (K[0] != 0)
+    /// they do not cover, gate and up of two types, a part of another type or layout than the layer's (SliceLane::init).
+    /// The lane set up for it ("" without parts: nothing to check)
+    std::string geo(const GeoMsg& g, const std::vector<GeoLayer>& layers);
+    /// a request's slice picks (its rows' slice bits; c: kReqK, kReqWrong) of x (nr rows of n_embd floats, ldx apart)
+    /// into ys (nr rows, ldy apart: each its slice picks' sum, in their order; 0 for a row with none).  False (err)
+    bool run(int layer, int32_t c, const ReqRow* rows, int nr, const float* x, size_t ldx, float* ys, size_t ldy,
+             std::string& err);
+    double last_ms() const { return last_ms_; }   // the last run's time in the lane
+    const SliceLane& lane() const { return lane_; }
+
+private:
+    ep::Parts parts_;
+    SliceLane lane_;
+    std::string dir_;
+    int lo_ = 0, threads_ = 0;
+    std::vector<int> cpus_;
+    double last_ms_ = 0.0;
+    bool wrong_said_ = false;
 };
 
 }  // namespace strata::ds4::rx

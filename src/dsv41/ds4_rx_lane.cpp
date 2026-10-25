@@ -3,7 +3,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
+#include <thread>
 
 namespace strata::ds4::rx {
 namespace gg = strata::ds4::gguf;
@@ -11,7 +14,7 @@ namespace gg = strata::ds4::gguf;
 namespace {
 constexpr int kRb = 64;     // rows a job (the main's cpu_experts_iq: RB)
 constexpr int kSumCols = 512;   // the weighted sums' columns a job
-double now_ms() {
+double lane_ms_now() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 }  // namespace
@@ -110,7 +113,7 @@ bool SliceLane::run(int layer, int k, const SlicePick* picks, int np, int nr, co
             err = "a slice pick of row " + std::to_string(picks[i].t) + ", expert " + std::to_string(picks[i].e);
             return false;
         }
-    const double t0 = now_ms();
+    const double t0 = lane_ms_now();
     const gg::IqCpu& fm = fmt_[(size_t) layer].fm;
     const int cap = fmt_[(size_t) layer].cap;
     const int E = dim_, ff0 = 256 * k, ffn = ff_ - ff0;
@@ -210,9 +213,142 @@ bool SliceLane::run(int layer, int k, const SlicePick* picks, int np, int nr, co
     go(SC);
     for (const Ent& en : ents)
         bytes_ += 2 * (uint64_t) en.v[0].rows * en.v[0].row_bytes + (uint64_t) en.v[2].rows * en.v[2].row_bytes;
-    busy_ms_ += now_ms() - t0;
+    busy_ms_ += lane_ms_now() - t0;
     ++runs_;
     (void) d_off;
+    return true;
+}
+
+bool SliceServer::open(const std::string& dir, int link, std::string& err) {
+    dir_ = dir;
+    if (!parts_.open(dir, err)) return false;
+    const int nb = parts_.blocks();
+    lo_ = 0;
+    bool any = false;
+    for (int l = 0; l < parts_.layers(); ++l) {   // (the lowest k every covered layer's every matrix takes: the hello's lo)
+        if (!parts_.covers(l)) continue;
+        any = true;
+        for (int e = 0; e < parts_.experts(); ++e)
+            for (int kind = 0; kind < 3; ++kind) {
+                ep::View v;
+                if (!parts_.view(l, e, kind, nb - 1, v) || v.b != nb) {
+                    err = "the parts at " + dir + ": layer " + std::to_string(l) + " expert " + std::to_string(e) +
+                          (kind == 0 ? " gate" : kind == 1 ? " up" : " down") + ": no part holds the last n_ff block";
+                    parts_.close();
+                    return false;
+                }
+                lo_ = std::max(lo_, v.a);
+            }
+    }
+    if (!any || lo_ < 1) {
+        err = "the parts at " + dir + (any ? " start at block 0: the main would have no part of n_ff" : " cover no layer");
+        parts_.close();
+        return false;
+    }
+    // the lane's CPUs: off the link core (its SMT siblings too), one a physical core; DS4_RX_LANE_THREADS past them:
+    // every logical CPU off the link core
+    const std::vector<int> link_sibs = link >= 0 ? os::cpu_siblings(link) : std::vector<int>();
+    std::vector<int> phys, logical;
+    const int hw = (int) std::max(1u, std::thread::hardware_concurrency());
+    for (int c = 0; c < hw && c < 1024; ++c) {
+        if (!os::cpu_allowed(c) || std::find(link_sibs.begin(), link_sibs.end(), c) != link_sibs.end()) continue;
+        logical.push_back(c);
+        if (os::cpu_siblings(c).front() == c) phys.push_back(c);
+    }
+    const char* tv = std::getenv("DS4_RX_LANE_THREADS");
+    const int want = tv != nullptr && *tv != '\0' ? std::max(0, std::atoi(tv)) : (int) phys.size();
+    cpus_ = want <= (int) phys.size() ? phys : logical;
+    threads_ = std::min(want, (int) cpus_.size());   // (no CPU known: none - the link thread computes the slices)
+    cpus_.resize((size_t) threads_);
+    if (const char* wv = std::getenv("DS4_RX_PARTS_WARM"); wv != nullptr && *wv == '1') {
+        const double t0 = lane_ms_now();
+        uint64_t sum = 0, n = 0;
+        for (const ep::Parts::File& f : parts_.files()) {
+            os::advise(f.fd, 0, f.bytes, true);
+            for (uint64_t at = 0; at < f.bytes; at += 4096) sum += f.map[at];   // (each page read once)
+            n += f.bytes;
+        }
+        std::fprintf(stderr, "expert server: the parts' %.2f GB read once in %.1f s (DS4_RX_PARTS_WARM; %llu)\n",
+                     (double) n / 1e9, (lane_ms_now() - t0) / 1000.0, (unsigned long long) (sum & 1));
+    }
+    return true;
+}
+
+std::string SliceServer::note() const {
+    if (!on()) return "no parts (whole picks only)";
+    uint64_t n = 0, cold = 0;
+    for (const ep::Parts::File& f : parts_.files()) {
+        n += f.bytes;
+        cold += os::cold_bytes(f.map, f.bytes);
+    }
+    char cache[64] = "";
+#if defined(__linux__)
+    std::snprintf(cache, sizeof cache, ", %.2f GB of them in the page cache", (double) (n - cold) / 1e9);
+#endif
+    char b[400];
+    std::snprintf(b, sizeof b, "parts %s: n_ff blocks [%d, %d), %.2f GB%s (pack_hash %016llx); the CPU lane %d workers "
+                  "off the link core", dir_.c_str(), lo_, parts_.blocks(), (double) n / 1e9, cache,
+                  (unsigned long long) parts_.pack_hash(), threads_);
+    std::string s = b;
+    if (!cpus_.empty()) {
+        s += " (CPUs";
+        for (int c : cpus_) s += " " + std::to_string(c);
+        s += ")";
+    }
+    return s;
+}
+
+std::string SliceServer::geo(const GeoMsg& g, const std::vector<GeoLayer>& layers) {
+    if (!on()) return "";
+    if (g.pack_hash != parts_.pack_hash()) {
+        char b[200];
+        std::snprintf(b, sizeof b, "the parts at %s were cut from another pack (pack_hash %016llx, the main's %016llx)",
+                      dir_.c_str(), (unsigned long long) parts_.pack_hash(), (unsigned long long) g.pack_hash);
+        return b;
+    }
+    std::vector<SliceLane::Types> ty(layers.size());
+    for (size_t l = 0; l < layers.size(); ++l) {
+        const GeoLayer& G = layers[l];
+        if (G.K[0] == 0) continue;
+        if (G.K[0] != G.K[1])
+            return "layer " + std::to_string(l) + ": gate and up of two types (" + std::to_string(G.K[0]) + ", " +
+                   std::to_string(G.K[1]) + "): the CPU lane takes one";
+        ty[l] = {G.K[0], G.K[2]};
+    }
+    std::string err;
+    if (!lane_.init(parts_, ty, g.n_embd, g.n_ff, g.limit, threads_, cpus_, 50000, err))
+        return "the parts at " + dir_ + ": " + err;
+    return "";
+}
+
+bool SliceServer::run(int layer, int32_t c, const ReqRow* rows, int nr, const float* x, size_t ldx, float* ys, size_t ldy,
+                      std::string& err) {
+    last_ms_ = 0.0;
+    const int dim = parts_.dim();
+    std::vector<SlicePick> pk;
+    for (int j = 0; j < nr; ++j) {
+        for (int c2 = 0; c2 < dim; ++c2) ys[(size_t) j * ldy + (size_t) c2] = 0.0f;
+        for (int i = 0; i < rows[j].n && i < kMaxPicks; ++i)
+            if ((rows[j].slice >> i) & 1) pk.push_back({j, rows[j].e[i], rows[j].w[i]});
+    }
+    if (pk.empty()) return true;
+    if (!on()) {
+        err = "slice picks, and no parts here (--expert-server-parts)";
+        return false;
+    }
+    int k = c & kReqK, times = 1;
+    if (c & kReqWrong) {   // (the check's own check: [k - 1, nb) where the parts hold it, else [k, nb) added twice)
+        if (k - 1 >= lo_) --k;
+        else times = 2;
+        if (!wrong_said_)
+            std::fprintf(stderr, "expert server: DS4_EP_SPLIT_VERIFY=2: the slice picks' sums wrong on purpose (%s)\n",
+                         times == 2 ? "[k, nb) twice: the parts hold no block before k" : "from block k - 1");
+        wrong_said_ = true;
+    }
+    const double t0 = lane_ms_now();
+    for (int r = 0; r < times; ++r)
+        if (!lane_.run(layer, k, pk.data(), (int) pk.size(), nr, x, ldx, ys, ldy, false, err)) return false;
+    last_ms_ = lane_ms_now() - t0;
     return true;
 }
 

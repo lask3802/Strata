@@ -15,6 +15,7 @@
 //                                                                     lane's experts on an expert server's GPU
 //   maya-ds4 --expert-server-connect HOST:PORT [--expert-server-reserve-mib N] [--expert-server-once] [--gpus I]
 //            [--expert-server-cpu]                                     (tests: the CPU lane's arithmetic, no GPU)
+//            [--expert-server-parts DIR]                               (H': slice picks from U3's parts pack)
 //                                                                     that server: no pack, it dials the main process
 //
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
@@ -114,7 +115,7 @@ void usage() {
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
                  "           | --pack-info)\n"
                  "maya-ds4 --expert-server-connect HOST:PORT [--expert-server-reserve-mib N] [--expert-server-once] [--gpus I]\n"
-                 "           [--expert-server-cpu (tests: no GPU)]\n");
+                 "           [--expert-server-cpu (tests: no GPU)] [--expert-server-parts DIR]\n");
 }
 
 // stdin lines on a thread, so a request can see STOP while it decodes
@@ -1598,6 +1599,7 @@ int main(int argc, char** argv) {
     const char* rx_flag = nullptr;   // (an expert server's flag given: it needs --expert-server-connect)
     bool rx_once = false;
     bool rx_cpu = false;        // (--expert-server-cpu, tests: the CPU lane's arithmetic, no GPU)
+    std::string rx_parts;       // (--expert-server-parts: the parts pack of H' slice picks, their n_ff blocks [k, nb))
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1684,6 +1686,9 @@ int main(int argc, char** argv) {
         } else if (a == "--expert-server-cpu") {
             rx_cpu = true;
             rx_flag = "--expert-server-cpu";
+        } else if (a == "--expert-server-parts") {
+            rx_parts = val("--expert-server-parts");
+            rx_flag = "--expert-server-parts";
         } else if (a == "--help" || a == "-h") {
             usage();
             return 0;
@@ -1701,8 +1706,8 @@ int main(int argc, char** argv) {
     if (!rx_at.empty()) {   // the expert server (ds4_rx.hpp): no pack, the main process sends what it computes
         std::string token;
         if (!stage_token(token)) return 1;
-        if (rx_cpu) return strata::ds4::rx::serve_cpu(rx_at, token, rx_once);
-        return strata::ds4::rx::serve(rx_at, token, rx_reserve, o.gpus.empty() ? 0 : o.gpus[0], rx_once);
+        if (rx_cpu) return strata::ds4::rx::serve_cpu(rx_at, token, rx_once, rx_parts);
+        return strata::ds4::rx::serve(rx_at, token, rx_reserve, o.gpus.empty() ? 0 : o.gpus[0], rx_once, rx_parts);
     }
     if (pack_info_mode) {   // the pack's description only: no device, no weights, no lock
         if (o.pack.empty()) {
@@ -2084,6 +2089,37 @@ int main(int argc, char** argv) {
                              "%d of the %d layers that differed above it - %s%s\n",
                      (long long) (s.ep_verify_n - s0.ep_verify_n), ln.c_str(), worst >= 0 ? s.ep_verify[worst] : 0.0f,
                      worst, (double) bound, above, seen, s.ep_verify_wrong ? "DS4_EP_DEFER_VERIFY=2: " : "", verdict);
+    }
+    if (s.rx_split_n > s0.rx_split_n) {   // DS4_EP_SPLIT_VERIFY
+        // the server's slice sums in bf16 against this lane's for the same x in bf16: the bf16 rounding of a sum (~4e-3);
+        // a layer above it is a wiring bug (a block twice or not at all) - and under =2 (the server's slice from k - 1,
+        // or twice) every layer checked must be above it
+        const float bound = 1e-2f;
+        int last = -1, worst = -1, above = 0, seen = 0;
+        for (int i = 0; i < 64; ++i)
+            if (s.rx_split_err[i] != 0.0f) {
+                last = i;
+                ++seen;
+                if (worst < 0 || !(s.rx_split_err[i] <= s.rx_split_err[worst])) worst = i;
+                if (!(s.rx_split_err[i] <= bound)) ++above;
+            }
+        const char* verdict = s.rx_split_wrong ? (seen > 0 && above == seen ? "the wrong slice seen: the check works"
+                                                  : above > 0 ? "the wrong slice seen in some layers only: partly blind"
+                                                              : "the wrong slice NOT seen: the check is blind")
+                              : above ? "MISMATCH (wiring, or inf)"
+                              : seen  ? "ok"
+                                      : "ok (no layer differed at all)";
+        std::string ln;
+        for (int i = 0; i <= last; ++i) {
+            char b[32];
+            std::snprintf(b, sizeof b, " %d:%.1e", i, s.rx_split_err[i]);
+            ln += b;
+        }
+        std::fprintf(stderr, "ep split verify: %lld rows of the server's slice sums checked against this lane's [k, nb) of "
+                             "the same picks (x in bf16 both); the largest |d| / |ref| by layer (since the load):%s; worst "
+                             "%.2e at layer %d; bound %.0e: %d of the %d layers above it - %s%s\n",
+                     (long long) (s.rx_split_n - s0.rx_split_n), ln.c_str(), worst >= 0 ? s.rx_split_err[worst] : 0.0f, worst,
+                     (double) bound, above, seen, s.rx_split_wrong ? "DS4_EP_SPLIT_VERIFY=2: " : "", verdict);
     }
     if (s.prof_tokens > s0.prof_tokens) {   // DS4_PROF
         const double pt = (double) (s.prof_tokens - s0.prof_tokens);
