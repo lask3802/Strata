@@ -335,6 +335,7 @@ int Conn::read_(uint8_t* p, size_t len) {
         m.msg_control = ctl;
         m.msg_controllen = sizeof ctl;
         const int k = (int) ::recvmsg((sock_t) fd_, &m, kRecvFlags);
+        if (k > 0) rx_ns_ = 0;   // (a read without a stamp leaves none, never the one before)
         if (k > 0)
             for (cmsghdr* c = CMSG_FIRSTHDR(&m); c != nullptr; c = CMSG_NXTHDR(&m, c))
                 if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPNS) {

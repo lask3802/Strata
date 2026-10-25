@@ -545,6 +545,54 @@ void case_spin_wake() {
     check(p.end() == 0, "the worker ends at the bye");
 }
 
+// the kernel's rx stamps (the probe's arrival times): each reply's is set, later than the last one's, and between its
+// request's send and the moment wait_resp returned it (Linux; elsewhere skipped with a note)
+void case_rx_stamps() {
+    Pair p;
+    p.open("good");
+    std::string err;
+    if (!p.m.req.rx_stamps(err)) {
+        std::printf("  the kernel's rx stamps: skipped here (%s)\n", err.c_str());
+        p.m.bye();
+        p.end();
+        return;
+    }
+    Reply r;
+    ReqData a(1, 1);
+    // (the kernel turns stamping on a little after the first socket asks - a deferred static key - so frames just
+    // after rx_stamps can come unstamped: wait for the first stamp, then check)
+    uint32_t s = 0;
+    int warm = 0;
+    bool served = true;
+    for (; warm < 200; ++warm) {
+        ++s;
+        served = p.m.send_req(s, 0, 1, 0, 0, a.picks.data(), a.x.data(), err) == 1 && p.m.wait_resp(s, now_ms() + 2000, r, err) == 1;
+        if (!served || p.m.req.last_rx_ns() != 0) break;
+        sleep_ms(1);
+    }
+    std::printf("  the kernel's rx stamps: the first after %d unstamped replies\n", warm);
+    bool set = served, rising = true, within = true;
+    int64_t last = p.m.req.last_rx_ns();
+    std::string why;
+    const uint32_t first = s + 1;
+    for (s = first; s < first + 5; ++s) {
+        const int64_t w0 = wall_ns();
+        const bool ok = p.m.send_req(s, 0, 1, 0, 0, a.picks.data(), a.x.data(), err) == 1 &&
+                        p.m.wait_resp(s, now_ms() + 2000, r, err) == 1;
+        const int64_t w1 = wall_ns(), rx = p.m.req.last_rx_ns();
+        set = set && ok && rx > 0;
+        rising = rising && rx > last;
+        within = within && rx >= w0 && rx <= w1;
+        if (why.empty() && !(ok && rx > 0 && rx > last && rx >= w0 && rx <= w1))
+            why = " (reply " + std::to_string(s) + ": stamp - send " + std::to_string(rx - w0) + " ns, read - stamp " +
+                  std::to_string(w1 - rx) + " ns, after the last by " + std::to_string(rx - last) + " ns)";
+        last = rx;
+    }
+    check(set && rising && within, "the kernel's rx stamps: each reply's set, rising, between its send and its read" + why);
+    p.m.bye();
+    p.end();
+}
+
 void case_fill() {
     Pair p;
     p.open("fill");
@@ -907,6 +955,7 @@ int main(int argc, char** argv) {
     case_spin_wake();
     case_fill();
     case_bulk_session();
+    case_rx_stamps();
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails != 0;
 }
