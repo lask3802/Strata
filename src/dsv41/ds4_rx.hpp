@@ -46,8 +46,9 @@ enum Msg : uint32_t {
     Geo = 2,        // main -> server: payload GeoMsg, then n_layers x GeoLayer
     Blob = 3,       // main -> server: a = layer, b = expert; payload the blob (GeoLayer's layout)
     BlobsEnd = 4,   // main -> server: a = the blobs sent
-    BlobsOk = 5,    // server -> main: payload uint8 ok[blobs] (1: in its VRAM); or an Error (it cannot serve them: the
-                    // room's VRAM in one piece or its warm-up requests failed) and the main drops the server
+    BlobsOk = 5,    // server -> main: payload uint8 ok[blobs] (1: in its VRAM); or an Error (its warm-up requests
+                    // failed) and the main drops the server.  A refusal known at the Geo (the geometry, the room's VRAM
+                    // in one piece) is an Error right after it: the main reads it before each blob and stops
     Req = 6,        // main -> server: seq, a = layer, b = rows; payload rows x (ReqRow, then bf16 x[n_embd])
     Resp = 7,       // server -> main: seq, a = rows, c = the server's time (us); payload rows x bf16 y[n_embd]
     Error = 9,      // either way: payload the message
@@ -269,6 +270,26 @@ inline const char* slice_refusal(bool remote, int ff0, int ffn, int n_ff) {
     return "the remote experts (--remote-experts) compute each expert whole";
 }
 
+/// A served layer's blob layout from the geometry, checked by a server at the Geo (before any blob): each role r
+/// (gate, up, down) of bytes[r] (its rows' bytes there: 0 = a type it has no layout for) at off[r], 256-aligned,
+/// inside the blob and over no other role.  An overrun would read past the blob (the GPU server's arena: the next
+/// one's).  "" or why not.
+inline std::string blob_refusal(int li, const GeoLayer& g, const uint64_t bytes[3]) {
+    static const char* const role[3] = {"gate", "up", "down"};
+    const std::string at = "layer " + std::to_string(li) + "'s ";
+    for (int r = 0; r < 3; ++r) {
+        if (bytes[r] == 0) return at + role[r] + ": a type this server has no layout for (" + std::to_string(g.K[r]) + ")";
+        if (g.off[r] % 256 != 0) return at + role[r] + ": its offset " + std::to_string(g.off[r]) + " not 256-aligned";
+        if (g.off[r] > g.blob || bytes[r] > g.blob - g.off[r])
+            return at + role[r] + ": " + std::to_string(bytes[r]) + " bytes at " + std::to_string(g.off[r]) +
+                   " past the blob's " + std::to_string(g.blob);
+        for (int q = 0; q < r; ++q)
+            if (g.off[r] < g.off[q] + bytes[q] && g.off[q] < g.off[r] + bytes[r])
+                return at + role[r] + " over its " + role[q];
+    }
+    return "";
+}
+
 /// The late replies of the main's last 64 requests: 8 of them idle the link for the next `hold` requests (the lane
 /// computes their picks), then it is tried again with a clean count.  Given up for good only when no reply at all
 /// (late or not) came from one idle spell to the next: a server that stopped answering on a link still open
@@ -353,6 +374,8 @@ public:
     std::string name() const { return std::string(peer_hello_.name, strnlen_(peer_hello_.name, sizeof peer_hello_.name)); }
     std::string peer() const { return c_.peer(); }
     bool send_geo(const GeoMsg& g, const std::vector<GeoLayer>& layers, std::string& err);
+    /// false (err) also when the server refused at the Geo: its Error, looked for before each blob ("expert server:
+    /// " and the reason), or the link it closed then - the blobs stop there, not after all of them
     bool send_blob(int layer, int e, const void* blob, size_t bytes, std::string& err);
     /// the end of the blobs: the server's ok[] (one a blob sent, in order)
     bool end_blobs(int n, std::vector<uint8_t>& ok, double timeout_ms, std::string& err);
@@ -410,5 +433,9 @@ int serve_cpu(const std::string& host_port, const std::string& token, bool once)
 /// answering Pings and taking Wakes on the way (the counts in *wakes); -1: the link went (err)
 int serve_loop(const std::string& host_port, bool once, const char* what, int (*session)(Conn&, void*), void* arg);
 int serve_next(Conn& c, Hdr& h, std::vector<uint8_t>& p, int64_t& pings, int64_t& wakes, std::string& err);
+/// A server's refusal at the Geo: the Error with `why`, then whatever the main still sends read and dropped until it
+/// closes the link (it stops at the Error: Main::send_blob) or 5 s pass - closed at once, the unread blobs would reset
+/// the link and the main's send would lose the reason.
+void refuse_at_geo(Conn& c, const std::string& why);
 
 }  // namespace strata::ds4::rx

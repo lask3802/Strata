@@ -103,8 +103,9 @@ enum class Copy { Base, Nr, One, Map };   // (DS4_RX_COPY: how a request's input
 
 // a request of one pick a layer format (the roles' types) on a blob of it, through the requests' kernels and copies,
 // before the BlobsOk: what a first request would meet (a kernel that does not load or launch, no memory left past the
-// room) the main then sees at load.  "" or why it failed
-std::string warm_up(const Session& ss, const Bufs& b, cudaStream_t s) {
+// room) the main then sees at load.  "" or why it failed.  (fault, tests: the first request's plan points at no memory -
+// an illegal address, a CUDA error the context keeps)
+std::string warm_up(const Session& ss, const Bufs& b, cudaStream_t s, bool fault) {
     const int D = ss.geo.n_embd;
     const int errs0 = gg::launch_errors();
     std::vector<float> x((size_t) D, 1.0f / 64.0f), y((size_t) D);
@@ -122,7 +123,7 @@ std::string warm_up(const Session& ss, const Bufs& b, cudaStream_t s) {
             }
         if (blob == nullptr) continue;
         done.push_back(li);
-        const unsigned long long plan[8] = {(unsigned long long) blob};
+        const unsigned long long plan[8] = {fault ? 0x1000ull : (unsigned long long) blob};
         const float w[8] = {1.0f};
         cudaError_t e = cudaMemcpyAsync(b.d_plan, plan, sizeof plan, cudaMemcpyHostToDevice, s);
         if (e == cudaSuccess) e = cudaMemcpyAsync(b.d_w, w, sizeof w, cudaMemcpyHostToDevice, s);
@@ -166,6 +167,7 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     //   DS4_RX_EVENTS=1  cudaEvents between the GPU parts (plan in, x in, gate_up, down, y out), printed with the host
     //                    parts' at the session's end
     //   DS4_RX_TEST_VRAM_MIB=N  (tests) the session's VRAM as N MiB free (Session::budget)
+    //   DS4_RX_TEST_FAULT=1     (tests) the warm-up's request at an illegal address (warm_up: a broken context)
     const char* nv = std::getenv("DS4_RX_NULL");
     const bool null_reply = nv != nullptr && *nv == '1';
     const char* cv = std::getenv("DS4_RX_COPY");
@@ -174,6 +176,9 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     const char* ev = std::getenv("DS4_RX_EVENTS");
     const bool evs = ev != nullptr && *ev == '1';
     const bool diag = null_reply || evs || cp != Copy::One;
+    const char* fv = std::getenv("DS4_RX_TEST_FAULT");
+    const bool fault = fv != nullptr && *fv == '1';
+    if (fault) std::fprintf(stderr, "expert server: test: the warm-up at an illegal address (DS4_RX_TEST_FAULT)\n");
     const char* bv = std::getenv("DS4_RX_TEST_VRAM_MIB");
     if (bv != nullptr && *bv != '\0') {
         ss.budget = (uint64_t) std::max(0LL, std::atoll(bv)) << 20;
@@ -224,35 +229,45 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     }
     std::memcpy(&ss.geo, p.data(), sizeof ss.geo);
     const GeoMsg& g = ss.geo;
-    if (g.n_embd <= 0 || g.n_embd > kMaxDim || g.n_ff <= 0 || g.n_ff > kMaxDim || g.n_layers <= 0 || g.n_layers > 256 ||
-        p.size() != sizeof(GeoMsg) + (size_t) g.n_layers * sizeof(GeoLayer)) {
-        const char why[] = "a geometry this server does not take";
-        (void) c.send(Error, 0, 0, 0, 0, why, sizeof why - 1, err);
+    // a refusal known here goes at once (refuse_at_geo): the main stops sending blobs at it
+    auto refuse_now = [&](const std::string& why) {
+        std::fprintf(stderr, "expert server: %s; the main process drops this server\n", why.c_str());
+        refuse_at_geo(c, why);
         return 0;
-    }
+    };
+    if (g.n_embd <= 0 || g.n_embd > kMaxDim || g.n_ff <= 0 || g.n_ff > kMaxDim || g.n_layers <= 0 || g.n_layers > 256 ||
+        p.size() != sizeof(GeoMsg) + (size_t) g.n_layers * sizeof(GeoLayer))
+        return refuse_now("a geometry this server does not take");
     ss.layers.resize((size_t) g.n_layers);
     std::memcpy(ss.layers.data(), p.data() + sizeof(GeoMsg), ss.layers.size() * sizeof(GeoLayer));
     ss.lay.resize(ss.layers.size());
     for (size_t li = 0; li < ss.layers.size(); ++li) {
+        const GeoLayer& G = ss.layers[li];
+        if (G.K[0] != 0) {   // (a served layer: what its kernels read of a blob, gate and up n_ff rows, down n_embd)
+            uint64_t bytes[3];
+            for (int r = 0; r < 3; ++r)
+                bytes[r] = (uint64_t) gg::type_row_bytes(G.K[r], r < 2 ? g.n_embd : g.n_ff) * (r < 2 ? g.n_ff : g.n_embd);
+            const std::string why = blob_refusal((int) li, G, bytes);
+            if (!why.empty()) return refuse_now("the geometry: " + why);
+        }
         x3::ExpertLayout& l = ss.lay[li];
         l.fmt = gg::kFmtMXFP4;
         for (int r = 0; r < 3; ++r) {
-            l.K[r] = ss.layers[li].K[r];
-            l.trellis[r] = l.suh[r] = l.svh[r] = (size_t) ss.layers[li].off[r];
+            l.K[r] = G.K[r];
+            l.trellis[r] = l.suh[r] = l.svh[r] = (size_t) G.off[r];
         }
     }
     std::fprintf(stderr, "expert server: main process %s: %d layers, n_embd %d, n_ff %d; %.2f GB of VRAM for blobs\n",
                  c.peer().c_str(), g.n_layers, g.n_embd, g.n_ff, (double) me.room / 1e9);
     // the blobs, once, into the arena: the room in one piece
-    std::string refuse;   // (not empty: the BlobsOk is an Error with it, and the main drops this server at load)
     const cudaError_t ea = me.room > 0 ? ss.alloc(&ss.arena, me.room) : cudaSuccess;
     if (ea != cudaSuccess) {
         cudaGetLastError();
+        ss.arena = nullptr;
         char w[160];
         std::snprintf(w, sizeof w, "the room's %.2f GB of VRAM in one piece failed (%s): a bigger --expert-server-reserve-mib",
                       (double) me.room / 1e9, cudaGetErrorString(ea));
-        refuse = w;
-        ss.arena = nullptr;
+        return refuse_now(w);
     }
     ss.cap = ss.arena != nullptr ? me.room : 0;
     std::vector<uint8_t> ok;
@@ -299,10 +314,18 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     b.d_y = b.d_x + (size_t) kMaxRows * D;
     b.d_h = b.d_y + (size_t) kMaxRows * D;
     void* const hm = ss.hm;
-    if (refuse.empty()) refuse = warm_up(ss, b, s);
+    const std::string refuse = warm_up(ss, b, s, fault);   // (not empty: the BlobsOk is an Error with it)
     if (!refuse.empty()) {
         (void) c.send(Error, 0, 0, 0, 0, refuse.data(), refuse.size(), err);
         std::fprintf(stderr, "expert server: %s; the main process drops this server\n", refuse.c_str());
+        // a CUDA error the context keeps (an illegal address in a kernel): every later call fails with it, so the next
+        // main process would meet it at its first request - the server ends here (nonzero) instead of dialing again
+        cudaError_t ek = cudaDeviceSynchronize();
+        if (ek == cudaSuccess) ek = cudaGetLastError();
+        if (ek != cudaSuccess) {
+            std::fprintf(stderr, "expert server: the GPU's context is broken (%s): the server ends\n", cudaGetErrorString(ek));
+            return -1;
+        }
         return 0;
     }
     if (!c.send(BlobsOk, 0, (int32_t) ok.size(), 0, 0, ok.data(), ok.size(), err)) return 0;

@@ -311,6 +311,31 @@ int main() {
         slot[5] = 0;
         check(rx::cache_in(hits, slot, heat, held3, nullptr) == 7, "5 in VRAM already, 3 on the server: 7");
     }
+    {
+        // a server's check of a served layer's blob layout at the Geo (lead 2026-10-25: an overrun read the next blob)
+        rx::GeoLayer g;
+        g.K[0] = g.K[1] = g.K[2] = 16;
+        g.off[0] = 0;
+        g.off[1] = 1024;
+        g.off[2] = 2048;
+        g.blob = 3072;
+        const uint64_t b[3] = {1000, 1000, 1024}, b0[3] = {1000, 0, 1024};
+        check(rx::blob_refusal(0, g, b).empty(), "the engine's layout (each role 256-aligned, in order, inside): taken");
+        auto has = [](const std::string& s, const char* w) { return s.find(w) != std::string::npos; };
+        rx::GeoLayer t = g;
+        t.off[2] = t.blob - 256;
+        check(has(rx::blob_refusal(0, t, b), "down: 1024 bytes at 2816 past the blob's 3072"), "down past the blob's end");
+        t = g;
+        t.off[2] = (uint64_t) -256;
+        check(has(rx::blob_refusal(0, t, b), "past the blob"), "an offset past the blob (no wrap in off + bytes)");
+        t = g;
+        t.off[1] = 1000;
+        check(has(rx::blob_refusal(0, t, b), "not 256-aligned"), "an offset not 256-aligned");
+        t = g;
+        t.off[1] = 768;
+        check(has(rx::blob_refusal(0, t, b), "up over its gate"), "up over gate");
+        check(has(rx::blob_refusal(3, g, b0), "layer 3's up: a type this server has no layout for"), "a type with no layout");
+    }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;
 }

@@ -405,6 +405,14 @@ bool Main::send_geo(const GeoMsg& g, const std::vector<GeoLayer>& layers, std::s
 }
 
 bool Main::send_blob(int layer, int e, const void* blob, size_t bytes, std::string& err) {
+    Hdr h;   // (the server's refusal at the Geo, if one came: nothing else comes before the BlobsEnd)
+    const int got = c_.recv(h, rx_, 0.0, err);
+    if (got < 0) return false;
+    if (got == 1) {
+        err = h.type == Error ? "expert server: " + std::string(rx_.begin(), rx_.end()) : "a message out of turn";
+        c_.close();
+        return false;
+    }
     return c_.send(Blob, 0, layer, e, 0, blob, bytes, err);
 }
 
@@ -545,6 +553,16 @@ int serve_next(Conn& c, Hdr& h, std::vector<uint8_t>& p, int64_t& pings, int64_t
             continue;
         }
         if (h.type == Req) return 1;
+    }
+}
+
+void refuse_at_geo(Conn& c, const std::string& why) {
+    std::string err;
+    if (!c.send(Error, 0, 0, 0, 0, why.data(), why.size(), err)) return;
+    const double give_up = now_ms() + 5000.0;
+    Hdr h;
+    std::vector<uint8_t> p;
+    while (c.recv(h, p, give_up, err) == 1 && h.type != BlobsEnd) {
     }
 }
 

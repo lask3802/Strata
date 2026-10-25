@@ -10,11 +10,14 @@
 //               [--ping N (then N pings of 56 B and of 10,320 B each way: the link and both ends' sockets alone)]
 //               [--fill 1 (as many blobs as the server's room holds, as the engine sends them: --experts N contents
 //                each layer, again under more expert ids)]
+//               [--bad-geo 1 (layer 0's down 256 bytes before its blob's end: past it - the server refuses at the Geo)]
+//               [--early 1 (a refusal must come before the last blob: one at the BlobsEnd is a failure)]
 //   (STRATA_STAGE_TOKEN: the same as the server's)
 // Exit 0 all good, 1 a failure, 3 the server refused the blobs with an Error (the engine drops it at load).  Two cases
 // of the server's load: a full room (the server with DS4_RX_TEST_VRAM_MIB=600 --expert-server-reserve-mib 0, this
 // with --fill 1): every blob held and served, exit 0; a type with no token kernel (--layers 16/16,16/13: the second
-// layer's down Q5_K): refused at load, exit 3.  Either way never a failure at a request.
+// layer's down Q5_K): refused at load, exit 3.  Either way never a failure at a request.  A refusal at the Geo (the
+// room's VRAM, the geometry: --bad-geo 1) stops the blobs at once: --early 1 checks that.
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_iq.cuh"
 #include "../../src/dsv41/ds4_rx.hpp"
@@ -69,7 +72,8 @@ struct Layer {
 
 int main(int argc, char** argv) {
     std::string at = "7861", layers_s = "29/29,16/16,17/17,16/17";
-    int n_exp = 8, n_req = 200, n_rtt = 1000, picks = 6, n_ref = 24, rtt_only = 0, n_ping = 0, fill = 0;
+    int n_exp = 8, n_req = 200, n_rtt = 1000, picks = 6, n_ref = 24, rtt_only = 0, n_ping = 0, fill = 0, bad_geo = 0,
+        early = 0;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--listen") at = v;
@@ -81,6 +85,8 @@ int main(int argc, char** argv) {
         else if (a == "--rtt-only") rtt_only = std::atoi(v.c_str());
         else if (a == "--ping") n_ping = std::atoi(v.c_str());
         else if (a == "--fill") fill = std::atoi(v.c_str());
+        else if (a == "--bad-geo") bad_geo = std::atoi(v.c_str());
+        else if (a == "--early") early = std::atoi(v.c_str());
         else if (a == "--picks") picks = std::max(1, std::min(rx::kMaxPicks, std::atoi(v.c_str())));
         else { std::printf("unknown option %s\n", a.c_str()); return 2; }
     }
@@ -160,23 +166,34 @@ int main(int argc, char** argv) {
         std::printf("FAILED: %.2f GB of test blobs do not fit\n", (double) all_b / 1e9);
         return 1;
     }
+    if (bad_geo) gl[0].off[2] = gl[0].blob - 256;   // (the blobs keep their real layout: only the geometry lies)
+    int n_all = 0;
+    for (int s : sent) n_all += s;
     const double t0 = rx::now_ms();
     int nb = 0;
+    // the server's Error (the engine drops it at load), after nb of the n_all blobs went out
+    auto refused = [&](bool at_end) {
+        const bool err_msg = err.rfind("expert server: ", 0) == 0;
+        if (!err_msg) {
+            std::printf("FAILED: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("REFUSED at load after %d of %d blobs, %.0f ms after the geometry: %s\n", nb, n_all, rx::now_ms() - t0,
+                    err.c_str());
+        if (early && at_end) {
+            std::printf("FAILED: --early: the refusal came only after every blob\n");
+            return 1;
+        }
+        return 3;
+    };
     if (!m.send_geo(gm, gl, err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
     for (size_t li = 0; li < L.size(); ++li)
         for (int e = 0; e < sent[li]; ++e, ++nb) {
             const std::vector<uint8_t>& bl = L[li].blobs[(size_t) (e % n_exp)];
-            if (!m.send_blob((int) li, e, bl.data(), bl.size(), err)) {
-                std::printf("FAILED: %s\n", err.c_str());
-                return 1;
-            }
+            if (!m.send_blob((int) li, e, bl.data(), bl.size(), err)) return refused(false);
         }
     std::vector<uint8_t> ok;
-    if (!m.end_blobs(nb, ok, 120000.0, err)) {
-        const bool refused = err.rfind("expert server: ", 0) == 0;   // (its Error: the engine drops it at load)
-        std::printf("%s: %s\n", refused ? "REFUSED at load" : "FAILED", err.c_str());
-        return refused ? 3 : 1;
-    }
+    if (!m.end_blobs(nb, ok, 120000.0, err)) return refused(true);
     const double t_up = rx::now_ms() - t0;
     int held = 0;
     for (uint8_t v : ok) held += v;

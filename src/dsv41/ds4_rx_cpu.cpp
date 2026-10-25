@@ -52,12 +52,14 @@ int cpu_session(Conn& c, void* arg) {
     }
     GeoMsg g;
     std::memcpy(&g, p.data(), sizeof g);
-    if (g.n_embd <= 0 || g.n_embd > 8192 || g.n_ff <= 0 || g.n_ff > 8192 || g.n_layers <= 0 || g.n_layers > 256 ||
-        p.size() != sizeof(GeoMsg) + (size_t) g.n_layers * sizeof(GeoLayer)) {
-        const char why[] = "a geometry this server does not take";
-        (void) c.send(Error, 0, 0, 0, 0, why, sizeof why - 1, err);
+    auto refuse_now = [&](const std::string& why) {   // (at once: the main stops sending blobs at it)
+        std::fprintf(stderr, "expert server (CPU): %s; the main process drops this server\n", why.c_str());
+        refuse_at_geo(c, why);
         return 0;
-    }
+    };
+    if (g.n_embd <= 0 || g.n_embd > 8192 || g.n_ff <= 0 || g.n_ff > 8192 || g.n_layers <= 0 || g.n_layers > 256 ||
+        p.size() != sizeof(GeoMsg) + (size_t) g.n_layers * sizeof(GeoLayer))
+        return refuse_now("a geometry this server does not take");
     std::vector<GeoLayer> layers((size_t) g.n_layers);
     std::memcpy(layers.data(), p.data() + sizeof(GeoMsg), layers.size() * sizeof(GeoLayer));
     std::vector<gg::IqCpu> fm(layers.size());
@@ -66,6 +68,11 @@ int cpu_session(Conn& c, void* arg) {
         std::string e2;
         takes[li] = layers[li].K[0] != 0 && layers[li].K[0] == layers[li].K[1] &&
                     gg::iq_cpu_fmt(layers[li].K[0], layers[li].K[2], g.n_embd, g.n_ff, fm[li], e2);
+        if (!takes[li]) continue;
+        const uint64_t bytes[3] = {(uint64_t) fm[li].gu_row * g.n_ff, (uint64_t) fm[li].gu_row * g.n_ff,
+                                   (uint64_t) fm[li].d_row * g.n_embd};
+        const std::string why = blob_refusal((int) li, layers[li], bytes);
+        if (!why.empty()) return refuse_now("the geometry: " + why);
     }
     std::fprintf(stderr, "expert server (CPU): main process %s: %d layers, n_embd %d, n_ff %d; %.2f GB of RAM for blobs\n",
                  c.peer().c_str(), g.n_layers, g.n_embd, g.n_ff, (double) me.room / 1e9);
