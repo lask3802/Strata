@@ -4,8 +4,8 @@
 // attention's comb - up to the order of the float sums (the coefficients held fixed: in the engine the attention's
 // own coefficients and output differ, the deferral's error, which this does not test).  The head's case (comb null:
 // nothing ran since) the same against one hc_post.  A token whose flag is 0 keeps its streams whatever its part row
-// holds.  First on the host (the algebra), then the device kernels (hc_post, hc_late_add) against the host's.  Needs a
-// GPU, no model.  defer_test
+// holds.  First on the host (the algebra), then the device kernels (hc_post, hc_late_add) against the host's; last
+// max_rel_diff, DS4_EP_DEFER_VERIFY's comparison.  Needs a GPU, no model.  defer_test
 #include "../../src/dsv41/ds4_kernels.cuh"
 
 #include <algorithm>
@@ -163,6 +163,41 @@ void run(int D, int H, int T) {
     cudaStreamDestroy(s);
 }
 
+// max_rel_diff (DS4_EP_DEFER_VERIFY's comparison): 0 for the same rows, the largest |a - b| / (1 + |a|) otherwise, kept
+// across calls into one host-mapped value; a NaN counts as inf
+void run_diff() {
+    const size_t n = 5000;
+    std::vector<float> a = rnd(n, 4.0f), b = a;
+    float *da = dev(a), *db = dev(b), *out = dev(std::vector<float>(1, 0.0f));
+    auto got = [&](const std::vector<float>& bb) {
+        CU(cudaMemcpy(db, bb.data(), n * 4, cudaMemcpyHostToDevice));
+        sd::max_rel_diff(da, db, n, out, nullptr);
+        CU(cudaDeviceSynchronize());
+        return host(out, 1)[0];
+    };
+    const float z = got(b);
+    b[1234] = a[1234] + 0.01f * (1.0f + std::fabs(a[1234]));   // (relative 1e-2 at one value)
+    const float r = got(b);
+    std::vector<float> c = a;
+    c[7] = a[7] + 1e-4f * (1.0f + std::fabs(a[7]));   // (smaller: the kept value stays r)
+    const float r2 = got(c);
+    c[9] = NAN;
+    const float rn = got(c);
+    ++g_cases;
+    const bool ok = z == 0.0f && std::fabs(r - 1e-2f) < 1e-5f && r2 == r && std::isinf(rn);
+    if (!ok) ++g_fail;
+    std::printf("%-58s same %.1e, one at 1e-2 %.3e, then a smaller one %.3e, a NaN %g -> %s\n", "device: max_rel_diff", z,
+                r, r2, rn, ok ? "ok" : "FAIL");
+    // add_diff: y += a - b (an in-place change of one buffer carried onto another)
+    std::vector<float> y = rnd(n), c2 = rnd(n), want(n);
+    for (size_t i = 0; i < n; ++i) want[i] = y[i] + (a[i] - c2[i]);
+    float *dy = dev(y), *dc = dev(c2);
+    sd::add_diff(dy, da, dc, n, nullptr);
+    CU(cudaDeviceSynchronize());
+    check("device: add_diff", diff(want, host(dy, n)), 0.0);
+    cudaFree(da), cudaFree(db), cudaFree(out), cudaFree(dy), cudaFree(dc);
+}
+
 }  // namespace
 
 int main() {
@@ -175,6 +210,7 @@ int main() {
     run(4096, 4, 1);   // (a model-sized row, 4 streams, a decode token)
     run(300, 4, 4);
     run(96, 2, 3);
+    run_diff();
     std::printf("%d of %d cases failed\n", g_fail, g_cases);
     return g_fail != 0;
 }
