@@ -25,10 +25,10 @@ struct LaneFlow {
 
     /// ne entries: on each of NH nodes GB gate / up jobs an entry (gu(X, q, b), b < GB), then DB down jobs an entry
     /// (dn(X, q, b), b < DB); hq(q) once entry q's NH GB gate / up jobs are done, before any of its down jobs.
-    /// pools[0]'s caller helps it, as run_nodes does.
+    /// pools[0]'s caller helps it, as run_nodes does; helped (DS4_LANE_PROF): called once the caller ran out of jobs.
     void run(const std::vector<std::unique_ptr<Pool>>& pools, int NH, int ne, int GB, int DB,
              const std::function<void(int, int, int)>& gu, const std::function<void(int)>& hq,
-             const std::function<void(int, int, int)>& dn) {
+             const std::function<void(int, int, int)>& dn, const std::function<void()>* helped = nullptr) {
         if (ne <= 0) return;
         if (ne > cap) {
             left.reset(new std::atomic<int>[(size_t) ne]);
@@ -63,6 +63,7 @@ struct LaneFlow {
             };
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, f[X]);
         pools[0]->help();
+        if (helped != nullptr) (*helped)();
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
     }
 };

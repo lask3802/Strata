@@ -2004,6 +2004,25 @@ int main(int argc, char** argv) {
                              "waited for their entry's h\n",
                      (s.flow_calls - s0.flow_calls) / nt, (s.flow_downs - s0.flow_downs) / nt,
                      100.0 * (double) (s.flow_waits - s0.flow_waits) / std::max<double>(1.0, (double) (s.flow_downs - s0.flow_downs)));
+    if (s.lp_calls > s0.lp_calls) {   // (DS4_LANE_PROF=1 only) the lane's phases, ms a token; use: busy / (threads x wall)
+        auto pt = [&](double a, double b) { return (a - b) / nt; };
+        auto use = [&](double busy, double busy0, double wall, double wall0) {
+            return 100.0 * (busy - busy0) / std::max(1e-9, (double) std::max(1, s.lp_threads) * (wall - wall0));
+        };
+        std::fprintf(stderr,
+                     "decode lane phases (DS4_LANE_PROF), ms a token: the request's wait (since the layer before's answer) "
+                     "%.2f, between tokens %.2f; plan %.2f; prefetch + x quant %.2f; gate / up %.2f (tail %.2f, use %.0f%%); "
+                     "h quant %.2f; down %.2f (tail %.2f, use %.0f%%); flow %.2f (tail %.2f, use %.0f%%); add %.2f; the remote "
+                     "reply %.2f; %.1f calls a token, %d threads\n",
+                     pt(s.lp_wait_ms, s0.lp_wait_ms), pt(s.lp_gap_ms, s0.lp_gap_ms), pt(s.lp_plan_ms, s0.lp_plan_ms),
+                     pt(s.lp_prep_ms, s0.lp_prep_ms), pt(s.lp_gu_ms, s0.lp_gu_ms), pt(s.lp_gu_tail_ms, s0.lp_gu_tail_ms),
+                     use(s.lp_gu_busy_ms, s0.lp_gu_busy_ms, s.lp_gu_ms, s0.lp_gu_ms), pt(s.lp_hq_ms, s0.lp_hq_ms),
+                     pt(s.lp_dn_ms, s0.lp_dn_ms), pt(s.lp_dn_tail_ms, s0.lp_dn_tail_ms),
+                     use(s.lp_dn_busy_ms, s0.lp_dn_busy_ms, s.lp_dn_ms, s0.lp_dn_ms), pt(s.lp_fl_ms, s0.lp_fl_ms),
+                     pt(s.lp_fl_tail_ms, s0.lp_fl_tail_ms), use(s.lp_fl_busy_ms, s0.lp_fl_busy_ms, s.lp_fl_ms, s0.lp_fl_ms),
+                     pt(s.lp_add_ms, s0.lp_add_ms), pt(s.lp_rx_ms, s0.lp_rx_ms),
+                     (double) (s.lp_calls - s0.lp_calls) / nt, s.lp_threads);
+    }
     std::fprintf(stderr, "%s", m.rx_lines(s0, nt).c_str());   // (--remote-experts)
     if (s.eg_rows > s0.eg_rows) {   // the Engram rows: how many the row cache served, the reads' time behind the layers
         const double rows = (double) (s.eg_rows - s0.eg_rows);
