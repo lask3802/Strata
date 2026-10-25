@@ -1158,6 +1158,12 @@ struct Model::Impl {
     std::unique_ptr<rx::Main> rx_link;
     std::vector<uint8_t> rx_has;
     std::vector<uint8_t> rx_pool;   // (the hybrid, U5c: the server's W, [layer][n_exp]; empty: none - rx_split)
+    // the hybrid's balance (DS4_EP_POOL_BAL, on with W; rx::pool_keep): EWMAs of the T=1 replies' times - this lane's
+    // ms a byte (send to its part done), the server lane's, the rest of a reply's (ms); -1: none yet.  The samples,
+    // and the margin (DS4_EP_POOL_MARGIN, ms)
+    bool rx_bal = false;
+    double rx_bal_rm = -1, rx_bal_rs = -1, rx_bal_fix = -1, rx_bal_margin = 0.1;
+    int64_t rx_bal_nm = 0, rx_bal_ns = 0;
     std::atomic<bool> rx_on{false};   // (rx_lost on the service thread clears it; the main thread's cache reads it)
     double rx_timeout_ms = 2.0;   // (counted from when the lane's own picks are done: until the lane's time a pick is
     bool rx_wait_fixed = false;   //  known, or always with DS4_RX_TIMEOUT_MS; rx::Gate::wait_ms)
@@ -6873,9 +6879,19 @@ struct Model::Impl {
             ++n;
         }
         st.rx_pool_w = n;
+        const char* bv = std::getenv("DS4_EP_POOL_BAL");
+        rx_bal = bv == nullptr || *bv != '0';
+        if (const char* mv = std::getenv("DS4_EP_POOL_MARGIN"); mv != nullptr && *mv != '\0')
+            rx_bal_margin = std::max(0.0, std::atof(mv));
+        char bal[160];
+        if (rx_bal)
+            std::snprintf(bal, sizeof bal, "; a decode request's W picks there only while the reply should come in before "
+                                           "this lane's part (DS4_EP_POOL_BAL, margin %.2f ms)", rx_bal_margin);
+        else
+            std::snprintf(bal, sizeof bal, "; all of them (DS4_EP_POOL_BAL=0)");
         std::fprintf(stderr, "ds4: the hybrid (the server's DS4_RX_POOL): its W of %lld experts - a CPU-lane pick of W "
                              "goes whole to its CPU lane ([0, %d) from its pool, [%d, %d) from its parts), not computed "
-                             "here (a late reply: here whole)\n", (long long) n, k, k, rx_nb);
+                             "here (a late reply: here whole)%s\n", (long long) n, k, k, rx_nb, bal);
     }
 
     // ---- remote experts (--remote-experts, ds4_rx.hpp): an expert server's GPU holds some of the CPU lane's experts
@@ -7362,7 +7378,7 @@ struct Model::Impl {
     // (spk: the request's slice picks - the reply holds their [k, nb), and so does the fallback: sp's late ranges)
     void rx_finish(const Layer& l, const Req& r, Resp& rp, int T, unsigned seq, double t0,
                    const std::vector<std::pair<int, int>>& rpk, const std::vector<std::pair<int, int>>& spk,
-                   const rx::SplitPlan& sp, const std::vector<std::pair<int, int>>& wpk) {
+                   const rx::SplitPlan& sp, const std::vector<std::pair<int, int>>& wpk, double mb = 0.0) {
         const double tw = rx::now_ms();
         const int rows = (int) rx_rows.size();
         // (the lane's picks' worth the server computes: a W pick whole)
@@ -7442,6 +7458,18 @@ struct Model::Impl {
             if (!spk.empty() || !wpk.empty()) {
                 ++st.rx_split_reqs;
                 st.rx_srv_lane_ms += lane_us / 1000.0;
+                // the balance's samples (T=1, the kernel's arrival known): the server lane's ms a byte, the rest of the
+                // reply's time, this lane's ms a byte from the send to its part done
+                const double sb = (double) spk.size() * (double) l.blob * (rx_nb - rx_k) / rx_nb + (double) wpk.size() * l.blob;
+                if (rx_bal && T == 1 && ta >= t0 && ta <= t1 && sb > 0 && lane_us > 0) {
+                    rx_bal_rs = rx::ewma(rx_bal_rs, lane_us / 1000.0 / sb, 0.05);
+                    rx_bal_fix = rx::ewma(rx_bal_fix, (ta - t0) - rx_bal_rs * sb, 0.05);
+                    ++rx_bal_ns;
+                }
+                if (rx_bal && T == 1 && mb > 0) {
+                    rx_bal_rm = rx::ewma(rx_bal_rm, (tw - t0) / mb, 0.05);
+                    ++rx_bal_nm;
+                }
             }
             st.rx_rtt_ms += t1 - t0;
             st.rx_srv_ms += srv_us / 1000.0;
@@ -7657,13 +7685,22 @@ struct Model::Impl {
                   (st.rx_srv_lane_ms - s0.rx_srv_lane_ms) * 1000.0 / nr, (long long) (st.rx_split_reqs - s0.rx_split_reqs),
                   (long long) (st.rx_split_fallback - s0.rx_split_fallback), rx_k, rx_nb,
                   rx_verify == 2 ? "; DS4_EP_SPLIT_VERIFY=2" : rx_verify ? "; DS4_EP_SPLIT_VERIFY=1" : "");
-            if (!rx_pool.empty())
+            if (!rx_pool.empty()) {
+                char bal[256] = "";
+                if (rx_bal)   // (the EWMAs as rates: GB/s = 1 / (ms a byte) / 1e6)
+                    std::snprintf(bal, sizeof bal,
+                                  "; the balance kept %lld W picks here (%.1f a token; at the end this lane %.1f GB/s from "
+                                  "the send, the server's lane %.1f GB/s, the rest of a reply %.3f ms)",
+                                  (long long) (st.rx_pool_kept - s0.rx_pool_kept),
+                                  (double) (st.rx_pool_kept - s0.rx_pool_kept) / std::max(1.0, nt),
+                                  rx_bal_rm > 0 ? 1e-6 / rx_bal_rm : 0.0, rx_bal_rs > 0 ? 1e-6 / rx_bal_rs : 0.0, rx_bal_fix);
                 add_f(b,
                       "the hybrid: the server's W of %lld experts - %lld W picks whole on its CPU lane (%.1f a token; not "
-                      "computed here), %lld computed here whole after all (late replies, a lost link)\n",
+                      "computed here), %lld computed here whole after all (late replies, a lost link)%s\n",
                       (long long) st.rx_pool_w, (long long) (st.rx_pool_picks - s0.rx_pool_picks),
                       (double) (st.rx_pool_picks - s0.rx_pool_picks) / std::max(1.0, nt),
-                      (long long) (st.rx_pool_fallback - s0.rx_pool_fallback));
+                      (long long) (st.rx_pool_fallback - s0.rx_pool_fallback), bal);
+            }
         }
         return b;
     }
@@ -7827,10 +7864,25 @@ struct Model::Impl {
                 if (want) {
                     if (sp.tagged && (size_t) (li + 1) * g.n_exp <= rx_pool.size()) {   // (the hybrid, U5c: W's picks
                         const uint8_t* pw = rx_pool.data() + (size_t) li * g.n_exp;   // whole on the server, not here)
+                        int nc = 0;
+                        for (const auto& q : picks) nc += pw[q.first] != 0;
+                        int keep = nc;   // (the balance: W candidates sent, the rest kept here - T=1 only)
+                        if (rx_bal && T == 1 && nc > 0) {
+                            const double wk = (double) l.blob * rx_k / rx_nb, wt = (double) l.blob - wk;
+                            keep = rx_bal_nm >= 16 && rx_bal_ns >= 16
+                                       ? rx::pool_keep(nc, (int) picks.size(), wk, wt, rx_bal_rm, rx_bal_rs, rx_bal_fix,
+                                                       rx_bal_margin)
+                                       : 0;   // (until both are seeded: none)
+                            st.rx_pool_kept += nc - keep;
+                        }
                         size_t n = 0;
                         for (const auto& q : picks) {
-                            if (pw[q.first]) wpicks.push_back(q);
-                            else picks[n++] = q;
+                            if (pw[q.first] && keep > 0) {
+                                wpicks.push_back(q);
+                                --keep;
+                            } else {
+                                picks[n++] = q;
+                            }
                         }
                         picks.resize(n);
                     }
@@ -7881,6 +7933,7 @@ struct Model::Impl {
                         }
                     po = ord;
                 }
+                double bal_mb = 0.0;   // (this lane's bytes of the request: the balance's sample)
                 if (!ents.empty()) {
                     const double tc = now_ms();
                     int ff0, ffn;
@@ -7905,12 +7958,13 @@ struct Model::Impl {
                     // (an expert's bytes once: past ent_cap's tokens it takes more than one entry, side by side)
                     size_t nexp = 0;
                     for (size_t q = 0; q < ents.size(); ++q) nexp += q == 0 || ents[q].e != ents[q - 1].e;
-                    st.lane_bytes += (double) nexp * (double) l.blob * (double) ffn / (double) g.ff;
+                    bal_mb = (double) nexp * (double) l.blob * (double) ffn / (double) g.ff;
+                    st.lane_bytes += bal_mb;
                     // (a pick's time whole: the slices computed [0, k) of nb blocks)
                     const double whole = (double) nslots * (double) (mr.b1 - mr.b0) / (double) std::max(1, rx_nb);
                     if (rx_on && whole > 0) rx_gate.pick_seen(T, (now_ms() - tc) / whole);
                 }
-                if (sp.sent) rx_finish(l, r, rp, T, next, rx_t0, rpicks, spicks, sp, wpicks);
+                if (sp.sent) rx_finish(l, r, rp, T, next, rx_t0, rpicks, spicks, sp, wpicks, bal_mb);
             }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;

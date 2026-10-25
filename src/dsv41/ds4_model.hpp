@@ -161,7 +161,8 @@ struct Stats {
     double rx_srv_lane_ms = 0.0;
     // the hybrid (EP U5c, the server's DS4_RX_POOL): the server's W (experts), the W picks its replies held whole, and
     // those the lane computed whole after all (a reply late or lost)
-    int64_t rx_pool_w = 0, rx_pool_picks = 0, rx_pool_fallback = 0;
+    // those of W the balance kept here (DS4_EP_POOL_BAL: the reply would have come in after this lane's part)
+    int64_t rx_pool_w = 0, rx_pool_picks = 0, rx_pool_fallback = 0, rx_pool_kept = 0;
     // DS4_RX_FILL=1 (EP U5b): fills queued, loaded by the server, refused; their bytes sent and the time in the paced
     // sends; the requests the server answered Stale (an expert mid-fill)
     int64_t rx_fills = 0, rx_fill_ok = 0, rx_fill_fail = 0, rx_fill_bytes = 0, rx_stale = 0;

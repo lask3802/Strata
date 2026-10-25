@@ -85,6 +85,21 @@ inline size_t slice_share(size_t n, int k, int nb) {
 /// the host-routed path's range for its CPU-lane picks (the decode's layers routed on the host, prefill): it sends no
 /// request, so a split layer's picks too are whole on the main
 inline BlockRange host_range(bool spl, int k, int nb) { return split_plan(spl, false, false, k, nb).here; }
+/// the hybrid's balance (U5c, DS4_EP_POOL_BAL): how many of a request's nc W candidates go whole to the server.  A W
+/// pick sent moves its [0, k) (wk bytes) from this lane to the server's; the reply should come in before this lane's own
+/// part is done.  The estimates, EWMAs of past replies: rm - this lane's ms a byte from the send to its part done; rs -
+/// the server's lane ms a byte; fix - the rest of a reply's time (send to its arrival in the kernel less rs x its bytes).
+/// n: the largest that keeps fix + rs (N wt + n wk) + margin <= rm (N - n) wk, N the request's CPU-lane picks (all
+/// slice picks, the candidates among them), wt a pick's [k, nb) bytes; 0..nc
+inline int pool_keep(int nc, int N, double wk, double wt, double rm, double rs, double fix, double margin) {
+    if (nc <= 0 || wk <= 0 || rm <= 0 || rs <= 0) return 0;
+    const double num = rm * N * wk - fix - rs * N * wt - margin, den = wk * (rs + rm);
+    if (num <= 0) return 0;
+    const double n = num / den;
+    return n >= nc ? nc : (int) n;
+}
+/// one EWMA step (a: the new sample's weight; v < 0: none yet - the sample)
+inline double ewma(double v, double x, double a) { return v < 0 ? x : v + a * (x - v); }
 /// blocks [b0, b1) as cpu_experts' n_ff values [ff0, ff0 + ffn) of n_ff (the last of nb blocks runs to n_ff)
 inline void ff_range(BlockRange br, int nb, int n_ff, int& ff0, int& ffn) {
     ff0 = 256 * br.b0 < n_ff ? 256 * br.b0 : n_ff;

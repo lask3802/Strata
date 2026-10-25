@@ -61,6 +61,26 @@ static void case_checks() {
           "ep_slice_refusal tagged: no i-quant lane, a drafter layer, a stage worker, DISK_SKIP, no whole blocks: refused");
     check(rx::slice_refusal(true, 0, 2048, FF) != nullptr && rx::slice_refusal(true, 0, 2048, FF, true) == nullptr,
           "rx::slice_refusal: a slice beside the remote experts refused untagged (U4), taken tagged (H')");
+
+    // the hybrid's balance (U5c) at U5c's first slot's rates: an 8.6 MB expert at k 6 of 9, this lane 20.5 GB/s from
+    // the send, the server's lane 23.5 GB/s, the rest of a reply 0.17 ms, margin 0.1 ms
+    const double wk = 8.6e6 * 6 / 9, wt = 8.6e6 - wk, rm = 1e-6 / 20.5, rs = 1e-6 / 23.5;
+    check(rx::pool_keep(3, 3, wk, wt, rm, rs, 0.17, 0.1) == 0, "pool_keep: 3 picks a layer - no slack for a W pick: none");
+    const int k6 = rx::pool_keep(6, 6, wk, wt, rm, rs, 0.17, 0.1), k8 = rx::pool_keep(8, 8, wk, wt, rm, rs, 0.17, 0.1);
+    check(k6 == 1 && k8 >= 1 && k8 < 8, "pool_keep: 6 / 8 picks - some of them, not all");
+    // the rule itself: the kept n fits, n + 1 does not (for n below nc)
+    bool rule = true;
+    for (int N = 1; N <= 16; ++N)
+        for (int nc = 1; nc <= N; ++nc) {
+            const int n = rx::pool_keep(nc, N, wk, wt, rm, rs, 0.17, 0.1);
+            auto fits = [&](int m) { return 0.17 + rs * (N * wt + m * wk) + 0.1 <= rm * (N - m) * wk; };
+            rule = rule && n >= 0 && n <= nc && (n == 0 || fits(n)) && (n == nc || !fits(n + 1));
+        }
+    check(rule, "pool_keep: the largest n that fits, 0..nc, N 1..16");
+    check(rx::pool_keep(4, 8, wk, wt, rm, rs, 0.0, 0.0) <= 4 && rx::pool_keep(4, 8, wk, wt, -1, rs, 0.17, 0.1) == 0 &&
+              rx::pool_keep(0, 8, wk, wt, rm, rs, 0.17, 0.1) == 0,
+          "pool_keep: at most nc; no estimate yet or no candidates: none");
+    check(rx::ewma(-1, 3.0, 0.05) == 3.0 && rx::ewma(2.0, 4.0, 0.5) == 3.0, "ewma: the first sample, then a step");
 }
 
 // serve_lane's flow over rx::split_plan, as the engine runs it: the plan as if the request goes (its tagged picks go on
