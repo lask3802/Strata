@@ -627,7 +627,7 @@ int main(int argc, char** argv) {
                 cpu_row(L[(size_t) li], rows[(size_t) t], xs[(size_t) t], lane);
                 for (int c = 0; c < E; ++c) srv[(size_t) c] = (double) rx::bf2f(y[(size_t) t * E + c]);
                 const double rel = rel_err(srv.data(), lane);
-                fworst = std::max(fworst, rel);
+                if (!(rel <= fworst)) fworst = rel;   // (a NaN shows: a slot of the wrong bytes can give one)
                 fbad += !(rel < 0.15);
             }
         }
