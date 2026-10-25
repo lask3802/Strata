@@ -28,6 +28,8 @@
 //   tables and the caches as cold as the engine's) - FILE is DS4_TRACE's (every pick of a decode token; --trace-hot N
 //   leaves out each layer's N most picked, the ones the GPUs would hold) or DS4_LANE_TRACE's (the lane's own calls,
 //   their slices too); one replay of --trace-tokens (default all) warms the mapping, a second is timed
+//   :cold - (:trace) no warm replay: the timed one on a mapping no page of which is mapped yet (the page cache warm), as an
+//   engine process's lane meets its experts - each one's first call faults its pages in (minor faults), later ones not
 // Rates: lane GB/s = bytes / (prep + gu + hq + down); in-job GB/s = a batch's bytes over its busy time / threads (the
 // rate while the jobs run); a thread's GB/s = bytes / busy.  minflt a token: getrusage (Linux), the page faults (Windows).
 // Linux: the core's counters of this process's threads over the timed tokens (perf_event_open; root or
@@ -896,7 +898,7 @@ struct Lane {   // the lane's pool and buffers (Impl's c_xh / c_xhd / c_yd)
 struct Variant {
     std::string name, mode;
     int k = 6, picks = 4, rb = 64, thr = 0;
-    bool split = false, empty = false, fix = false, dparts = false, trace = false;
+    bool split = false, empty = false, fix = false, dparts = false, trace = false, cold = false;
     int pf_age = 0;          // (:pf=N)
     std::vector<int> skip;   // (:skip=2+18: those CPUs not used)
     std::vector<int> spin;   // (:spin=16+18: a spinning thread on each)
@@ -922,6 +924,7 @@ static bool parse_variant(const std::string& s, const Variant& def, Variant& v) 
         else if (p == "pool=fix") v.fix = true;
         else if (p == "dparts") v.dparts = true;
         else if (p == "trace") v.trace = true;
+        else if (p == "cold") v.cold = true;
         else if (p.rfind("pf=", 0) == 0) v.pf_age = std::atoi(p.c_str() + 3);
         else if (p.rfind("skip=", 0) == 0) plus_list(p.substr(5), v.skip);
         else if (p.rfind("spin=", 0) == 0) plus_list(p.substr(5), v.spin);
@@ -1015,7 +1018,7 @@ int main(int argc, char** argv) {
             Variant v;
             if (!parse_variant(s, def, v)) {
                 std::printf("variant %s: a mode (file file-nopf file-fresh file-populate anon4k anon2m hot), then :k= :picks= "
-                            ":rb= :thr= :split :skip=A+B :empty :pool=fix :dparts :pf=N :spin=A+B :trace\n", s.c_str());
+                            ":rb= :thr= :split :skip=A+B :empty :pool=fix :dparts :pf=N :spin=A+B :trace :cold\n", s.c_str());
                 return 2;
             }
             vs.push_back(v);
@@ -1281,6 +1284,10 @@ int main(int argc, char** argv) {
             std::printf("%-26s (:trace: --trace FILE, and the modes file / file-nopf only)\n", v.name.c_str());
             continue;
         }
+        if (v.cold && !v.trace) {
+            std::printf("%-26s (:cold: a :trace variant only)\n", v.name.c_str());
+            continue;
+        }
         if (v.dparts && (!gdp.is_open() || anon)) {
             std::printf("%-26s (:dparts: --down-parts DIR, and not the anonymous copies)\n", v.name.c_str());
             continue;
@@ -1381,7 +1388,7 @@ int main(int argc, char** argv) {
             }
         };
         Acc warm;
-        if (v.trace)   // (the trace once through this mapping: its PTEs as the engine's, the caches its reuse's)
+        if (v.trace && !v.cold)   // (the trace once through this mapping: its PTEs as the engine's, the caches its reuse's)
             for (int t = 0; t < (int) tr.tok.size(); ++t) token(t, warm);
         else if (!fresh)   // (every pool expert once through this mapping, then once more: PTEs and caches as in steady state)
             for (int t = 0; t < 2 * ((P + v.picks - 1) / v.picks); ++t) token(t, warm);
