@@ -434,8 +434,9 @@ int serve_cpu(const std::string& host_port, const std::string& token, bool once)
 int serve_loop(const std::string& host_port, bool once, const char* what, int (*session)(Conn&, void*), void* arg);
 int serve_next(Conn& c, Hdr& h, std::vector<uint8_t>& p, int64_t& pings, int64_t& wakes, std::string& err);
 /// A server's refusal at the Geo: the Error with `why`, then whatever the main still sends read and dropped until it
-/// closes the link (it stops at the Error: Main::send_blob) or 5 s pass - closed at once, the unread blobs would reset
-/// the link and the main's send would lose the reason.
+/// closes the link (it stops at the Error: Main::send_blob), sends its BlobsEnd (a main that does not look: the Error is
+/// its answer), or is silent for 30 s - closed at once, the unread blobs would reset the link and the main's send
+/// would lose the reason.
 void refuse_at_geo(Conn& c, const std::string& why);
 
 }  // namespace strata::ds4::rx

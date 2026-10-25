@@ -559,10 +559,9 @@ int serve_next(Conn& c, Hdr& h, std::vector<uint8_t>& p, int64_t& pings, int64_t
 void refuse_at_geo(Conn& c, const std::string& why) {
     std::string err;
     if (!c.send(Error, 0, 0, 0, 0, why.data(), why.size(), err)) return;
-    const double give_up = now_ms() + 5000.0;
     Hdr h;
     std::vector<uint8_t> p;
-    while (c.recv(h, p, give_up, err) == 1 && h.type != BlobsEnd) {
+    while (c.recv(h, p, now_ms() + 30000.0, err) == 1 && h.type != BlobsEnd) {
     }
 }
 

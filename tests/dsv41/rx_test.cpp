@@ -361,7 +361,7 @@ int main(int argc, char** argv) {
         std::vector<std::vector<float>> xs2;
         make_req((int) (1 % L.size()), 1, picks, rows2, xs2);
         const uint32_t next = seq++;
-        if (!m.send_req(next, 1, 1, rows2.data(), ptrs(xs2), err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
+        if (!m.send_req(next, (int) (1 % L.size()), 1, rows2.data(), ptrs(xs2), err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
         const int g2 = m.wait_resp(next, 1, rx::now_ms() + 5000.0, &y, us, err);
         double num = 0, den = 0;
         if (g2 == 1) {

@@ -6950,8 +6950,7 @@ struct Model::Impl {
     }
     // the link given up: the lane computes every pick from now on (said once)
     void rx_lost(const std::string& why) {
-        if (!rx_on) return;
-        rx_on = false;
+        if (!rx_on.exchange(false)) return;
         if (rx_link) rx_link->close();
         std::fprintf(stderr, "ds4: remote experts: %s - the CPU lane computes all its experts from now on\n", why.c_str());
     }
