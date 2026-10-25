@@ -14,10 +14,17 @@
 //   hot            every call the same experts (layer 0's first picks): from the caches, the kernels' own rate
 //                  (hot:k=9:picks=8 is the engine's load probe: 8 whole experts, one token each, the same ones again)
 //   :k=K :picks=N :rb=R :split (one job a thread an entry) :thr=T   - any variant, e.g. file:thr=8, hot:picks=1
+//   :thr=T past the physical cores takes their second hardware threads (SMT), in the cores' order; :skip=2+18 leaves
+//   those CPUs out (the link core's pair); :empty - the same jobs doing nothing (the batches' dispatch and barrier
+//   alone); :pool=fix - the bench's FixPool instead of the engine's Pool (its flags on lines of their own, each worker's
+//   done count added once a batch, the jobs' busy time in a slot a thread: no shared write a job)
 // Rates: lane GB/s = bytes / (prep + gu + hq + down); in-job GB/s = a batch's bytes over its busy time / threads (the
 // rate while the jobs run); a thread's GB/s = bytes / busy.  minflt a token: getrusage (Linux), the page faults (Windows).
+// Linux: the core's counters of this process's threads over the timed tokens (perf_event_open; root or
+// perf_event_paranoid <= 2 - "pmc: unavailable" otherwise): IPC, the dispatch stalls, the FP pipes, the L1D fills.
 //   ds4_lane_bench --pack DIR [--layers 0-39] [--picks 4] [--k 6] [--pool 8] [--tokens 16] [--fresh-tokens 4]
 //                  [--threads N (every physical core)] [--variants file,file-nopf,..] [--dim 5120] [--ff 2304]
+//                  [--remap FROM=TO (the pack's paths: the host's view of a container's)] [--no-pmc]
 //   ds4_lane_bench --synthetic DIR [--syn-layers 2] [--syn-experts 16] [--syn-type IQ2_XXS] [the options above]:
 //                  a small fake pack (random legal blocks) written to DIR, then benched as --pack DIR
 // Read only on a pack; nothing else written.  No GPU.
@@ -44,6 +51,16 @@
 #include <vector>
 #if !defined(_WIN32)
 #include <sys/resource.h>
+#endif
+#if defined(__linux__)
+#include <cerrno>
+#include <cpuid.h>
+#include <dirent.h>
+#include <linux/perf_event.h>
+#include <sched.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace gg = strata::ds4::gguf;
@@ -110,12 +127,16 @@ struct Pack {
         return it == t.end() ? nullptr : &it->second;
     }
 };
+static std::string g_from, g_to;   // --remap FROM=TO: a path the pack names under FROM is read under TO
+static std::string remap(const std::string& p) {
+    return !g_from.empty() && p.rfind(g_from, 0) == 0 ? g_to + p.substr(g_from.size()) : p;
+}
 static bool read_pack(const std::string& dir, Pack& pk) {
     std::string mdir = dir;
     {
         std::ifstream f(dir + "/ds4.txt");
         for (std::string s; std::getline(f, s);)
-            if (s.rfind("model_dir ", 0) == 0) mdir = s.substr(10);
+            if (s.rfind("model_dir ", 0) == 0) mdir = remap(s.substr(10));
     }
     std::ifstream f(dir + "/tensors.txt");
     if (!f) {
@@ -132,7 +153,7 @@ static bool read_pack(const std::string& dir, Pack& pk) {
             std::string nm;
             is >> n >> nm;
             if ((int) pk.files.size() <= n) pk.files.resize((size_t) n + 1);
-            pk.files[(size_t) n] = nm[0] == '/' || (nm.size() > 1 && nm[1] == ':') ? nm : mdir + "/" + nm;
+            pk.files[(size_t) n] = nm[0] == '/' || (nm.size() > 1 && nm[1] == ':') ? remap(nm) : mdir + "/" + nm;
             continue;
         }
         if (k != "t") continue;
@@ -272,6 +293,287 @@ struct Anon {   // copies of a set of matrices, each 4 KiB aligned, on 4 KiB or 
     }
 };
 
+// ---- the logical CPUs in the order the threads take them: each core's first (Windows: os::node_cores' order; Linux:
+// this process's affinity), then the second hardware threads (SMT) in their cores' order
+static void cpu_order(std::vector<int>& phys, std::vector<int>& smt) {
+    std::vector<int> all;
+#if defined(_WIN32)
+    for (const auto& n : os::node_cores(false)) phys.insert(phys.end(), n.begin(), n.end());
+    for (const auto& n : os::node_cores(true)) all.insert(all.end(), n.begin(), n.end());
+#else
+    cpu_set_t s;
+    if (sched_getaffinity(0, sizeof s, &s) == 0)
+        for (int c = 0; c < CPU_SETSIZE; ++c)
+            if (CPU_ISSET(c, &s)) all.push_back(c);
+    for (int c : all) {
+        const std::vector<int> sib = os::cpu_siblings(c);   // (sorted: the core's first is the smallest)
+        if (sib.empty() || sib[0] == c || std::find(all.begin(), all.end(), sib[0]) == all.end()) phys.push_back(c);
+    }
+#endif
+    if (phys.empty()) phys.push_back(0);
+    for (int c : all)
+        if (std::find(phys.begin(), phys.end(), c) == phys.end()) smt.push_back(c);
+    auto core_at = [&](int c) {
+        const std::vector<int> sib = os::cpu_siblings(c);
+        const auto it = std::find(phys.begin(), phys.end(), sib.empty() ? c : sib[0]);
+        return (int) (it - phys.begin());
+    };
+    std::stable_sort(smt.begin(), smt.end(), [&](int a, int b) { return core_at(a) < core_at(b); });
+}
+
+// ---- :pool=fix - the engine's Pool (ds4_pool.hpp) with what a batch writes to shared lines cut down: every flag on a
+// line of its own (the Pool's sleeping_ / quit_ share done_'s line, which every job's fetch_add writes while the idle
+// workers poll quit_), each worker's jobs counted locally and added to done_ once when it runs out (one write a worker
+// a batch instead of one a job); the ticket claimed by CAS as the Pool claims it (a late worker of an older batch
+// must not take a job of this one).  t_slot: the thread's index (the caller 0), for the jobs' busy time a slot each.
+static thread_local int t_slot = 0;
+class FixPool {
+public:
+    explicit FixPool(int n, const std::vector<int>& cpus, int spin_us) : spin_us_(spin_us) {
+        for (int i = 0; i < n; ++i) {
+            th_.emplace_back([this, i] {
+                t_slot = i + 1;
+                loop(0);
+            });
+            if (!cpus.empty()) os::pin_thread(th_.back(), cpus[(size_t) i % cpus.size()]);
+        }
+    }
+    ~FixPool() {
+        quit_.store(true);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+        }
+        cv_.notify_all();
+        for (auto& t : th_) t.join();
+    }
+    void start(int n, const std::function<void(int)>& fn) {
+        n_ = n;
+        if (n <= 0) return;
+        const uint64_t g = (gen_.load(std::memory_order_relaxed) + 1) & 0xffffffffu;
+        ticket_.store((g << 32) | 0x7fffffffu, std::memory_order_seq_cst);
+        fn_ = &fn;
+        total_.store(n, std::memory_order_release);
+        done_.store(0, std::memory_order_relaxed);
+        ticket_.store(g << 32, std::memory_order_release);
+        gen_.store(g, std::memory_order_seq_cst);
+        if (sleeping_.load(std::memory_order_seq_cst) > 0) {
+            std::lock_guard<std::mutex> lk(mu_);
+            cv_.notify_all();
+        }
+    }
+    void help() {
+        if (n_ > 0) work(gen_.load(std::memory_order_acquire));
+    }
+    void wait() {
+        if (n_ <= 0) return;
+        while (done_.load(std::memory_order_acquire) < n_) strata::ds4::cpu_relax();
+        n_ = 0;
+    }
+
+private:
+    void work(uint64_t g) {
+        int mine = 0;
+        for (;;) {
+            uint64_t t = ticket_.load(std::memory_order_acquire);
+            if ((t >> 32) != g) break;
+            const int n = total_.load(std::memory_order_acquire);
+            if ((int) (t & 0xffffffffu) >= n) break;
+            if (!ticket_.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel)) continue;
+            (*fn_)((int) (t & 0xffffffffu));
+            ++mine;
+        }
+        if (mine > 0) done_.fetch_add(mine, std::memory_order_acq_rel);
+    }
+    void loop(uint64_t seen) {
+        for (;;) {
+            const auto t0 = std::chrono::steady_clock::now();
+            uint64_t g;
+            for (;;) {
+                g = gen_.load(std::memory_order_acquire);
+                if (g != seen || quit_.load(std::memory_order_relaxed)) break;
+                strata::ds4::cpu_relax();
+                if (std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(spin_us_)) {
+                    std::unique_lock<std::mutex> lk(mu_);
+                    sleeping_.fetch_add(1);
+                    cv_.wait(lk, [&] { return gen_.load() != seen || quit_.load(); });
+                    sleeping_.fetch_sub(1);
+                }
+            }
+            if (quit_.load()) return;
+            seen = g;
+            work(g);
+        }
+    }
+    std::vector<std::thread> th_;
+    int spin_us_;
+    int n_ = 0;
+    const std::function<void(int)>* fn_ = nullptr;
+    alignas(64) std::atomic<uint64_t> ticket_{0};
+    alignas(64) std::atomic<uint64_t> gen_{0};
+    alignas(64) std::atomic<int> total_{0};
+    alignas(64) std::atomic<int> done_{0};
+    alignas(64) std::atomic<int> sleeping_{0};
+    alignas(64) std::atomic<bool> quit_{false};
+    alignas(64) std::mutex mu_;
+    std::condition_variable cv_;
+};
+
+// ---- the core's counters (Linux perf_event_open), every thread of this process counted on its own (pid = its tid,
+// any CPU), user mode only, from start() to stop().  The events come in groups of at most 5, each led by cycles (a
+// group is counted together, so an event's share of its group's cycles is exact; the kernel time-shares the groups on
+// the 6 counters - one may be the NMI watchdog's - and a group's counts are scaled by its enabled / running time).  The
+// raw events are AMD family 0x19's (Zen 3; the PPR's PMCx numbers - the names after perf's amdzen3 lists, not checked
+// against the PPR here); another CPU gets cycles and instructions only.
+struct PmcEv {
+    const char* name;
+    uint32_t type;
+    uint64_t cfg;
+};
+#if defined(__linux__)
+static uint64_t amd_raw(unsigned ev, unsigned umask) { return (ev & 0xffu) | ((uint64_t) umask << 8) | ((uint64_t) (ev >> 8) << 32); }
+static bool amd_zen3() {
+    unsigned a, b, c, d;
+    if (!__get_cpuid(0, &a, &b, &c, &d)) return false;
+    char v[13];
+    std::memcpy(v, &b, 4), std::memcpy(v + 4, &d, 4), std::memcpy(v + 8, &c, 4);
+    v[12] = 0;
+    if (std::strcmp(v, "AuthenticAMD") != 0 || !__get_cpuid(1, &a, &b, &c, &d)) return false;
+    const unsigned base = (a >> 8) & 0xf, fam = base == 0xf ? base + ((a >> 20) & 0xff) : base;
+    return fam == 0x19;
+}
+// the groups (each after its cycles leader)
+static std::vector<std::vector<PmcEv>> pmc_groups() {
+    std::vector<std::vector<PmcEv>> g = {{{"instructions", PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS}}};
+    if (!amd_zen3()) return g;
+    const struct {
+        int grp;
+        const char* n;
+        unsigned ev, um;
+    } raw[] = {
+        {0, "ret-mops", 0xc1, 0x00},          // retired macro-ops
+        {0, "op-src-decoder", 0xaa, 0x01},    // ops dispatched from the decoder
+        {0, "op-src-opcache", 0xaa, 0x02},    // .. from the op cache
+        {1, "AE.01 int-prf", 0xae, 0x01},     // dispatch stall cycles: integer physical registers
+        {1, "AE.02 load-queue", 0xae, 0x02},
+        {1, "AE.04 store-queue", 0xae, 0x04},
+        {1, "AE.08 int-sched-misc", 0xae, 0x08},
+        {2, "AE.10 taken-br-buf", 0xae, 0x10},
+        {2, "AE.20 fp-prf", 0xae, 0x20},
+        {2, "AE.40 fp-sched", 0xae, 0x40},
+        {2, "AE.80 fp-misc", 0xae, 0x80},
+        {3, "AF.01 int-sq0", 0xaf, 0x01},     // .. an integer scheduler queue full
+        {3, "AF.02 int-sq1", 0xaf, 0x02},
+        {3, "AF.04 int-sq2", 0xaf, 0x04},
+        {3, "AF.08 int-sq3", 0xaf, 0x08},
+        {4, "AF.10 agsq", 0xaf, 0x10},
+        {4, "AF.20 retire", 0xaf, 0x20},
+        {5, "x000.01 fp-pipe0", 0x00, 0x01},  // FP pipe assignment (Zen 2's PMCx000; on Zen 3 it may read 0)
+        {5, "x000.02 fp-pipe1", 0x00, 0x02},
+        {5, "x000.04 fp-pipe2", 0x00, 0x04},
+        {5, "x000.08 fp-pipe3", 0x00, 0x08},
+        {6, "44.01 fill-l2", 0x44, 0x01},     // L1D fills by source: the core's L2
+        {6, "44.02 fill-ccx", 0x44, 0x02},    // .. another L2 or the L3 of the CCX
+        {6, "44.04 fill-ext", 0x44, 0x04},    // .. another CCX's cache
+        {6, "44.08 fill-dram", 0x44, 0x08},   // .. DRAM or IO (the node's)
+        {7, "64.08 l2-dc-miss", 0x64, 0x08},  // L2: data cache read misses
+        {7, "71 l2pf-l3-hit", 0x71, 0xff},    // L2 prefetches: missed the L2, hit the L3
+        {7, "72 l2pf-l3-miss", 0x72, 0xff},   // .. missed the L3 too
+    };
+    g.resize(8);
+    for (const auto& r : raw) g[(size_t) r.grp].push_back({r.n, PERF_TYPE_RAW, amd_raw(r.ev, r.um)});
+    return g;
+}
+struct Pmc {
+    std::vector<std::vector<PmcEv>> grp;
+    std::vector<std::vector<std::vector<int>>> fd;   // [thread][group][0: the cycles leader, then the group's events]
+    std::string err;
+    static long open1(uint32_t type, uint64_t cfg, int tid, int leader) {
+        perf_event_attr a;
+        std::memset(&a, 0, sizeof a);
+        a.size = sizeof a;
+        a.type = type;
+        a.config = cfg;
+        a.disabled = leader < 0 ? 1 : 0;   // (the leader starts and stops its group)
+        a.exclude_kernel = 1;
+        a.exclude_hv = 1;
+        a.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
+        return syscall(SYS_perf_event_open, &a, tid, -1, leader, PERF_FLAG_FD_CLOEXEC);
+    }
+    // every thread of the process now (the pool's are running): false with err if not even the first counter opens; an
+    // event this CPU or kernel refuses is left out of its group (-1)
+    bool open() {
+        grp = pmc_groups();
+        std::vector<int> tids;
+        if (DIR* d = opendir("/proc/self/task")) {
+            while (dirent* x = readdir(d))
+                if (x->d_name[0] >= '0' && x->d_name[0] <= '9') tids.push_back(std::atoi(x->d_name));
+            closedir(d);
+        }
+        for (int tid : tids) {
+            std::vector<std::vector<int>> t;
+            for (const auto& g : grp) {
+                std::vector<int> f(g.size() + 1, -1);
+                const long l = open1(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, tid, -1);
+                if (l < 0 && fd.empty() && t.empty()) {
+                    err = "errno " + std::to_string(errno) + ", " + std::strerror(errno);
+                    return false;
+                }
+                f[0] = (int) l;
+                for (size_t i = 0; i < g.size() && l >= 0; ++i) f[i + 1] = (int) open1(g[i].type, g[i].cfg, tid, (int) l);
+                t.push_back(f);
+            }
+            fd.push_back(t);
+        }
+        return !fd.empty();
+    }
+    void ctl(unsigned long op) {
+        for (auto& t : fd)
+            for (auto& f : t)
+                if (f[0] >= 0) ioctl(f[0], op, PERF_IOC_FLAG_GROUP);
+    }
+    void start() {
+        ctl(PERF_EVENT_IOC_RESET);
+        ctl(PERF_EVENT_IOC_ENABLE);
+    }
+    void stop() { ctl(PERF_EVENT_IOC_DISABLE); }
+    // per group: [0] its cycles, then its events, summed over the threads, each thread's scaled by its enabled / running
+    // time; running: the share of the groups' enabled time they were counted, never: the thread-groups never counted
+    // (their counts lost: a run shorter than a few time-sharing ticks)
+    std::vector<std::vector<double>> read(double& running, int& never) {
+        std::vector<std::vector<double>> s(grp.size());
+        double en = 0, ru = 0;
+        never = 0;
+        for (size_t k = 0; k < grp.size(); ++k) s[k].assign(grp[k].size() + 1, -1.0);
+        for (auto& t : fd)
+            for (size_t k = 0; k < t.size(); ++k) {
+                const std::vector<int>& f = t[k];
+                if (f[0] < 0) continue;
+                uint64_t r[3 + 8];   // nr, enabled, running, the values of the events opened (leader first)
+                const ssize_t got = ::read(f[0], r, sizeof r);
+                if (got < (ssize_t) (3 * sizeof(uint64_t))) continue;
+                const double sc = r[2] > 0 ? (double) r[1] / (double) r[2] : 0.0;
+                en += (double) r[1];
+                ru += (double) r[2];
+                if (r[1] > 0 && r[2] == 0) ++never;
+                size_t v = 3;
+                for (size_t i = 0; i < f.size() && v < 3 + (size_t) r[0]; ++i) {
+                    if (f[i] < 0) continue;   // (not opened: not in the group's values)
+                    if (s[k][i] < 0) s[k][i] = 0;
+                    s[k][i] += (double) r[v++] * sc;
+                }
+            }
+        running = en > 0 ? ru / en : 0.0;
+        return s;
+    }
+    ~Pmc() {
+        for (auto& t : fd)
+            for (auto& f : t)
+                for (size_t i = f.size(); i-- > 0;)
+                    if (f[i] >= 0) close(f[i]);
+    }
+};
+#endif
+
 // ---- the bench
 struct Layer {
     int L = 0, tg = -1, td = -1;
@@ -284,30 +586,54 @@ struct Exp {
 enum Pf { kPfNone, kPfWillneed, kPfPopulate };
 struct Acc {
     double prep = 0, gu = 0, gu_tail = 0, gu_busy = 0, hq = 0, dn = 0, dn_tail = 0, dn_busy = 0, gu_bytes = 0, dn_bytes = 0;
+    int batches = 0;
+};
+struct alignas(64) Slot {   // (:pool=fix) a thread's jobs' busy time, a line each
+    int64_t ns = 0;
 };
 struct Lane {   // the lane's pool and buffers (Impl's c_xh / c_xhd / c_yd)
     std::unique_ptr<Pool> pool;
+    std::unique_ptr<FixPool> fpool;   // (:pool=fix: this one instead)
+    std::vector<Slot> slot;
     int threads = 1;
+    bool empty = false;   // (:empty: the jobs return at once)
     std::vector<float> x, h, y;
     std::vector<uint8_t> xq, hq;
     // run_nodes_prof's batch: wall, tail (the caller's wait once it ran out of jobs), busy (the jobs' time in all)
-    void batch(int n, const std::function<void(int)>& f, double& wall, double& tail, double& busy) {
+    void batch(int n, const std::function<void(int)>& f, double& wall, double& tail, double& busy, int& batches) {
         std::atomic<int64_t> ns{0};
         const std::function<void(int)> g = [&](int j) {
             const auto a = std::chrono::steady_clock::now();
-            f(j);
+            if (!empty) f(j);
             ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - a).count(),
                          std::memory_order_relaxed);
         };
+        const std::function<void(int)> gs = [&](int j) {   // (FixPool: no shared write a job)
+            const auto a = std::chrono::steady_clock::now();
+            if (!empty) f(j);
+            slot[(size_t) t_slot].ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - a).count();
+        };
+        for (Slot& s : slot) s.ns = 0;
         const double t0 = now_ms();
-        pool->start(n, g);
-        pool->help();
-        const double th = now_ms();
-        pool->wait();
+        double th;
+        if (fpool) {
+            fpool->start(n, gs);
+            fpool->help();
+            th = now_ms();
+            fpool->wait();
+        } else {
+            pool->start(n, g);
+            pool->help();
+            th = now_ms();
+            pool->wait();
+        }
         const double t1 = now_ms();
         wall += t1 - t0;
         tail += t1 - th;
-        busy += (double) ns.load() / 1e6;
+        int64_t sum = ns.load();
+        for (const Slot& s : slot) sum += s.ns;
+        busy += (double) sum / 1e6;
+        ++batches;
     }
     // one call: ne experts (one token each) over n_ff [0, ffn)
     void call(const Layer& ly, const Exp* ex, int ne, int ffn, int rb, bool split, Pf pf, Acc& a) {
@@ -343,7 +669,7 @@ struct Lane {   // the lane's pool and buffers (Impl's c_xh / c_xhd / c_yd)
             if (r0 >= r1) return;
             float* hp[1] = {h.data() + (size_t) q * FF};
             gg::iq_cpu_gate_up(fm, ex[q].m[0], ex[q].m[1], ap, 1, hp, r0, r1, kLim);
-        }, a.gu, a.gu_tail, a.gu_busy);
+        }, a.gu, a.gu_tail, a.gu_busy, a.batches);
         const double th = now_ms();
         for (int q = 0; q < ne; ++q) gg::iq_cpu_quant(fm.d_act, h.data() + (size_t) q * FF, ffn, hq.data() + (size_t) q * E * 4);
         a.hq += now_ms() - th;
@@ -353,7 +679,8 @@ struct Lane {   // the lane's pool and buffers (Impl's c_xh / c_xhd / c_yd)
             const void* hp[1] = {hq.data() + (size_t) q * E * 4};
             float* yp[1] = {y.data() + (size_t) q * E};
             gg::iq_cpu_down(fd, ex[q].m[2] + d_off, hp, 1, yp, r0, r1);
-        }, a.dn, a.dn_tail, a.dn_busy);
+        }, a.dn, a.dn_tail, a.dn_busy, a.batches);
+        if (empty) return;   // (nothing read)
         a.gu_bytes += (double) ne * 2.0 * (double) ffn * (double) fm.gu_row;
         a.dn_bytes += (double) ne * (double) E * (double) fd.d_row;
     }
@@ -362,7 +689,8 @@ struct Lane {   // the lane's pool and buffers (Impl's c_xh / c_xhd / c_yd)
 struct Variant {
     std::string name, mode;
     int k = 6, picks = 4, rb = 64, thr = 0;
-    bool split = false;
+    bool split = false, empty = false, fix = false;
+    std::vector<int> skip;   // (:skip=2+18: those CPUs not used)
 };
 static bool parse_variant(const std::string& s, const Variant& def, Variant& v) {
     v = def;
@@ -376,7 +704,13 @@ static bool parse_variant(const std::string& s, const Variant& def, Variant& v) 
         else if (p.rfind("rb=", 0) == 0) v.rb = std::atoi(p.c_str() + 3);
         else if (p.rfind("thr=", 0) == 0) v.thr = std::atoi(p.c_str() + 4);
         else if (p == "split") v.split = true;
-        else return false;
+        else if (p == "empty") v.empty = true;
+        else if (p == "pool=fix") v.fix = true;
+        else if (p.rfind("skip=", 0) == 0) {
+            std::istringstream ss(p.substr(5));
+            for (std::string c; std::getline(ss, c, '+');)
+                if (!c.empty()) v.skip.push_back(std::atoi(c.c_str()));
+        } else return false;
     }
     const char* modes[] = {"file", "file-nopf", "file-fresh", "file-populate", "anon4k", "anon2m", "hot"};
     bool known = false;
@@ -387,9 +721,12 @@ static bool parse_variant(const std::string& s, const Variant& def, Variant& v) 
 int main(int argc, char** argv) {
     std::string pack, syn, syn_type = "IQ2_XXS", vlist =
         "file,file:k=9,file-nopf,file-fresh,file-populate,anon4k,anon2m,file:picks=1,hot:picks=1,file:k=9:picks=8,"
-        "hot:k=9:picks=8,file:rb=128,file:rb=256,file:split,file:thr=1,file:thr=2,file:thr=4,file:thr=8,file:thr=12";
+        "hot:k=9:picks=8,file:rb=128,file:rb=256,file:split,file:thr=1,file:thr=2,file:thr=4,file:thr=8,file:thr=12,"
+        "file:thr=24,file:thr=30:skip=2+18,file:thr=32,hot,hot:thr=1,hot:thr=8,hot:thr=24,hot:thr=30:skip=2+18,hot:thr=32,"
+        "file:empty,file:empty:pool=fix,file:pool=fix,hot:pool=fix";
     std::string layers_s;
     int syn_l = 2, syn_e = 16, pool_n = 8, tokens = 16, fresh_tokens = 4, threads = 0;
+    bool want_pmc = true;
     Variant def;
     def.mode = "file";
     for (int i = 1; i < argc; ++i) {
@@ -410,12 +747,27 @@ int main(int argc, char** argv) {
         else if (a == "--variants" && v) vlist = argv[++i];
         else if (a == "--dim" && v) E = std::atoi(argv[++i]);
         else if (a == "--ff" && v) FF = std::atoi(argv[++i]);
+        else if (a == "--remap" && v && std::strchr(argv[i + 1], '=') != nullptr) {
+            const std::string m = argv[++i];
+            g_from = m.substr(0, m.find('='));
+            g_to = m.substr(m.find('=') + 1);
+        } else if (a == "--no-pmc") want_pmc = false;
         else {
             std::printf("usage: ds4_lane_bench --pack DIR | --synthetic DIR [--layers 0-39] [--picks 4] [--k 6] [--pool 8] "
-                        "[--tokens 16] [--fresh-tokens 4] [--threads N] [--variants a,b,..] [--dim 5120] [--ff 2304]\n");
+                        "[--tokens 16] [--fresh-tokens 4] [--threads N] [--variants a,b,..] [--dim 5120] [--ff 2304] "
+                        "[--remap FROM=TO] [--no-pmc]\n");
             return 2;
         }
     }
+#if defined(__linux__)
+    if (want_pmc) {   // (a counter a thread an event: 32 threads x 30 events need more than the usual 1024 descriptors)
+        rlimit r;
+        if (getrlimit(RLIMIT_NOFILE, &r) == 0 && r.rlim_cur < r.rlim_max) {
+            r.rlim_cur = r.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &r);
+        }
+    }
+#endif
     if (!syn.empty()) {
         if (!write_synthetic(syn, syn_l, syn_e, syn_type)) return 2;
         pack = syn;
@@ -432,7 +784,7 @@ int main(int argc, char** argv) {
             Variant v;
             if (!parse_variant(s, def, v)) {
                 std::printf("variant %s: a mode (file file-nopf file-fresh file-populate anon4k anon2m hot), then :k= :picks= "
-                            ":rb= :thr= :split\n", s.c_str());
+                            ":rb= :thr= :split :skip=A+B :empty :pool=fix\n", s.c_str());
                 return 2;
             }
             vs.push_back(v);
@@ -494,10 +846,11 @@ int main(int argc, char** argv) {
         std::printf("--picks / :picks= up to 16\n");
         return 2;
     }
-    std::vector<int> cores;
-    for (const auto& n : os::node_cores()) cores.insert(cores.end(), n.begin(), n.end());
-    if (cores.empty()) cores.push_back(0);
-    if (threads <= 0) threads = (int) cores.size();
+    std::vector<int> cores, smt;   // (cores: the order the threads take; the first `phys` one a core)
+    cpu_order(cores, smt);
+    const int phys = (int) cores.size();
+    cores.insert(cores.end(), smt.begin(), smt.end());
+    if (threads <= 0) threads = phys;
     // the page cache warm for every expert used: each page read once through a mapping of its own (its PTEs dropped
     // with it), so file-fresh's mapping finds the pages cached but not mapped
     double cold_before = 0, cold_after = 0, used = 0;
@@ -522,33 +875,60 @@ int main(int argc, char** argv) {
                 "cores", pack.c_str(), ly.size(), ly.front().L, ly.back().L, ggml_type_name((ggml_type) ly[0].tg),
                 ggml_type_name((ggml_type) ly[0].td), pool_n, (int) ly[0].fresh.size(), threads);
     for (int i = 0; i < threads && i < (int) cores.size(); ++i) std::printf("%s%d", i ? "," : " ", cores[(size_t) i]);
+    std::printf("; then (:thr= past %d, SMT)", phys);
+    for (size_t i = 0; i < smt.size(); ++i) std::printf("%s%d", i ? "," : " ", smt[i]);
     std::printf("\nthe experts used: %.0f MB, %.0f MB of it not in the page cache before the warm read, %.0f MB after it\n",
                 used / 1e6, cold_before / 1e6, cold_after / 1e6);
-    std::printf("%-20s %3s %5s %2s %4s %6s %7s %5s %6s %5s %4s %5s %6s %5s %4s %7s %6s %6s %6s %6s %6s %8s\n", "variant", "thr",
-                "picks", "k", "rb", "tokens", "lane-ms", "prep", "gu", "gu-tl", "gu%", "hq", "down", "dn-tl", "dn%", "MB/tok",
-                "lane", "gu-job", "dn-job", "gu-thr", "dn-thr", "minflt");
-    os::pin_self(cores[0]);
+#if defined(__linux__)
+    if (want_pmc) {   // (once: the counters open here or not at all)
+        Pmc t;
+        if (!t.open()) {
+            std::printf("pmc: unavailable (%s)\n", t.err.empty() ? "no threads" : t.err.c_str());
+            want_pmc = false;
+        } else {
+            std::printf("pmc: %zu groups a thread (%s)\n", t.grp.size(), amd_zen3() ? "AMD family 0x19 raw events" : "cycles, instructions");
+        }
+    }
+#else
+    if (want_pmc) std::printf("pmc: unavailable (Linux only)\n");
+    want_pmc = false;
+#endif
+    std::printf("%-26s %3s %5s %2s %4s %6s %7s %5s %6s %5s %4s %5s %6s %5s %4s %7s %6s %6s %6s %6s %6s %6s %8s\n", "variant",
+                "thr", "picks", "k", "rb", "tokens", "lane-ms", "prep", "gu", "gu-tl", "gu%", "hq", "down", "dn-tl", "dn%",
+                "MB/tok", "lane", "gu-job", "dn-job", "gu-thr", "dn-thr", "bat-us", "minflt");
     std::mt19937 rng(7);
     std::vector<float> xv((size_t) E);
     for (float& v : xv) v = ((float) (rng() % 20001) - 10000.0f) * 1e-4f;
     for (const Variant& v : vs) {
-        const int thr = std::max(1, std::min(v.thr > 0 ? v.thr : threads, (int) cores.size()));
+        std::vector<int> cpus;   // (this variant's CPUs, in the threads' order: the caller on the first)
+        for (int c : cores)
+            if (std::find(v.skip.begin(), v.skip.end(), c) == v.skip.end()) cpus.push_back(c);
+        if (cpus.empty()) cpus.push_back(cores[0]);
+        const int thr = std::max(1, std::min(v.thr > 0 ? v.thr : threads, (int) cpus.size()));
         const bool fresh = v.mode == "file-fresh" || v.mode == "file-populate";
         const bool anon = v.mode == "anon4k" || v.mode == "anon2m";
         const Pf pf = v.mode == "file-nopf" || anon || v.mode == "hot" ? kPfNone : v.mode == "file-populate" ? kPfPopulate : kPfWillneed;
 #if defined(_WIN32)
         if (v.mode == "file-populate") {
-            std::printf("%-20s (MADV_POPULATE_READ: Linux only)\n", v.name.c_str());
+            std::printf("%-26s (MADV_POPULATE_READ: Linux only)\n", v.name.c_str());
             continue;
         }
 #endif
         if (fresh && fresh_tokens < 1) {
-            std::printf("%-20s (no fresh experts: the layers have too few beyond the pool)\n", v.name.c_str());
+            std::printf("%-26s (no fresh experts: the layers have too few beyond the pool)\n", v.name.c_str());
             continue;
         }
+        os::pin_self(cpus[0]);
         Lane ln;
         ln.threads = thr;
-        ln.pool = std::make_unique<Pool>(thr - 1, std::vector<int>(cores.begin() + 1, cores.begin() + thr), 20000);
+        ln.empty = v.empty;
+        const std::vector<int> wcpus(cpus.begin() + 1, cpus.begin() + thr);
+        if (v.fix) {
+            ln.fpool = std::make_unique<FixPool>(thr - 1, wcpus, 20000);
+            ln.slot.assign((size_t) thr, Slot{});
+        } else {
+            ln.pool = std::make_unique<Pool>(thr - 1, wcpus, 20000);
+        }
         ln.x = xv;
         ln.h.assign((size_t) v.picks * FF, 0.0f);
         ln.y.assign((size_t) v.picks * E, 0.0f);
@@ -566,7 +946,7 @@ int main(int argc, char** argv) {
                     for (int e : x.pool)
                         for (int r = 0; r < 3; ++r) need += (size_t) ((pk.at(x.L, e, r)->bytes + 4095) / 4096 * 4096);
             if (anon && !an.make(need, v.mode == "anon2m")) {
-                std::printf("%-20s (no %.0f MB of anonymous memory)\n", v.name.c_str(), (double) need / 1e6);
+                std::printf("%-26s (no %.0f MB of anonymous memory)\n", v.name.c_str(), (double) need / 1e6);
                 continue;
             }
             uint8_t* w = anon ? an.aligned() : nullptr;
@@ -606,24 +986,86 @@ int main(int argc, char** argv) {
             for (int t = 0; t < 2 * ((P + v.picks - 1) / v.picks); ++t) token(t, warm);
         const int nt = fresh ? fresh_tokens : tokens;
         Acc a;
+#if defined(__linux__)
+        Pmc pm;   // (the pool's threads are up: each counted)
+        const bool pmc_on = want_pmc && pm.open();
+        if (pmc_on) pm.start();
+#endif
         const int64_t f0 = faults();
         for (int t = 0; t < nt; ++t) token(t, a);
         const int64_t f1 = faults();
+#if defined(__linux__)
+        std::vector<std::vector<double>> pc;
+        double pc_run = 0;
+        int pc_never = 0;
+        if (pmc_on) {
+            pm.stop();
+            pc = pm.read(pc_run, pc_never);
+        }
+#endif
         const double n = nt, lane = (a.prep + a.gu + a.hq + a.dn) / n, mb = (a.gu_bytes + a.dn_bytes) / n / 1e6;
         auto use = [&](double busy, double wall) { return 100.0 * busy / std::max(1e-9, wall * thr); };
         auto gbs = [](double bytes, double ms) { return bytes / 1e6 / std::max(1e-9, ms); };   // (MB / ms = GB/s)
-        std::printf("%-20s %3d %5d %2d %4s %6d %7.2f %5.2f %6.2f %5.2f %4.0f %5.2f %6.2f %5.2f %4.0f %7.1f %6.1f %6.1f %6.1f "
-                    "%6.2f %6.2f %8.0f%s\n",
+        std::printf("%-26s %3d %5d %2d %4s %6d %7.2f %5.2f %6.2f %5.2f %4.0f %5.2f %6.2f %5.2f %4.0f %7.1f %6.1f %6.1f %6.1f "
+                    "%6.2f %6.2f %6.1f %8.0f%s\n",
                     v.name.c_str(), thr, v.picks, v.k, v.split ? "thr" : std::to_string(v.rb).c_str(), nt, lane, a.prep / n,
                     a.gu / n, a.gu_tail / n, use(a.gu_busy, a.gu), a.hq / n, a.dn / n, a.dn_tail / n, use(a.dn_busy, a.dn), mb,
                     gbs(a.gu_bytes + a.dn_bytes, a.prep + a.gu + a.hq + a.dn), gbs(a.gu_bytes, a.gu_busy / thr),
                     gbs(a.dn_bytes, a.dn_busy / thr), gbs(a.gu_bytes, a.gu_busy), gbs(a.dn_bytes, a.dn_busy),
-                    f0 >= 0 ? (double) (f1 - f0) / n : -1.0,
+                    1000.0 * (a.gu + a.dn) / std::max(1, a.batches), f0 >= 0 ? (double) (f1 - f0) / n : -1.0,
                     huge >= 0 ? (" (AnonHugePages " + std::to_string(huge / 1024) + " MB)").c_str() : "");
+#if defined(__linux__)
+        if (!pc.empty()) {   // (the counters over the timed tokens, every thread: spin waits included)
+            // an event's total, and its group's cycles (for its share: both counted over the same time)
+            auto at = [&](const char* nm, double* gcyc) {
+                for (size_t k = 0; k < pm.grp.size(); ++k)
+                    for (size_t i = 0; i < pm.grp[k].size(); ++i)
+                        if (std::strcmp(pm.grp[k][i].name, nm) == 0) {
+                            if (gcyc != nullptr) *gcyc = pc[k][0];
+                            return pc[k][i + 1];
+                        }
+                return -1.0;
+            };
+            double cyc = -1;
+            const double ins = at("instructions", &cyc), kb = (a.gu_bytes + a.dn_bytes) / 1024.0;
+            std::printf("  pmc %s: IPC %.2f, %.0f cycles a token a thread, %.1f cycles a KB read; the groups counted %.0f%% "
+                        "of their time, %d thread-groups never", v.name.c_str(), cyc > 0 && ins >= 0 ? ins / cyc : -1.0,
+                        cyc / n / thr, kb > 0 ? cyc / kb : -1.0, 100.0 * pc_run, pc_never);
+            const double mops = at("ret-mops", nullptr), dec = at("op-src-decoder", nullptr), opc = at("op-src-opcache", nullptr);
+            if (mops >= 0) std::printf("; %.2f macro-ops an instruction, %.0f%% of ops from the op cache", ins > 0 ? mops / ins : -1.0,
+                                       dec + opc > 0 ? 100.0 * opc / (dec + opc) : -1.0);
+            std::printf("\n");
+            // pct: an event's share of its group's cycles; else a KB read (or of the FP ops in all: fp)
+            auto line = [&](const char* title, const char* pre, int how, const char* unit) {
+                double fp = 0;
+                for (size_t k = 0; k < pm.grp.size(); ++k)
+                    for (size_t i = 0; i < pm.grp[k].size(); ++i)
+                        if (std::strncmp(pm.grp[k][i].name, pre, std::strlen(pre)) == 0 && pc[k][i + 1] > 0) fp += pc[k][i + 1];
+                bool any = false;
+                for (size_t k = 0; k < pm.grp.size(); ++k)
+                    for (size_t i = 0; i < pm.grp[k].size(); ++i) {
+                        if (std::strncmp(pm.grp[k][i].name, pre, std::strlen(pre)) != 0) continue;
+                        const double x = pc[k][i + 1], over = how == 0 ? pc[k][0] / 100.0 : how == 1 ? kb : fp / 100.0;
+                        if (!any) std::printf("    %s:", title);
+                        any = true;
+                        if (x < 0) std::printf(" %s n/a", pm.grp[k][i].name);
+                        else std::printf(" %s %.2f", pm.grp[k][i].name, over > 0 ? x / over : 0.0);
+                    }
+                if (any) std::printf(" (%s)\n", unit);
+            };
+            line("dispatch stalls", "AE.", 0, "% of cycles");
+            line("dispatch stalls", "AF.", 0, "% of cycles");
+            line("FP pipes", "x000.", 2, "% of the FP ops; all 0: not counted on this CPU");
+            line("L1D fills", "44.", 1, "a KB read");
+            line("L2", "64.", 1, "a KB read");
+            line("L2 prefetches", "7", 1, "a KB read");
+        }
+#endif
         std::fflush(stdout);
     }
     std::printf("(ms a token: lane = prep + gu + hq + down; prep: the hint and the x quant; gu / down: each batch's wall, -tl\n"
                 " its tail, %% its jobs' time over threads x wall; MB/tok: the bytes the jobs read; GB/s: lane over lane-ms,\n"
-                " -job over the busy time / threads, -thr a thread's own; minflt: page faults a token)\n");
+                " -job over the busy time / threads, -thr a thread's own; bat-us: a batch's wall, us (gate / up and down\n"
+                " alike); minflt: page faults a token)\n");
     return 0;
 }
