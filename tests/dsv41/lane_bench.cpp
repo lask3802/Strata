@@ -23,6 +23,8 @@
 //   :pf=N - the hint only on the experts the layer's last N calls did not take (DS4_IQ_PF=N)
 //   :spin=A+B - a thread on each CPU listed spinning on a load (no pause) the whole variant: a busy neighbour (the
 //   engine's CUDA host thread waiting, a polling link) on a lane core or its sibling
+//   :gap=N - after each timed call the caller idles N us polling (cpu_relax), the pool's workers in their 20 ms spin: the
+//   engine's time between the lane's calls (the GPU's part of each layer), its threads idling as the engine's do
 //   :trace - the calls of --trace FILE instead of the pool's (file / file-nopf only): the engine's picks a layer, their
 //   number varying call to call and their reuse as a session has it, over the pack's every expert (the TLB, the page
 //   tables and the caches as cold as the engine's) - FILE is DS4_TRACE's (every pick of a decode token; --trace-hot N
@@ -987,6 +989,7 @@ struct Variant {
     int k = 6, picks = 4, rb = 64, thr = 0;
     bool split = false, empty = false, fix = false, dparts = false, trace = false, cold = false;
     int pf_age = 0;          // (:pf=N)
+    int gap_us = 0;          // (:gap=N: the caller's idle after each timed call, us)
     std::vector<int> skip;   // (:skip=2+18: those CPUs not used)
     std::vector<int> spin;   // (:spin=16+18: a spinning thread on each)
 };
@@ -1013,6 +1016,7 @@ static bool parse_variant(const std::string& s, const Variant& def, Variant& v) 
         else if (p == "trace") v.trace = true;
         else if (p == "cold") v.cold = true;
         else if (p.rfind("pf=", 0) == 0) v.pf_age = std::atoi(p.c_str() + 3);
+        else if (p.rfind("gap=", 0) == 0) v.gap_us = std::atoi(p.c_str() + 4);
         else if (p.rfind("skip=", 0) == 0) plus_list(p.substr(5), v.skip);
         else if (p.rfind("spin=", 0) == 0) plus_list(p.substr(5), v.spin);
         else return false;
@@ -1020,7 +1024,7 @@ static bool parse_variant(const std::string& s, const Variant& def, Variant& v) 
     const char* modes[] = {"file", "file-nopf", "file-fresh", "file-populate", "anon4k", "anon2m", "hot"};
     bool known = false;
     for (const char* m : modes) known = known || v.mode == m;
-    return known && v.k >= 1 && v.k <= 9 && v.picks >= 1 && v.rb >= 1;
+    return known && v.k >= 1 && v.k <= 9 && v.picks >= 1 && v.rb >= 1 && v.gap_us >= 0 && v.gap_us <= 100000;
 }
 
 // (:dparts) expert e's down part in `p` - the first that holds a block, of the layer's type and row layout (one row's
@@ -1105,7 +1109,7 @@ int main(int argc, char** argv) {
             Variant v;
             if (!parse_variant(s, def, v)) {
                 std::printf("variant %s: a mode (file file-nopf file-fresh file-populate anon4k anon2m hot), then :k= :picks= "
-                            ":rb= :thr= :split :skip=A+B :empty :pool=fix :dparts :pf=N :spin=A+B :trace :cold\n", s.c_str());
+                            ":rb= :thr= :split :skip=A+B :empty :pool=fix :dparts :pf=N :spin=A+B :gap=N :trace :cold\n", s.c_str());
                 return 2;
             }
             vs.push_back(v);
@@ -1452,6 +1456,17 @@ int main(int argc, char** argv) {
         }
         const long huge = anon ? anon_huge_kb() : -1;
         const int P = (int) ly[0].pool.size(), ffn = v.k * 256;
+        // (:gap=N, the timed tokens) after each call the caller idles N us as the engine's service thread does between
+        // a token's layers - polling with cpu_relax (it naps only after kSpinMs) - and the pool's workers sit in their
+        // 20 ms spin as the engine's do: the engine's ~190 us a call between the lane's calls (the GPU's part of a layer)
+        bool gapping = false;
+        double gap_ms = 0.0;   // (the idles' time in all, timed tokens)
+        auto gap = [&] {
+            if (!gapping || v.gap_us <= 0) return;
+            const auto t0 = std::chrono::steady_clock::now(), t1 = t0 + std::chrono::microseconds(v.gap_us);
+            while (std::chrono::steady_clock::now() < t1) strata::ds4::cpu_relax();
+            gap_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        };
         auto token = [&](int t, Acc& a) {
             if (v.trace) {   // (the trace's token t: its calls as they were; a DS4_TRACE call over [0, k))
                 for (const TCall& c : tr.tok[(size_t) t]) {
@@ -1460,6 +1475,7 @@ int main(int argc, char** argv) {
                     for (int q = 0; q < np; ++q) e[q] = ex[(size_t) c.li][(size_t) c.e[(size_t) q]];
                     const int s0 = c.a >= 0 ? 256 * c.a : 0, sn = c.a >= 0 ? 256 * (c.b - c.a) : ffn;
                     ln.call(ly[(size_t) c.li], e, np, s0, sn, v.rb, v.split, pf, v.dparts, a);
+                    gap();
                 }
                 return;
             }
@@ -1472,6 +1488,7 @@ int main(int argc, char** argv) {
                     else e[q] = ex[i][(size_t) ((t * v.picks + q) % P)];
                 }
                 ln.call(v.mode == "hot" ? ly[0] : ly[i], e, np, 0, ffn, v.rb, v.split, pf, v.dparts, a);
+                gap();
             }
         };
         Acc warm;
@@ -1490,7 +1507,11 @@ int main(int argc, char** argv) {
         if (!v.spin.empty()) spin = std::make_unique<Spin>(v.spin);
         Clock clk(256);
         const int64_t f0 = faults();
+        gapping = true;
+        const auto tw0 = std::chrono::steady_clock::now();
         for (int t = 0; t < nt; ++t) token(t, a);
+        const double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
+        gapping = false;
         const int64_t f1 = faults();
         clk.end();
         spin.reset();
@@ -1522,6 +1543,10 @@ int main(int argc, char** argv) {
             std::printf("); downs from the parts %.0f%%; experts hinted %.0f%%\n", 100.0 * (double) a.downs_dp / (double) std::max(1L, a.picks),
                         pf == kPfNone ? 0.0 : 100.0 * (double) a.hinted / (double) std::max(1L, a.picks));
         }
+        if (v.gap_us > 0)   // (:gap=N) the idles, and the timed tokens' wall: lane + gaps + the calls' own overhead
+            std::printf("  %s: gap %d us after each call: %.2f ms a token idle (%.0f us a call), %.2f ms a token in all\n",
+                        v.name.c_str(), v.gap_us, gap_ms / n, 1000.0 * gap_ms / (double) std::max(1L, a.calls),
+                        wall_ms / n);
         const std::vector<int> lcpus(cpus.begin(), cpus.begin() + thr);   // (the lane's threads' CPUs)
         if (!clk.ok)
             std::printf("  %s: clock: unavailable\n", v.name.c_str());
