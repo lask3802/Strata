@@ -267,9 +267,11 @@ static void case_rules() {
     const int big = rx::link_cpu();
     set_env("DS4_EP_CPU", "2x");
     const int junk = rx::link_cpu();
+    set_env("DS4_EP_CPU", "4294967298");   // (2 + 2^32: not CPU 2 as an int)
+    const int wrap = rx::link_cpu();
     set_env("DS4_EP_CPU", nullptr);
-    check(d == (hw > 2 ? 2 : -1) && off == -1 && one == (hw > 1 ? 1 : -1) && big == -1 && junk == -1,
-          "link_cpu: 2 by default, off: -1, 1: 1, a CPU this PC has not: -1, not a number: -1");
+    check(d == (hw > 2 ? 2 : -1) && off == -1 && one == (hw > 1 ? 1 : -1) && big == -1 && junk == -1 && wrap == -1,
+          "link_cpu: 2 by default, off: -1, 1: 1, a CPU this PC has not: -1, not a number or 2 + 2^32: -1");
     // the siblings: each CPU among its own, the relation symmetric; Linux: as many as the kernel lists
     bool own = true, sym = true;
     for (int a = 0; a < std::min(hw, 64); ++a) {

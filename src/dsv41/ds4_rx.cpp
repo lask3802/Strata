@@ -491,7 +491,7 @@ int link_cpu() {
     char* end = nullptr;
     const long cpu = v != nullptr && *v != '\0' ? std::strtol(v, &end, 10) : 2;
     if (end != nullptr && *end != '\0') return -1;   // (not a number)
-    return cpu >= 0 && cpu < (long) std::thread::hardware_concurrency() && os::cpu_allowed((int) cpu) ? (int) cpu : -1;
+    return cpu >= 0 && cpu < 4096 && os::cpu_allowed((int) cpu) ? (int) cpu : -1;   // (cpu_allowed: this PC has it too)
 }
 
 std::vector<int> off_link(const std::vector<int>& cores, const std::vector<int>& link) {
