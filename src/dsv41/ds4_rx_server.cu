@@ -548,6 +548,7 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
             if (sl.pools())
                 std::fprintf(stderr, "expert server: %lld W picks computed whole here (the pool's [0, k) and the parts' "
                                      "[k, nb))\n", (long long) sl.pool_picks());
+            if (sl.slices()) std::fprintf(stderr, "expert server: at the end, %s\n", sl.cached().c_str());
             static const char* const bucket_name[3] = {"T=1", "T=4", "T=other"};
             for (int bk = 0; diag && bk < 3; ++bk)
                 for (int k = 0; k < kParts; ++k) {

@@ -145,6 +145,8 @@ public:
     std::vector<uint32_t> pool_choose(const std::vector<uint32_t>& held);
     bool pools() const { return slices() && !w_.empty(); }   // (the session has a W: pool picks taken)
     std::string pool_note() const { return pool_note_; }   // (the last pool_choose in a line)
+    /// the parts' bytes in the page cache now, of all of them (Linux mincore, every page), in a phrase
+    std::string cached() const;
     int64_t pool_picks() const { return pool_picks_; }   // (W picks computed whole here)
 
 private:

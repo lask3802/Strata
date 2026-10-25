@@ -364,7 +364,23 @@ std::vector<uint32_t> SliceServer::pool_choose(const std::vector<uint32_t>& held
                   lk == rs.size() ? "locked" : lk == 0 ? "read once (not locked: RLIMIT_MEMLOCK?)" : "partly locked",
                   (lane_ms_now() - t0) / 1000.0, (unsigned long long) (sum & 1));
     pool_note_ = b;
+    pool_note_ += "; then " + cached();   // (W's pages are the pool file's page cache, locked: not a copy)
     return w_;
+}
+
+std::string SliceServer::cached() const {
+#if defined(__linux__)
+    uint64_t n = 0, cold = 0;
+    for (const ep::Parts::File& f : parts_.files()) {
+        n += f.bytes;
+        cold += os::cold_bytes(f.map, f.bytes);
+    }
+    char b[80];
+    std::snprintf(b, sizeof b, "the parts' %.2f of %.2f GB in the page cache", (double) (n - cold) / 1e9, (double) n / 1e9);
+    return b;
+#else
+    return "the parts' page cache not known here";
+#endif
 }
 
 std::string SliceServer::note() const {
