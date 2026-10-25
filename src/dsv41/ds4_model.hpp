@@ -97,6 +97,7 @@ struct Stats {
     int64_t tokens = 0;
     int64_t experts = 0, cpu_experts = 0;   // routed experts run, and how many of them on the CPU lane
     double cpu_ms = 0.0, gpu_wait_ms = 0.0;   // the CPU lane's time; the host's waits for the routing
+    double lane_bytes = 0.0;   // the expert bytes that time read (an entry its blob, a slice's share of it: H')
     double layer_ms = 0.0, head_ms = 0.0, engram_ms = 0.0;   // the layers' host time in all; the head's wait; Engram reads
     int64_t eg_rows = 0, eg_hits = 0, eg_reads = 0;   // Engram rows asked for, served without a read, read from the files
     double eg_io_ms = 0.0;                            // the windows' Engram reads, issue to last done (mostly hidden)
@@ -150,6 +151,16 @@ struct Stats {
     // the link's keep-awake (ds4_rx.hpp): Wakes sent at a window's start, and the CPU lane's requests that found
     // serve_lane napping (its 20 us sleeps: after 2 ms idle, kSpinMs while the link is up)
     int64_t rx_wakes = 0, lane_nap_reqs = 0;
+    // expert parallelism H' (DS4_EP_K): the slice picks the server's replies held ([k, nb)), the requests with them and
+    // the server's CPU lane's time for them (its replies' b, ms in all), the slice picks whose [k, nb) the lane computed
+    // after all (a reply late or lost)
+    int64_t rx_split_picks = 0, rx_split_reqs = 0, rx_split_fallback = 0;
+    double rx_srv_lane_ms = 0.0;
+    // DS4_EP_SPLIT_VERIFY: the rows checked (a reply's slice sum against this lane's), the largest |d| / |ref| by layer
+    // since the load; =2: the server's slice wrong on purpose (the check must see it)
+    int64_t rx_split_n = 0;
+    float rx_split_err[64] = {};
+    bool rx_split_wrong = false;
     int64_t ep_late = 0;   // DS4_EP_DEFER: the layers whose mailbox part the next layer (or the head) added
     // DS4_EP_DEFER_VERIFY: the checks made (a layer's deferred streams against the exact ones), and by the layer whose
     // part it was the largest relative difference since the load (the last layer's: before the head)

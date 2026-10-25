@@ -26,6 +26,12 @@
 // lane's 2 ms naps (A/B).
 //
 // The wire: a 32-byte header (magic, type, seq, a, b, c, payload bytes), then the payload; TCP_NODELAY, rows bf16.
+//
+// Expert parallelism H' (protocol 2, ep-u6-plan.md): a server given the parts pack (--expert-server-parts DIR, U3's
+// ep_parts.py) also takes slice picks - a pick of the main's CPU lane whose n_ff blocks [k, nb) its own CPU lane computes
+// from the parts in place while the main's computes [0, k) (DS4_EP_K).  Its hello says the lowest k its parts take (lo),
+// the Geo carries the main's pack_hash (another pack: refused at the Geo, the main runs alone), a request's row marks its
+// slice picks (ReqRow::slice) and the header's c their k; the reply is the same one sum a row (whole + slice picks).
 #pragma once
 
 #include <cstddef>
@@ -37,9 +43,13 @@
 namespace strata::ds4::rx {
 
 constexpr uint32_t kMagic = 0x58524453u;   // "SDRX"
-constexpr uint32_t kProto = 1;
+constexpr uint32_t kProto = 2;             // (2: H' - the hello's lo, the Geo's pack_hash, the slice picks)
 constexpr int kMaxRows = 16;               // a request's rows at most (kWin)
 constexpr int kMaxPicks = 8;               // picks a row at most (kPicks)
+// a Req's c: the slice picks' first n_ff block k (0: none), and flags
+constexpr int32_t kReqK = 0xff;
+constexpr int32_t kReqSets = 1 << 8;    // (DS4_EP_SPLIT_VERIFY) the reply's rows twice: the whole picks' sums, then the slice's
+constexpr int32_t kReqWrong = 1 << 9;   // (DS4_EP_SPLIT_VERIFY=2, the check's own check) the slice from k - 1 on purpose
 
 enum Msg : uint32_t {
     Hello = 1,      // payload HelloMsg (each side sends one; the server first)
@@ -49,8 +59,10 @@ enum Msg : uint32_t {
     BlobsOk = 5,    // server -> main: payload uint8 ok[blobs] (1: in its VRAM); or an Error (its warm-up requests
                     // failed) and the main drops the server.  A refusal known at the Geo (the geometry, the room's VRAM
                     // in one piece) is an Error right after it: the main reads it before each blob and stops
-    Req = 6,        // main -> server: seq, a = layer, b = rows; payload rows x (ReqRow, then bf16 x[n_embd])
-    Resp = 7,       // server -> main: seq, a = rows, c = the server's time (us); payload rows x bf16 y[n_embd]
+    Req = 6,        // main -> server: seq, a = layer, b = rows, c = k | flags (kReqK); payload rows x (ReqRow, then bf16
+                    // x[n_embd])
+    Resp = 7,       // server -> main: seq, a = rows, b = its CPU lane's time (us; the slice picks), c = the server's
+                    // time (us); payload rows x bf16 y[n_embd] (kReqSets: twice as many, the whole sums then the slice's)
     Error = 9,      // either way: payload the message
     Ping = 10,      // main -> server (tests: the link alone): seq; the server answers Pong with the same payload at once
     Pong = 11,      // (a = the Wakes the server took, b = its waits in poll (the low 31 bits), c = the one CPU its
@@ -82,11 +94,16 @@ struct HelloMsg {
     uint32_t proto = kProto;
     char token[64] = {};
     uint64_t room = 0;    // (the server) bytes of VRAM it can give the blobs
-    char name[52] = {};   // the GPU's / the host's name (informational)
+    int32_t lo = 0;       // (the server) the lowest k its parts take for slice picks (0: no parts, no slice picks)
+    int32_t lane_threads = 0;   // (the server) its CPU lane's workers (informational)
+    char name[44] = {};   // the GPU's / the host's name (informational)
 };
 struct GeoMsg {
     int32_t n_embd = 0, n_ff = 0, n_layers = 0;
     float limit = 0.0f;   // the swiglu's clamp (0: none)
+    uint64_t pack_hash = 0;   // the main's pack (ds4_stage.hpp pack_hash): a server's parts must be cut from it
+    int32_t k = 0;   // the main's DS4_EP_K: 1 .. nb - 1 it splits (parts that do not serve it: refused at the Geo); else
+                     // (DS4_EP_K unset, nb) whole picks only: a parts problem is the server's warning, and it serves as U4
 };
 struct GeoLayer {         // a layer's experts: the roles' ggml types (0: the layer is not served), each role's offset in
     int32_t K[3] = {0, 0, 0};   // a blob (gate | up | down, 256-aligned) and the blob's bytes
@@ -95,13 +112,24 @@ struct GeoLayer {         // a layer's experts: the roles' ggml types (0: the la
 };
 struct ReqRow {           // a request's row: the window's token t, n picks (expert ids, route weights)
     uint8_t t = 0, n = 0;
-    uint16_t pad = 0;
+    uint16_t slice = 0;   // bit i: pick i is a slice pick (its n_ff blocks [k, nb) from the parts), else a blob's whole
     int16_t e[kMaxPicks] = {};
     float w[kMaxPicks] = {};
 };
 #pragma pack(pop)
 static_assert(sizeof(Hdr) == 32, "the header's size");
 static_assert(sizeof(HelloMsg) == 128, "the hello's size");
+static_assert(sizeof(GeoMsg) == 28 && sizeof(ReqRow) == 52, "the geometry's and a row's sizes");
+
+/// A server's check of a request row: 1..kMaxPicks picks, slice bits only on them, and slice picks only with a k (c's
+/// kReqK) and parts here (has_parts).  "" or why.
+inline std::string row_refusal(const ReqRow& rw, int32_t c, bool has_parts) {
+    if (rw.n < 1 || rw.n > kMaxPicks) return "a request row with " + std::to_string(rw.n) + " picks";
+    if ((rw.slice >> rw.n) != 0) return "a request row's slice bits past its " + std::to_string(rw.n) + " picks";
+    if (rw.slice != 0 && (c & kReqK) == 0) return "slice picks without a k";
+    if (rw.slice != 0 && !has_parts) return "slice picks, and no parts here (--expert-server-parts)";
+    return "";
+}
 
 /// The main's send gate and a reply's deadline, from EWMAs (0: none yet) of the round trip at a request's rows and of
 /// the CPU lane's time a pick at the window's T.  A window's remote picks go out only when the round trip is expected
@@ -272,9 +300,10 @@ inline int cache_in(const std::vector<int>& hits, const int* slot, const float* 
 
 /// The remote experts beside expert parallelism's n_ff slice [ff0, ff0 + ffn) of a layer (Layer::ep_ff0 / ep_ffn; ffn -1:
 /// the whole n_ff): refused - the server computes each expert whole, an EP window's lane a slice of it, and the other
-/// PC's part would add the rest a second time.  The reason, or nullptr
-inline const char* slice_refusal(bool remote, int ff0, int ffn, int n_ff) {
-    if (!remote || ffn < 0 || (ff0 == 0 && ffn == n_ff)) return nullptr;
+/// PC's part would add the rest a second time - unless tagged (H', DS4_EP_K): the lane then computes the slice only of
+/// a pick sent tagged slice in the same request, whose rest the server computes (ds4_rx_split.hpp).  The reason, or nullptr
+inline const char* slice_refusal(bool remote, int ff0, int ffn, int n_ff, bool tagged = false) {
+    if (!remote || tagged || ffn < 0 || (ff0 == 0 && ffn == n_ff)) return nullptr;
     return "the remote experts (--remote-experts) compute each expert whole";
 }
 
@@ -382,6 +411,8 @@ public:
     /// listen at `at` ([BIND:]PORT) for wait_s seconds; check the server's hello, send ours
     bool accept(const std::string& at, const std::string& token, int wait_s, std::string& err);
     uint64_t room() const { return peer_hello_.room; }
+    int lo() const { return peer_hello_.lo; }   // (the lowest k of the server's slice picks; 0: it has no parts)
+    int lane_threads() const { return peer_hello_.lane_threads; }
     std::string name() const { return std::string(peer_hello_.name, strnlen_(peer_hello_.name, sizeof peer_hello_.name)); }
     std::string peer() const { return c_.peer(); }
     bool send_geo(const GeoMsg& g, const std::vector<GeoLayer>& layers, std::string& err);
@@ -390,11 +421,14 @@ public:
     bool send_blob(int layer, int e, const void* blob, size_t bytes, std::string& err);
     /// the end of the blobs: the server's ok[] (one a blob sent, in order)
     bool end_blobs(int n, std::vector<uint8_t>& ok, double timeout_ms, std::string& err);
-    /// rows[j] and its x (n_embd floats, sent as bf16)
-    bool send_req(uint32_t seq, int layer, int nrows, const ReqRow* rows, const float* const* x, std::string& err);
-    /// request seq's reply: 1 and its rows (nrows x n_embd bf16, valid until the next call) in *y, the server's time
-    /// in srv_us; 0: not in by the deadline (steady ms; it is skipped when it comes); -1: the link failed (err)
-    int wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y, int& srv_us, std::string& err);
+    /// rows[j] and its x (n_embd floats, sent as bf16); c: the slice picks' k and flags (kReqK)
+    bool send_req(uint32_t seq, int layer, int nrows, const ReqRow* rows, const float* const* x, std::string& err,
+                  int32_t c = 0);
+    /// request seq's reply: 1 and its rows (sets x nrows x n_embd bf16, valid until the next call; sets 2: a kReqSets
+    /// request's) in *y, the server's time in srv_us (its CPU lane's in *lane_us); 0: not in by the deadline (steady
+    /// ms; it is skipped when it comes); -1: the link failed (err)
+    int wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y, int& srv_us, std::string& err,
+                  int sets = 1, int* lane_us = nullptr);
     /// the last reply's arrival in the kernel (Conn::arrival_ms: steady ms, -1 unknown)
     double arrival_ms() const { return c_.arrival_ms(); }
     /// the replies wait_resp skipped since the last call (late ones, their picks computed here): seq and the kernel's
@@ -432,11 +466,13 @@ private:
 
 /// The expert server (--expert-server-connect): dials `host_port` (again each second until a main process takes it),
 /// serves it until it goes away, frees the blobs, dials again (once: return after one main process).  GPU `dev`, VRAM
-/// free less reserve_mib for blobs.  Returns nonzero on a CUDA error.
-int serve(const std::string& host_port, const std::string& token, int64_t reserve_mib, int dev, bool once);
+/// free less reserve_mib for blobs.  parts_dir (--expert-server-parts; empty: none): the parts pack its CPU lane takes
+/// slice picks from (ds4_rx_lane.hpp SliceServer).  Returns nonzero on a CUDA error, or parts it cannot open.
+int serve(const std::string& host_port, const std::string& token, int64_t reserve_mib, int dev, bool once,
+          const std::string& parts_dir = "");
 /// tests (--expert-server-cpu): the same server with the CPU lane's arithmetic (ds4_iq_cpu.cpp, the i-quant types) in
 /// place of a GPU, the blobs in RAM (room: DS4_RX_CPU_ROOM_MIB, 2048)
-int serve_cpu(const std::string& host_port, const std::string& token, bool once);
+int serve_cpu(const std::string& host_port, const std::string& token, bool once, const std::string& parts_dir = "");
 
 /// Either server's parts.  serve_loop: dial `host_port` (again each second until a main process takes it), run
 /// `session` on the connection (0: the main went away; < 0: an error, returned as 1), again unless `once`; the calling

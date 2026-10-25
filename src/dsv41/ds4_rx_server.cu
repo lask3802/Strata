@@ -1,9 +1,12 @@
 // src/dsv41/ds4_rx_server.cu - the expert server of ds4_rx.hpp: the main process's blobs in this GPU's VRAM, each
 // request's rows through the engine's own token-path kernels for VRAM experts (gg::moe_gate_up / moe_down: q8 inputs,
-// the i-quant or MXFP4 dots, the clamped swiglu, the weighted sum in pick order), the sums back as bf16.
+// the i-quant or MXFP4 dots, the clamped swiglu, the weighted sum in pick order), the sums back as bf16.  With parts
+// (--expert-server-parts, H'): a request's slice picks through the CPU lane (SliceServer) while the GPU computes its
+// whole ones, a row's reply the sum of both.
 #include "ds4_rx.hpp"
 
 #include "ds4_gguf.cuh"
+#include "ds4_rx_lane.hpp"
 
 #include <cuda_runtime.h>
 
@@ -154,7 +157,7 @@ std::string warm_up(const Session& ss, const Bufs& b, cudaStream_t s, bool fault
 }
 
 // one main process: 0 when it went away, -1 on a CUDA error
-int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cudaStream_t s) {
+int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cudaStream_t s, SliceServer& sl) {
     std::string err;
     Session ss;
     // the requests: the rows' plan, weights and x packed, one copy in (DS4_RX_COPY=one, the default: 0.02-0.05 ms less a
@@ -204,6 +207,8 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     HelloMsg me;
     std::memcpy(me.token, token.data(), std::min(token.size(), sizeof me.token - 1));
     me.room = fr > (uint64_t) reserve_mib << 20 ? fr - ((uint64_t) reserve_mib << 20) : 0;
+    me.lo = sl.lo();
+    me.lane_threads = sl.threads();
     cudaDeviceProp pr{};
     cudaGetDeviceProperties(&pr, dev);
     std::snprintf(me.name, sizeof me.name, "%s", pr.name);
@@ -217,10 +222,10 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     }
     HelloMsg peer;
     std::memcpy(&peer, p.data(), sizeof peer);
-    if (std::strncmp(peer.token, me.token, sizeof me.token) != 0) {
-        const char why[] = "wrong token (STRATA_STAGE_TOKEN)";
-        (void) c.send(Error, 0, 0, 0, 0, why, sizeof why - 1, err);
-        std::fprintf(stderr, "expert server: %s: %s\n", c.peer().c_str(), why);
+    if (peer.proto != kProto || std::strncmp(peer.token, me.token, sizeof me.token) != 0) {
+        const std::string why = peer.proto != kProto ? "protocol differs" : "wrong token (STRATA_STAGE_TOKEN)";
+        (void) c.send(Error, 0, 0, 0, 0, why.data(), why.size(), err);
+        std::fprintf(stderr, "expert server: %s: %s\n", c.peer().c_str(), why.c_str());
         return 0;
     }
     if (c.recv(h, p, -1, err) != 1 || h.type != Geo || p.size() < sizeof(GeoMsg)) {
@@ -257,8 +262,11 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
             l.trellis[r] = l.suh[r] = l.svh[r] = (size_t) G.off[r];
         }
     }
-    std::fprintf(stderr, "expert server: main process %s: %d layers, n_embd %d, n_ff %d; %.2f GB of VRAM for blobs\n",
-                 c.peer().c_str(), g.n_layers, g.n_embd, g.n_ff, (double) me.room / 1e9);
+    std::string warn;
+    if (const std::string why = sl.geo(g, ss.layers, warn); !why.empty()) return refuse_now(why);
+    if (!warn.empty()) std::fprintf(stderr, "expert server: %s: %s\n", c.peer().c_str(), warn.c_str());
+    std::fprintf(stderr, "expert server: main process %s: %d layers, n_embd %d, n_ff %d; %.2f GB of VRAM for blobs; %s\n",
+                 c.peer().c_str(), g.n_layers, g.n_embd, g.n_ff, (double) me.room / 1e9, sl.note().c_str());
     // the blobs, once, into the arena: the room in one piece
     const cudaError_t ea = me.room > 0 ? ss.alloc(&ss.arena, me.room) : cudaSuccess;
     if (ea != cudaSuccess) {
@@ -342,11 +350,15 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     auto keep = [&](int k, double ms) {
         if (parts[bucket][k].size() < (size_t(1) << 20)) parts[bucket][k].push_back((float) (ms * 1000.0));
     };
-    std::vector<uint16_t> yb((size_t) kMaxRows * D);
+    std::vector<uint16_t> yb((size_t) 2 * kMaxRows * D);
+    std::vector<float> ys((size_t) kMaxRows * D);   // (the rows' slice picks' sums: the CPU lane's)
+    ReqRow rws[kMaxRows];
+    int nw[kMaxRows] = {};   // (each row's whole picks: the GPU's)
     int rc = 0;
     int64_t served = 0, pings = 0, wakes = 0, slow = 0;   // (slow: requests over 2 ms here)
+    int64_t sliced = 0;   // (requests with slice picks)
     double last_end = -1;
-    double busy = 0, prep = 0, gpu = 0;
+    double busy = 0, prep = 0, gpu = 0, lane = 0;
     const int errs0 = gg::launch_errors();
     for (;;) {
         if (serve_next(c, h, p, pings, wakes, err) != 1) {
@@ -359,6 +371,11 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
                          (long long) wakes, (unsigned long long) c.polls, (unsigned long long) c.quickacks);
             if (pings > 0) std::fprintf(stderr, "expert server: %lld pings answered\n", (long long) pings);
             std::fprintf(stderr, "expert server: %lld requests over 2 ms here\n", (long long) slow);
+            if (sliced > 0)
+                std::fprintf(stderr, "expert server: %lld requests with slice picks, the CPU lane %.1f us each (%.2f GB read, "
+                                     "%.1f GB/s in the lane)\n", (long long) sliced, lane * 1000.0 / (double) sliced,
+                             (double) sl.lane().bytes() / 1e9,
+                             sl.lane().busy_ms() > 0 ? (double) sl.lane().bytes() / 1e6 / sl.lane().busy_ms() : 0.0);
             static const char* const bucket_name[3] = {"T=1", "T=4", "T=other"};
             for (int bk = 0; diag && bk < 3; ++bk)
                 for (int k = 0; k < kParts; ++k) {
@@ -379,10 +396,11 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         const size_t per = sizeof(ReqRow) + (size_t) D * 2;
         std::string why;
         if (li < 0 || li >= g.n_layers || nr < 1 || nr > kMaxRows || p.size() != (size_t) nr * per) why = "a malformed request";
+        const int sets = (h.c & kReqSets) != 0 ? 2 : 1;
         if (null_reply && why.empty()) {
-            std::fill(yb.begin(), yb.begin() + (long) ((size_t) nr * D), (uint16_t) 0);
+            std::fill(yb.begin(), yb.begin() + (long) ((size_t) sets * nr * D), (uint16_t) 0);
             const double dt = now_ms() - tr;
-            if (!c.send(Resp, h.seq, nr, 0, (int32_t) (dt * 1000.0), yb.data(), (size_t) nr * D * 2, err)) break;
+            if (!c.send(Resp, h.seq, nr, 0, (int32_t) (dt * 1000.0), yb.data(), (size_t) sets * nr * D * 2, err)) break;
             keep(kAll, now_ms() - tr);
             busy += dt;
             ++served;
@@ -400,25 +418,27 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         float* dx = cp == Copy::One ? (float*) ((char*) ds + xoff) : cp == Copy::Map ? dm : b.d_x;
         float* hy = cp == Copy::Map ? (float*) hm + (size_t) kMaxRows * D : b.h_y;
         float* dy = cp == Copy::Map ? dm + (size_t) kMaxRows * D : b.d_y;
+        bool any_slice = false;
         for (int j = 0; why.empty() && j < nr; ++j) {
-            ReqRow rw;
+            ReqRow& rw = rws[j];
             std::memcpy(&rw, p.data() + (size_t) j * per, sizeof rw);
-            if (rw.n < 1 || rw.n > kMaxPicks) {
-                why = "a request row with " + std::to_string(rw.n) + " picks";
-                break;
-            }
-            for (int i = 0; i < kMaxPicks; ++i) {
-                void* d = nullptr;
-                if (i < rw.n) {
-                    auto it = ss.blobs.find((uint32_t) li << 16 | (uint32_t) (uint16_t) rw.e[i]);
-                    if (it == ss.blobs.end()) {
-                        why = "layer " + std::to_string(li) + " expert " + std::to_string(rw.e[i]) + " is not here";
-                        break;
-                    }
-                    d = it->second;
+            if (!(why = row_refusal(rw, h.c, sl.slices())).empty()) break;
+            any_slice = any_slice || rw.slice != 0;
+            nw[j] = 0;   // (the plan: the row's whole picks first, in their order; a slice pick is the lane's)
+            for (int i = 0; i < rw.n; ++i) {
+                if ((rw.slice >> i) & 1) continue;
+                auto it = ss.blobs.find((uint32_t) li << 16 | (uint32_t) (uint16_t) rw.e[i]);
+                if (it == ss.blobs.end()) {
+                    why = "layer " + std::to_string(li) + " expert " + std::to_string(rw.e[i]) + " is not here";
+                    break;
                 }
-                hp[j * 8 + i] = (unsigned long long) d;
-                hw[j * 8 + i] = i < rw.n ? rw.w[i] : 0.0f;
+                hp[j * 8 + nw[j]] = (unsigned long long) it->second;
+                hw[j * 8 + nw[j]] = rw.w[i];
+                ++nw[j];
+            }
+            for (int i = nw[j]; i < kMaxPicks; ++i) {
+                hp[j * 8 + i] = 0;
+                hw[j * 8 + i] = 0.0f;
             }
             const uint16_t* xb = (const uint16_t*) (p.data() + (size_t) j * per + sizeof(ReqRow));
             float* xf = hx + (size_t) j * D;
@@ -446,24 +466,36 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         if (cp == Copy::Base || cp == Copy::Nr) RX_CK(cudaMemcpyAsync(dx, hx, (size_t) nr * D * 4, cudaMemcpyHostToDevice, s));
         if (evs) RX_CK(cudaEventRecord(evt[ne++], s));
         for (int j = 0; j < nr; ++j) {
-            ReqRow rw;
-            std::memcpy(&rw, p.data() + (size_t) j * per, sizeof rw);
             x3::MoeArgs ma;
             ma.plan_ptr = dp + j * 8;
             ma.plan_w = dw + j * 8;
             ma.lay = ss.lay[(size_t) li];
-            ma.k = rw.n;
+            ma.k = nw[j];
             ma.n_embd = D;
             ma.n_ff = FF;
             ma.limit = g.limit;
-            gg::moe_gate_up(ma, dx + (size_t) j * D, b.d_h, s);
+            if (nw[j] > 0) gg::moe_gate_up(ma, dx + (size_t) j * D, b.d_h, s);   // (a row of slice picks alone: no kernels)
             if (evs) RX_CK(cudaEventRecord(evt[ne++], s));
-            gg::moe_down(ma, b.d_h, nullptr, dy + (size_t) j * D, s);
+            if (nw[j] > 0) gg::moe_down(ma, b.d_h, nullptr, dy + (size_t) j * D, s);
             if (evs) RX_CK(cudaEventRecord(evt[ne++], s));
         }
         if (cp != Copy::Map) RX_CK(cudaMemcpyAsync(hy, dy, (size_t) nr * D * 4, cudaMemcpyDeviceToHost, s));
         if (evs) RX_CK(cudaEventRecord(evt[ne++], s));
         const double te = now_ms();
+        // the slice picks on the CPU lane while the GPU computes the whole ones (x: the rows as the GPU's copy has them)
+        double tl = 0;
+        if (any_slice) {
+            std::string we;
+            if (!sl.run(li, h.c, rws, nr, hx, (size_t) D, ys.data(), (size_t) D, we)) {
+                cudaStreamSynchronize(s);
+                (void) c.send(Error, h.seq, 0, 0, 0, we.data(), we.size(), err);
+                std::fprintf(stderr, "expert server: %s\n", we.c_str());
+                break;
+            }
+            tl = sl.last_ms();
+            lane += tl;
+            ++sliced;
+        }
         RX_CK(cudaStreamSynchronize(s));
         const double ts = now_ms();
         gpu += ts - tg;
@@ -473,9 +505,25 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
             rc = -1;
             break;
         }
-        for (size_t i = 0; i < (size_t) nr * D; ++i) yb[i] = f2bf(hy[i]);
+        for (int j = 0; j < nr; ++j) {   // a row's sum: its whole picks' (the GPU's) and its slice picks' (the lane's)
+            const float* yg = hy + (size_t) j * D;
+            const float* yl = ys.data() + (size_t) j * D;
+            uint16_t* o = yb.data() + (size_t) j * D;
+            if (sets == 2) {   // (DS4_EP_SPLIT_VERIFY: the whole picks' sums, then the slice picks' after all the rows)
+                uint16_t* o2 = yb.data() + (size_t) (nr + j) * D;
+                for (int i = 0; i < D; ++i) {
+                    o[i] = f2bf(nw[j] > 0 ? yg[i] : 0.0f);
+                    o2[i] = f2bf(rws[j].slice != 0 ? yl[i] : 0.0f);
+                }
+            } else if (rws[j].slice == 0) {
+                for (int i = 0; i < D; ++i) o[i] = f2bf(yg[i]);
+            } else {
+                for (int i = 0; i < D; ++i) o[i] = f2bf(nw[j] > 0 ? yg[i] + yl[i] : yl[i]);
+            }
+        }
         const double dt = now_ms() - tr;
-        if (!c.send(Resp, h.seq, nr, 0, (int32_t) (dt * 1000.0), yb.data(), (size_t) nr * D * 2, err)) {
+        if (!c.send(Resp, h.seq, nr, (int32_t) (tl * 1000.0), (int32_t) (dt * 1000.0), yb.data(), (size_t) sets * nr * D * 2,
+                    err)) {
             std::fprintf(stderr, "expert server: reply failed (%s)\n", err.c_str());
             break;
         }
@@ -521,7 +569,17 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
 
 }  // namespace
 
-int serve(const std::string& host_port, const std::string& token, int64_t reserve_mib, int dev, bool once) {
+int serve(const std::string& host_port, const std::string& token, int64_t reserve_mib, int dev, bool once,
+          const std::string& parts_dir) {
+    SliceServer sl;   // (before the GPU: parts that do not open end the server at once)
+    if (!parts_dir.empty()) {
+        std::string err;
+        if (!sl.open(parts_dir, link_cpu(), err)) {
+            std::fprintf(stderr, "expert server: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "expert server: %s\n", sl.note().c_str());
+    }
     RX_CK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
     RX_CK(cudaSetDevice(dev));
     cudaStream_t s = nullptr;
@@ -545,10 +603,11 @@ int serve(const std::string& host_port, const std::string& token, int64_t reserv
         int64_t reserve_mib;
         int dev;
         cudaStream_t s;
-    } a{token, reserve_mib, dev, s};
+        SliceServer& sl;
+    } a{token, reserve_mib, dev, s, sl};
     return serve_loop(host_port, once, "expert server", [](Conn& c, void* p) {
         const Arg& x = *(const Arg*) p;
-        return session(c, x.token, x.reserve_mib, x.dev, x.s);
+        return session(c, x.token, x.reserve_mib, x.dev, x.s, x.sl);
     }, &a);
 }
 

@@ -228,15 +228,21 @@ void roundtrip_tests(const fs::path& root) {
                     bool same = true;
                     for (uint32_t r = 0; r < v.rows; ++r) same = same && std::memcmp(v.data + (size_t) r * v.stride, want.data() + (size_t) r * v.row_bytes, v.row_bytes) == 0;
                     CHECK(same);
-                    // a view that starts inside the stored part: k + 1 of [k, nb) (the worker reading a larger k in place)
-                    if (k + 1 < g.nb()) {
-                        CHECK(p.view(l, e, kind, k + 1, v) && v.a == k);
-                        const std::vector<uint8_t> w1 = cut(g, l, kind, orig, k + 1, g.nb());
+                    // a view that starts inside the stored part: every k2 of (k, nb) of [k, nb) (the worker reading a larger
+                    // k in place, U6: a stored [6, 9) read at 7 and 8); the down rows stay the stored part's apart
+                    const uint64_t stored_stride = v.stride;
+                    for (int k2 = k + 1; k2 < g.nb(); ++k2) {
+                        CHECK(p.view(l, e, kind, k2, v) && v.a == k && v.b == g.nb());
+                        CHECK(v.stride == (kind == ep::kDown ? stored_stride : (uint64_t) v.row_bytes));
+                        const std::vector<uint8_t> w1 = cut(g, l, kind, orig, k2, g.nb());
                         CHECK(v.rows * (size_t) v.row_bytes == w1.size());
                         bool s1 = true;
                         for (uint32_t r = 0; r < v.rows; ++r) s1 = s1 && std::memcmp(v.data + (size_t) r * v.stride, w1.data() + (size_t) r * v.row_bytes, v.row_bytes) == 0;
                         CHECK(s1);
                     }
+                    // below the stored a: refused where only the tail is stored (the even ones), never a view into the head
+                    if (!odd) CHECK(!p.view(l, e, kind, k - 1, v));
+                    else CHECK(p.view(l, e, kind, k - 1, v) && v.a == 0 && v.b == k);
                     CHECK(!p.view(l, e, kind, g.nb(), v));   // (past the end)
                 }
                 if (odd) {   // the engine blob: gate | up | down, each at its own aligned place

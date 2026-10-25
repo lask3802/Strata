@@ -23,6 +23,7 @@
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
 #include "ds4_rx.hpp"
+#include "ds4_rx_split.hpp"
 #include "ds4_stage.hpp"
 #include "ds4_store.hpp"
 #include "ds4_u9.hpp"
@@ -686,11 +687,10 @@ struct Layer {
     x3::ExpertLayout hlay;
     size_t hblob = 0;
     int ff0 = 0, ffn = 0;     // this member's FFN columns [ff0, ff0 + ffn) (split128 of n_ff; the whole one alone)
-    // expert parallelism: the routed experts' n_ff slice [ep_ff0, ep_ff0 + ep_ffn) this process's CPU lane computes in an
-    // EP window (decode, a draft's verification: WinPlan::ep, on either lane -> the GGUF i-quant experts' cpu_experts_iq,
-    // a partial sum of each expert's output; the prompt's windows and calibrate_paths compute them whole) - ep_ffn -1:
-    // the whole n_ff (resolved at load, ep_resolve); a slice on a layer whose experts another path computes is refused
-    // there (ep_slices_ok)
+    // expert parallelism: the routed experts' n_ff slice [ep_ff0, ep_ff0 + ep_ffn) this process's CPU lane computes of a
+    // pick it sent tagged slice (H', DS4_EP_K: rx_split sets [0, 256 k); each cpu_experts call is given its range by the
+    // pick's lane, ds4_rx_split.hpp - these fields are what ep_slices_ok checks) - ep_ffn -1: the whole n_ff (resolved at
+    // load, ep_resolve); a slice on a layer whose experts another path computes is refused there (ep_slices_ok)
     int ep_ff0 = 0, ep_ffn = -1;
     // this member's heads [ah0, ah0 + ahn) and wo_a groups [og0, og0 + ogn) - all of them alone; in a group of more
     // members than the heads split among evenly (head_members: 9, 7 or 6 over 64 heads), the first ones none: their
@@ -1164,6 +1164,16 @@ struct Model::Impl {
     bool rx_kts = false;         // the link has given a kernel arrival time (then a late request waits for its reply's)
     static_assert(rx::kMaxRows == kWin && rx::kMaxPicks == kPicks, "a request's rows and picks are a window's");
     std::vector<rx::ReqRow> rx_rows;
+    // expert parallelism H' (DS4_EP_K, ds4_rx_split.hpp): the n_ff blocks a layer's CPU-lane picks split at (rx_nb: none)
+    // - a request of an EP window that goes to the server takes them tagged slice, the server's CPU lane computes their
+    // [k, nb) from its parts and this one [0, k) - and the layers that split (rx_split_l[il]; checked at rx_setup).
+    // DS4_EP_SPLIT_VERIFY=1: the server's reply in two sets (rx::kReqSets), the slice picks' sum checked against this
+    // lane's [k, nb) of them for x in bf16 (the server's x); =2 the server's slice wrong on purpose (the check's check)
+    int rx_k = 1, rx_nb = 1;   // (rx_setup: nb = n_ff / 256)
+    std::vector<uint8_t> rx_split_l;
+    int rx_verify = 0;
+    bool rx_tagged = false;   // (H' on: a layer's slice computed only for picks sent tagged - ep_slices_ok)
+    std::vector<float> rx_vx, rx_vy;   // (the verify's x in bf16 and its sums: kWin rows)
     mutable std::mutex rx_mu;
     std::vector<float> rx_rtt, rx_wait, rx_arr;
     std::vector<std::pair<float, int>> rx_late_arr;   // the late replies that came: send to arrival in the kernel, layer
@@ -2009,7 +2019,7 @@ struct Model::Impl {
         for (const Layer& l : L)
             if (const char* why = ep_slice_refusal(l.ep_ff0, l.ep_ffn, g.ff, l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay),
                                                    l.n_slots > 0, !l.zc.empty(), l.mtp, o.stage_worker,
-                                                   disk_skip_w > 0.0f)) {
+                                                   disk_skip_w > 0.0f, rx_tagged)) {
                 err = "expert parallelism: layer " + std::to_string(l.il) + "'s n_ff slice [" + std::to_string(l.ep_ff0) + ", " +
                       std::to_string(l.ep_ff0 + l.ep_ffn) + "): " + why;
                 return false;
@@ -2020,7 +2030,7 @@ struct Model::Impl {
     // slices' own checks (ep_slices_ok) for whatever sets a slice later
     bool rx_slices_ok(std::string& err) const {
         for (const Layer& l : L)
-            if (const char* why = rx::slice_refusal(!o.remote_experts.empty(), l.ep_ff0, l.ep_ffn, g.ff)) {
+            if (const char* why = rx::slice_refusal(!o.remote_experts.empty(), l.ep_ff0, l.ep_ffn, g.ff, rx_tagged)) {
                 err = "expert parallelism: layer " + std::to_string(l.il) + "'s n_ff slice [" + std::to_string(l.ep_ff0) + ", " +
                       std::to_string(l.ep_ff0 + l.ep_ffn) + "): " + why;
                 return false;
@@ -5974,12 +5984,11 @@ struct Model::Impl {
     // them, exact integer sums a block; every CPU tier the same bits): each token's input quantized once, whatever
     // number of entries take it, and each job its band of h straight into the down's int8 input.
     // (ord: the order the entries are computed in - their slots, so the sums, stay the same; null: as they are)
-    void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, bool ep) {
-        if (!gg::mx_experts(l.lay)) {   // (ep: an EP window, the layer's slice; false: the whole n_ff - ep_range)
-            int ff0, ffn;
-            ep_range(ep, l.ep_ff0, l.ep_ffn, g.ff, ff0, ffn);
-            return cpu_experts_iq(l, x, ents, ldx, ord, ff0, ffn);
-        }
+    void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, int ff0,
+                        int ffn) {
+        if (!gg::mx_experts(l.lay)) return cpu_experts_iq(l, x, ents, ldx, ord, ff0, ffn);
+        // (MXFP4 here: whole - a slice is the i-quants' alone, and only a layer that takes it is ever asked for one:
+        // rx_split_l, ep_slices_ok)
         constexpr int RB = 64;   // rows a job (whole blocks of h: RB % 32 == 0)
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
         const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
@@ -6067,8 +6076,8 @@ struct Model::Impl {
     }
     // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
     // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same.
-    // Over the n_ff slice [ff0, ff0 + ffn) (an EP window, on either lane: the layer's ep_ff0 / ep_ffn; any other window
-    // the whole n_ff - ep_range): the gate / up rows of the slice, and the down over the slice's values in place (gg::iq_cpu_slice) -
+    // Over the n_ff slice [ff0, ff0 + ffn) (cpu_experts' caller's: the whole n_ff, or a split pick's share - H',
+    // ds4_rx_split.hpp): the gate / up rows of the slice, and the down over the slice's values in place (gg::iq_cpu_slice) -
     // each entry's yd then its part of the expert's output
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, int ff0,
                         int ffn) {
@@ -6180,11 +6189,14 @@ struct Model::Impl {
             if (m) m->store->release(layer, es.data(), (int) es.size(), ok);
         }
     };
-    void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, bool ep) {
+    // ents over the n_ff range [ff0, ff0 + ffn) - each caller says which (ds4_rx_split.hpp): the whole n_ff, but [0, k)
+    // for the picks a request just sent tagged slice (serve_lane) and [k, nb) for those of a reply late or lost (lane_add)
+    void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, int ff0,
+                     int ffn) {
         if (ldx == 0) ldx = (size_t) g.dim;
         if (l.lay.fmt == gg::kFmtMXFP4) {
             StoreHold hold(this, l, ents);
-            return cpu_experts_mx(l, x, ents, ldx, ord, ep);
+            return cpu_experts_mx(l, x, ents, ldx, ord, ff0, ffn);
         }
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, GQ = E / 256, DQ = FF / 128;
         const int GB = FFh / 128, DB = Eh / 128, EB = E / 128, FB = FF / 128;
@@ -6748,11 +6760,70 @@ struct Model::Impl {
         pf_cv.notify_one();
     }
 
+    // ---- expert parallelism H' (DS4_EP_K=k, 1 <= k < nb; ep-u6-plan.md): which layers split (rx_split_l) - every trunk
+    // layer, each one the server's Geo serves, on the i-quant CPU lane - given a server whose parts take k (its hello's lo
+    // <= k).  Any of it not so: a line why, and k stays nb (U4 as it is: the server's GPU experts alone).  The layers'
+    // ep_ff0 / ep_ffn then say [0, 256 k), as ep_slices_ok checks them (tagged: the lane slices only a pick it sent tagged)
+    void rx_split(const rx::Main& link, const std::vector<rx::GeoLayer>& gl) {
+        const char* kv = std::getenv("DS4_EP_K");
+        if (kv == nullptr || *kv == '\0') return;
+        const int k = std::atoi(kv);
+        if (k >= rx_nb) return;   // (nb: off)
+        std::string why;
+        if (k < 1) why = std::string("DS4_EP_K=") + kv + " is not 1 to " + std::to_string(rx_nb);
+        else if (g.ff % 256 != 0) why = "n_ff " + std::to_string(g.ff) + " is not whole 256-value blocks";
+        else if (link.lo() <= 0) why = "the expert server has no parts (--expert-server-parts)";
+        else if (link.lo() > k)
+            why = "the expert server's parts hold blocks [" + std::to_string(link.lo()) + ", " + std::to_string(rx_nb) +
+                  "), not [" + std::to_string(k) + ", " + std::to_string(rx_nb) + ")";
+        std::vector<uint8_t> sl(L.size(), 0);
+        for (size_t li = 0; why.empty() && li < gl.size() && li < L.size(); ++li) {
+            const Layer& l = L[li];
+            if (gl[li].blob == 0) why = "layer " + std::to_string(li) + "'s experts are not the expert server's (none in the Geo)";
+            else if (!(l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay)))
+                why = "layer " + std::to_string(li) + "'s CPU lane computes its experts whole (only the GGUF i-quants slice)";
+            sl[li] = 1;
+        }
+        if (why.empty()) {
+            for (size_t li = 0; li < sl.size(); ++li)
+                if (sl[li]) {
+                    L[li].ep_ff0 = 0;
+                    L[li].ep_ffn = 256 * k;
+                }
+            rx_tagged = true;
+            if (!ep_slices_ok(why)) {
+                for (Layer& l : L) {
+                    l.ep_ff0 = 0;
+                    l.ep_ffn = g.ff;
+                }
+                rx_tagged = false;
+            }
+        }
+        if (!why.empty()) {
+            std::fprintf(stderr, "ds4: expert parallelism H' (DS4_EP_K=%s): %s - not split (the server's GPU experts alone)\n",
+                         kv, why.c_str());
+            return;
+        }
+        rx_k = k;
+        rx_split_l = sl;
+        const char* vv = std::getenv("DS4_EP_SPLIT_VERIFY");
+        rx_verify = vv != nullptr && *vv != '\0' ? std::max(0, std::min(2, std::atoi(vv))) : 0;
+        std::fprintf(stderr, "ds4: expert parallelism H': k %d - an EP window's CPU-lane picks that go to the expert server "
+                             "split at n_ff block %d of %d: [0, %d) here, [%d, %d) on its CPU lane (%d workers; its parts "
+                             "from block %d)%s\n",
+                     k, k, rx_nb, k, k, rx_nb, link.lane_threads(), link.lo(),
+                     rx_verify == 2 ? "; DS4_EP_SPLIT_VERIFY=2: the server's slice sums wrong on purpose (the check's check)"
+                     : rx_verify    ? "; DS4_EP_SPLIT_VERIFY=1: each reply's slice sums checked here"
+                                    : "");
+    }
+
     // ---- remote experts (--remote-experts, ds4_rx.hpp): an expert server's GPU holds some of the CPU lane's experts
     // the load: wait for the server, send it the geometry and the hottest CPU-lane experts by the profile that fit its
     // room (none came, or the link failed: the lane computes all of them, as without the option)
     void rx_setup() {
         if (o.remote_experts.empty()) return;
+        rx_nb = std::max(1, g.ff / 256);
+        rx_k = rx_nb;   // (H' off until rx_split says otherwise)
         if (const char* v = std::getenv("DS4_RX_TIMEOUT_MS"); v != nullptr && *v != '\0') {
             rx_timeout_ms = std::max(0.05, std::atof(v));
             rx_wait_fixed = true;
@@ -6797,6 +6868,11 @@ struct Model::Impl {
             }
             gl[(size_t) li].blob = off;
         }
+        gm.pack_hash = stage::pack_hash(o.pack);   // (a server's parts must be cut from this pack: refused at the Geo if not)
+        // the k rx_split tries (DS4_EP_K; else nb: no split, so a server's parts that do not fit are only its warning)
+        const char* kv = std::getenv("DS4_EP_K");
+        const int kw = kv != nullptr && *kv != '\0' ? std::atoi(kv) : rx_nb;
+        gm.k = kw >= 1 && kw < rx_nb ? kw : rx_nb;
         struct Cand {
             uint32_t n;
             int li, e;
@@ -6888,6 +6964,7 @@ struct Model::Impl {
         st.rx_held = held;
         st.rx_upload_bytes = (int64_t) held_b;
         st.rx_upload_ms = now_ms() - t0;
+        rx_split(*link, gl);
 #if defined(__linux__)
         std::fprintf(stderr, "ds4: remote experts: the upload read %.2f of its %.2f GB from the disk (not in the page "
                              "cache before it); the CPU lane's other %zu experts not in the page cache (4 pages a matrix "
@@ -6950,7 +7027,7 @@ struct Model::Impl {
         st.rx_bytes_out = (int64_t) link->bytes_out();   // (the per-token bytes count from here)
         st.rx_bytes_in = (int64_t) link->bytes_in();
         rx_link = std::move(link);
-        rx_on = held > 0;
+        rx_on = held > 0 || rx_k < rx_nb;   // (H': the slice picks need no blob held)
         rx_rtt.reserve(1 << 20);
         rx_wait.reserve(1 << 20);
         rx_arr.reserve(1 << 20);
@@ -6978,33 +7055,45 @@ struct Model::Impl {
         if (rx_link) rx_link->close();
         std::fprintf(stderr, "ds4: remote experts: %s - the CPU lane computes all its experts from now on\n", why.c_str());
     }
-    static int rx_nrows(const std::vector<std::pair<int, int>>& rpk) {   // (the tokens with a remote pick)
+    // (the tokens with a remote pick: the server's whole ones, then its slice ones)
+    static int rx_nrows(const std::vector<std::pair<int, int>>& rpk, const std::vector<std::pair<int, int>>& spk = {}) {
         unsigned m = 0;
         for (const auto& q : rpk) m |= 1u << (q.second / kPicks);
+        for (const auto& q : spk) m |= 1u << (q.second / kPicks);
         return (int) std::bitset<32>(m).count();
     }
-    // request seq's picks the server holds ((expert, t * kPicks + i), in token order) as rows of r's tokens
-    bool rx_send(unsigned seq, int li, int T, const Req& r, const std::vector<std::pair<int, int>>& rpk) {
+    // the picks a request's server computes, as picks of the lane: the whole ones and the slice ones' [k, nb) share
+    // (rx::server_range) - the gate's and the deadline's count
+    size_t rx_npicks(size_t whole, size_t slice) const {
+        return whole + rx::slice_share(slice, rx_k, rx_nb);
+    }
+    // request seq's picks the server holds ((expert, t * kPicks + i), in token order) and its slice picks (spk: tagged,
+    // from block rx_k) as rows of r's tokens
+    bool rx_send(unsigned seq, int li, int T, const Req& r, const std::vector<std::pair<int, int>>& rpk,
+                 const std::vector<std::pair<int, int>>& spk) {
         rx_rows.clear();
         const float* xs[kWin];
         int row_of[kWin];
         for (int t = 0; t < kWin; ++t) row_of[t] = -1;
-        for (const auto& q : rpk) {
-            const int t = q.second / kPicks, i = q.second % kPicks;
-            if (t >= T) continue;
-            if (row_of[t] < 0) {
-                row_of[t] = (int) rx_rows.size();
-                rx_rows.emplace_back();
-                rx_rows.back().t = (uint8_t) t;
-                xs[row_of[t]] = r.x[t];
+        for (int pass = 0; pass < 2; ++pass)
+            for (const auto& q : pass == 0 ? rpk : spk) {
+                const int t = q.second / kPicks, i = q.second % kPicks;
+                if (t >= T) continue;
+                if (row_of[t] < 0) {
+                    row_of[t] = (int) rx_rows.size();
+                    rx_rows.emplace_back();
+                    rx_rows.back().t = (uint8_t) t;
+                    xs[row_of[t]] = r.x[t];
+                }
+                rx::ReqRow& w = rx_rows[(size_t) row_of[t]];
+                if (pass == 1) w.slice |= (uint16_t) (1u << w.n);
+                w.e[w.n] = (int16_t) q.first;
+                w.w[w.n] = r.w[t][i];
+                ++w.n;
             }
-            rx::ReqRow& w = rx_rows[(size_t) row_of[t]];
-            w.e[w.n] = (int16_t) q.first;
-            w.w[w.n] = r.w[t][i];
-            ++w.n;
-        }
+        const int32_t c = spk.empty() ? 0 : rx_k | (rx_verify > 0 ? rx::kReqSets : 0) | (rx_verify == 2 ? rx::kReqWrong : 0);
         std::string e;
-        if (!rx_link->send_req(seq, li, (int) rx_rows.size(), rx_rows.data(), xs, e)) {
+        if (!rx_link->send_req(seq, li, (int) rx_rows.size(), rx_rows.data(), xs, e, c)) {
             rx_lost("a request did not go out (" + e + ")");
             return false;
         }
@@ -7012,8 +7101,16 @@ struct Model::Impl {
         ++st.rx_req_t[T];
         return true;
     }
-    // picks (expert, t * kPicks + i) of request r computed on the lane and added to rp's parts
-    void lane_add(const Layer& l, const Req& r, Resp& rp, int T, std::vector<std::pair<int, int>> pk2) {
+    // picks (expert, t * kPicks + i) of request r over the n_ff blocks br (rx::fallback_range: the server's share of
+    // them) computed on the lane and added to rp's parts
+    void lane_add(const Layer& l, const Req& r, Resp& rp, int T, std::vector<std::pair<int, int>> pk2, rx::BlockRange br) {
+        lane_sum(l, &r.x[0][0], r, T, std::move(pk2), br, &rp.part[0][0], rp.cpu);
+    }
+    // ... into out (kWin rows, kMaxDim apart; has[t]: row t holds a sum, else it is set by the first pick added) for x
+    // (kWin rows, kMaxDim apart: r's, or the verify's in bf16)
+    void lane_sum(const Layer& l, const float* x, const Req& r, int T, std::vector<std::pair<int, int>> pk2,
+                  rx::BlockRange br, float* out, int* has) {
+        if (br.empty() || pk2.empty()) return;
         std::sort(pk2.begin(), pk2.end());
         std::vector<Ent> ents;
         float wv[kWin * kPicks];
@@ -7033,15 +7130,17 @@ struct Model::Impl {
             }
             ents.push_back(en);
         }
-        cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, nullptr, false);   // (whole: no slices with the remote experts)
+        int ff0, ffn;
+        rx::ff_range(br, rx_nb, g.ff, ff0, ffn);   // (the last block: to n_ff)
+        cpu_experts(l, x, ents, (size_t) kMaxDim, nullptr, ff0, ffn);
         const int D = g.dim;
         for (int t = 0; t < T; ++t)
             for (int sl = 0; sl < nslots; ++sl) {
                 if (tok_of[sl] != t) continue;
-                float* o = rp.part[t];
-                if (!rp.cpu[t]) {
+                float* o = out + (size_t) t * kMaxDim;
+                if (!has[t]) {
                     for (int c = 0; c < D; ++c) o[c] = 0.0f;
-                    rp.cpu[t] = 1;
+                    has[t] = 1;
                 }
                 const float* y = c_yd.data() + (size_t) sl * D;
                 for (int c = 0; c < D; ++c) o[c] += wv[sl] * y[c];
@@ -7091,16 +7190,20 @@ struct Model::Impl {
     // the reply to request seq (sent at t0) into rp's parts; late or no link: those picks computed here.  The deadline:
     // after the lane's own picks, as long as the lane would take for these (rx::Gate::wait_ms), but not before 1.5 x the
     // round trip expected at these rows; the link's lateness (rx::Backoff) against the fixed wait's (rx::Gate::deadlines)
+    // (spk: the request's slice picks - the reply holds their [k, nb), and so does the fallback: sp's late ranges)
     void rx_finish(const Layer& l, const Req& r, Resp& rp, int T, unsigned seq, double t0,
-                   const std::vector<std::pair<int, int>>& rpk) {
+                   const std::vector<std::pair<int, int>>& rpk, const std::vector<std::pair<int, int>>& spk,
+                   const rx::SplitPlan& sp) {
         const double tw = rx::now_ms();
         const int rows = (int) rx_rows.size();
-        const auto dl = rx_gate.deadlines(T, rpk.size(), rows, t0, tw, rx_timeout_ms, rx_wait_fixed, rx_kts);
+        const size_t n_srv = rx_npicks(rpk.size(), spk.size());   // (the lane's picks' worth the server computes)
+        const auto dl = rx_gate.deadlines(T, n_srv, rows, t0, tw, rx_timeout_ms, rx_wait_fixed, rx_kts);
         const double deadline = dl.first, bound = dl.second;   // (the lane's; the link's, rx::Backoff's)
         const uint16_t* y = nullptr;
-        int srv_us = 0;
+        int srv_us = 0, lane_us = 0;
+        const int sets = !spk.empty() && rx_verify > 0 ? 2 : 1;
         std::string e;
-        const int got = rx_on ? rx_link->wait_resp(seq, rows, deadline, &y, srv_us, e) : -1;
+        const int got = rx_on ? rx_link->wait_resp(seq, rows, deadline, &y, srv_us, e, sets, &lane_us) : -1;
         const double t1 = rx::now_ms();
         const double ta = got == 1 ? rx_link->arrival_ms() : -1.0;   // (the kernel's time the reply came in: Linux)
         // earlier late requests' replies, skipped here: their round trips.  A stamp is a read's last skb: one equal to
@@ -7148,18 +7251,25 @@ struct Model::Impl {
         }
         if (got == 1) {
             const int D = g.dim;
-            for (size_t j = 0; j < rx_rows.size(); ++j) {
-                const int t = rx_rows[j].t;
-                float* o = rp.part[t];
-                const uint16_t* yj = y + j * (size_t) D;
-                if (rp.cpu[t]) {
-                    for (int c = 0; c < D; ++c) o[c] += rx::bf2f(yj[c]);
-                } else {
-                    for (int c = 0; c < D; ++c) o[c] = rx::bf2f(yj[c]);
-                    rp.cpu[t] = 1;
+            if (sets == 2) rx_split_check(l, r, T, spk, y + (size_t) rows * D);   // (before y is added: the same bits)
+            for (int s = 0; s < sets; ++s)   // (DS4_EP_SPLIT_VERIFY: the whole picks' sums, then the slice picks')
+                for (size_t j = 0; j < rx_rows.size(); ++j) {
+                    const int t = rx_rows[j].t;
+                    float* o = rp.part[t];
+                    const uint16_t* yj = y + ((size_t) s * rows + j) * (size_t) D;
+                    if (rp.cpu[t]) {
+                        for (int c = 0; c < D; ++c) o[c] += rx::bf2f(yj[c]);
+                    } else {
+                        for (int c = 0; c < D; ++c) o[c] = rx::bf2f(yj[c]);
+                        rp.cpu[t] = 1;
+                    }
                 }
-            }
             st.rx_picks += (int64_t) rpk.size();
+            st.rx_split_picks += (int64_t) spk.size();
+            if (!spk.empty()) {
+                ++st.rx_split_reqs;
+                st.rx_srv_lane_ms += lane_us / 1000.0;
+            }
             st.rx_rtt_ms += t1 - t0;
             st.rx_srv_ms += srv_us / 1000.0;
             rx_back.reply();   // (a long wait, past the bound: in time for the lane, late for the link)
@@ -7178,12 +7288,45 @@ struct Model::Impl {
         }
         rx_here_note(l, rpk);
         const double tf = rx::now_ms();
-        lane_add(l, r, rp, T, rpk);
+        // exactly the server's share (the late reply is dropped when it comes): its experts whole, the slice picks' [k, nb)
+        lane_add(l, r, rp, T, rpk, sp.late_whole);
+        const int64_t ce = st.cpu_experts;   // (a slice pick is in cpu_experts once: serve_lane counted its [0, k))
+        lane_add(l, r, rp, T, spk, sp.late_slice);
+        st.cpu_experts = ce;
         st.rx_fallback += (int64_t) rpk.size();
+        st.rx_split_fallback += (int64_t) spk.size();
         st.rx_fallback_ms += rx::now_ms() - tf;
     }
+    // DS4_EP_SPLIT_VERIFY: a reply's slice sums (ys: the request's rows, bf16) against this lane's [k, nb) of the same
+    // picks for x in bf16, as the server has it (so both quantize the same activations: the bf16 sums' rounding is the
+    // difference, ~4e-3 of a row); the largest |d| / |ref| by layer since the load
+    void rx_split_check(const Layer& l, const Req& r, int T, const std::vector<std::pair<int, int>>& spk, const uint16_t* ys) {
+        const int D = g.dim;
+        rx_vx.resize((size_t) kWin * kMaxDim);
+        rx_vy.resize((size_t) kWin * kMaxDim);
+        int has[kWin] = {};
+        for (int t = 0; t < T; ++t)
+            for (int c = 0; c < D; ++c) rx_vx[(size_t) t * kMaxDim + c] = rx::bf2f(rx::f2bf(r.x[t][c]));
+        const int64_t ce = st.cpu_experts;   // (the check's own work: not the lane's)
+        lane_sum(l, rx_vx.data(), r, T, spk, rx::server_range(rx::PickLane::kSplit, rx_k, rx_nb), rx_vy.data(), has);
+        st.cpu_experts = ce;
+        for (size_t j = 0; j < rx_rows.size(); ++j) {
+            const int t = rx_rows[j].t;
+            if (rx_rows[j].slice == 0 || !has[t]) continue;
+            double dd = 0, rr = 0;
+            for (int c = 0; c < D; ++c) {
+                const double ref = rx_vy[(size_t) t * kMaxDim + c], d = (double) rx::bf2f(ys[j * (size_t) D + c]) - ref;
+                dd += d * d;
+                rr += ref * ref;
+            }
+            const float rel = (float) (rr > 0 ? std::sqrt(dd / rr) : std::sqrt(dd) > 0 ? 1.0 : 0.0);
+            ++st.rx_split_n;
+            if (l.il >= 0 && l.il < 64 && !(rel <= st.rx_split_err[l.il])) st.rx_split_err[l.il] = rel;
+        }
+        st.rx_split_wrong = rx_verify == 2;
+    }
     std::string rx_lines(const Stats& s0, double nt) const {
-        if (st.rx_held == 0) return "";
+        if (st.rx_held == 0 && rx_k >= rx_nb) return "";   // (H' with no blob held: its slice picks still)
         std::vector<float> rt, wt, at, lt;
         float lt_max = -1.0f;   // (the slowest late reply's time, its layer)
         int lt_layer = -1;
@@ -7317,6 +7460,18 @@ struct Model::Impl {
               ep_cpu, ep_cpu < 0 ? " (DS4_EP_CPU off: as without the link)" : "", sibs.empty() ? " -" : sibs.c_str(),
               ep_wake ? "on" : "off (DS4_EP_WAKE=0)", (long long) (st.rx_wakes - s0.rx_wakes),
               (double) (st.rx_wakes - s0.rx_wakes) / std::max(1.0, nt), (long long) (st.lane_nap_reqs - s0.lane_nap_reqs));
+        if (rx_k < rx_nb) {   // H' (DS4_EP_K)
+            const double nr = (double) std::max<int64_t>(1, st.rx_split_reqs - s0.rx_split_reqs);
+            add_f(b,
+                  "expert parallelism H': k %d of %d n_ff blocks - %lld slice picks served (%.1f a token; this lane [0, "
+                  "%d), the server's CPU lane [%d, %d) of them: %.1f us a request of %lld), %lld computed here after all "
+                  "([%d, %d): late replies, a lost link)%s\n",
+                  rx_k, rx_nb, (long long) (st.rx_split_picks - s0.rx_split_picks),
+                  (double) (st.rx_split_picks - s0.rx_split_picks) / std::max(1.0, nt), rx_k, rx_k, rx_nb,
+                  (st.rx_srv_lane_ms - s0.rx_srv_lane_ms) * 1000.0 / nr, (long long) (st.rx_split_reqs - s0.rx_split_reqs),
+                  (long long) (st.rx_split_fallback - s0.rx_split_fallback), rx_k, rx_nb,
+                  rx_verify == 2 ? "; DS4_EP_SPLIT_VERIFY=2" : rx_verify ? "; DS4_EP_SPLIT_VERIFY=1" : "");
+        }
         return b;
     }
 
@@ -7369,6 +7524,9 @@ struct Model::Impl {
                 std::vector<std::pair<int, int>> rpicks;
                 const bool rxl = rx_on && !l.mtp && li < g.nl && l.n_exp == g.n_exp &&
                                  li < (int) (rx_has.size() / (size_t) g.n_exp);
+                // (H', DS4_EP_K) an EP window's CPU-lane picks of a layer that splits go tagged slice with the request
+                // (the server's CPU lane [k, nb) of them): ds4_rx_split.hpp's kSplit when it is sent, kMainWhole when not
+                const bool spl = rxl && ep && rx_k < rx_nb && (size_t) li < rx_split_l.size() && rx_split_l[(size_t) li];
                 if (trace_f != nullptr && !l.mtp) {   // DS4_TRACE=file: one record a route request: u8 layer, u8 T, T x k int16 expert ids
                     // DS4_TRACE_AHEAD=1: T has bit 7 set and the guesses follow: u8 na1, u8 na2, T x (na1 + na2) int16 (the
                     // next layer's likely picks by rank, then the one after's), as the lookahead made them for THIS layer's
@@ -7450,27 +7608,43 @@ struct Model::Impl {
                 }
                 if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
                 double rx_t0 = 0.0;
-                if (!rpicks.empty() && rx_back.idle()) {   // (8 late of 64 a while ago: the link idle for now)
+                // a request goes out (the gate and the link allowing) for the server's experts, or for slice picks
+                bool want = !rpicks.empty() || (spl && !picks.empty());
+                if (want && rx_back.idle()) {   // (8 late of 64 a while ago: the link idle for now)
                     rx_here_note(l, rpicks);
                     picks.insert(picks.end(), rpicks.begin(), rpicks.end());
                     ++st.rx_idle;
                     rpicks.clear();
+                    want = false;
                 }
-                if (!rpicks.empty() && !rx_gate.send(T, rx_nrows(rpicks), rpicks.size(), picks.size())) {
+                // (the lane's picks whole in the gate's local cost, split or not: sent, the lane's [0, k) of them hides
+                // the round trip - U4's rule; slice_share is the deadline's)
+                if (want && !rx_gate.send(T, rx_nrows(rpicks, spl ? picks : std::vector<std::pair<int, int>>()), rpicks.size(),
+                                          picks.size())) {
                     rx_here_note(l, rpicks);
                     picks.insert(picks.end(), rpicks.begin(), rpicks.end());   // (the round trip would cost more)
                     ++st.rx_skip_t[T];
                     rpicks.clear();
+                    want = false;
                 }
-                if (!rpicks.empty()) {
+                // the slice picks: every CPU-lane pick of the request (not one on this GPU: picks holds none) - which go
+                // tagged, the lane's range for them and the fallback's: rx::split_plan (ds4_rx_split.hpp)
+                std::vector<std::pair<int, int>> spicks;
+                rx::SplitPlan sp = rx::split_plan(spl, want, true, rx_k, rx_nb);
+                if (want) {
+                    if (sp.tagged) spicks = picks;
                     rx_t0 = rx::now_ms();
-                    if (!rx_send(next, li, T, r, rpicks)) {   // (no link: the lane computes them as it did before)
+                    if (!rx_send(next, li, T, r, rpicks, spicks)) {   // (no link: the lane computes them as it did before)
                         rx_here_note(l, rpicks);
                         picks.insert(picks.end(), rpicks.begin(), rpicks.end());
                         st.rx_fallback += (int64_t) rpicks.size();
                         rpicks.clear();
+                        spicks.clear();
+                        sp = rx::split_plan(spl, want, false, rx_k, rx_nb);
                     }
                 }
+                // the lane's n_ff range for its picks: [0, k) of the slice picks just sent, else whole
+                const rx::BlockRange mr = sp.here;
                 std::sort(picks.begin(), picks.end());
                 for (size_t a = 0; a < picks.size();) {
                     Ent en;
@@ -7505,7 +7679,9 @@ struct Model::Impl {
                 }
                 if (!ents.empty()) {
                     const double tc = now_ms();
-                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, ep);   // (an EP window: the layer's slice)
+                    int ff0, ffn;
+                    rx::ff_range(mr, rx_nb, g.ff, ff0, ffn);
+                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, ff0, ffn);
                     const int D = g.dim;
                     for (int t = 0; t < T; ++t) {
                         bool any = false;
@@ -7522,9 +7698,15 @@ struct Model::Impl {
                     }
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
-                    if (rx_on) rx_gate.pick_seen(T, (now_ms() - tc) / nslots);
+                    // (an expert's bytes once: past ent_cap's tokens it takes more than one entry, side by side)
+                    size_t nexp = 0;
+                    for (size_t q = 0; q < ents.size(); ++q) nexp += q == 0 || ents[q].e != ents[q - 1].e;
+                    st.lane_bytes += (double) nexp * (double) l.blob * (double) ffn / (double) g.ff;
+                    // (a pick's time whole: the slices computed [0, k) of nb blocks)
+                    const double whole = (double) nslots * (double) (mr.b1 - mr.b0) / (double) std::max(1, rx_nb);
+                    if (rx_on && whole > 0) rx_gate.pick_seen(T, (now_ms() - tc) / whole);
                 }
-                if (!rpicks.empty()) rx_finish(l, r, rp, T, next, rx_t0, rpicks);
+                if (sp.sent) rx_finish(l, r, rp, T, next, rx_t0, rpicks, spicks, sp);
             }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;
@@ -8944,12 +9126,12 @@ struct Model::Impl {
             for (size_t i = 0; i < x.size(); ++i) x[i] = 0.02f * std::sin(0.37f * (float) i);
             const double bytes = (double) ents.size() * (double) l.blob;
             double a = now_ms();
-            cpu_experts(l, x.data(), ents, (size_t) g.dim, nullptr, false);   // (whole: the main's speed)
+            cpu_experts(l, x.data(), ents, (size_t) g.dim, nullptr, 0, g.ff);   // (whole: the main's speed)
             const double t_first = now_ms() - a;
             double t_warm = 1e30;
             for (int rep = 0; rep < 2; ++rep) {
                 a = now_ms();
-                cpu_experts(l, x.data(), ents, (size_t) g.dim, nullptr, false);
+                cpu_experts(l, x.data(), ents, (size_t) g.dim, nullptr, 0, g.ff);
                 t_warm = std::min(t_warm, now_ms() - a);
             }
             pm.cpu = bytes / std::max(1e-3, t_warm / 1000.0);
@@ -10654,7 +10836,9 @@ struct Model::Impl {
         }
         if (!ents.empty()) {
             const double tc = now_ms();
-            cpu_experts(l, h_x, ents, 0, nullptr, wp.ep);   // (the window's kind, as serve_lane would take it)
+            int ff0, ffn;
+            rx::ff_range(rx::host_range(rx_k < rx_nb, rx_k, rx_nb), rx_nb, g.ff, ff0, ffn);   // (whole: no request)
+            cpu_experts(l, h_x, ents, 0, nullptr, ff0, ffn);
             std::fill(h_part, h_part + (size_t) T * D, 0.0f);
             for (int sl = 0; sl < nslots; ++sl) {
                 float* o = h_part + (size_t) cpu_rows[(size_t) sl].first * D;
