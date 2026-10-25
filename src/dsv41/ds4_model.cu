@@ -140,13 +140,13 @@ std::vector<int> cpu_list(const std::string& s) {   // "0-3,8,10-11"
     }
     return v;
 }
-// each NUMA node's physical cores (the first logical CPU of each core), in order
+// each NUMA node's physical cores (the first logical CPU of each core), in order; DS4_CPU_SMT=1: every logical CPU
 std::vector<std::vector<int>> node_cores() {
-#if defined(_WIN32)
     static const bool smt = [] {   // DS4_CPU_SMT=1: the second hardware thread of every core as well (memory-bound rows gain from it)
         const char* v = std::getenv("DS4_CPU_SMT");
         return v != nullptr && std::atoi(v) != 0;
     }();
+#if defined(_WIN32)
     std::vector<std::vector<int>> nodes = os::node_cores(smt);
 #else
     std::vector<std::vector<int>> nodes;
@@ -157,14 +157,15 @@ std::vector<std::vector<int>> node_cores() {
         for (int c : cpu_list(cl)) {
             const std::vector<int> sib = cpu_list(
                 read_file("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list"));
-            if (sib.empty() || sib[0] == c) cores.push_back(c);
+            if (smt || sib.empty() || sib[0] == c) cores.push_back(c);   // (smt: its siblings too, in the node's order)
         }
         if (!cores.empty()) nodes.push_back(cores);
     }
 #endif
     if (nodes.empty()) {
         std::vector<int> all;
-        for (unsigned c = 0; c < std::max(1u, std::thread::hardware_concurrency() / 2); ++c) all.push_back((int) c);
+        const unsigned hw = std::thread::hardware_concurrency();
+        for (unsigned c = 0; c < std::max(1u, smt ? hw : hw / 2); ++c) all.push_back((int) c);
         nodes.push_back(all);
     }
     return nodes;
