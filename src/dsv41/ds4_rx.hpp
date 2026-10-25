@@ -225,6 +225,14 @@ struct LateBook {
     }
 };
 
+/// The remote experts beside expert parallelism's n_ff slice [ff0, ff0 + ffn) of a layer (Layer::ep_ff0 / ep_ffn; ffn -1:
+/// the whole n_ff): refused - the server computes each expert whole, an EP window's lane a slice of it, and the other
+/// PC's part would add the rest a second time.  The reason, or nullptr
+inline const char* slice_refusal(bool remote, int ff0, int ffn, int n_ff) {
+    if (!remote || ffn < 0 || (ff0 == 0 && ffn == n_ff)) return nullptr;
+    return "the remote experts (--remote-experts) compute each expert whole";
+}
+
 /// The late replies of the main's last 64 requests: 8 of them idle the link for the next `hold` requests (the lane
 /// computes their picks), then it is tried again with a clean count.  Given up for good only when no reply at all
 /// (late or not) came from one idle spell to the next: a server that stopped answering on a link still open

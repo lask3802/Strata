@@ -285,6 +285,14 @@ int main() {
         for (int i = 0; i < 7; ++i) s.seen(true);
         check(s.seen(true) == B::Silent, "8 late again and no reply at all since the spell: given up");
     }
+    {
+        // the remote experts beside expert parallelism's n_ff slices (U2): refused (lead 2026-10-25, U4a)
+        check(rx::slice_refusal(true, 0, -1, 2304) == nullptr, "the whole n_ff (unresolved, -1): taken");
+        check(rx::slice_refusal(true, 0, 2304, 2304) == nullptr, "the whole n_ff: taken");
+        check(rx::slice_refusal(true, 0, 1024, 2304) != nullptr, "a slice [0, 1024): refused");
+        check(rx::slice_refusal(true, 1024, 1280, 2304) != nullptr, "a slice [1024, 2304): refused");
+        check(rx::slice_refusal(false, 0, 1024, 2304) == nullptr, "no --remote-experts: the slice is not ours to refuse");
+    }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;
 }

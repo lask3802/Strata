@@ -1950,10 +1950,22 @@ struct Model::Impl {
     // alone (no VRAM tier, no GPU-visible store slots), in a process that is no remote stage's worker and skips no expert
     // by its RAM (STRATA_DS4_DISK_SKIP_W) - false (err) otherwise.  At load, and again by whatever sets a slice later
     bool ep_slices_ok(std::string& err) const {
+        if (!rx_slices_ok(err)) return false;
         for (const Layer& l : L)
             if (const char* why = ep_slice_refusal(l.ep_ff0, l.ep_ffn, g.ff, l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay),
                                                    l.n_slots > 0, !l.zc.empty(), l.mtp, o.stage_worker,
                                                    disk_skip_w > 0.0f)) {
+                err = "expert parallelism: layer " + std::to_string(l.il) + "'s n_ff slice [" + std::to_string(l.ep_ff0) + ", " +
+                      std::to_string(l.ep_ff0 + l.ep_ffn) + "): " + why;
+                return false;
+            }
+        return true;
+    }
+    // --remote-experts beside n_ff slices: refused (rx::slice_refusal) - at load before the server's upload, and with the
+    // slices' own checks (ep_slices_ok) for whatever sets a slice later
+    bool rx_slices_ok(std::string& err) const {
+        for (const Layer& l : L)
+            if (const char* why = rx::slice_refusal(!o.remote_experts.empty(), l.ep_ff0, l.ep_ffn, g.ff)) {
                 err = "expert parallelism: layer " + std::to_string(l.il) + "'s n_ff slice [" + std::to_string(l.ep_ff0) + ", " +
                       std::to_string(l.ep_ff0 + l.ep_ffn) + "): " + why;
                 return false;
@@ -3080,6 +3092,7 @@ struct Model::Impl {
                 }
             }
         }
+        if (!rx_slices_ok(err)) return false;
         rx_setup();   // (--remote-experts: the expert server's blobs, before the service thread takes the link)
         {
             void* m = nullptr;
