@@ -13,8 +13,8 @@
 //   (STRATA_STAGE_TOKEN: the same as the server's)
 // Exit 0 all good, 1 a failure, 3 the server refused the blobs with an Error (the engine drops it at load).  Two cases
 // of the server's load: a full room (the server with DS4_RX_TEST_VRAM_MIB=600 --expert-server-reserve-mib 0, this
-// with --fill 1): every blob held and served, exit 0; a type with no token kernel (--layers 13/13,16/16: Q5_K): refused
-// at load, exit 3.  Either way never a failure at a request.
+// with --fill 1): every blob held and served, exit 0; a type with no token kernel (--layers 16/16,16/13: the second
+// layer's down Q5_K): refused at load, exit 3.  Either way never a failure at a request.
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_iq.cuh"
 #include "../../src/dsv41/ds4_rx.hpp"
