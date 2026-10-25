@@ -9,9 +9,11 @@
 //
 // This file is the pure part (no socket, no GPU, no model), so it is tested alone (tests/dsv41/rx_fill_test.cpp):
 //   - remote_pick / remote_choose: which (layer, in, out) to fill, over the layers with the most lane hits first;
-//     a server-held expert that is also in this GPU's VRAM (a duplicate) leaves first, whatever its heat;
+//     `in` only an expert the main computes on its CPU lane (not in VRAM, the RAM tier or the zero-copy store), and a
+//     server-held expert that stays in this GPU's VRAM (a duplicate) leaves first, whatever its heat;
 //   - FillBook: the fills a token (R), pending (Q), the bulk pace (bytes a second) and the pause while the link idles;
-//   - ram_in: the RAM tier's next expert, never one the server holds (the RAM tier would save the lane nothing there).
+//   - ram_in: the RAM tier's next expert, never one the server holds (the RAM tier would save the lane nothing there);
+//   - PromptSettle: one cache settle a prompt that ends on windows.
 // The server's list (the main's rx_has row of a layer) has three states here: 0 not held, kHeld, kFilling.  cache_in
 // (ds4_rx.hpp) and ram_in treat any non-zero as the server's, so neither cache takes an expert on its way there.
 #pragma once
@@ -19,6 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 namespace strata::ds4::rx {
@@ -43,21 +46,42 @@ struct Fill {
     int layer = -1, in = -1, out = -1;
 };
 
-/// One layer's fill: `in` the hottest of the CPU-lane hits that is not in VRAM (slot < 0), not the VRAM tier's pick
-/// this tick (vin) and not on the server's list (has[e] == 0); `out` a held expert (has[e] == kHeld, never kFilling):
-/// the coldest one that is also in VRAM if there is one (the server's copy saves the lane nothing; any `in` beats it),
+/// One layer as the remote tier sees it at a tick (pointers into the engine's Layer and rx_has row)
+struct TierLayer {
+    int layer = -1;
+    const std::vector<int>* hits = nullptr;   // its CPU-lane hits since the last tick
+    const int* slot = nullptr;                // [n_exp] VRAM slot, -1: not in VRAM
+    const int* ram = nullptr;                 // [n_exp] RAM-tier slot, -1: not there (null: no RAM tier)
+    const uint8_t* zc = nullptr;              // [n_exp] != 0: the zero-copy store's, computed on this GPU (null: none)
+    const float* heat = nullptr;              // [n_exp]
+    uint8_t* has = nullptr;                   // [n_exp] the server's list (rx_has row): 0, kHeld, kFilling
+    int n_exp = 0;
+    int vin = -1;                             // the VRAM tier's pick this tick (-1: none)
+    int vout = -1;                            // the VRAM expert the layer's pending swap takes out (this tick's or one
+                                              // still under way; -1: none) - leaving VRAM, so no duplicate
+    double bytes = 0.0;                       // a fill's bytes in this layer (its blob)
+};
+
+/// One layer's fill: `in` the hottest of the CPU-lane hits the main computes on its lane - not in VRAM (slot < 0), not
+/// in the RAM tier or the zero-copy store, not the VRAM tier's pick this tick (vin) - and not on the server's list
+/// (has[e] == 0); `out` a held expert (has[e] == kHeld, never kFilling): the coldest one that stays in VRAM if there
+/// is one (vout is leaving it; the server's copy of such a duplicate saves the lane nothing, so any `in` beats it),
 /// else the coldest held, and then only when heat[in] > heat[out] x margin + bonus.  {-1, -1}: none
-inline Fill remote_pick(const std::vector<int>& hits, const int* slot, const float* heat, const uint8_t* has, int n_exp,
-                        int vin, float margin, float bonus) {
+inline Fill remote_pick(const TierLayer& t, float margin, float bonus) {
     Fill f;
+    const int* slot = t.slot;
+    const float* heat = t.heat;
+    const uint8_t* has = t.has;
     int in = -1;
-    for (int e : hits)
-        if (e >= 0 && e < n_exp && e != vin && slot[e] < 0 && has[e] == 0 && (in < 0 || heat[e] > heat[in])) in = e;
+    for (int e : *t.hits)
+        if (e >= 0 && e < t.n_exp && e != t.vin && slot[e] < 0 && (t.ram == nullptr || t.ram[e] < 0) &&
+            (t.zc == nullptr || t.zc[e] == 0) && has[e] == 0 && (in < 0 || heat[e] > heat[in]))
+            in = e;
     if (in < 0) return f;
     int dup = -1, cold = -1;
-    for (int e = 0; e < n_exp; ++e) {
+    for (int e = 0; e < t.n_exp; ++e) {
         if (has[e] != kHeld) continue;
-        if (slot[e] >= 0 && (dup < 0 || heat[e] < heat[dup])) dup = e;
+        if (slot[e] >= 0 && e != t.vout && (dup < 0 || heat[e] < heat[dup])) dup = e;
         if (cold < 0 || heat[e] < heat[cold]) cold = e;
     }
     if (dup >= 0) {
@@ -72,10 +96,19 @@ inline Fill remote_pick(const std::vector<int>& hits, const int* slot, const flo
 
 /// The fill budget: at most R fills leave a token (tick), at most Q are pending (queued, not yet FillOk), the bytes
 /// queued keep to the bulk pace (a bucket of pace_bps that holds `burst` bytes at most; a fill needs its bytes in it),
-/// and none leaves while the link idles (rx::Backoff's spell: the server is late already).  pace_bps <= 0: no pace
+/// and none leaves while the link idles (rx::Backoff's spell: the server is late already).  pace_bps <= 0: no pace.
+/// A burst below the largest fill (max_fill bytes) would never let that fill go: raised to it (clamped(), said once)
 class FillBook {
 public:
-    FillBook(int r, int q, double pace_bps, double burst) : r_(r), q_(q), pace_(pace_bps), burst_(burst) {}
+    FillBook(int r, int q, double pace_bps, double burst, double max_fill)
+        : r_(r), q_(q), pace_(pace_bps), burst_(burst) {
+        if (pace_ > 0.0 && burst_ < max_fill) {
+            std::fprintf(stderr, "ds4: remote experts: the fills' burst %.1f MB is below one fill (%.1f MB): raised to it\n",
+                         burst_ / 1e6, max_fill / 1e6);
+            burst_ = max_fill;
+            clamped_ = true;
+        }
+    }
     /// a token boundary at now_ms: the token's R again, the bucket refilled for the time since the last tick
     void tick(double now_ms, bool idle) {
         if (last_ms_ >= 0.0 && pace_ > 0.0)
@@ -102,25 +135,15 @@ public:
     int pending() const { return pending_; }
     int left() const { return left_; }
     double bucket() const { return bucket_; }
+    double burst() const { return burst_; }
+    bool clamped() const { return clamped_; }
 
 private:
     int r_, q_;
     double pace_, burst_;
     double bucket_ = 0.0, last_ms_ = -1.0;
     int left_ = 0, pending_ = 0;
-    bool idle_ = false;
-};
-
-/// One layer as the remote tier sees it at a tick (pointers into the engine's Layer and rx_has row)
-struct TierLayer {
-    int layer = -1;
-    const std::vector<int>* hits = nullptr;   // its CPU-lane hits since the last tick
-    const int* slot = nullptr;                // [n_exp] VRAM slot, -1: not in VRAM
-    const float* heat = nullptr;              // [n_exp]
-    uint8_t* has = nullptr;                   // [n_exp] the server's list (rx_has row): 0, kHeld, kFilling
-    int n_exp = 0;
-    int vin = -1;                             // the VRAM tier's pick this tick (-1: none)
-    double bytes = 0.0;                       // a fill's bytes in this layer (its blob)
+    bool idle_ = false, clamped_ = false;
 };
 
 /// A tick's fills: the layers with the most hits first (ties: the lower index), at most one a layer, while the book
@@ -138,7 +161,7 @@ inline std::vector<Fill> remote_choose(std::vector<TierLayer>& ls, FillBook& boo
         if (book.spent()) break;
         TierLayer& t = ls[i];
         if (t.hits == nullptr || t.hits->empty() || t.has == nullptr || !book.can(t.bytes)) continue;
-        Fill f = remote_pick(*t.hits, t.slot, t.heat, t.has, t.n_exp, t.vin, margin, bonus);
+        Fill f = remote_pick(t, margin, bonus);
         if (f.in < 0) continue;
         f.layer = t.layer;
         t.has[f.out] = 0;
@@ -156,5 +179,17 @@ inline bool fill_landed(uint8_t* has, int in, bool ok) {
     has[in] = ok ? kHeld : 0;
     return true;
 }
+
+/// The cache settle after a prompt that ends on windows (feed_windows), with the expert server on: once a prompt.
+/// A prompt comes in several feeds (the server's 16-token units with --prefill-chunk 0, feed_mark's run then its last
+/// token, a chunked run then a last window); only the one that asks for logits ends it, and a settle already made
+/// since the last decode token (the chunked path's own) counts.  settled(): any cache_settle; decoded(): a decode window
+struct PromptSettle {
+    bool done = false;
+    /// at a window feed's end: settle now?
+    bool after_feed(bool rx_on, int logits_rows) const { return rx_on && logits_rows > 0 && !done; }
+    void settled() { done = true; }
+    void decoded() { done = false; }
+};
 
 }  // namespace strata::ds4::rx

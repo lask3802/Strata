@@ -20,6 +20,22 @@ static bool near(double a, double b) { return std::fabs(a - b) < 1e-9; }
 
 static const float M = 1.25f, B = 1.0f;
 
+// one layer's pick with no RAM tier and no zero-copy store unless given, and no VRAM swap under way unless vout
+static rx::Fill pick(const std::vector<int>& hits, const int* slot, const float* heat, uint8_t* has, int n, int vin,
+                     const int* ram = nullptr, const uint8_t* zc = nullptr, int vout = -1) {
+    rx::TierLayer t;
+    t.hits = &hits;
+    t.slot = slot;
+    t.ram = ram;
+    t.zc = zc;
+    t.heat = heat;
+    t.has = has;
+    t.n_exp = n;
+    t.vin = vin;
+    t.vout = vout;
+    return rx::remote_pick(t, M, B);
+}
+
 int main() {
     {
         // the rule: in's heat past the coldest held one's x 1.25 + 1
@@ -29,28 +45,28 @@ int main() {
         std::vector<uint8_t> has = {rx::kHeld, rx::kHeld, 0, 0, 0, 0};   // (held: 0 (8), 1 (3): the coldest is 1)
         // 3 x 1.25 + 1 = 4.75
         heat[4] = 4.75f;
-        rx::Fill f = rx::remote_pick({4}, slot.data(), heat.data(), has.data(), n, -1, M, B);
+        rx::Fill f = pick({4}, slot.data(), heat.data(), has.data(), n, -1);
         check(f.in < 0, "in's heat equal to the coldest's x 1.25 + 1 (4.75): no fill");
         heat[4] = 4.76f;
-        f = rx::remote_pick({4}, slot.data(), heat.data(), has.data(), n, -1, M, B);
+        f = pick({4}, slot.data(), heat.data(), has.data(), n, -1);
         check(f.in == 4 && f.out == 1, "past it (4.76): in 4, out the coldest held (1)");
         heat[4] = 4.0f;   // (past 3 x 1.25 = 3.75, not past 4.75: the bonus decides)
-        f = rx::remote_pick({4}, slot.data(), heat.data(), has.data(), n, -1, M, B);
+        f = pick({4}, slot.data(), heat.data(), has.data(), n, -1);
         check(f.in < 0, "past the margin alone (4.0 > 3.75), not the bonus: no fill");
-        f = rx::remote_pick({4, 2, 5}, slot.data(), heat.data(), has.data(), n, -1, M, B);
+        f = pick({4, 2, 5}, slot.data(), heat.data(), has.data(), n, -1);
         check(f.in == 2 && f.out == 1, "several hits: the hottest (2, heat 20) goes in");
-        f = rx::remote_pick({0, 1}, slot.data(), heat.data(), has.data(), n, -1, M, B);
+        f = pick({0, 1}, slot.data(), heat.data(), has.data(), n, -1);
         check(f.in < 0, "hits the server holds already: no fill");
         std::vector<uint8_t> none(n, 0);
-        f = rx::remote_pick({2}, slot.data(), heat.data(), none.data(), n, -1, M, B);
+        f = pick({2}, slot.data(), heat.data(), none.data(), n, -1);
         check(f.in < 0, "the server holds nothing in the layer: nothing to swap out");
         slot[2] = 0;
-        f = rx::remote_pick({2}, slot.data(), heat.data(), has.data(), n, -1, M, B);
+        f = pick({2}, slot.data(), heat.data(), has.data(), n, -1);
         check(f.in < 0, "a hit in this GPU's VRAM: not a candidate");
         slot[2] = -1;
-        f = rx::remote_pick({2}, slot.data(), heat.data(), has.data(), n, 2, M, B);
+        f = pick({2}, slot.data(), heat.data(), has.data(), n, 2);
         check(f.in < 0, "the VRAM tier's pick this tick (vin): not a candidate");
-        f = rx::remote_pick({-1, 9}, slot.data(), heat.data(), has.data(), n, -1, M, B);
+        f = pick({-1, 9}, slot.data(), heat.data(), has.data(), n, -1);
         check(f.in < 0, "hit ids outside the layer: ignored");
     }
     {
@@ -59,11 +75,33 @@ int main() {
         std::vector<int> slot = {3, -1, -1, -1, -1};          // (0 in VRAM)
         std::vector<float> heat = {50.0f, 2.0f, 9.0f, 1.0f, 1.5f};
         std::vector<uint8_t> has = {rx::kHeld, rx::kHeld, rx::kHeld, 0, 0};
-        rx::Fill f = rx::remote_pick({3}, slot.data(), heat.data(), has.data(), n, -1, M, B);
+        rx::Fill f = pick({3}, slot.data(), heat.data(), has.data(), n, -1);
         check(f.in == 3 && f.out == 0, "a duplicate (0, hot 50) leaves before the coldest held (1), and a cold in (1.0) beats it");
         slot[2] = 1;
-        f = rx::remote_pick({3}, slot.data(), heat.data(), has.data(), n, -1, M, B);
+        f = pick({3}, slot.data(), heat.data(), has.data(), n, -1);
         check(f.in == 3 && f.out == 2, "two duplicates: the colder one (2, 9) leaves");
+        f = pick({3}, slot.data(), heat.data(), has.data(), n, -1, nullptr, nullptr, 2);
+        check(f.in == 3 && f.out == 0, "the colder one (2) is the VRAM tier's pending swap-out: not a duplicate, 0 leaves");
+        slot[2] = -1;
+        heat[3] = 4.0f;
+        f = pick({3}, slot.data(), heat.data(), has.data(), n, -1, nullptr, nullptr, 0);
+        check(f.in == 3 && f.out == 1,
+              "the only duplicate (0) leaving VRAM this round: no duplicate; the coldest held (1, 2) leaves by the rule");
+        has[0] = rx::kFilling;
+        f = pick({3}, slot.data(), heat.data(), has.data(), n, -1);
+        check(f.in == 3 && f.out == 1, "a filling expert in VRAM (0) is no duplicate to evict: the coldest held (1) leaves");
+    }
+    {
+        // in: only an expert the main computes on its CPU lane (not the RAM tier's, not the zero-copy store's)
+        const int n = 4;
+        std::vector<int> slot(n, -1), ram = {-1, 0, -1, -1};
+        std::vector<uint8_t> zc = {0, 0, 1, 0};
+        std::vector<float> heat = {1.0f, 30.0f, 20.0f, 10.0f};
+        std::vector<uint8_t> has = {rx::kHeld, 0, 0, 0};
+        rx::Fill f = pick({1, 2, 3}, slot.data(), heat.data(), has.data(), n, -1, ram.data(), zc.data());
+        check(f.in == 3 && f.out == 0, "1 in the RAM tier, 2 in the zero-copy store: in is 3");
+        f = pick({1, 2, 3}, slot.data(), heat.data(), has.data(), n, -1);
+        check(f.in == 1, "no RAM tier, no store: in is the hottest, 1");
     }
     {
         // the filling state: neither in nor out, and no cache takes it
@@ -71,10 +109,10 @@ int main() {
         std::vector<int> slot(n, -1), ram(n, -1);
         std::vector<float> heat = {1.0f, 30.0f, 40.0f, 5.0f};
         std::vector<uint8_t> has = {rx::kFilling, rx::kHeld, rx::kFilling, 0};
-        rx::Fill f = rx::remote_pick({2, 3}, slot.data(), heat.data(), has.data(), n, -1, M, B);
+        rx::Fill f = pick({2, 3}, slot.data(), heat.data(), has.data(), n, -1);
         check(f.in < 0, "a filling hit (2, heat 40) is not a candidate; the other (3, 5) is not past the held 1 (30)");
         heat[1] = 2.0f;
-        f = rx::remote_pick({3}, slot.data(), heat.data(), has.data(), n, -1, M, B);
+        f = pick({3}, slot.data(), heat.data(), has.data(), n, -1);
         check(f.in == 3 && f.out == 1, "a filling one (0, heat 1) never leaves: the coldest held (1) does");
         check(rx::cache_in({2, 3}, slot.data(), heat.data(), has.data(), nullptr) == 3,
               "cache_in: a filling expert is the server's (not into this GPU's VRAM)");
@@ -98,7 +136,7 @@ int main() {
     }
     {
         // the book: R a token, Q pending, the pace's bucket, the idle pause
-        rx::FillBook b(2, 3, 0.0, 0.0);
+        rx::FillBook b(2, 3, 0.0, 0.0, 8.6e6);
         b.tick(0.0, false);
         check(b.can(8.6e6), "no pace: a fill may leave");
         b.take(8.6e6);
@@ -119,7 +157,7 @@ int main() {
         b.done();
         check(b.pending() == 0, "done past zero stays at 0");
 
-        rx::FillBook p(8, 8, 0.6e9, 2 * 8.6e6);   // (0.6 GB/s, room for two fills of 8.6 MB)
+        rx::FillBook p(8, 8, 0.6e9, 2 * 8.6e6, 8.6e6);   // (0.6 GB/s, room for two fills of 8.6 MB)
         p.tick(0.0, false);
         check(!p.can(8.6e6), "the pace's bucket starts empty");
         p.tick(10.0, false);   // (10 ms: 6 MB)
@@ -133,6 +171,76 @@ int main() {
         check(!p.spent(), "spent: only R, Q or idle, not the bucket");
         p.tick(999.0, false);
         check(near(p.bucket(), 17.2e6), "a clock that went back adds nothing");
+
+        rx::FillBook e(8, 8, 0.86e9, 2 * 8.6e6, 8.6e6);
+        e.tick(0.0, false);
+        e.tick(10.0, false);   // (10 ms at 0.86 GB/s: 8.6 MB exactly)
+        check(near(e.bucket(), 8.6e6) && e.can(8.6e6), "the bucket holding exactly one fill's bytes: it may leave");
+        rx::FillBook c(8, 8, 1.0e9, 1.0e6, 8.6e6);
+        check(c.clamped() && near(c.burst(), 8.6e6), "a burst (1 MB) below one fill (8.6 MB): raised to the fill");
+        c.tick(0.0, false);
+        c.tick(100.0, false);
+        check(near(c.bucket(), 8.6e6) && c.can(8.6e6), "so a fill of that size can leave after all");
+        rx::FillBook z(8, 8, 1.0e9, 0.0, 8.6e6);
+        check(z.clamped() && near(z.burst(), 8.6e6), "a burst of 0: raised too");
+        rx::FillBook u(8, 8, 0.0, 0.0, 8.6e6), w(8, 8, 1.0e9, 2.0e7, 8.6e6);
+        check(!u.clamped() && !w.clamped() && near(w.burst(), 2.0e7), "no pace, or a burst above one fill: as given");
+    }
+    {
+        // the layers' order on equal hits, and one fill a layer at most
+        const int n = 4;
+        std::vector<int> s0(n, -1), s1(n, -1);
+        std::vector<float> h = {1.0f, 2.0f, 10.0f, 12.0f};
+        std::vector<uint8_t> a0 = {rx::kHeld, rx::kHeld, 0, 0}, a1 = {rx::kHeld, rx::kHeld, 0, 0};
+        std::vector<int> k = {2, 3};
+        std::vector<rx::TierLayer> ls(2);
+        for (int i = 0; i < 2; ++i) {
+            ls[(size_t) i].layer = 20 + i;
+            ls[(size_t) i].hits = &k;
+            ls[(size_t) i].slot = (i == 0 ? s0 : s1).data();
+            ls[(size_t) i].heat = h.data();
+            ls[(size_t) i].has = (i == 0 ? a0 : a1).data();
+            ls[(size_t) i].n_exp = n;
+            ls[(size_t) i].bytes = 8.6e6;
+        }
+        rx::FillBook one(1, 4, 0.0, 0.0, 8.6e6);
+        one.tick(0.0, false);
+        std::vector<rx::Fill> f = rx::remote_choose(ls, one, M, B);
+        check(f.size() == 1 && f[0].layer == 20, "equal hits (2 each), R=1: the lower layer (20) first");
+        rx::FillBook four(4, 4, 0.0, 0.0, 8.6e6);
+        four.tick(0.0, false);
+        std::vector<rx::TierLayer> only(ls.begin() + 1, ls.end());
+        f = rx::remote_choose(only, four, M, B);
+        check(f.size() == 1 && f[0].in == 3 && f[0].out == 0 && a1[2] == 0 && a1[1] == rx::kHeld,
+              "two held and two ins in one layer, R=4: one fill (3 for 0); the other pair waits for the next tick");
+    }
+    {
+        // a window prompt's settle, once a prompt (rx::PromptSettle), over the feeds the engine sees
+        auto run = [](rx::PromptSettle& ps, bool rx_on, const std::vector<int>& feeds) {
+            int n = 0;   // (feeds: a window feed's logits rows; -1: a chunked run, which settles; -2: a decode window)
+            for (int lr : feeds) {
+                if (lr == -1) {
+                    ps.settled();
+                    ++n;
+                } else if (lr == -2) {
+                    ps.decoded();
+                } else if (ps.after_feed(rx_on, lr)) {
+                    ps.settled();
+                    ++n;
+                }
+            }
+            return n;
+        };
+        rx::PromptSettle ps;
+        std::vector<int> unit16(256, 0);   // (--prefill-chunk 0: a 4K prompt in 16-token feeds, the last with logits)
+        unit16.back() = 1;
+        check(run(ps, true, unit16) == 1, "a 4K prompt in 256 feeds of 16 tokens: one settle, at the last");
+        check(run(ps, true, {-2, 0, 1}) == 1, "a decode, then feed_mark's windows (n - 1 rows, then the last): one settle");
+        check(run(ps, true, {-2, -1, 1}) == 1, "a decode, then a chunked run and its last window: the chunked run's settle only");
+        check(run(ps, true, {-2, 1, -2, 1}) == 2, "two prompts with a decode between: two");
+        check(run(ps, true, {-2, 4, 4, 4}) == 1, "scoring windows (logits each) after a decode: one");
+        rx::PromptSettle off;
+        check(run(off, false, {1, -2, 1}) == 0, "no expert server: none");
     }
     {
         // a tick over the layers: the most hits first, one a layer, the list's states set at once
@@ -158,7 +266,7 @@ int main() {
             }
             return v;
         };
-        rx::FillBook b(2, 2, 0.0, 0.0);
+        rx::FillBook b(2, 2, 0.0, 0.0, 8.6e6);
         b.tick(0.0, false);
         auto ls = layers();
         std::vector<rx::Fill> f = rx::remote_choose(ls, b, M, B);
@@ -180,7 +288,7 @@ int main() {
         f = rx::remote_choose(ls, b, M, B);
         check(f.size() == 1 && f[0].layer == 10 && f[0].in == 1 && f[0].out == 0,
               "layer 12's next (2, heat 9) not past its held 1 (10), 11 holds nothing: layer 10's fill");
-        rx::FillBook p(8, 8, 1.0e9, 9.0e6);
+        rx::FillBook p(8, 8, 1.0e9, 9.0e6, 8.6e6);
         p.tick(0.0, false);
         p.tick(9.0, false);   // (9 MB: one fill)
         a0 = a1 = a2 = {rx::kHeld, 0, 0, 0};

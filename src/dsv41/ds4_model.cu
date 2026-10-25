@@ -1148,6 +1148,7 @@ struct Model::Impl {
     // logical CPUs, which the CPU lane's pools leave out; a window's start (forward), for serve_lane's Wake;
     // DS4_EP_WAKE=0: no Wake and the lane's 2 ms naps as without the link (A/B)
     int ep_cpu = -1;
+    bool ep_freed = false;   // (no server held any expert: the link core went back to the CPU lane at the load)
     std::vector<int> ep_sibs;
     std::atomic<bool> rx_wake{false};
     bool ep_wake = true;
@@ -1199,6 +1200,7 @@ struct Model::Impl {
     float* v_err = nullptr;
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
     bool win_prompt = false;   // (feed_windows: a prompt's windows - their cache ticks are the decode's, serve_T 0)
+    rx::PromptSettle psettle;  // (a window prompt's settle: once a prompt, ds4_rx_fill.hpp)
     // lookahead: while layer L runs, the device guesses the next layer's picks (its gate on L's FFN input, the same
     // choice) and publishes them with L's routing; the CPU lane asks for the guessed experts it will read from the files
     // at once (a thread of its own, os::prefetch), so the SSD reads them while L computes instead of on the next
@@ -3160,6 +3162,7 @@ struct Model::Impl {
                                        // pools are idle until the service thread starts, below)
             std::fprintf(stderr, "ds4: remote experts: none held - the link core (CPU %d) goes back to the CPU lane\n", ep_cpu);
             ep_cpu = -1;
+            ep_freed = true;
             ep_sibs.clear();
             pools.clear();
             make_pools();
@@ -6486,6 +6489,7 @@ struct Model::Impl {
     // follows finds the hot experts in VRAM.  Rounds of the ordinary swap rule (the hottest CPU-lane pick of each layer
     // in, its coldest VRAM expert out) until nothing is worth moving or DS4_SETTLE_MS (6000) is spent
     void cache_settle() {
+        psettle.settled();
         if (!o.expert_cache || cache_ths.empty()) return;
         static const double budget = env_f("DS4_SETTLE_MS", 6000.0f);
         if (budget <= 0.0) return;
@@ -6967,9 +6971,9 @@ struct Model::Impl {
         rx_wait.reserve(1 << 20);
         rx_arr.reserve(1 << 20);
     }
-    // layer l's experts the expert server holds, for the hits of a window of T rows (0: the settle, or the tick after a
-    // chunked prompt - the decode's) ([n_exp]; null:
-    // none, the link given up - the lane's again -, or a window the server does not serve: DS4_SYNC, T past
+    // layer l's experts the expert server holds, for the hits of a window of T rows (0: the settle, the tick after a
+    // chunked prompt or a window prompt's ticks - the decode's) ([n_exp]; null:
+    // none, the link given up - the lane's again -, or a decode window the server does not serve: DS4_SYNC, T past
     // async_max_t - rx::lane_serves - whose CPU lane computed them itself)
     const uint8_t* rx_row(const Layer& l, int T) const {
         return rx_on && rx::lane_serves(T, par, sync_decode, async_max_t) && !l.mtp && l.n_exp == g.n_exp &&
@@ -7243,7 +7247,7 @@ struct Model::Impl {
               "remote experts per token: the lane's own part %.2f ms + its wait %.2f ms + the late ones %.2f ms; the "
               "link %.1f KB out, %.1f KB in; the upload %lld experts, %.2f GB in %.1f s, %lld of them in this "
               "GPU's VRAM too now (the cache's: none but zero-copy ones, after the link was given up, or after "
-              "windows the server does not serve: DS4_SYNC, T past DS4_ASYNC_T)\n",
+              "decode windows the server does not serve: DS4_SYNC, T past DS4_ASYNC_T)\n",
               local + served > 0 ? 100.0 * served / (local + served) : 0.0, served / nt, (local + served) / nt,
               (double) (st.rx_fallback - s0.rx_fallback) / nt, (long long) (st.rx_late - s0.rx_late),
               (long long) (st.rx_late_link - s0.rx_late_link), (long long) (st.rx_backoffs - s0.rx_backoffs),
@@ -7326,7 +7330,8 @@ struct Model::Impl {
         add_f(b,
               "remote experts' link: the service thread on CPU %d%s (the CPU lane's pools off CPUs%s); keep-awake "
               "%s: %lld Wakes sent (%.3f a token), %lld requests found the lane napping\n",
-              ep_cpu, ep_cpu < 0 ? " (DS4_EP_CPU off: as without the link)" : "", sibs.empty() ? " -" : sibs.c_str(),
+              ep_cpu, ep_cpu >= 0 ? "" : ep_freed ? " (none: no server held any expert, the core went back to the CPU lane)"
+                                                 : " (DS4_EP_CPU off: as without the link)", sibs.empty() ? " -" : sibs.c_str(),
               ep_wake ? "on" : "off (DS4_EP_WAKE=0)", (long long) (st.rx_wakes - s0.rx_wakes),
               (double) (st.rx_wakes - s0.rx_wakes) / std::max(1.0, nt), (long long) (st.lane_nap_reqs - s0.lane_nap_reqs));
         return b;
@@ -9089,19 +9094,23 @@ struct Model::Impl {
     // n tokens through windows of 16, the last one's logits_rows rows of logits
     bool feed_windows(const int* tokens, int n, int logits_rows, std::string& err) {
         logits_all = false;
-        win_prompt = true;   // (its ticks as the chunked prompt's: for the decode that follows)
-        for (int a = 0; a < n; a += kWin) {
-            const int T = std::min(kWin, n - a);
-            if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, false, err)) {   // (a prompt's: whole)
-                win_prompt = false;
-                return false;
+        {
+            struct Off {   // (win_prompt false again on every way out)
+                bool& f;
+                ~Off() { f = false; }
+            } off{win_prompt};
+            win_prompt = true;   // (its ticks as the chunked prompt's: for the decode that follows)
+            for (int a = 0; a < n; a += kWin) {
+                const int T = std::min(kWin, n - a);
+                if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, false, err)) return false;   // (a prompt's: whole)
             }
         }
-        win_prompt = false;
-        // with the expert server: the settle, as after a chunked prompt - the windows past async_max_t computed its
-        // experts on the lane, so their ticks could not tell them from the lane's (no settle, server experts in this
-        // GPU's VRAM: slot 1243Z's ep2).  Without it as before
-        if (rx_on && (!o.stage_worker || stage_last)) cache_settle();
+        // with the expert server: the settle, as after a chunked prompt, once a prompt (rx::PromptSettle: the feed that
+        // asks for logits, unless the prompt's chunked part settled already).  Without it the windows' ticks put the
+        // server's experts into this GPU's VRAM: the windows past async_max_t compute them on the lane, and nothing
+        // settled after them (slot 20261025T1243Z's ep2 arm: no settle line, 9 server experts in VRAM).  Without the
+        // server as before
+        if (psettle.after_feed(rx_on, logits_rows) && (!o.stage_worker || stage_last)) cache_settle();
         return true;
     }
     // the picked path took ms: the flow's predictions for the prompt's size class scaled by what it really takes (taken
@@ -9877,6 +9886,7 @@ struct Model::Impl {
         pos += T;
         st.tokens += T;
         cache_tick(T, win_prompt ? 0 : -1);   // (a window prompt's: the server's experts as the decode's, rx_row(.., 0))
+        if (ep) psettle.decoded();   // (a decode window: the next prompt settles again)
         if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err)) return false;
         return true;
     }
@@ -10949,7 +10959,9 @@ bool Model::stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err
     }
     p.stage_t = 0;
     p.spec_win = T > 1;   // (a window of 2 or more rows may be a draft's check: its layers keep their backups)
-    const bool ok = p.forward(tk.data(), T, 0, false, err);   // (the link carries no window kind: no slices here, ep_slices_ok)
+    // (the link carries no window kind: no slices here, ep_slices_ok; its cache ticks keep serve_T = T - a stage worker is
+    // not on the expert server's path)
+    const bool ok = p.forward(tk.data(), T, 0, false, err);
     p.spec_win = false;
     if (!ok) return false;
     if (T > 1) p.stage_t = T;
