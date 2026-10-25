@@ -56,9 +56,12 @@ void FillGeo::gather(const uint8_t* const src[3], int k, uint8_t* dst) const {
     }
     std::memcpy(dst, src[0], (size_t) ((uint64_t) k * 256 * row[0]));
     std::memcpy(dst + ship_off(1, k), src[1], (size_t) ((uint64_t) k * 256 * row[1]));
+    gather_down(src[2], k, dst + ship_off(2, k));
+}
+
+void FillGeo::gather_down(const uint8_t* src2, int k, uint8_t* dst) const {
     const size_t kb = (size_t) ((uint64_t) k * (row[2] / (uint64_t) nb));
-    uint8_t* d = dst + ship_off(2, k);
-    for (int i = 0; i < rows[2]; ++i) std::memcpy(d + (size_t) i * kb, src[2] + (size_t) i * row[2], kb);
+    for (int i = 0; i < rows[2]; ++i) std::memcpy(dst + (size_t) i * kb, src2 + (size_t) i * row[2], kb);
 }
 
 FillLink::~FillLink() { close(); }
@@ -136,6 +139,11 @@ std::string FillLink::why() {
     return why_;
 }
 
+std::string FillLink::zc_note() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return zc_note_;
+}
+
 void FillLink::close() {
     stop_ = true;
     cv_.notify_all();
@@ -166,8 +174,36 @@ void FillLink::loop_() {
         }
         if (have) {
             const uint64_t n = j.geo.ship_bytes(j.k);
-            if (buf.size() < n) buf.resize((size_t) n);
-            j.geo.gather(j.src, j.k, buf.data());
+            // the payload in pieces as gather lays it out: one buffer (zc 0, or a whole blob), or a split fill's gate
+            // and up from the pack (the mapping; zc 2: its file) and its downs gathered
+            struct Seg {
+                const uint8_t* p = nullptr;
+                std::intptr_t fd = -1;
+                uint64_t foff = 0, n = 0;
+                bool pack = false;
+            } seg[3];
+            int nseg = 1;
+            if (zc > 0 && j.geo.split(j.k)) {
+                const uint64_t o1 = j.geo.ship_off(1, j.k), o2 = j.geo.ship_off(2, j.k);
+                if (buf.size() < n - o2) buf.resize((size_t) (n - o2));
+                j.geo.gather_down(j.src[2], j.k, buf.data());
+                const uint64_t len[2] = {o1, o2 - o1};
+                for (int r = 0; r < 2; ++r) {
+                    seg[r].p = j.src[r];
+                    seg[r].fd = zc == 2 ? j.fd[r] : -1;
+                    seg[r].foff = j.foff[r];
+                    seg[r].n = len[r];
+                    seg[r].pack = true;
+                }
+                seg[2].p = buf.data();
+                seg[2].n = n - o2;
+                nseg = 3;
+            } else {
+                if (buf.size() < n) buf.resize((size_t) n);
+                j.geo.gather(j.src, j.k, buf.data());
+                seg[0].p = buf.data();
+                seg[0].n = n;
+            }
             net::ep::EpHdr h;
             h.type = net::ep::Fill;
             h.layer = (uint8_t) j.layer;
@@ -180,16 +216,36 @@ void FillLink::loop_() {
             const uint64_t t0 = net::ep::now_ns();
             bool ok = c_.send_bytes(&h, sizeof h, err);
             // paced here, not by the Conn (its pace spins between 64 KB pieces - beside the link core, on its sibling):
-            // 1 MB pieces, a sleep until each is due; time the socket idled earns no burst
-            for (uint64_t at = 0; ok && at < n; at += kPiece) {
-                const size_t m = (size_t) std::min<uint64_t>(kPiece, n - at);
-                if (pace_ > 0.0) {
-                    const double now = net::ep::now_ms();
-                    if (due_ > now) std::this_thread::sleep_for(std::chrono::microseconds((int64_t) ((due_ - now) * 1000.0)));
-                    due_ = std::max(due_, now) + 1000.0 * (double) m / pace_;
+            // 1 MB pieces of each segment, a sleep until each is due; time the socket idled earns no burst
+            for (int s = 0; ok && s < nseg; ++s)
+                for (uint64_t at = 0; ok && at < seg[s].n; at += kPiece) {
+                    const size_t m = (size_t) std::min<uint64_t>(kPiece, seg[s].n - at);
+                    if (pace_ > 0.0) {
+                        const double now = net::ep::now_ms();
+                        if (due_ > now) std::this_thread::sleep_for(std::chrono::microseconds((int64_t) ((due_ - now) * 1000.0)));
+                        due_ = std::max(due_, now) + 1000.0 * (double) m / pace_;
+                    }
+                    if (stop_.load(std::memory_order_acquire)) {
+                        ok = false;
+                        break;
+                    }
+                    int r = 0;
+                    if (seg[s].fd >= 0 && file_ok_) {
+                        r = c_.send_file(seg[s].fd, seg[s].foff + at, m, err);
+                        if (r == 0) {   // (refused before a byte went: the mapping's way from here on)
+                            file_ok_ = false;
+                            std::lock_guard<std::mutex> lk(mu_);
+                            zc_note_ = err;
+                        } else if (r > 0) {
+                            filed += m;
+                        }
+                    }
+                    if (r == 0) {
+                        r = c_.send_bytes(seg[s].p + at, m, err) ? 1 : -1;
+                        if (r > 0 && seg[s].pack) direct += m;
+                    }
+                    ok = r > 0;
                 }
-                ok = !stop_.load(std::memory_order_acquire) && c_.send_bytes(buf.data() + at, m, err);
-            }
             if (!ok) {
                 fail("a fill did not go out (" + err + ")");
                 return;

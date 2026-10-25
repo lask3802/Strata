@@ -207,6 +207,11 @@ public:
     int peek(uint8_t* out, size_t n, double deadline, std::string& err);
     /// bytes as they are, no header (tests: a peer that breaks the framing)
     bool send_bytes(const void* p, size_t len, std::string& err) { return send_raw_((const uint8_t*) p, len, err); }
+    /// len bytes of the file file_fd from off, as they are, no header (Linux: sendfile - the page cache's pages to the
+    /// socket, no copy through this process; pace_bps not applied: its caller paces).  1 sent; 0 not on this OS or
+    /// refused by the kernel before a byte went (err; the link as it was: send them some other way); -1 the link
+    /// failed (err; closed)
+    int send_file(std::intptr_t file_fd, uint64_t off, size_t len, std::string& err);
     /// close with a reset (SO_LINGER 0): the peer reads ECONNRESET, not an orderly close (tests)
     void reset();
     double last_frame_ms() const { return last_frame_; }

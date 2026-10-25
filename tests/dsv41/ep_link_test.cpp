@@ -1098,6 +1098,70 @@ void case_rx_stamps() {
     p.end();
 }
 
+// Conn::send_file (DS4_RX_FILL_ZC=2's sendfile): a frame whose payload is a file's bytes from an offset, in pieces as
+// the fill thread sends them, read back whole; a refused file (a bad fd) says 0 and leaves the link as it was
+void case_send_file() {
+    Listener ls;
+    std::string err;
+    check(ls.open("127.0.0.1:0", err), "send_file: a listener (" + err + ")");
+    Conn a, b;
+    std::string derr;
+    std::thread dial([&] { (void) a.dial("127.0.0.1:" + std::to_string(ls.port()), 3000, derr); });
+    const bool acc = ls.accept(b, 3000, err);
+    dial.join();
+    check(acc && a.ok(), "send_file: connected (" + err + derr + ")");
+    if (!acc || !a.ok()) return;
+    const size_t skip = 4099, n = (size_t) (5u << 20) + 77;   // (an odd offset and length, past a few 1 MB pieces)
+    std::vector<uint8_t> want(skip + n);
+    for (size_t i = 0; i < want.size(); ++i) want[i] = (uint8_t) (i * 2654435761u >> 13);
+    b.max_frame = n;
+    std::intptr_t fd = -1;
+#if !defined(_WIN32)
+    std::FILE* f = std::tmpfile();
+    check(f != nullptr && std::fwrite(want.data(), 1, want.size(), f) == want.size() && std::fflush(f) == 0,
+          "send_file: the temporary file");
+    if (f != nullptr) fd = fileno(f);
+#endif
+    EpHdr g;
+    std::vector<uint8_t> pl;
+    std::string rerr;
+    int got = -1;
+    std::thread rd([&] { got = b.recv(g, pl, now_ms() + 20000, rerr); });   // (read as it comes: past a socket's buffer)
+    EpHdr h;
+    h.type = Fill;
+    h.bytes = (uint32_t) n;
+    bool ok = a.send_bytes(&h, sizeof h, err);
+    int r = 1;
+    size_t at = 0;
+    for (; ok && at < n; at += (size_t) 1 << 20) {
+        const size_t m = std::min(n - at, (size_t) 1 << 20);
+        r = a.send_file(fd, skip + at, m, err);
+        if (r == 0) break;   // (no sendfile here: the rest from memory, as the fill thread does)
+        ok = r > 0;
+    }
+#if defined(__linux__)
+    check(r == 1 && at >= n, "send_file: every piece through sendfile on Linux (" + err + ")");
+#else
+    check(r == 0 && a.ok(), "send_file: 0 off Linux, the link kept (" + err + ")");
+#endif
+    if (ok && at < n) ok = a.send_bytes(want.data() + skip + at, n - at, err);
+    if (!ok) a.close();   // (the reader sees the close, not its deadline)
+    rd.join();
+    check(ok && got == 1 && g.type == Fill && pl.size() == n && std::memcmp(pl.data(), want.data() + skip, n) == 0,
+          "send_file: the frame read back is the file's bytes from the offset (" + err + rerr + ")");
+    if (ok) {
+        std::string e2;
+        check(a.send_file(-1, 0, 16, e2) == 0 && a.ok(), "send_file: a bad fd refused (0), the link kept (" + e2 + ")");
+        const bool after = a.send(EpHdr{0, Ping}, nullptr, 0, err) && b.recv(g, pl, now_ms() + 2000, err) == 1 && g.type == Ping;
+        check(after, "send_file: a frame after the refusal goes through (" + err + ")");
+    }
+#if !defined(_WIN32)
+    if (f != nullptr) std::fclose(f);
+#endif
+    a.close();
+    b.close();
+}
+
 void case_fill() {
     Pair p;
     p.open("fill");
@@ -1906,6 +1970,7 @@ int main(int argc, char** argv) {
     run_case("case_bulk_accept", case_bulk_accept);
     run_case("case_pin_restore", case_pin_restore);
     run_case("case_rx_stamps", case_rx_stamps);
+    run_case("case_send_file", case_send_file);
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails != 0;
 }

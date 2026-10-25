@@ -42,6 +42,10 @@ struct FillGeo {
     void gather(const uint8_t* const src[3], int k, uint8_t* dst) const;
     /// (split(k)) where the shipped [0, k) of matrix r begins in the payload, its bytes a row and its rows
     uint64_t ship_off(int r, int k) const;
+    /// (split(k)) the payload's down part alone: each down row's first k blocks, ship_bytes(k) - ship_off(2, k) bytes.
+    /// The gate and up parts before it are the matrices' first ship_off(1, k) and ship_off(2, k) - ship_off(1, k)
+    /// bytes as the pack has them (DS4_RX_FILL_ZC: sent from there, not gathered)
+    void gather_down(const uint8_t* src2, int k, uint8_t* dst) const;
 };
 
 /// The main's end.  open() and queue() / take() on the decode thread; the fill thread owns the socket after open().
@@ -60,6 +64,8 @@ public:
         uint32_t seq = 0;
         int layer = -1, in = -1, out = -1, k = 0;
         const uint8_t* src[3] = {};   // in's matrices (valid until its FillOk, or the link's end)
+        std::intptr_t fd[3] = {-1, -1, -1};   // (zc 2) the pack files src[] map, and where in them src[] begins
+        uint64_t foff[3] = {};
         FillGeo geo;
     };
     void queue(const Job& j);
@@ -77,6 +83,13 @@ public:
 
     std::atomic<uint64_t> sent{0}, bytes{0}, oks{0}, fails{0};
     std::atomic<uint64_t> send_us{0};   // the fill thread's time in send (the pace's)
+    /// (DS4_RX_FILL_ZC, set before open) how a split fill's gate and up go out: 0 gathered into a buffer with the downs
+    /// (U5b's); 1 sent straight from the mapping (no gather: the socket's copy alone); 2 through sendfile from the pack's
+    /// file (no copy through this process; refused: 1's way from then on, zc_note says why).  The downs are gathered
+    /// in every mode (n_embd rows of k blocks each, strided)
+    int zc = 0;
+    std::atomic<uint64_t> direct{0}, filed{0};   // gate / up bytes sent from the mapping, through sendfile
+    std::string zc_note();                       // (zc 2) why sendfile went off, "" while it is on
 
 private:
     void loop_();
@@ -88,6 +101,8 @@ private:
     std::deque<Job> jobs_;      // (under mu_)
     std::vector<Done> done_;    // (under mu_)
     std::string why_;           // (under mu_)
+    std::string zc_note_;       // (under mu_)
+    bool file_ok_ = true;       // (the fill thread's: sendfile not refused yet)
     std::atomic<bool> stop_{false}, up_{false};
     int cpu_ = -1, port_ = 0;
     double pace_ = 0.0, due_ = 0.0;   // (the fill thread's: bytes a second; when the next piece may go, steady ms)

@@ -1249,6 +1249,7 @@ struct Model::Impl {
     // socket, their budget (R a token, Q pending; the socket paces the bytes), each layer's blob as a fill ships it, the
     // VRAM expert a layer's swap under way takes out (rx_vout: no duplicate kept on the server), a tick's layers
     std::unique_ptr<rx::FillLink> rx_fill;
+    bool rx_zc_noted = false;   // (DS4_RX_FILL_ZC=2: sendfile's refusal said)
     std::unique_ptr<rx::FillBook> rx_book;
     std::vector<rx::FillGeo> rx_fgeo;
     std::vector<int> rx_vout;
@@ -7597,6 +7598,8 @@ struct Model::Impl {
             rx_fill_max = std::max(rx_fill_max, (double) gl[li].blob);   // (the largest fill: a whole blob)
         }
         auto fl = std::make_unique<rx::FillLink>();
+        // DS4_RX_FILL_ZC: a split fill's gate and up from the pack - 1 the mapping, 2 sendfile from its file (0: gathered)
+        fl->zc = std::clamp((int) env_f("DS4_RX_FILL_ZC", 0.0f), 0, 2);
         std::string e;
         const int cpu = rx::fill_cpu();
         if (!fl->open(*rx_link, o.remote_experts, port, token, pace, cpu, 3000, e)) {
@@ -7610,6 +7613,9 @@ struct Model::Impl {
                              "thread on CPU %d)\n", fl->port(), pace / 1e9, R, Q,
                      rx_k < rx_nb ? ("the main's [0, " + std::to_string(rx_k) + ") of a split layer").c_str()
                                   : "whole blobs", cpu);
+        if (fl->zc > 0)
+            std::fprintf(stderr, "ds4: DS4_RX_FILL_ZC=%d: a split fill's gate and up %s, its downs gathered\n", fl->zc,
+                         fl->zc == 2 ? "through sendfile from the pack's file" : "sent straight from the pack's mapping");
         rx_fill = std::move(fl);
     }
     // (a token boundary, cache_tick_swaps) the fills the server loaded since the last one: theirs from now; the link
@@ -7623,6 +7629,16 @@ struct Model::Impl {
         }
         st.rx_fill_bytes = (int64_t) rx_fill->bytes.load();
         st.rx_fill_ms = (double) rx_fill->send_us.load() / 1000.0;
+        st.rx_fill_direct = (int64_t) rx_fill->direct.load();
+        st.rx_fill_filed = (int64_t) rx_fill->filed.load();
+        st.rx_fill_zc = rx_fill->zc;
+        if (rx_fill->zc == 2 && !rx_zc_noted) {   // (sendfile refused once: said once)
+            const std::string n = rx_fill->zc_note();
+            if (!n.empty()) {
+                std::fprintf(stderr, "ds4: DS4_RX_FILL_ZC=2: %s - the gate and up from the mapping from now on\n", n.c_str());
+                rx_zc_noted = true;
+            }
+        }
         if (rx_fill->up() && rx_on) return;
         const std::string why = rx_fill->up() ? "the link given up" : rx_fill->why();
         rx_fill->close();
@@ -7670,8 +7686,12 @@ struct Model::Impl {
             const bool spl = rx_k < rx_nb && (size_t) l.il < rx_split_l.size() && rx_split_l[(size_t) l.il];
             j.k = spl ? rx_k : 0;
             j.geo = rx_fgeo[(size_t) f.layer];
-            for (int r = 0; r < 3; ++r)   // (the file's: `in` is in neither VRAM nor RAM, and the mapping outlives the link)
-                j.src[r] = pk.at(l.mx_file[r], l.mx_off[r] + (uint64_t) f.in * l.mx_stride[r]);
+            for (int r = 0; r < 3; ++r) {   // (the file's: `in` is in neither VRAM nor RAM, and the mapping outlives the link)
+                j.foff[r] = l.mx_off[r] + (uint64_t) f.in * l.mx_stride[r];
+                j.src[r] = pk.at(l.mx_file[r], j.foff[r]);
+                const size_t fi = (size_t) l.mx_file[r];
+                j.fd[r] = fi < pk.fds.size() && pk.fds[fi] != os::kBadFd ? (std::intptr_t) pk.fds[fi] : -1;
+            }
             rx_fill->queue(j);
             ++st.rx_fills;
         }
@@ -8137,6 +8157,14 @@ struct Model::Impl {
                   (long long) (st.rx_fill_ok - s0.rx_fill_ok), (long long) (st.rx_fill_fail - s0.rx_fill_fail),
                   (double) (st.rx_fill_bytes - s0.rx_fill_bytes) / 1e6 / nt, (st.rx_fill_ms - s0.rx_fill_ms) / 1000.0,
                   (long long) (st.rx_stale - s0.rx_stale), (long long) held, rx_fill ? "" : " (the fills' link gone)");
+            if (st.rx_fill_zc > 0) {
+                const double all = (double) (st.rx_fill_bytes - s0.rx_fill_bytes);
+                const double di = (double) (st.rx_fill_direct - s0.rx_fill_direct), fi = (double) (st.rx_fill_filed - s0.rx_fill_filed);
+                add_f(out, "remote experts' fills (DS4_RX_FILL_ZC=%d): %.1f MB a token through sendfile, %.1f straight from "
+                           "the mapping, %.1f gathered (%.0f%% not copied by the gather)\n",
+                      st.rx_fill_zc, fi / 1e6 / nt, di / 1e6 / nt, std::max(0.0, all - di - fi) / 1e6 / nt,
+                      all > 0 ? 100.0 * (di + fi) / all : 0.0);
+            }
         }
         out += ep_line(s0, nt);
         return out;

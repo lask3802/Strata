@@ -30,11 +30,16 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
+#include <csignal>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+#endif
+#if defined(__linux__)
+#include <sys/sendfile.h>
 #endif
 
 namespace strata::net::ep {
@@ -459,6 +464,65 @@ bool Conn::send_raw_(const uint8_t* p, size_t len, std::string& err) {
         return false;
     }
     return true;
+}
+
+int Conn::send_file(std::intptr_t file_fd, uint64_t off, size_t len, std::string& err) {
+#if defined(__linux__)
+    if (fd_ < 0) {
+        err = "not connected";
+        return -1;
+    }
+    // (sendfile takes no MSG_NOSIGNAL: a closed peer's SIGPIPE held off in this thread, and taken back, around it)
+    sigset_t pipe, old;
+    sigemptyset(&pipe);
+    sigaddset(&pipe, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &pipe, &old);
+    auto unblock = [&](bool epipe) {
+        if (epipe) {
+            const timespec z{0, 0};
+            (void) sigtimedwait(&pipe, nullptr, &z);
+        }
+        pthread_sigmask(SIG_SETMASK, &old, nullptr);
+    };
+    const double give_up = now_ms() + 30000.0;   // (send_raw_'s)
+    off_t at = (off_t) off;
+    size_t sent = 0;
+    while (sent < len) {
+        if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) {
+            unblock(false);
+            err = "send cancelled";
+            close();
+            return -1;
+        }
+        const ssize_t k = ::sendfile((sock_t) fd_, (int) file_fd, &at, std::min<size_t>(len - sent, (size_t) 1 << 30));
+        if (k > 0) {
+            sent += (size_t) k;
+            stat.bytes_out += (uint64_t) k;
+            continue;
+        }
+        const int e = errno;
+        if (k < 0 && would_block(e) && now_ms() < give_up) {
+            (void) wait_sock((sock_t) fd_, false, cancel != nullptr ? 20 : 100);
+            continue;
+        }
+        unblock(e == EPIPE);
+        if (sent == 0 && k < 0 && (e == EINVAL || e == ENOSYS || e == EOPNOTSUPP || e == EBADF)) {
+            err = "sendfile refused (error " + std::to_string(e) + ")";   // (the file or the socket takes none)
+            return 0;
+        }
+        err = k == 0 ? "the file ended before its bytes" : "sendfile failed (error " + std::to_string(e) + ")";
+        close();
+        return -1;
+    }
+    unblock(false);
+    return 1;
+#else
+    (void) file_fd;
+    (void) off;
+    (void) len;
+    err = "no sendfile on this OS";
+    return 0;
+#endif
 }
 
 bool Conn::send(EpHdr h, const void* p, size_t n, std::string& err, const void* p2, size_t n2) {
