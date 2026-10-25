@@ -18,6 +18,16 @@
 //   those CPUs out (the link core's pair); :empty - the same jobs doing nothing (the batches' dispatch and barrier
 //   alone); :pool=fix - the bench's FixPool instead of the engine's Pool (its flags on lines of their own, each worker's
 //   done count added once a batch, the jobs' busy time in a slot a thread: no shared write a job)
+//   :dparts - the down's slice from --down-parts DIR (ep_parts.py --down-only 0:K: each row's [0, K) back to back, as
+//   DS4_IQ_DOWN_PARTS reads it) instead of the pack's rows in place (strided); a slice the parts do not end at: the pack's
+//   :pf=N - the hint only on the experts the layer's last N calls did not take (DS4_IQ_PF=N)
+//   :spin=A+B - a thread on each CPU listed spinning on a load (no pause) the whole variant: a busy neighbour (the
+//   engine's CUDA host thread waiting, a polling link) on a lane core or its sibling
+//   :trace - the calls of --trace FILE instead of the pool's (file / file-nopf only): the engine's picks a layer, their
+//   number varying call to call and their reuse as a session has it, over the pack's every expert (the TLB, the page
+//   tables and the caches as cold as the engine's) - FILE is DS4_TRACE's (every pick of a decode token; --trace-hot N
+//   leaves out each layer's N most picked, the ones the GPUs would hold) or DS4_LANE_TRACE's (the lane's own calls,
+//   their slices too); one replay of --trace-tokens (default all) warms the mapping, a second is timed
 // Rates: lane GB/s = bytes / (prep + gu + hq + down); in-job GB/s = a batch's bytes over its busy time / threads (the
 // rate while the jobs run); a thread's GB/s = bytes / busy.  minflt a token: getrusage (Linux), the page faults (Windows).
 // Linux: the core's counters of this process's threads over the timed tokens (perf_event_open; root or
@@ -25,9 +35,11 @@
 //   ds4_lane_bench --pack DIR [--layers 0-39] [--picks 4] [--k 6] [--pool 8] [--tokens 16] [--fresh-tokens 4]
 //                  [--threads N (every physical core)] [--variants file,file-nopf,..] [--dim 5120] [--ff 2304]
 //                  [--remap FROM=TO (the pack's paths: the host's view of a container's)] [--no-pmc]
+//                  [--down-parts DIR] [--trace FILE] [--trace-hot N (0)] [--trace-tokens N (all)]
 //   ds4_lane_bench --synthetic DIR [--syn-layers 2] [--syn-experts 16] [--syn-type IQ2_XXS] [the options above]:
 //                  a small fake pack (random legal blocks) written to DIR, then benched as --pack DIR
 // Read only on a pack; nothing else written.  No GPU.
+#include "../../src/dsv41/ds4_epparts.hpp"
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_os.hpp"
 #include "../../src/dsv41/ds4_pool.hpp"
@@ -42,6 +54,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -65,6 +78,7 @@
 
 namespace gg = strata::ds4::gguf;
 namespace os = strata::ds4::os;
+namespace epx = strata::ds4::ep;
 using strata::ds4::Pool;
 
 static int E = 5120, FF = 2304;       // the DeepSeek-V4.1-Flash geometry (--dim, --ff)
@@ -172,6 +186,141 @@ static bool read_pack(const std::string& dir, Pack& pk) {
         pk.n_exp[L] = std::max(pk.n_exp[L], e + 1);
     }
     return !pk.t.empty();
+}
+
+// ---- --trace: the calls to replay, by token.  A call: its layer (an index into the bench's layers), its n_ff blocks
+// [a, b) (a < 0: the variant's [0, k)) and its experts, a token each.  DS4_TRACE (ds4_model.cu: a decode record u8 layer,
+// u8 T (bit 7: the guesses follow - u8 na1, u8 na2, T x (na1 + na2) int16), T x 6 int16 picks; a prompt chunk's u8
+// layer | 0x80, u16 T, T x 6 int16): one call a decode record of one token, its picks less the layer's --trace-hot most
+// picked.  DS4_LANE_TRACE ("LANETRC1", a call u8 layer, u8 a, u8 b, u8 entries, each int16 expert and u8 tokens): the
+// lane's calls as they were.  A token: the records from one whose layer is below the one before it.
+struct TCall {
+    int li = 0, a = -1, b = -1;
+    std::vector<int> e;
+};
+struct Trace {
+    std::string kind;
+    std::vector<std::vector<TCall>> tok;
+    // the calls read, and those left out: a layer not benched, more than one token (a call or an entry; over 16
+    // entries), none left once the hot picks are out; the hot picks left out
+    long calls = 0, out_layer = 0, out_multi = 0, out_empty = 0, out_hot = 0;
+};
+static constexpr int kTraceK = 6;   // (DS4_TRACE's picks a token: the model's k_exp)
+static bool read_trace(const std::string& path, const std::map<int, int>& li_of, int hot, Trace& tr, std::string& err) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        err = "cannot open";
+        return false;
+    }
+    const std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    size_t at = 0;
+    auto u8 = [&](int& v) { return at < s.size() ? (v = (uint8_t) s[at++], true) : false; };
+    auto i16 = [&](int& v) {
+        if (at + 2 > s.size()) return false;
+        v = (int16_t) (uint16_t) ((uint8_t) s[at] | (uint8_t) s[at + 1] << 8);
+        at += 2;
+        return true;
+    };
+    int prev = 1 << 30;
+    // (a token begins at a layer below the record before it - every decode record counts, the ones left out too)
+    auto mark = [&](int layer) {
+        if (layer < prev || tr.tok.empty()) tr.tok.emplace_back();
+        prev = layer;
+    };
+    if (s.compare(0, 8, "LANETRC1") == 0) {
+        tr.kind = "DS4_LANE_TRACE";
+        at = 8;
+        for (int L, a, b, ne; u8(L) && u8(a) && u8(b) && u8(ne);) {
+            TCall c;
+            c.a = a, c.b = b;
+            bool multi = ne > 16 || b <= a;
+            for (int i = 0, e, n; i < ne; ++i) {
+                if (!i16(e) || !u8(n)) {
+                    err = "a call cut short at byte " + std::to_string(at);
+                    return false;
+                }
+                multi = multi || n != 1;
+                c.e.push_back(e);
+            }
+            ++tr.calls;
+            mark(L);
+            const auto li = li_of.find(L);
+            if (li == li_of.end()) ++tr.out_layer;
+            else if (multi) ++tr.out_multi;
+            else if (c.e.empty()) ++tr.out_empty;
+            else {
+                c.li = li->second;
+                tr.tok.back().push_back(std::move(c));
+            }
+        }
+    } else {
+        tr.kind = "DS4_TRACE";
+        for (int L; u8(L);) {
+            int T = 0, x = 0, y = 0;
+            if (L & 0x80) {   // (a prompt chunk: not the decode's)
+                if (!u8(x) || !u8(y)) break;
+                at += (size_t) (x | y << 8) * kTraceK * 2;
+                continue;
+            }
+            if (!u8(T)) break;
+            const bool ahead = (T & 0x80) != 0;
+            T &= 0x7f;
+            TCall c;
+            for (int i = 0, e; i < T * kTraceK; ++i) {
+                if (!i16(e)) {
+                    err = "a record cut short at byte " + std::to_string(at);
+                    return false;
+                }
+                c.e.push_back(e);
+            }
+            if (ahead) {
+                if (!u8(x) || !u8(y)) break;
+                at += (size_t) T * (size_t) (x + y) * 2;
+            }
+            ++tr.calls;
+            mark(L);
+            const auto li = li_of.find(L);
+            if (li == li_of.end()) ++tr.out_layer;
+            else if (T != 1) ++tr.out_multi;
+            else {
+                c.li = li->second;
+                tr.tok.back().push_back(std::move(c));
+            }
+        }
+        if (at > s.size()) {
+            err = "the last record cut short";
+            return false;
+        }
+        if (hot > 0) {   // each layer's `hot` most picked (ties: the lower expert) left out of its calls
+            std::map<std::pair<int, int>, long> n;
+            for (const auto& t : tr.tok)
+                for (const TCall& c : t)
+                    for (int e : c.e) ++n[{c.li, e}];
+            std::map<int, std::vector<std::pair<long, int>>> by;
+            for (const auto& x : n) by[x.first.first].push_back({-x.second, x.first.second});
+            std::map<std::pair<int, int>, bool> out;
+            for (auto& x : by) {
+                std::sort(x.second.begin(), x.second.end());
+                for (size_t i = 0; i < x.second.size() && (int) i < hot; ++i) out[{x.first, x.second[i].second}] = true;
+            }
+            for (auto& t : tr.tok) {
+                for (TCall& c : t) {
+                    const size_t n0 = c.e.size();
+                    c.e.erase(std::remove_if(c.e.begin(), c.e.end(), [&](int e) { return out.count({c.li, e}) != 0; }), c.e.end());
+                    tr.out_hot += (long) (n0 - c.e.size());
+                }
+                const size_t n0 = t.size();
+                t.erase(std::remove_if(t.begin(), t.end(), [](const TCall& c) { return c.e.empty(); }), t.end());
+                tr.out_empty += (long) (n0 - t.size());
+            }
+        }
+    }
+    tr.tok.erase(std::remove_if(tr.tok.begin(), tr.tok.end(), [](const std::vector<TCall>& t) { return t.empty(); }), tr.tok.end());
+    if (tr.tok.empty()) {
+        err = "no call of a benched layer in it";
+        return false;
+    }
+    return true;
 }
 
 // ---- a fake pack: --syn-layers x --syn-experts experts of --syn-type, random legal blocks (iq_expert_test's generator)
@@ -582,11 +731,35 @@ struct Layer {
 };
 struct Exp {
     const uint8_t* m[3];
+    int id = -1;
+    const uint8_t* dp = nullptr;   // (:dparts) its down part's row 0 at block dpa, the part [dpa, dpb); null: none
+    int dpa = 0, dpb = 0;
 };
 enum Pf { kPfNone, kPfWillneed, kPfPopulate };
 struct Acc {
     double prep = 0, gu = 0, gu_tail = 0, gu_busy = 0, hq = 0, dn = 0, dn_tail = 0, dn_busy = 0, gu_bytes = 0, dn_bytes = 0;
     int batches = 0;
+    long calls = 0, picks = 0, downs_dp = 0, hinted = 0;   // (the picks' downs from the parts; the experts hinted)
+    long hist[17] = {};                                    // calls by their picks
+};
+// (:spin=) a thread a CPU loading a flag until the variant's timed tokens end - started after the counters open, so
+// they count the lane's threads alone
+struct Spin {
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> th;
+    explicit Spin(const std::vector<int>& cpus) {
+        for (int c : cpus) {
+            th.emplace_back([this] {
+                while (!stop.load(std::memory_order_relaxed)) {
+                }
+            });
+            os::pin_thread(th.back(), c);
+        }
+    }
+    ~Spin() {
+        stop.store(true);
+        for (auto& t : th) t.join();
+    }
 };
 struct alignas(64) Slot {   // (:pool=fix) a thread's jobs' busy time, a line each
     int64_t ns = 0;
@@ -597,6 +770,9 @@ struct Lane {   // the lane's pool and buffers (Impl's c_xh / c_xhd / c_yd)
     std::vector<Slot> slot;
     int threads = 1;
     bool empty = false;   // (:empty: the jobs return at once)
+    int pf_age = 0;       // (:pf=N) the hint on the experts the layer's last N calls did not take only
+    std::map<long long, uint32_t> seen;   // (layer, expert) -> the layer's call count at its last call
+    std::map<int, uint32_t> calls;        // layer -> its calls
     std::vector<float> x, h, y;
     std::vector<uint8_t> xq, hq;
     // run_nodes_prof's batch: wall, tail (the caller's wait once it ran out of jobs), busy (the jobs' time in all)
@@ -635,21 +811,51 @@ struct Lane {   // the lane's pool and buffers (Impl's c_xh / c_xhd / c_yd)
         busy += (double) sum / 1e6;
         ++batches;
     }
-    // one call: ne experts (one token each) over n_ff [0, ffn)
-    void call(const Layer& ly, const Exp* ex, int ne, int ffn, int rb, bool split, Pf pf, Acc& a) {
+    // one call: ne experts (one token each, ne <= 16) over n_ff [ff0, ff0 + ffn); dparts: each expert's down from its
+    // part when the part ends where the slice ends (Impl's DS4_IQ_DOWN_PARTS), else the pack's
+    void call(const Layer& ly, const Exp* ex, int ne, int ff0, int ffn, int rb, bool split, Pf pf, bool dparts, Acc& a) {
         const gg::IqCpu& fm = ly.fm;
         gg::IqCpu fs;
         size_t d_off = 0;
         std::string err;
-        const bool sliced = ffn != FF;
-        if (sliced) gg::iq_cpu_slice(fm, 0, ffn, fs, d_off, err);
+        const bool sliced = ff0 != 0 || ffn != FF;
+        if (sliced) gg::iq_cpu_slice(fm, ff0, ffn, fs, d_off, err);
         const gg::IqCpu& fd = sliced ? fs : fm;
+        const size_t ub = fm.d_row / (size_t) (FF / 256);   // (a down row's bytes a block)
+        const uint8_t* dn[16];
+        bool usep[16];
+        gg::IqCpu fq[16];
+        for (int q = 0; q < ne; ++q) {
+            const Exp& x = ex[q];
+            const bool p = dparts && x.dp != nullptr && ff0 / 256 >= x.dpa && ff0 + ffn == 256 * x.dpb;
+            fq[q] = fd;
+            usep[q] = p;
+            dn[q] = x.m[2] + d_off;
+            if (p) {
+                fq[q].d_stride = (size_t) (x.dpb - x.dpa) * ub;
+                dn[q] = x.dp + (size_t) (ff0 / 256 - x.dpa) * ub;
+                ++a.downs_dp;
+            }
+        }
+        ++a.calls;
+        a.picks += ne;
+        ++a.hist[std::min(ne, 16)];
         const double t0 = now_ms();
-        if (pf != kPfNone) {   // (Impl's: a slice's gate / up rows, the down's whole - its rows hold every slice)
+        if (pf != kPfNone) {   // (Impl's: a slice's gate / up rows, the down's whole - its rows hold every slice - or its part's)
+            const uint32_t tick = pf_age > 0 ? ++calls[ly.L] : 0;
             std::vector<std::pair<const void*, size_t>> want;
-            for (int q = 0; q < ne; ++q)
-                for (int r = 0; r < 3; ++r)
-                    want.push_back({ex[q].m[r], r < 2 ? (size_t) ffn * fm.gu_row : (size_t) E * fm.d_row});
+            for (int q = 0; q < ne; ++q) {
+                if (pf_age > 0) {   // (:pf=N: only an expert the layer's last N calls did not take)
+                    uint32_t& s = seen[(long long) ly.L * 65536 + ex[q].id];
+                    const bool stale = s == 0 || tick - s > (uint32_t) pf_age;
+                    s = tick;
+                    if (!stale) continue;
+                }
+                ++a.hinted;
+                for (int r = 0; r < 2; ++r) want.push_back({ex[q].m[r] + (size_t) ff0 * fm.gu_row, (size_t) ffn * fm.gu_row});
+                if (usep[q]) want.push_back({dn[q], (size_t) (E - 1) * fq[q].d_stride + fd.d_row});
+                else want.push_back({ex[q].m[2], (size_t) E * fm.d_row});
+            }
             if (pf == kPfWillneed) os::prefetch(want);
 #if !defined(_WIN32)
             else   // MADV_POPULATE_READ (22, Linux 5.14): the pages mapped now, as a read fault would map them
@@ -664,21 +870,22 @@ struct Lane {   // the lane's pool and buffers (Impl's c_xh / c_xhd / c_yd)
         const int GB = split ? threads : (ffn + rb - 1) / rb, DB = split ? threads : (E + rb - 1) / rb;
         const int grs = (ffn + GB - 1) / GB, drs = (E + DB - 1) / DB;   // (rows a job)
         const void* ap[1] = {xq.data()};
-        batch(ne * GB, [&](int j) {
-            const int q = j / GB, r0 = (j % GB) * grs, r1 = std::min(ffn, r0 + grs);
+        batch(ne * GB, [&](int j) {   // (rows of n_ff, h's indices: [ff0, ff0 + ffn))
+            const int q = j / GB, r0 = ff0 + (j % GB) * grs, r1 = std::min(ff0 + ffn, r0 + grs);
             if (r0 >= r1) return;
             float* hp[1] = {h.data() + (size_t) q * FF};
             gg::iq_cpu_gate_up(fm, ex[q].m[0], ex[q].m[1], ap, 1, hp, r0, r1, kLim);
         }, a.gu, a.gu_tail, a.gu_busy, a.batches);
         const double th = now_ms();
-        for (int q = 0; q < ne; ++q) gg::iq_cpu_quant(fm.d_act, h.data() + (size_t) q * FF, ffn, hq.data() + (size_t) q * E * 4);
+        for (int q = 0; q < ne; ++q)
+            gg::iq_cpu_quant(fm.d_act, h.data() + (size_t) q * FF + ff0, ffn, hq.data() + (size_t) q * E * 4);
         a.hq += now_ms() - th;
         batch(ne * DB, [&](int j) {
             const int q = j / DB, r0 = (j % DB) * drs, r1 = std::min(E, r0 + drs);
             if (r0 >= r1) return;
             const void* hp[1] = {hq.data() + (size_t) q * E * 4};
             float* yp[1] = {y.data() + (size_t) q * E};
-            gg::iq_cpu_down(fd, ex[q].m[2] + d_off, hp, 1, yp, r0, r1);
+            gg::iq_cpu_down(fq[q], dn[q], hp, 1, yp, r0, r1);
         }, a.dn, a.dn_tail, a.dn_busy, a.batches);
         if (empty) return;   // (nothing read)
         a.gu_bytes += (double) ne * 2.0 * (double) ffn * (double) fm.gu_row;
@@ -689,9 +896,16 @@ struct Lane {   // the lane's pool and buffers (Impl's c_xh / c_xhd / c_yd)
 struct Variant {
     std::string name, mode;
     int k = 6, picks = 4, rb = 64, thr = 0;
-    bool split = false, empty = false, fix = false;
+    bool split = false, empty = false, fix = false, dparts = false, trace = false;
+    int pf_age = 0;          // (:pf=N)
     std::vector<int> skip;   // (:skip=2+18: those CPUs not used)
+    std::vector<int> spin;   // (:spin=16+18: a spinning thread on each)
 };
+static void plus_list(const std::string& s, std::vector<int>& v) {   // "2+18"
+    std::istringstream ss(s);
+    for (std::string c; std::getline(ss, c, '+');)
+        if (!c.empty()) v.push_back(std::atoi(c.c_str()));
+}
 static bool parse_variant(const std::string& s, const Variant& def, Variant& v) {
     v = def;
     v.name = s;
@@ -706,16 +920,29 @@ static bool parse_variant(const std::string& s, const Variant& def, Variant& v) 
         else if (p == "split") v.split = true;
         else if (p == "empty") v.empty = true;
         else if (p == "pool=fix") v.fix = true;
-        else if (p.rfind("skip=", 0) == 0) {
-            std::istringstream ss(p.substr(5));
-            for (std::string c; std::getline(ss, c, '+');)
-                if (!c.empty()) v.skip.push_back(std::atoi(c.c_str()));
-        } else return false;
+        else if (p == "dparts") v.dparts = true;
+        else if (p == "trace") v.trace = true;
+        else if (p.rfind("pf=", 0) == 0) v.pf_age = std::atoi(p.c_str() + 3);
+        else if (p.rfind("skip=", 0) == 0) plus_list(p.substr(5), v.skip);
+        else if (p.rfind("spin=", 0) == 0) plus_list(p.substr(5), v.spin);
+        else return false;
     }
     const char* modes[] = {"file", "file-nopf", "file-fresh", "file-populate", "anon4k", "anon2m", "hot"};
     bool known = false;
     for (const char* m : modes) known = known || v.mode == m;
     return known && v.k >= 1 && v.k <= 9 && v.picks >= 1 && v.rb >= 1;
+}
+
+// (:dparts) expert e's down part in `p` - the first that holds a block, of the layer's type and row layout (one row's
+// bytes a block the pack's) - into x.dp / dpa / dpb; none: x.dp stays null (its downs read from the pack)
+static void down_part(const epx::Parts& p, const Layer& ly, int e, Exp& x) {
+    epx::View v;
+    for (int k = 0; k < FF / 256; ++k)
+        if (p.view(ly.L, e, epx::kDown, k, v)) {   // (the first block found is the part's a: v.data its row 0 there)
+            if (v.type == ly.td && v.rows == (uint32_t) E && v.stride == (uint64_t) (v.b - v.a) * (ly.fm.d_row / (size_t) (FF / 256)))
+                x.dp = v.data, x.dpa = v.a, x.dpb = v.b;
+            return;
+        }
 }
 
 int main(int argc, char** argv) {
@@ -724,8 +951,8 @@ int main(int argc, char** argv) {
         "hot:k=9:picks=8,file:rb=128,file:rb=256,file:split,file:thr=1,file:thr=2,file:thr=4,file:thr=8,file:thr=12,"
         "file:thr=24,file:thr=30:skip=2+18,file:thr=32,hot,hot:thr=1,hot:thr=8,hot:thr=24,hot:thr=30:skip=2+18,hot:thr=32,"
         "file:empty,file:empty:pool=fix,file:pool=fix,hot:pool=fix";
-    std::string layers_s;
-    int syn_l = 2, syn_e = 16, pool_n = 8, tokens = 16, fresh_tokens = 4, threads = 0;
+    std::string layers_s, dparts_dir, trace_path;
+    int syn_l = 2, syn_e = 16, pool_n = 8, tokens = 16, fresh_tokens = 4, threads = 0, trace_hot = 0, trace_tokens = 0;
     bool want_pmc = true;
     Variant def;
     def.mode = "file";
@@ -752,10 +979,14 @@ int main(int argc, char** argv) {
             g_from = m.substr(0, m.find('='));
             g_to = m.substr(m.find('=') + 1);
         } else if (a == "--no-pmc") want_pmc = false;
+        else if (a == "--down-parts" && v) dparts_dir = argv[++i];
+        else if (a == "--trace" && v) trace_path = argv[++i];
+        else if (a == "--trace-hot" && v) trace_hot = std::atoi(argv[++i]);
+        else if (a == "--trace-tokens" && v) trace_tokens = std::atoi(argv[++i]);
         else {
             std::printf("usage: ds4_lane_bench --pack DIR | --synthetic DIR [--layers 0-39] [--picks 4] [--k 6] [--pool 8] "
                         "[--tokens 16] [--fresh-tokens 4] [--threads N] [--variants a,b,..] [--dim 5120] [--ff 2304] "
-                        "[--remap FROM=TO] [--no-pmc]\n");
+                        "[--remap FROM=TO] [--no-pmc] [--down-parts DIR] [--trace FILE] [--trace-hot N] [--trace-tokens N]\n");
             return 2;
         }
     }
@@ -784,7 +1015,7 @@ int main(int argc, char** argv) {
             Variant v;
             if (!parse_variant(s, def, v)) {
                 std::printf("variant %s: a mode (file file-nopf file-fresh file-populate anon4k anon2m hot), then :k= :picks= "
-                            ":rb= :thr= :split :skip=A+B :empty :pool=fix\n", s.c_str());
+                            ":rb= :thr= :split :skip=A+B :empty :pool=fix :dparts :pf=N :spin=A+B :trace\n", s.c_str());
                 return 2;
             }
             vs.push_back(v);
@@ -798,6 +1029,18 @@ int main(int argc, char** argv) {
     if (want.empty())
         for (const auto& x : pk.n_exp) want.push_back(x.first);
     std::vector<Layer> ly;
+    auto exp_ok = [&](const Layer& x, int e) {   // its three matrices in the pack, of the layer's types and sizes
+        for (int r = 0; r < 3; ++r) {
+            const Ref* t = pk.at(x.L, e, r);
+            const uint64_t want_b = r < 2 ? (uint64_t) FF * rowb(x.tg, E) : (uint64_t) E * rowb(x.td, FF);
+            if (t == nullptr || t->bytes != want_b || t->type != (r < 2 ? x.tg : x.td)) {
+                std::printf("layer %d expert %d matrix %d: missing, or not %llu bytes of the layer's type\n", x.L, e, r,
+                            (unsigned long long) want_b);
+                return false;
+            }
+        }
+        return true;
+    };
     for (int L : want) {
         const auto ne = pk.n_exp.find(L);
         if (ne == pk.n_exp.end()) {
@@ -828,15 +1071,7 @@ int main(int argc, char** argv) {
         while (std::gcd(step, n) != 1) ++step;
         for (int j = 0; j < pool_n + fn; ++j) {
             const int e = (L * 7 + j * step) % n;
-            for (int r = 0; r < 3; ++r) {
-                const Ref* t = pk.at(L, e, r);
-                const uint64_t want_b = r < 2 ? (uint64_t) FF * rowb(x.tg, E) : (uint64_t) E * rowb(x.td, FF);
-                if (t == nullptr || t->bytes != want_b || t->type != (r < 2 ? x.tg : x.td)) {
-                    std::printf("layer %d expert %d matrix %d: missing, or not %llu bytes of the layer's type\n", L, e, r,
-                                (unsigned long long) want_b);
-                    return 2;
-                }
-            }
+            if (!exp_ok(x, e)) return 2;
             (j < pool_n ? x.pool : x.fresh).push_back(e);
         }
         ly.push_back(x);
@@ -846,6 +1081,89 @@ int main(int argc, char** argv) {
         std::printf("--picks / :picks= up to 16\n");
         return 2;
     }
+    // --trace: its calls (each expert checked against the pack), the first --trace-tokens tokens of them
+    Trace tr;
+    int trace_k = 0;   // (the largest :k= of the :trace variants: a DS4_TRACE call's [0, k))
+    for (const Variant& v : vs)
+        if (v.trace) trace_k = std::max(trace_k, v.k);
+    if (!trace_path.empty()) {
+        std::map<int, int> li_of;
+        for (size_t i = 0; i < ly.size(); ++i) li_of[ly[i].L] = (int) i;
+        std::string err;
+        if (!read_trace(trace_path, li_of, trace_hot, tr, err)) {
+            std::printf("--trace %s: %s\n", trace_path.c_str(), err.c_str());
+            return 2;
+        }
+        if (trace_tokens > 0 && (int) tr.tok.size() > trace_tokens) tr.tok.resize((size_t) trace_tokens);
+        std::map<long long, bool> ok;
+        for (const auto& t : tr.tok)
+            for (const TCall& c : t) {
+                const Layer& x = ly[(size_t) c.li];
+                if (c.a >= 0 && (c.b > FF / 256 || c.a >= c.b)) {
+                    std::printf("--trace: layer %d: a call over the n_ff blocks [%d, %d) of %d\n", x.L, c.a, c.b, FF / 256);
+                    return 2;
+                }
+                for (int e : c.e) {
+                    if (e < 0 || e >= pk.n_exp[x.L]) {
+                        std::printf("--trace: layer %d: expert %d, the pack has %d\n", x.L, e, pk.n_exp[x.L]);
+                        return 2;
+                    }
+                    const long long key = (long long) c.li * 65536 + e;
+                    if (ok.count(key) == 0 && !exp_ok(x, e)) return 2;
+                    ok[key] = true;
+                }
+            }
+    }
+    // --down-parts: checked here and read by the warm read; each :dparts variant maps its own (a new mapping, as Maps)
+    epx::Parts gdp;
+    if (!dparts_dir.empty()) {
+        std::string err;
+        if (!gdp.open(dparts_dir, err)) {
+            std::printf("--down-parts %s: %s\n", dparts_dir.c_str(), err.c_str());
+            return 2;
+        }
+        if (gdp.dim() != E || gdp.n_ff() != FF || gdp.unit() != 256) {
+            std::printf("--down-parts %s: dim %d, n_ff %d, unit %d (the bench's %d, %d, 256)\n", dparts_dir.c_str(), gdp.dim(),
+                        gdp.n_ff(), gdp.unit(), E, FF);
+            return 2;
+        }
+        // each layer's first pool expert's down over the parts' slices [a, b) and [a + 1, b): from the parts as :dparts
+        // (and DS4_IQ_DOWN_PARTS) read them, and from the pack in place - the same bytes, so the same bits
+        Maps cm;
+        if (!cm.open(pk)) return 2;
+        std::mt19937 crng(11);
+        std::vector<float> hv((size_t) FF), y0((size_t) E), y1((size_t) E);
+        std::vector<uint8_t> hq((size_t) FF * 4);
+        int checked = 0;
+        for (const Layer& x : ly) {
+            Exp d;
+            down_part(gdp, x, x.pool[0], d);
+            if (d.dp == nullptr) continue;
+            const size_t ub = x.fm.d_row / (size_t) (FF / 256);
+            for (int k = d.dpa; k < d.dpb && k <= d.dpa + 1; ++k) {
+                gg::IqCpu fs, fp;
+                size_t d_off = 0;
+                std::string err;
+                if (!gg::iq_cpu_slice(x.fm, 256 * k, 256 * (d.dpb - k), fs, d_off, err)) continue;
+                fp = fs;
+                fp.d_stride = (size_t) (d.dpb - d.dpa) * ub;
+                for (float& f : hv) f = ((float) (crng() % 20001) - 10000.0f) * 1e-4f;
+                gg::iq_cpu_quant(x.fm.d_act, hv.data(), 256 * (d.dpb - k), hq.data());
+                const void* hp[1] = {hq.data()};
+                float* p0[1] = {y0.data()};
+                float* p1[1] = {y1.data()};
+                gg::iq_cpu_down(fs, cm.at(*pk.at(x.L, x.pool[0], 2)) + d_off, hp, 1, p0, 0, E);
+                gg::iq_cpu_down(fp, d.dp + (size_t) (k - d.dpa) * ub, hp, 1, p1, 0, E);
+                if (std::memcmp(y0.data(), y1.data(), (size_t) E * 4) != 0) {
+                    std::printf("--down-parts: layer %d expert %d, the slice [%d, %d): the parts' down is not the pack's\n", x.L,
+                                x.pool[0], k, d.dpb);
+                    return 2;
+                }
+                ++checked;
+            }
+        }
+        std::printf("down parts check: %d slices of the layers' first pool experts, the parts' down bit for bit the pack's\n", checked);
+    }
     std::vector<int> cores, smt;   // (cores: the order the threads take; the first `phys` one a core)
     cpu_order(cores, smt);
     const int phys = (int) cores.size();
@@ -853,22 +1171,49 @@ int main(int argc, char** argv) {
     if (threads <= 0) threads = phys;
     // the page cache warm for every expert used: each page read once through a mapping of its own (its PTEs dropped
     // with it), so file-fresh's mapping finds the pages cached but not mapped
+    // (--trace: its experts' gate / up rows up to the largest slice end of their calls and their downs whole; with
+    // --down-parts every expert's down part too - the parts' pages are those of gdp's mapping, dropped at the end too)
     double cold_before = 0, cold_after = 0, used = 0;
     {
         Maps wm;
         if (!wm.open(pk)) return 2;
         volatile uint8_t sink = 0;
+        auto touch = [&](const uint8_t* p, size_t n) {
+            cold_before += (double) os::cold_bytes(p, n);
+            for (size_t o = 0; o < n; o += 4096) sink = (uint8_t) (sink + p[o]);
+            cold_after += (double) os::cold_bytes(p, n);
+            used += (double) n;
+        };
+        auto touch_part = [&](const Layer& x, int e) {
+            Exp d;
+            if (gdp.is_open()) down_part(gdp, x, e, d);
+            if (d.dp != nullptr) touch(d.dp, (size_t) E * (size_t) (d.dpb - d.dpa) * (x.fm.d_row / (size_t) (FF / 256)));
+        };
         for (const Layer& x : ly)
             for (int pass = 0; pass < 2; ++pass)
-                for (int e : pass ? x.fresh : x.pool)
+                for (int e : pass ? x.fresh : x.pool) {
                     for (int r = 0; r < 3; ++r) {
                         const Ref& t = *pk.at(x.L, e, r);
-                        const uint8_t* p = wm.at(t);
-                        cold_before += (double) os::cold_bytes(p, (size_t) t.bytes);
-                        for (uint64_t o = 0; o < t.bytes; o += 4096) sink = (uint8_t) (sink + p[o]);
-                        cold_after += (double) os::cold_bytes(p, (size_t) t.bytes);
-                        used += (double) t.bytes;
+                        touch(wm.at(t), (size_t) t.bytes);
                     }
+                    touch_part(x, e);
+                }
+        std::map<long long, int> tb;   // (--trace) (layer index, expert) -> the largest slice end of its calls, in blocks
+        for (const auto& t : tr.tok)
+            for (const TCall& c : t)
+                for (int e : c.e) {
+                    int& b = tb[(long long) c.li * 65536 + e];
+                    b = std::max(b, c.a >= 0 ? c.b : trace_k);
+                }
+        for (const auto& y : tb) {
+            const Layer& x = ly[(size_t) (y.first / 65536)];
+            const int e = (int) (y.first % 65536);
+            for (int r = 0; r < 3; ++r) {
+                const Ref& t = *pk.at(x.L, e, r);
+                touch(wm.at(t), r < 2 ? (size_t) y.second * 256 * x.fm.gu_row : (size_t) t.bytes);
+            }
+            touch_part(x, e);
+        }
         (void) sink;
     }
     std::printf("ds4_lane_bench: %s; %zu layers (%d..%d), %s / %s, a pool of %d experts a layer and %d fresh; %d threads on "
@@ -879,6 +1224,20 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < smt.size(); ++i) std::printf("%s%d", i ? "," : " ", smt[i]);
     std::printf("\nthe experts used: %.0f MB, %.0f MB of it not in the page cache before the warm read, %.0f MB after it\n",
                 used / 1e6, cold_before / 1e6, cold_after / 1e6);
+    if (!tr.tok.empty()) {
+        long n = 0, p = 0;
+        for (const auto& t : tr.tok)
+            for (const TCall& c : t) ++n, p += (long) c.e.size();
+        std::printf("trace: %s %s, %zu tokens, %.1f calls a token, %.2f picks a call; of its %ld calls left out: %ld of a layer not "
+                    "benched, %ld of more than one token, %ld with no pick left (%ld picks of the layers' %d most picked out)\n",
+                    tr.kind.c_str(), trace_path.c_str(), tr.tok.size(), (double) n / (double) tr.tok.size(),
+                    (double) p / (double) std::max(1L, n), tr.calls, tr.out_layer, tr.out_multi, tr.out_empty, tr.out_hot, trace_hot);
+    }
+    if (gdp.is_open()) {
+        int lay = 0;
+        for (const Layer& x : ly) lay += gdp.covers(x.L) ? 1 : 0;
+        std::printf("down parts: %s, %zu files, %d of the %zu layers covered\n", dparts_dir.c_str(), gdp.files().size(), lay, ly.size());
+    }
 #if defined(__linux__)
     if (want_pmc) {   // (once: the counters open here or not at all)
         Pmc t;
@@ -918,6 +1277,14 @@ int main(int argc, char** argv) {
             std::printf("%-26s (no fresh experts: the layers have too few beyond the pool)\n", v.name.c_str());
             continue;
         }
+        if (v.trace && (tr.tok.empty() || (v.mode != "file" && v.mode != "file-nopf"))) {
+            std::printf("%-26s (:trace: --trace FILE, and the modes file / file-nopf only)\n", v.name.c_str());
+            continue;
+        }
+        if (v.dparts && (!gdp.is_open() || anon)) {
+            std::printf("%-26s (:dparts: --down-parts DIR, and not the anonymous copies)\n", v.name.c_str());
+            continue;
+        }
         os::pin_self(cpus[0]);
         Lane ln;
         ln.threads = thr;
@@ -929,17 +1296,40 @@ int main(int argc, char** argv) {
         } else {
             ln.pool = std::make_unique<Pool>(thr - 1, wcpus, 20000);
         }
+        ln.pf_age = v.pf_age;
         ln.x = xv;
-        ln.h.assign((size_t) v.picks * FF, 0.0f);
-        ln.y.assign((size_t) v.picks * E, 0.0f);
+        ln.h.assign((size_t) 16 * FF, 0.0f);   // (a call's entries: up to 16)
+        ln.y.assign((size_t) 16 * E, 0.0f);
         ln.xq.assign((size_t) E * 4, 0);
-        ln.hq.assign((size_t) v.picks * E * 4, 0);
+        ln.hq.assign((size_t) 16 * E * 4, 0);
         Maps mp;
         if (!mp.open(pk)) return 2;
+        epx::Parts vdp;   // (:dparts: the parts mapped anew, as mp)
+        if (v.dparts) {
+            std::string err;
+            if (!vdp.open(dparts_dir, err)) {
+                std::printf("--down-parts %s: %s\n", dparts_dir.c_str(), err.c_str());
+                return 2;
+            }
+        }
         Anon an;
-        // each layer's experts' pointers: pool then fresh
+        // each layer's experts' pointers: pool then fresh (:trace: every expert of the layer by its number, those the
+        // trace calls set)
         std::vector<std::vector<Exp>> ex(ly.size());
-        {
+        auto exp_at = [&](const Layer& x, int e) {
+            Exp y;
+            y.id = e;
+            for (int r = 0; r < 3; ++r) y.m[r] = mp.at(*pk.at(x.L, e, r));
+            if (v.dparts) down_part(vdp, x, e, y);
+            return y;
+        };
+        if (v.trace) {
+            for (size_t i = 0; i < ly.size(); ++i) ex[i].resize((size_t) pk.n_exp[ly[i].L]);
+            for (const auto& t : tr.tok)
+                for (const TCall& c : t)
+                    for (int e : c.e)
+                        if (ex[(size_t) c.li][(size_t) e].id < 0) ex[(size_t) c.li][(size_t) e] = exp_at(ly[(size_t) c.li], e);
+        } else {
             size_t need = 0;
             if (anon)
                 for (const Layer& x : ly)
@@ -953,10 +1343,9 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < ly.size(); ++i) {
                 for (int pass = 0; pass < 2; ++pass)
                     for (int e : pass ? ly[i].fresh : ly[i].pool) {
-                        Exp x;
+                        Exp x = exp_at(ly[i], e);
                         for (int r = 0; r < 3; ++r) {
                             const Ref& t = *pk.at(ly[i].L, e, r);
-                            x.m[r] = mp.at(t);
                             if (anon && pass == 0) {
                                 std::memcpy(w, x.m[r], (size_t) t.bytes);
                                 x.m[r] = w;
@@ -970,6 +1359,16 @@ int main(int argc, char** argv) {
         const long huge = anon ? anon_huge_kb() : -1;
         const int P = (int) ly[0].pool.size(), ffn = v.k * 256;
         auto token = [&](int t, Acc& a) {
+            if (v.trace) {   // (the trace's token t: its calls as they were; a DS4_TRACE call over [0, k))
+                for (const TCall& c : tr.tok[(size_t) t]) {
+                    Exp e[16];
+                    const int np = (int) c.e.size();
+                    for (int q = 0; q < np; ++q) e[q] = ex[(size_t) c.li][(size_t) c.e[(size_t) q]];
+                    const int s0 = c.a >= 0 ? 256 * c.a : 0, sn = c.a >= 0 ? 256 * (c.b - c.a) : ffn;
+                    ln.call(ly[(size_t) c.li], e, np, s0, sn, v.rb, v.split, pf, v.dparts, a);
+                }
+                return;
+            }
             for (size_t i = 0; i < ly.size(); ++i) {
                 Exp e[16];
                 const int np = std::min(v.picks, 16);
@@ -978,22 +1377,27 @@ int main(int argc, char** argv) {
                     else if (fresh) e[q] = ex[i][(size_t) (P + t * v.picks + q)];
                     else e[q] = ex[i][(size_t) ((t * v.picks + q) % P)];
                 }
-                ln.call(v.mode == "hot" ? ly[0] : ly[i], e, np, ffn, v.rb, v.split, pf, a);
+                ln.call(v.mode == "hot" ? ly[0] : ly[i], e, np, 0, ffn, v.rb, v.split, pf, v.dparts, a);
             }
         };
         Acc warm;
-        if (!fresh)   // (every pool expert once through this mapping, then once more: PTEs and caches as in steady state)
+        if (v.trace)   // (the trace once through this mapping: its PTEs as the engine's, the caches its reuse's)
+            for (int t = 0; t < (int) tr.tok.size(); ++t) token(t, warm);
+        else if (!fresh)   // (every pool expert once through this mapping, then once more: PTEs and caches as in steady state)
             for (int t = 0; t < 2 * ((P + v.picks - 1) / v.picks); ++t) token(t, warm);
-        const int nt = fresh ? fresh_tokens : tokens;
+        const int nt = v.trace ? (int) tr.tok.size() : fresh ? fresh_tokens : tokens;
         Acc a;
 #if defined(__linux__)
         Pmc pm;   // (the pool's threads are up: each counted)
         const bool pmc_on = want_pmc && pm.open();
         if (pmc_on) pm.start();
 #endif
+        std::unique_ptr<Spin> spin;   // (after the counters opened: they count the lane's threads alone)
+        if (!v.spin.empty()) spin = std::make_unique<Spin>(v.spin);
         const int64_t f0 = faults();
         for (int t = 0; t < nt; ++t) token(t, a);
         const int64_t f1 = faults();
+        spin.reset();
 #if defined(__linux__)
         std::vector<std::vector<double>> pc;
         double pc_run = 0;
@@ -1014,6 +1418,14 @@ int main(int argc, char** argv) {
                     gbs(a.dn_bytes, a.dn_busy / thr), gbs(a.gu_bytes, a.gu_busy), gbs(a.dn_bytes, a.dn_busy),
                     1000.0 * (a.gu + a.dn) / std::max(1, a.batches), f0 >= 0 ? (double) (f1 - f0) / n : -1.0,
                     huge >= 0 ? (" (AnonHugePages " + std::to_string(huge / 1024) + " MB)").c_str() : "");
+        if (v.trace || v.dparts || v.pf_age > 0) {   // (what the row's calls were: their picks, the downs' source, the hints)
+            std::printf("  %s: %.1f calls a token, %.2f picks a call (calls by picks:", v.name.c_str(), (double) a.calls / n,
+                        (double) a.picks / (double) std::max(1L, a.calls));
+            for (int i = 1; i <= 16; ++i)
+                if (a.hist[i] > 0) std::printf(" %d:%ld", i, a.hist[i]);
+            std::printf("); downs from the parts %.0f%%; experts hinted %.0f%%\n", 100.0 * (double) a.downs_dp / (double) std::max(1L, a.picks),
+                        pf == kPfNone ? 0.0 : 100.0 * (double) a.hinted / (double) std::max(1L, a.picks));
+        }
 #if defined(__linux__)
         if (!pc.empty()) {   // (the counters over the timed tokens, every thread: spin waits included)
             // an event's total, and its group's cycles (for its share: both counted over the same time)
