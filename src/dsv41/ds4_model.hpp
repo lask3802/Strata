@@ -170,6 +170,12 @@ struct Stats {
     int64_t rx_pool_blocks = 0;
     int64_t rx_wb_n[5] = {}, rx_wb_na[5] = {};
     double rx_wb_part[5] = {}, rx_wb_arr[5] = {}, rx_wb_wait[5] = {};
+    // the sent decode requests (T=1) by their CPU-lane picks (W's among them; 9: 9 or more): requests, the lane's part
+    // (ms in all: its own picks' [0, k) and the cut W picks' [0, cut)) and the W blocks of [0, k) they moved there
+    int64_t rx_np_n[10] = {};
+    double rx_np_ms[10] = {}, rx_np_wb[10] = {};
+    // DS4_EP_POOL_CUT_CHECK=1: the requests whose cut W picks' pass was checked against two calls, and those not the same
+    int64_t rx_cut_chk = 0, rx_cut_bad = 0;
     // DS4_RX_FILL=1 (EP U5b): fills queued, loaded by the server, refused; their bytes sent and the time in the paced
     // sends; the requests the server answered Stale (an expert mid-fill)
     int64_t rx_fills = 0, rx_fill_ok = 0, rx_fill_fail = 0, rx_fill_bytes = 0, rx_stale = 0;

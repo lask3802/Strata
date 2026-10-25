@@ -1162,7 +1162,7 @@ struct Model::Impl {
     // ms a byte (send to its part done), the server lane's, the rest of a reply's (ms); -1: none yet.  The samples,
     // and the margin (DS4_EP_POOL_MARGIN, ms)
     // (DS4_EP_POOL_CUT, on with the balance: rx::pool_cut - a W pick's [cut, k) there, its [0, cut) here)
-    bool rx_bal = false, rx_cut = false;
+    bool rx_bal = false, rx_cut = false, rx_cut_chk = false;   // (rx_cut_chk: DS4_EP_POOL_CUT_CHECK=1, not for speed)
     double rx_bal_rm = -1, rx_bal_rs = -1, rx_bal_fix = -1, rx_bal_margin = 0.1;
     int64_t rx_bal_nm = 0, rx_bal_ns = 0;
     std::atomic<bool> rx_on{false};   // (rx_lost on the service thread clears it; the main thread's cache reads it)
@@ -6005,6 +6005,10 @@ struct Model::Impl {
     };
     // tokens an entry holds: the i-quant GGUF experts take a whole window's tokens of an expert in one call (the CPU
     // lane's exact multi-token rows, 7+ tokens an expert: decoded once for all), the others (MXFP4, EXL3) up to 8
+    // (cpu_experts' second slice: the entries from `from` on over n_ff values [ff0, ff0 + ffn) instead; from < 0: none)
+    struct FfSplit {
+        int from = -1, ff0 = 0, ffn = 0;
+    };
     static int ent_cap(const Layer& l) {
         return l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay) ? kEntMax : kc::kExl3CpuMaxN;
     }
@@ -6022,8 +6026,8 @@ struct Model::Impl {
     // number of entries take it, and each job its band of h straight into the down's int8 input.
     // (ord: the order the entries are computed in - their slots, so the sums, stay the same; null: as they are)
     void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, int ff0,
-                        int ffn) {
-        if (!gg::mx_experts(l.lay)) return cpu_experts_iq(l, x, ents, ldx, ord, ff0, ffn);
+                        int ffn, FfSplit sb = {}) {
+        if (!gg::mx_experts(l.lay)) return cpu_experts_iq(l, x, ents, ldx, ord, ff0, ffn, sb);
         // (MXFP4 here: whole - a slice is the i-quants' alone, and only a layer that takes it is ever asked for one:
         // rx_split_l, ep_slices_ok)
         constexpr int RB = 64;   // rows a job (whole blocks of h: RB % 32 == 0)
@@ -6115,24 +6119,37 @@ struct Model::Impl {
     // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same.
     // Over the n_ff slice [ff0, ff0 + ffn) (cpu_experts' caller's: the whole n_ff, or a split pick's share - H',
     // ds4_rx_split.hpp): the gate / up rows of the slice, and the down over the slice's values in place (gg::iq_cpu_slice) -
-    // each entry's yd then its part of the expert's output
+    // each entry's yd then its part of the expert's output.  sb: the entries from sb.from on over sb's slice instead, in
+    // the same rounds (the hybrid's cut W picks, [0, cut): one pass with the lane's own [0, k) - ord orders the others)
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, int ff0,
-                        int ffn) {
+                        int ffn, FfSplit sb = {}) {
         constexpr int RB = 64;   // rows a job
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
-        const bool sliced = ff0 != 0 || ffn != FF;
-        int glo[4], ghi[4], gmax = 0;   // node X's gate / up rows: its part's [X FFh, ..) within the slice
-        for (int X = 0; X < NH; ++X) {
-            glo[X] = std::max(X * FFh, ff0);
-            ghi[X] = std::min(X * FFh + FFh, ff0 + ffn);
-            gmax = std::max(gmax, ghi[X] - glo[X]);
+        const int ne = (int) ents.size(), na = sb.from >= 0 && sb.from < ne ? sb.from : ne;   // (entries [na, ne): sb's)
+        const int ns = na < ne ? 2 : 1;
+        const int rf0[2] = {ff0, sb.ff0}, rfn[2] = {ffn, sb.ffn};
+        int glo[2][4], ghi[2][4], GB[2] = {0, 0};   // node X's gate / up rows: its part's [X FFh, ..) within each slice
+        bool sliced[2] = {false, false};
+        for (int s = 0; s < ns; ++s) {
+            int gmax = 0;
+            for (int X = 0; X < NH; ++X) {
+                glo[s][X] = std::max(X * FFh, rf0[s]);
+                ghi[s][X] = std::min(X * FFh + FFh, rf0[s] + rfn[s]);
+                gmax = std::max(gmax, ghi[s][X] - glo[s][X]);
+            }
+            GB[s] = (gmax + RB - 1) / RB;
+            sliced[s] = rf0[s] != 0 || rfn[s] != FF;
         }
-        const int GB = (gmax + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
-        gg::IqCpu fm, fs;
-        size_t d_off = 0;
+        const int DB = (Eh + RB - 1) / RB;
+        auto set_of = [&](int q) { return q >= na ? 1 : 0; };
+        auto ent_at = [&](int i) { return i < na && ord != nullptr ? ord[i] : i; };   // (the i-th entry computed)
+        gg::IqCpu fm, fs[2];
+        size_t d_off[2] = {0, 0};
         std::string ferr;
-        if (!gg::iq_cpu_fmt(gg::expert_type(l.lay, 0), gg::expert_type(l.lay, 2), E, FF, fm, ferr) ||
-            fm.act_bytes > (size_t) E * 4 || fm.h_bytes > (size_t) E * 4 || (sliced && !gg::iq_cpu_slice(fm, ff0, ffn, fs, d_off, ferr))) {
+        bool ok = gg::iq_cpu_fmt(gg::expert_type(l.lay, 0), gg::expert_type(l.lay, 2), E, FF, fm, ferr) &&
+                  fm.act_bytes <= (size_t) E * 4 && fm.h_bytes <= (size_t) E * 4;
+        for (int s = 0; s < ns && ok; ++s) ok = !sliced[s] || gg::iq_cpu_slice(fm, rf0[s], rfn[s], fs[s], d_off[s], ferr);
+        if (!ok) {
             static std::atomic<bool> said{false};
             if (!said.exchange(true)) std::fprintf(stderr, "ds4: layer %d's CPU-lane experts: %s\n", l.il, ferr.c_str());
             for (const Ent& en : ents) std::memset(c_yd.data() + (size_t) en.slot0 * E, 0, (size_t) en.n * E * 4);
@@ -6143,11 +6160,14 @@ struct Model::Impl {
             // range, ~0.13 ms an IQ2_XXS expert, on the lane's critical path before the first entry computes.
             // off by default (the mmap path, owner PC: not faster in every pair); DS4_IQ_PF_COLD=1 turns it on)
             std::vector<std::pair<const void*, size_t>> want;
-            for (const Ent& en : ents)
+            for (int q = 0; q < ne; ++q) {
+                const Ent& en = ents[(size_t) q];
+                const int s = set_of(q);
                 if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
                     for (int r = 0; r < 3; ++r)   // (a slice's gate / up rows; the down's rows hold every slice)
-                        want.push_back({mx_mat(l, en.e, r) + (r < 2 ? (size_t) ff0 * mx_row_b(l, r) : 0),
-                                        r < 2 ? (size_t) ffn * mx_row_b(l, r) : mx_part_bytes(l, r)});
+                        want.push_back({mx_mat(l, en.e, r) + (r < 2 ? (size_t) rf0[s] * mx_row_b(l, r) : 0),
+                                        r < 2 ? (size_t) rfn[s] * mx_row_b(l, r) : mx_part_bytes(l, r)});
+            }
             static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
             if (pf_all) os::prefetch(want);
             else os::prefetch_cold(want);
@@ -6170,11 +6190,14 @@ struct Model::Impl {
                     gg::iq_cpu_quant(fm.gu_act, x + (size_t) t * ldx, E, x_act(en, i));
                 }
         }
+        // the gate / up jobs: the first na entries' GB[0] each, then the others' GB[1]
+        const int ja = na * GB[0];
         std::function<void(int)> f[4];
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
-                const int r0 = glo[X] + (j % GB) * RB, r1 = std::min(ghi[X], r0 + RB);
+                const int s = j < ja ? 0 : 1, jj = s == 0 ? j : j - ja;
+                const Ent& en = ents[(size_t) ent_at(s == 0 ? jj / GB[0] : na + jj / GB[1])];
+                const int r0 = glo[s][X] + (jj % GB[s]) * RB, r1 = std::min(ghi[s][X], r0 + RB);
                 if (r0 >= r1) return;   // (a node with fewer of the slice's rows)
                 const void* ap[kEntMax];
                 float* hp[kEntMax];
@@ -6187,15 +6210,18 @@ struct Model::Impl {
                 gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
                                    r0 - X * FFh, r1 - X * FFh, lim);
             };
-        run_nodes(ne * GB, f);
-        for (const Ent& en : ents)
+        run_nodes(ja + (ne - na) * GB[1], f);
+        for (int q = 0; q < ne; ++q) {
+            const Ent& en = ents[(size_t) q];
+            const int s = set_of(q);
             for (int i = 0; i < en.n; ++i)
-                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF + ff0, ffn,
+                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF + rf0[s], rfn[s],
                                  aq + (size_t) (kWin + en.slot0 + i) * E * 4);
-        const gg::IqCpu& fd = sliced ? fs : fm;
+        }
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
+                const int q = ent_at(j / DB), s = set_of(q);
+                const Ent& en = ents[(size_t) q];
                 const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
                 const void* hp[kEntMax];
                 float* yp[kEntMax];
@@ -6203,7 +6229,8 @@ struct Model::Impl {
                     hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
                     yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
                 }
-                gg::iq_cpu_down(fd, mx_part_ptr(l, en.e, 2, X) + d_off, hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+                gg::iq_cpu_down(sliced[s] ? fs[s] : fm, mx_part_ptr(l, en.e, 2, X) + d_off[s], hp, en.n, yp, r0 - X * Eh,
+                                r1 - X * Eh);
             };
         run_nodes(ne * DB, f);
     }
@@ -6227,13 +6254,20 @@ struct Model::Impl {
         }
     };
     // ents over the n_ff range [ff0, ff0 + ffn) - each caller says which (ds4_rx_split.hpp): the whole n_ff, but [0, k)
-    // for the picks a request just sent tagged slice (serve_lane) and [k, nb) for those of a reply late or lost (lane_add)
+    // for the picks a request just sent tagged slice (serve_lane) and [k, nb) for those of a reply late or lost (lane_add);
+    // sb: the entries from sb.from on over its range (the i-quant lane in the same pass, else a call of their own)
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, int ff0,
-                     int ffn) {
+                     int ffn, FfSplit sb = {}) {
         if (ldx == 0) ldx = (size_t) g.dim;
+        if (sb.from >= (int) ents.size()) sb = FfSplit{};
+        if (sb.from >= 0 && !(l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay))) {   // (one slice a call there)
+            const std::vector<Ent> a(ents.begin(), ents.begin() + sb.from), b(ents.begin() + sb.from, ents.end());
+            if (!a.empty()) cpu_experts(l, x, a, ldx, ord, ff0, ffn);
+            return cpu_experts(l, x, b, ldx, nullptr, sb.ff0, sb.ffn);
+        }
         if (l.lay.fmt == gg::kFmtMXFP4) {
             StoreHold hold(this, l, ents);
-            return cpu_experts_mx(l, x, ents, ldx, ord, ff0, ffn);
+            return cpu_experts_mx(l, x, ents, ldx, ord, ff0, ffn, sb);
         }
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, GQ = E / 256, DQ = FF / 128;
         const int GB = FFh / 128, DB = Eh / 128, EB = E / 128, FB = FF / 128;
@@ -6884,6 +6918,8 @@ struct Model::Impl {
         rx_bal = bv == nullptr || *bv != '0';
         const char* cv = std::getenv("DS4_EP_POOL_CUT");
         rx_cut = rx_bal && (cv == nullptr || *cv != '0');
+        const char* chv = std::getenv("DS4_EP_POOL_CUT_CHECK");
+        rx_cut_chk = rx_cut && chv != nullptr && *chv == '1';
         if (const char* mv = std::getenv("DS4_EP_POOL_MARGIN"); mv != nullptr && *mv != '\0')
             rx_bal_margin = std::max(0.0, std::atof(mv));
         char bal[256];
@@ -7726,6 +7762,10 @@ struct Model::Impl {
                              "(%.1f blocks a token; [0, k) is %d of them)\n",
                           (double) (st.rx_pool_blocks - s0.rx_pool_blocks) / (double) wp, rx_nb,
                           (double) (st.rx_pool_blocks - s0.rx_pool_blocks) / std::max(1.0, nt), rx_k);
+                if (rx_cut_chk)
+                    add_f(b, "the hybrid's cut check (DS4_EP_POOL_CUT_CHECK): %lld requests' one pass against two calls, "
+                             "%lld not the same bits\n",
+                          (long long) (st.rx_cut_chk - s0.rx_cut_chk), (long long) (st.rx_cut_bad - s0.rx_cut_bad));
                 std::string wb;
                 static const char* const kWb[5] = {"0", "1-3", "4-6", "7-12", "13+"};
                 for (int q = 0; q < 5; ++q) {
@@ -7744,6 +7784,18 @@ struct Model::Impl {
                     add_f(b, "the hybrid's decode requests by the W blocks of [0, k) they moved to the server: %s\n",
                           wb.c_str());
             }
+            std::string np;   // (every split arm, W or not: the lane's part at the same pick count)
+            for (int q = 0; q < 10; ++q) {
+                const int64_t n = st.rx_np_n[q] - s0.rx_np_n[q];
+                if (n <= 0) continue;
+                char one[160];
+                std::snprintf(one, sizeof one, "%s%d%s - %.1f a token, the lane's part %.3f ms, %.2f W blocks moved",
+                              np.empty() ? "" : "; ", q, q == 9 ? "+" : "", (double) n / std::max(1.0, nt),
+                              (st.rx_np_ms[q] - s0.rx_np_ms[q]) / (double) n, (st.rx_np_wb[q] - s0.rx_np_wb[q]) / (double) n);
+                np += one;
+            }
+            if (!np.empty())
+                add_f(b, "the decode requests sent by their CPU-lane picks (W's among them): %s\n", np.c_str());
         }
         return b;
     }
@@ -7905,6 +7957,7 @@ struct Model::Impl {
                 std::vector<std::pair<int, int>> spicks, wpicks;
                 int wcut = 0;   // (W picks' first block on the server: [0, wcut) of them here - DS4_EP_POOL_CUT)
                 rx::SplitPlan sp = rx::split_plan(spl, want, true, rx_k, rx_nb);
+                const int nlane = (int) picks.size();   // (the request's CPU-lane picks, W's among them: the lane's stats)
                 if (want) {
                     if (sp.tagged && (size_t) (li + 1) * g.n_exp <= rx_pool.size()) {   // (the hybrid, U5c: W's picks
                         const uint8_t* pw = rx_pool.data() + (size_t) li * g.n_exp;   // whole on the server, not here)
@@ -7970,9 +8023,9 @@ struct Model::Impl {
                     }
                     ents.push_back(en);
                 }
-                // the W picks cut (DS4_EP_POOL_CUT): their [0, wcut) here, in slots after the lane's own
-                const int nmain = nslots;
-                std::vector<Ent> wents;
+                // the W picks cut (DS4_EP_POOL_CUT): their [0, wcut) here, in slots and entries after the lane's own
+                // (cpu_experts' second slice: the same pass)
+                const int nmain = nslots, na = (int) ents.size();
                 if (wcut > 0) {
                     std::vector<std::pair<int, int>> wp(wpicks);
                     std::sort(wp.begin(), wp.end());
@@ -7989,19 +8042,18 @@ struct Model::Impl {
                             ++nslots;
                             ++a;
                         }
-                        wents.push_back(en);
+                        ents.push_back(en);
                     }
                 }
                 // lookahead: the entries asked for early (or in the RAM tier) computed first, so the ones asked for
                 // only now get the others' time to come in from the SSD (their slots, so the sums, stay the same)
                 int ord[kWin * kPicks];
                 const int* po = nullptr;
-                if (ahead_order && !ahead_for.empty() && ahead_for[(size_t) li] == next && ents.size() > 1 &&
-                    ents.size() <= (size_t) (kWin * kPicks)) {
-                    const uint8_t* fa = ahead_fl.data() + (size_t) li * 1024;
+                if (ahead_order && !ahead_for.empty() && ahead_for[(size_t) li] == next && na > 1 && na <= kWin * kPicks) {
+                    const uint8_t* fa = ahead_fl.data() + (size_t) li * 1024;   // (the lane's own entries)
                     int n = 0;
                     for (int pass = 0; pass < 2; ++pass)
-                        for (size_t q = 0; q < ents.size(); ++q) {
+                        for (size_t q = 0; q < (size_t) na; ++q) {
                             const int e = ents[q].e;
                             const bool early = !file_read(l, e) || (fa[e] & 8) != 0;
                             if (early == (pass == 0)) ord[n++] = (int) q;
@@ -8009,16 +8061,24 @@ struct Model::Impl {
                     po = ord;
                 }
                 double bal_mb = 0.0;   // (this lane's bytes of the request: the balance's sample)
-                if (!ents.empty() || !wents.empty()) {
+                if (!ents.empty()) {
                     const double tc = now_ms();
-                    int ff0, ffn;
+                    int ff0, ffn, wf0 = 0, wfn = 0;
                     rx::ff_range(mr, rx_nb, g.ff, ff0, ffn);
-                    if (!ents.empty()) cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, ff0, ffn);
-                    const double tm = now_ms();
-                    int wf0 = 0, wfn = 0;
-                    if (!wents.empty()) {
+                    FfSplit wsb;
+                    if (na < (int) ents.size()) {
                         rx::ff_range(rx::BlockRange{0, wcut}, rx_nb, g.ff, wf0, wfn);
-                        cpu_experts(l, &r.x[0][0], wents, (size_t) kMaxDim, nullptr, wf0, wfn);
+                        wsb = FfSplit{na, wf0, wfn};
+                    }
+                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, ff0, ffn, wsb);
+                    if (rx_cut_chk && wsb.from >= 0) {   // (DS4_EP_POOL_CUT_CHECK: the pass against two calls, bit for bit)
+                        const size_t D = (size_t) g.dim;
+                        const std::vector<float> y1(c_yd.begin(), c_yd.begin() + (ptrdiff_t) ((size_t) nslots * D));
+                        const std::vector<Ent> a(ents.begin(), ents.begin() + na), w(ents.begin() + na, ents.end());
+                        if (!a.empty()) cpu_experts(l, &r.x[0][0], a, (size_t) kMaxDim, po, ff0, ffn);
+                        cpu_experts(l, &r.x[0][0], w, (size_t) kMaxDim, nullptr, wf0, wfn);
+                        ++st.rx_cut_chk;
+                        if (std::memcmp(y1.data(), c_yd.data(), (size_t) nslots * D * sizeof(float)) != 0) ++st.rx_cut_bad;
                     }
                     const int D = g.dim;
                     for (int t = 0; t < T; ++t) {
@@ -8034,17 +8094,25 @@ struct Model::Impl {
                         }
                         rp.cpu[t] = 1;
                     }
-                    st.cpu_ms += now_ms() - tc;
+                    const double tl = now_ms() - tc;
+                    st.cpu_ms += tl;
+                    if (T == 1 && sp.sent) {   // (by the request's CPU-lane picks: the lane's part at the same count)
+                        const int q = std::min(nlane, 9);
+                        ++st.rx_np_n[q];
+                        st.rx_np_ms[q] += tl;
+                        st.rx_np_wb[q] += (double) wpicks.size() * (rx_k - wcut);
+                    }
                     st.cpu_experts += nmain;   // (a W pick cut: the reply's, as one whole there)
                     // (an expert's bytes once: past ent_cap's tokens it takes more than one entry, side by side)
                     size_t nexp = 0, nwexp = 0;
-                    for (size_t q = 0; q < ents.size(); ++q) nexp += q == 0 || ents[q].e != ents[q - 1].e;
-                    for (size_t q = 0; q < wents.size(); ++q) nwexp += q == 0 || wents[q].e != wents[q - 1].e;
+                    for (size_t q = 0; q < (size_t) na; ++q) nexp += q == 0 || ents[q].e != ents[q - 1].e;
+                    for (size_t q = (size_t) na; q < ents.size(); ++q) nwexp += q == (size_t) na || ents[q].e != ents[q - 1].e;
                     bal_mb = ((double) nexp * ffn + (double) nwexp * wfn) * (double) l.blob / (double) g.ff;
                     st.lane_bytes += bal_mb;
-                    // (a pick's time whole: the slices computed [0, k) of nb blocks; the lane's own picks alone)
-                    const double whole = (double) nmain * (double) (mr.b1 - mr.b0) / (double) std::max(1, rx_nb);
-                    if (rx_on && whole > 0) rx_gate.pick_seen(T, (tm - tc) / whole);
+                    // (a pick's time whole: the slices computed - [0, k) of nb blocks, a cut W pick's [0, cut))
+                    const double whole = ((double) nmain * (double) (mr.b1 - mr.b0) + (double) (nslots - nmain) * wcut) /
+                                         (double) std::max(1, rx_nb);
+                    if (rx_on && whole > 0) rx_gate.pick_seen(T, tl / whole);
                 }
                 if (sp.sent) rx_finish(l, r, rp, T, next, rx_t0, rpicks, spicks, sp, wpicks, bal_mb, wcut);
             }
