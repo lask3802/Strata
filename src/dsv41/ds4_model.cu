@@ -1084,6 +1084,9 @@ struct Model::Impl {
     uint16_t* embed_pinned = nullptr;
     std::vector<float> freqs_win, freqs_comp;
     std::vector<std::unique_ptr<Pool>> pools;   // one per NUMA node, its workers on that node's cores
+    // DS4_LANE_PROF=1: the lane's phases timed (Stats::lp_*, the decode's "decode lane phases" line) - clocks read,
+    // nothing computed otherwise
+    const bool lane_prof = std::getenv("DS4_LANE_PROF") != nullptr && std::atoi(std::getenv("DS4_LANE_PROF")) != 0;
     std::vector<std::vector<int>> cores;        // each node's physical cores
     int NH = 1;                                 // the CPU lane's parts of an expert (the NUMA nodes)
     // the CPU lane's experts read in place from the model's files (one part, the files' layout; the page cache keeps
@@ -5147,6 +5150,8 @@ struct Model::Impl {
             for (auto& p : pools) nthr += p->size();
             std::fprintf(stderr, "ds4: CPU lane: %d threads, MXFP4 rows %s (%s)\n", nthr, gg::mx_tier_name(gg::mx_tier()),
                          gg::mx_tier_report());
+            if (lane_prof)
+                std::fprintf(stderr, "ds4: DS4_LANE_PROF=1: the i-quant CPU lane's phases timed (%d threads)\n", cpu_threads());
         }
     }
 
@@ -6005,6 +6010,28 @@ struct Model::Impl {
         pools[0]->help();
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
     }
+    // (DS4_LANE_PROF) run_nodes timed: its wall time, its tail (the caller's wait once it ran out of jobs: the
+    // barrier's wait for the slowest worker's last job) and its jobs' time in all (busy), each added to its own
+    void run_nodes_prof(int n, const std::function<void(int)>* f, double& wall, double& tail, double& busy) {
+        std::atomic<int64_t> ns{0};
+        std::function<void(int)> g[4];
+        for (int X = 0; X < NH; ++X)
+            g[X] = [&, X](int j) {
+                const auto a = std::chrono::steady_clock::now();
+                f[X](j);
+                ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - a).count(),
+                             std::memory_order_relaxed);
+            };
+        const double t0 = now_ms();
+        for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, g[X]);
+        pools[0]->help();
+        const double th = now_ms();
+        for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
+        const double t1 = now_ms();
+        wall += t1 - t0;
+        tail += t1 - th;
+        busy += (double) ns.load(std::memory_order_relaxed) / 1e6;
+    }
 
     // a GGUF's MXFP4 experts on the CPU lane, read from the file's mapping or their copy in RAM (mx_part_ptr): each
     // node its rows of every matrix - the gate / up rows [X n_ff / NH, ..) of each entry (the swiglu into its h row),
@@ -6131,6 +6158,7 @@ struct Model::Impl {
             return;
         }
         const float lim = g.lim;
+        const double tp0 = lane_prof ? now_ms() : 0.0;   // (DS4_LANE_PROF: the prefetch and the x quant from here)
         {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
             // range, ~0.13 ms an IQ2_XXS expert, on the lane's critical path before the first entry computes.
             // off by default (the mmap path, owner PC: not faster in every pair); DS4_IQ_PF_COLD=1 turns it on)
@@ -6162,41 +6190,58 @@ struct Model::Impl {
                     gg::iq_cpu_quant(fm.gu_act, x + (size_t) t * ldx, E, x_act(en, i));
                 }
         }
-        std::function<void(int)> f[4];
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
-                const int r0 = glo[X] + (j % GB) * RB, r1 = std::min(ghi[X], r0 + RB);
-                if (r0 >= r1) return;   // (a node with fewer of the slice's rows)
-                const void* ap[kEntMax];
-                float* hp[kEntMax];
-                for (int i = 0; i < en.n; ++i) {
-                    ap[i] = x_act(en, i);
-                    hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;   // (part X's rows of h)
-                }
-                // (part X's rows, from where they are: a copy's part on node X, or the file's - whole rows, so any
-                // block size of the type)
-                gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
-                                   r0 - X * FFh, r1 - X * FFh, lim);
-            };
-        run_nodes(ne * GB, f);
-        for (const Ent& en : ents)
+        if (lane_prof) {
+            st.lp_prep_ms += now_ms() - tp0;
+            ++st.lp_calls;
+            st.lp_threads = cpu_threads();
+        }
+        // the jobs: entry q's (ents[ord[q]]) gate / up band b of part X, its h quantized, its down band b of part X
+        auto gu_job = [&](int X, int q, int b) {
+            const Ent& en = ents[(size_t) (ord != nullptr ? ord[q] : q)];
+            const int r0 = glo[X] + b * RB, r1 = std::min(ghi[X], r0 + RB);
+            if (r0 >= r1) return;   // (a node with fewer of the slice's rows)
+            const void* ap[kEntMax];
+            float* hp[kEntMax];
+            for (int i = 0; i < en.n; ++i) {
+                ap[i] = x_act(en, i);
+                hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;   // (part X's rows of h)
+            }
+            // (part X's rows, from where they are: a copy's part on node X, or the file's - whole rows, so any
+            // block size of the type)
+            gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
+                               r0 - X * FFh, r1 - X * FFh, lim);
+        };
+        auto h_quant = [&](const Ent& en) {
             for (int i = 0; i < en.n; ++i)
                 gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF + ff0, ffn,
                                  aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+        };
         const gg::IqCpu& fd = sliced ? fs : fm;
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
-                const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
-                const void* hp[kEntMax];
-                float* yp[kEntMax];
-                for (int i = 0; i < en.n; ++i) {
-                    hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
-                    yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
-                }
-                gg::iq_cpu_down(fd, mx_part_ptr(l, en.e, 2, X) + d_off, hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
-            };
+        auto dn_job = [&](int X, int q, int b) {
+            const Ent& en = ents[(size_t) (ord != nullptr ? ord[q] : q)];
+            const int r0 = X * Eh + b * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
+            const void* hp[kEntMax];
+            float* yp[kEntMax];
+            for (int i = 0; i < en.n; ++i) {
+                hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
+                yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
+            }
+            gg::iq_cpu_down(fd, mx_part_ptr(l, en.e, 2, X) + d_off, hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+        };
+        std::function<void(int)> f[4];
+        for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { gu_job(X, j / GB, j % GB); };
+        if (lane_prof) {   // (DS4_LANE_PROF: the same calls, timed)
+            run_nodes_prof(ne * GB, f, st.lp_gu_ms, st.lp_gu_tail_ms, st.lp_gu_busy_ms);
+            const double th = now_ms();
+            for (const Ent& en : ents) h_quant(en);
+            st.lp_hq_ms += now_ms() - th;
+            for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { dn_job(X, j / DB, j % DB); };
+            run_nodes_prof(ne * DB, f, st.lp_dn_ms, st.lp_dn_tail_ms, st.lp_dn_busy_ms);
+            return;
+        }
+        run_nodes(ne * GB, f);
+        for (const Ent& en : ents) h_quant(en);
+        for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { dn_job(X, j / DB, j % DB); };
         run_nodes(ne * DB, f);
     }
 
@@ -7631,6 +7676,8 @@ struct Model::Impl {
         auto last = std::chrono::steady_clock::now();
         bool napped = false;
         std::vector<Ent> ents;
+        double lp_ans = 0.0;   // (DS4_LANE_PROF: the last answer's time and its layer)
+        int lp_li = -1;
         while (!quit.load(std::memory_order_relaxed)) {
             Req& r = reqs[next % kRing];
             if (*(volatile unsigned*) &r.seq != next) {
@@ -7652,6 +7699,8 @@ struct Model::Impl {
             napped = false;
             std::atomic_thread_fence(std::memory_order_acquire);
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
+            const double lp_req = lane_prof ? now_ms() : 0.0;
+            if (lane_prof && lp_ans > 0.0) (li == lp_li + 1 ? st.lp_wait_ms : st.lp_gap_ms) += lp_req - lp_ans;
             const bool ep = ep_of[next % kRing];   // (written before the request's launch: ep_of)
             Resp& rp = resps[next % kRing];
             const int T = std::max(1, std::min(kWin, r.T));
@@ -7828,9 +7877,11 @@ struct Model::Impl {
                 }
                 if (!ents.empty()) {
                     const double tc = now_ms();
+                    if (lane_prof) st.lp_plan_ms += tc - lp_req;
                     int ff0, ffn;
                     rx::ff_range(mr, rx_nb, g.ff, ff0, ffn);
                     cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, ff0, ffn);
+                    const double ta = lane_prof ? now_ms() : 0.0;
                     const int D = g.dim;
                     for (int t = 0; t < T; ++t) {
                         bool any = false;
@@ -7845,6 +7896,7 @@ struct Model::Impl {
                         }
                         rp.cpu[t] = 1;
                     }
+                    if (lane_prof) st.lp_add_ms += now_ms() - ta;
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
                     // (an expert's bytes once: past ent_cap's tokens it takes more than one entry, side by side)
@@ -7855,10 +7907,18 @@ struct Model::Impl {
                     const double whole = (double) nslots * (double) (mr.b1 - mr.b0) / (double) std::max(1, rx_nb);
                     if (rx_on && whole > 0) rx_gate.pick_seen(T, (now_ms() - tc) / whole);
                 }
-                if (sp.sent) rx_finish(l, r, rp, T, next, rx_t0, rpicks, spicks, sp);
+                if (sp.sent) {
+                    const double tr = lane_prof ? now_ms() : 0.0;
+                    rx_finish(l, r, rp, T, next, rx_t0, rpicks, spicks, sp);
+                    if (lane_prof) st.lp_rx_ms += now_ms() - tr;
+                }
             }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;
+            if (lane_prof) {
+                lp_ans = now_ms();
+                lp_li = li;
+            }
             ++next;
             last = std::chrono::steady_clock::now();
         }
