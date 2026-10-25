@@ -900,6 +900,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                                  ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
       target_link_libraries(ds4_ep_slice_test PRIVATE strata_kernels_cpu Threads::Threads)
       target_compile_definitions(ds4_ep_slice_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+      # the i-quant CPU lane's decode calls replayed on a pack's experts (or a fake pack's), each phase and its jobs timed,
+      # one thing changed a variant (the hint, the mapping, huge pages, the job size, the threads); no GPU, read only
+      add_executable(ds4_lane_bench tests/dsv41/lane_bench.cpp src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp
+                     src/dsv41/ds4_tq_cpu.cpp)
+      target_include_directories(ds4_lane_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
+      target_compile_features(ds4_lane_bench PRIVATE cxx_std_17)
+      target_link_libraries(ds4_lane_bench PRIVATE strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(ds4_lane_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
       # the expert server's CPU lane over the parts pack's n_ff slices (rx::SliceLane, ds4_rx_lane.hpp): its sums against
       # the slice computed in place on the whole expert, and with the main's [0, k) against the whole; no GPU
       add_executable(ds4_rx_lane_test tests/dsv41/rx_lane_test.cpp src/dsv41/ds4_rx_lane.cpp src/dsv41/ds4_iq_cpu.cpp
