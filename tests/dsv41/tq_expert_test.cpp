@@ -75,7 +75,7 @@ static double dotd(const float* w, const float* x, int k, double* sabs = nullptr
 
 // one decode token of the DeepSeek shape (n_embd 5120, n_ff 2304, top-6 experts, distinct blobs) through the token path: gate/up +
 // down launches, hipEvent time per layer; and a 5-entry verify window of one expert group
-static void bench(int type) {
+static bool bench(int type) {
     const int K = iq::tq_kbits(type), E = 5120, FF = 2304, NE = 6;
     const size_t rb_g = (size_t) (E / 128) * (2 + 4 * K), rb_d = (size_t) (FF / 128) * (2 + 4 * K);
     auto al = [](size_t n) { return (n + 255) / 256 * 256; };
@@ -90,6 +90,11 @@ static void bench(int type) {
     a.plan_ptr = up(plan); a.n_embd = E; a.n_ff = FF; a.limit = 10.0f; a.xq = up(xq); a.xd = up(xd); a.hq = up(hq); a.hd = up(hd); a.tg = a.td = type;
     for (int r = 0; r < 3; ++r) a.tr[r] = off[r];
     float *dh, *dp; CK(hipMalloc(&dh, (size_t) NE * FF * 4)); CK(hipMalloc(&dp, (size_t) NE * E * 4)); a.h = dh; a.part = dp;
+    // (the timing loops below ignore the returns: a geometry the kernels refuse - silently now - would time no launch)
+    if (!iq::gate_up(a, NE, 1, 0) || !iq::down(a, NE, 1, 0)) {
+        std::printf("bench %-6s: gate_up / down refused this geometry (n_embd %d, n_ff %d): not timed\n", iq::name(type), E, FF);
+        return false;
+    }
     hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
     for (int rep = 0; rep < 5; ++rep) { iq::gate_up(a, NE, 1, 0); iq::down(a, NE, 1, 0); }
     CK(hipDeviceSynchronize());
@@ -104,12 +109,17 @@ static void bench(int type) {
     const double bytes = (double) NE * blob;
     std::printf("bench %-6s token path, 6 experts: gate/up %.0f us, down %.0f us, layer %.0f us (%.0f GB/s, %.2f Tw/s), x40 = %.1f ms per token\n", iq::name(type), ms_gu * 1e3,
                 ms_dn * 1e3, (ms_gu + ms_dn) * 1e3, bytes / ((ms_gu + ms_dn) * 1e-3) / 1e9, (double) NE * 3 * FF * E / ((ms_gu + ms_dn) * 1e-3) / 1e12, 40.0 * (ms_gu + ms_dn));
+    return true;
 }
 
 int main(int argc, char** argv) {
     std::vector<int> types = {145, 146, 224, 225, 226, 227};
     for (int i = 1; i < argc; ++i)
-        if (std::string(argv[i]) == "--bench") { for (int t : {225, 224, 145, 146}) bench(t); return 0; }
+        if (std::string(argv[i]) == "--bench") {
+            bool ok = true;
+            for (int t : {225, 224, 145, 146}) ok = bench(t) && ok;
+            return ok ? 0 : 1;
+        }
         else if (std::string(argv[i]) == "--type" && i + 1 < argc) { types.clear(); for (const char* p = argv[++i]; *p;) { types.push_back(std::atoi(p)); while (*p && *p != ',') ++p; if (*p) ++p; } }
     std::mt19937_64 rng(11);
     std::normal_distribution<float> nd(0.f, 1.f);

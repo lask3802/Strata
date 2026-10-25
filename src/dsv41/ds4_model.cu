@@ -10480,7 +10480,7 @@ struct Model::Impl {
                 // U9 tail: the device experts' down before the wait (it reads the plan, not the answer; DS4_PROF's
                 // gate/up stretch then holds it)
                 const bool early = mx && u9::on(u9::kTail);
-                const bool down_ok = early && gg::moe_down_experts(ma, d.xg, s);   // (false: printed, as moe_down)
+                const bool down_ok = early && gg::moe_down_experts(ma, d.xg, s);   // (false: printed once, counted)
                 prof_mark(d, 3);
                 if (lead && !skip) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
