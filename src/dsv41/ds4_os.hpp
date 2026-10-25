@@ -7,9 +7,11 @@
 #pragma once
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -325,6 +327,25 @@ inline void prefetch(const std::vector<std::pair<const void*, size_t>>& ranges) 
 #endif
 }
 
+/// [p, p + n) of a file's mapping read in and mapped now (Linux 5.14+ madvise MADV_POPULATE_READ: the page cache
+/// filled from the file where it has not the pages and this process's page tables set, so the first read of each page
+/// is no fault): 1 done, 0 not had here (EINVAL: a kernel without it; Windows), -1 failed otherwise (errno: a part of
+/// the range not mapped, an I/O error) - the caller reads it then (pread: the page cache, not the page tables)
+inline int populate(const void* p, size_t n) {
+#if defined(_WIN32)
+    (void) p, (void) n;
+    return 0;
+#else
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+    const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
+    int r;
+    while ((r = madvise((void*) b, n + (a - b), MADV_POPULATE_READ)) != 0 && errno == EINTR) {}
+    return r == 0 ? 1 : errno == EINVAL ? 0 : -1;
+#endif
+}
+
 /// Whether every page of [p, p + n) of a file's mapping is in the page cache (Linux mincore; elsewhere false: the
 /// caller reads buffered anyway, which the cache serves)
 inline bool resident(const void* p, size_t n) {
@@ -569,6 +590,26 @@ inline int pinned_cpu() {
         if (CPU_ISSET(c, &s)) one = c;
 #endif
     return one;
+}
+/// The logical CPU the calling thread runs on now (-1: not known)
+inline int cpu_now() {
+#if defined(_WIN32)
+    PROCESSOR_NUMBER pn{};
+    GetCurrentProcessorNumberEx(&pn);
+    return pn.Group == 0 ? (int) pn.Number : -1;
+#else
+    return sched_getcpu();
+#endif
+}
+/// The calling thread's CPU time, ms (Linux: CLOCK_THREAD_CPUTIME_ID; Windows: its cycles at the base clock are not
+/// time - -1)
+inline double thread_cpu_ms() {
+#if defined(_WIN32)
+    return -1.0;
+#else
+    timespec t{};
+    return clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t) == 0 ? (double) t.tv_sec * 1e3 + (double) t.tv_nsec / 1e6 : -1.0;
+#endif
 }
 /// A kernel CPU list ("3,19", "3-4", "0-1,8-9") as its CPUs, in its order; it ends at anything else
 inline std::vector<int> cpu_list(const char* s) {

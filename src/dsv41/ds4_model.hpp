@@ -98,7 +98,22 @@ struct Stats {
     int64_t experts = 0, cpu_experts = 0;   // routed experts run, and how many of them on the CPU lane
     double cpu_ms = 0.0, gpu_wait_ms = 0.0;   // the CPU lane's time; the host's waits for the routing
     double lane_bytes = 0.0;   // the expert bytes that time read (an entry its blob, a slice's share of it: H')
+    // DS4_LANE_PROF=1: the i-quant CPU lane's phases, ms in all - serve_lane's: a request's wait since the layer
+    // before's answer (gap: since an answer of another token or window), its plan before the call, the weighted add
+    // after it, the remote reply (rx_finish, with its fallback's calls); cpu_experts_iq's: the prefetch and x quant,
+    // each batch's wall time, its tail (the caller's wait once it ran out of jobs: the barrier's wait for the slowest
+    // worker), its jobs' time in all (busy), the serial h quant; lp_threads: the lane's threads
+    int64_t lp_calls = 0;
+    int lp_threads = 0;
+    double lp_wait_ms = 0.0, lp_gap_ms = 0.0, lp_plan_ms = 0.0, lp_add_ms = 0.0, lp_rx_ms = 0.0, lp_prep_ms = 0.0;
+    double lp_gu_ms = 0.0, lp_gu_tail_ms = 0.0, lp_gu_busy_ms = 0.0, lp_hq_ms = 0.0;
+    double lp_dn_ms = 0.0, lp_dn_tail_ms = 0.0, lp_dn_busy_ms = 0.0;
     double layer_ms = 0.0, head_ms = 0.0, engram_ms = 0.0;   // the layers' host time in all; the head's wait; Engram reads
+    // the head's waits (its cudaStreamSynchronize, decode and prompt): the waiting thread's CPU time in them (Linux; a
+    // spinning wait's is its wall time, a blocking one's near 0) and the CPU each began on, by CPU (the last: past 127
+    // or not known)
+    double head_cpu_ms = 0.0;
+    int64_t head_waits = 0, head_on[129] = {};
     int64_t eg_rows = 0, eg_hits = 0, eg_reads = 0;   // Engram rows asked for, served without a read, read from the files
     double eg_io_ms = 0.0;                            // the windows' Engram reads, issue to last done (mostly hidden)
     int64_t eg_cached = 0, eg_cache_cap = 0;          // the row cache's rows held, its capacity

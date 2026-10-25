@@ -14,6 +14,7 @@
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_model.hpp"
 #include "ds4_engram_io.hpp"
+#include "ds4_epparts.hpp"
 
 #include "ds4_gguf.cuh"
 #include "ds4_iq.cuh"
@@ -1084,6 +1085,52 @@ struct Model::Impl {
     uint16_t* embed_pinned = nullptr;
     std::vector<float> freqs_win, freqs_comp;
     std::vector<std::unique_ptr<Pool>> pools;   // one per NUMA node, its workers on that node's cores
+    // DS4_LANE_PROF=1: the lane's phases timed (Stats::lp_*, the decode's "decode lane phases" line) - clocks read,
+    // nothing computed otherwise
+    const bool lane_prof = std::getenv("DS4_LANE_PROF") != nullptr && std::atoi(std::getenv("DS4_LANE_PROF")) != 0;
+    // DS4_IQ_PF: the i-quant CPU lane's hint on its experts' ranges each call (madvise WILLNEED; on pages the cache holds
+    // it only costs the walk - 1.7 ms a token of 160 slices on CT 580, lane-bench file vs file-nopf): unset as before
+    // (every range; DS4_IQ_PF_COLD=1 prefetch_cold), 0 none, 1 every range, N > 1 the experts the layer's last N calls did
+    // not take only (pf_seen: the layer's call count at an expert's last call, pf_calls: the layer's calls)
+    const int iq_pf = std::getenv("DS4_IQ_PF") != nullptr ? std::max(0, std::atoi(std::getenv("DS4_IQ_PF"))) : -1;
+    std::vector<uint32_t> pf_seen, pf_calls;
+    size_t pf_ne = 0;
+    // DS4_IQ_DOWN_PARTS=dir: the CPU lane's down over a slice [ff0, ff0 + ffn) read from a parts pack of the down
+    // matrices alone (ep_parts.py --down-only A:B: each expert's dim rows cut to the blocks [A, B), back to back) instead
+    // of the pack's rows in place - there a row's [0, k) is strided (594 bytes a row, 396 of them read at k 6 on IQ2_XXS)
+    // and the prefetchers bring the rest of the row too: the down's DRAM time at k 6 is the whole row's (lane-bench file
+    // 11.10 ms at k 6 vs 11.40 at k 9).  A slice the parts end at (ff0 + ffn = 256 B, A <= ff0 / 256) of an expert read
+    // from the files (not a RAM-tier copy, no store) takes them; any other the pack's.  init_down_parts checks the parts:
+    // the pack's (pack_hash), every expert of a covered i-quant layer one part of the layer's down type and row layout.
+    ::strata::ds4::ep::Parts dparts;
+    struct DownParts {
+        int a = 0, b = 0;
+        size_t ub = 0, rb = 0;                // a row's bytes a block, and the part's row (b - a) ub
+        std::vector<const uint8_t*> at;       // expert -> its part's row 0, block a (empty: the layer has none)
+    };
+    std::vector<DownParts> dpl;               // by layer index
+    // DS4_IQ_WARM=split: the load's read-ahead of the CPU lane's experts (load_experts_mx: each one whole, read into a
+    // buffer - the page cache warm, the lane's mapping not) left out, warm_split after the expert server's upload
+    // instead: of each CPU-lane expert only what the lane reads of a pick - its layer's slice [ep_ff0, ep_ff0 + ep_ffn)
+    // of the gate / up rows, the down from the parts where they serve that slice (DS4_IQ_DOWN_PARTS), else the pack's
+    // down whole - read in through the lane's own mapping (os::populate: the page cache and the page tables; pread where
+    // the kernel has no MADV_POPULATE_READ), the most-routed first, up to warm_bytes.  At k 6 with the parts that is 2/3
+    // of an expert's bytes: lane-bench-report.md section 13 - the whole read-ahead's 97 GB held 12559 of CT 580's 15229
+    // CPU-lane experts, and the parts, outside it, were pushed out by the arms before.  Unset or empty: as before; any
+    // other value fails the load
+    const char* iq_warm_env = std::getenv("DS4_IQ_WARM");
+    const bool iq_warm_split = iq_warm_env != nullptr && std::strcmp(iq_warm_env, "split") == 0;
+    // DS4_LANE_TRACE=file: the i-quant CPU lane's calls as cpu_experts_iq gets them, for lane-bench --trace (its picks,
+    // their n_ff slice and tokens): "LANETRC1", then a record a call - u8 layer, u8 ff0 / 256, u8 (ff0 + ffn) / 256,
+    // u8 entries, then each entry's int16 expert and u8 tokens (flushed every 4096 calls and at the end)
+    std::FILE* lane_tr = open_lane_trace();
+    uint32_t lane_tr_n = 0;
+    static std::FILE* open_lane_trace() {
+        const char* p = std::getenv("DS4_LANE_TRACE");
+        std::FILE* f = p != nullptr && *p != '\0' ? std::fopen(p, "wb") : nullptr;
+        if (f != nullptr) std::fwrite("LANETRC1", 1, 8, f);
+        return f;
+    }
     std::vector<std::vector<int>> cores;        // each node's physical cores
     int NH = 1;                                 // the CPU lane's parts of an expert (the NUMA nodes)
     // the CPU lane's experts read in place from the model's files (one part, the files' layout; the page cache keeps
@@ -1130,6 +1177,19 @@ struct Model::Impl {
     bool slot_held = false;           // slot_save took this state and nothing has changed it since
     std::vector<uint32_t> prof;       // [nl][n_exp] routed-expert hits
     Stats st;
+    // the head's wait (a token's long host wait on the GPU, decode and prompt): its wall time, the waiting thread's CPU
+    // time in it and the CPU it began on (Stats::head_*) - whether the wait spins (DS4_CUDA_SYNC) and on which CPU
+    bool head_wait(cudaStream_t s, std::string& err) {
+        const int c = os::cpu_now();
+        ++st.head_on[c >= 0 && c < 128 ? c : 128];
+        ++st.head_waits;
+        const double th = now_ms(), tc = os::thread_cpu_ms();
+        CK(cudaStreamSynchronize(s));
+        st.head_ms += now_ms() - th;
+        const double tc1 = os::thread_cpu_ms();
+        if (tc >= 0 && tc1 >= 0) st.head_cpu_ms += tc1 - tc;
+        return true;
+    }
     int cur_topk_n[kWin] = {}, cur_cand_n[kWin] = {};   // what the latest indexer / candidate source left, per query
                                                         // (plan_window's: the windows' plans are made in order)
     int n_logits = 0;                 // the last forward's logit rows
@@ -1497,6 +1557,8 @@ struct Model::Impl {
             }
         quit.store(true);
         if (service.joinable()) service.join();
+        if (lane_tr != nullptr) std::fclose(lane_tr);   // (the lane's calls are over: its service thread is)
+        lane_tr = nullptr;
         {
             std::lock_guard<std::mutex> lk(pf_mu);
         }
@@ -2038,6 +2100,205 @@ struct Model::Impl {
     // expert parallelism's n_ff slices: every layer with one must be a trunk layer with its experts on the i-quant CPU lane
     // alone (no VRAM tier, no GPU-visible store slots), in a process that is no remote stage's worker and skips no expert
     // by its RAM (STRATA_DS4_DISK_SKIP_W) - false (err) otherwise.  At load, and again by whatever sets a slice later
+    // DS4_IQ_DOWN_PARTS (dparts above): the parts opened and checked against this pack and its layers; false (err): set
+    // but not usable - a layer the parts cover with an expert missing or of another type or layout, no layer at all
+    bool init_down_parts(std::string& err) {
+        const char* dir = std::getenv("DS4_IQ_DOWN_PARTS");
+        if (dir == nullptr || *dir == '\0') return true;
+        namespace epp = ::strata::ds4::ep;
+        auto refuse = [&](const std::string& why) {
+            err = std::string("DS4_IQ_DOWN_PARTS=") + dir + ": " + why;
+            dparts.close();
+            dpl.clear();
+            return false;
+        };
+        std::string perr;
+        if (!dparts.open(dir, perr)) return refuse(perr);
+        if (dparts.pack_hash() != stage::pack_hash(o.pack)) return refuse("cut from another pack than " + o.pack + " (pack_hash)");
+        if (dparts.dim() != g.dim || dparts.n_ff() != g.ff || dparts.unit() != 256)
+            return refuse("the parts' geometry (dim " + std::to_string(dparts.dim()) + ", n_ff " + std::to_string(dparts.n_ff()) +
+                          ") is not the model's");
+        const int nb = dparts.blocks();
+        dpl.assign(L.size(), DownParts{});
+        int on = 0, a0 = 0, b0 = 0;
+        for (size_t li = 0; li < L.size(); ++li) {
+            const Layer& l = L[li];
+            if (l.mtp || (size_t) l.il != li || l.il >= dparts.layers() || !dparts.covers(l.il) || l.lay.fmt != gg::kFmtMXFP4 ||
+                gg::mx_experts(l.lay))
+                continue;   // (dpl and down_parts index by il: L's own order)
+            const std::string ln = "layer " + std::to_string(l.il);
+            const int td = gg::expert_type(l.lay, 2);
+            const size_t ub = gg::type_row_bytes(td, g.ff) / (size_t) nb;
+            epp::View v;
+            int k = 0;
+            while (k < nb && !dparts.view(l.il, 0, epp::kDown, k, v)) ++k;
+            if (k == nb) return refuse(ln + ": covered, but no down part of expert 0");
+            DownParts& d = dpl[li];
+            d.a = v.a, d.b = v.b, d.ub = ub, d.rb = (size_t) (v.b - v.a) * ub;
+            d.at.assign((size_t) l.n_exp, nullptr);
+            for (int e = 0; e < l.n_exp; ++e) {
+                if (!dparts.view(l.il, e, epp::kDown, d.a, v) || v.a != d.a || v.b != d.b || v.type != td || v.rows != (uint32_t) g.dim ||
+                    v.stride != d.rb)
+                    return refuse(ln + " expert " + std::to_string(e) + ": no down part [" + std::to_string(d.a) + ", " +
+                                  std::to_string(d.b) + ") of the layer's type " + std::to_string(td) + " and row layout");
+                d.at[(size_t) e] = v.data;
+            }
+            // (the parts' bytes against the pack's, read through dpart_at as the lane reads them: experts 0 and the last,
+            // the slices from a and from b - 1, every row - an offset or a stride wrong fails the load, not the tokens)
+            const size_t rowb = gg::type_row_bytes(td, g.ff);
+            if (l.mx_file[2] < 0 || (size_t) l.mx_file[2] >= pk.maps.size() || pk.maps[(size_t) l.mx_file[2]].first == nullptr)
+                return refuse(ln + ": its downs are not in a mapped file of the pack (the lane reads no expert in place)");
+            for (int e : {0, l.n_exp - 1})
+                for (int f : {d.a, d.b - 1}) {
+                    const uint8_t* p = dpart_at(d, e, 256 * f);
+                    const uint8_t* q = pk.at(l.mx_file[2], l.mx_off[2] + (uint64_t) e * l.mx_stride[2]) + (size_t) f * ub;
+                    for (int r = 0; r < g.dim; ++r)
+                        if (std::memcmp(p + (size_t) r * d.rb, q + (size_t) r * rowb, (size_t) (d.b - f) * ub) != 0)
+                            return refuse(ln + " expert " + std::to_string(e) + ": the parts' row " + std::to_string(r) +
+                                          " of blocks [" + std::to_string(f) + ", " + std::to_string(d.b) + ") is not the pack's");
+                }
+            ++on;
+            a0 = d.a, b0 = d.b;
+        }
+        if (on == 0) return refuse("it covers none of the i-quant layers of the CPU lane");
+        std::fprintf(stderr, "ds4: DS4_IQ_DOWN_PARTS: %d layers' down slices [%d, %d) (and [k, %d) of them) from %s, rows contiguous "
+                             "(each layer's first and last expert byte for byte the pack's)\n",
+                     on, a0, b0, b0, dir);
+        return true;
+    }
+    // expert e's down rows from n_ff value ff0 (a block's start in [a, b)) in its parts: row 0's, the rows d.rb apart
+    static const uint8_t* dpart_at(const DownParts& d, int e, int ff0) {
+        return d.at[(size_t) e] + (size_t) (ff0 / 256 - d.a) * d.ub;
+    }
+    // the layer's down parts when they serve the slice [ff0, ff0 + ffn) (it ends where they end), else null
+    const DownParts* down_parts(const Layer& l, int ff0, int ffn) const {
+        if (dpl.empty() || l.il < 0 || (size_t) l.il >= dpl.size() || L[(size_t) l.il].il != l.il) return nullptr;
+        const DownParts& d = dpl[(size_t) l.il];
+        return !d.at.empty() && ff0 % 256 == 0 && ff0 / 256 >= d.a && ff0 + ffn == 256 * d.b ? &d : nullptr;
+    }
+    // DS4_IQ_WARM=split (iq_warm_split above), at the end of the load (the server's upload, rx_split's slices and the
+    // parts known): what the CPU lane reads of each of its experts' picks read in and mapped, the most-routed first up
+    // to warm_bytes.  Neither read ahead nor dropped from the page cache (no POSIX_FADV_DONTNEED): a CPU-lane expert's
+    // rows past its layer's slice (its gate / up [k, 9); with the parts the pack's down), and the expert server's experts
+    // (rx_has).  The lane reads those only when it computes a pick's [k, 9), or a pick whole, after all - a late or lost
+    // reply, a pick the send gate keeps here, the link given up - and then they come in by page faults through the same
+    // mapping: from the page cache where something left them, else from the disk (such an expert's first fallback pick
+    // waits for its reads: ~2.9 MB of the pack's down, 1.9 MB of gate / up [6, 9) at k 6 on this pack).  No range of a
+    // CPU-lane expert is one the lane never reads, so none is dropped; the VRAM experts' pages are, as before
+    // (load_experts_mx)
+    void warm_split() {
+        if (!iq_warm_split) return;
+        if (!file_experts || ram_tier || warm_bytes == 0) {
+            std::fprintf(stderr, "ds4: DS4_IQ_WARM=split: nothing read ahead (%s)\n",
+                         !file_experts ? "the CPU lane's experts are not read in place"
+                         : ram_tier    ? "the RAM tier holds the CPU lane's hottest experts"
+                                       : "no RAM to keep them: warm_bytes 0");
+            return;
+        }
+        struct Rg {   // a range of the lane's mapping and where a pread reads it from: the pack's file, or the parts'
+            const uint8_t* p;
+            size_t n;
+            int file;     // (the pack's; -1: the parts', fd)
+            uint64_t off;
+            os::fd_t fd;
+        };
+        struct W {
+            double share;
+            int li, e;
+        };
+        std::vector<W> ws;
+        size_t n_rx = 0;
+        for (const Layer& l : L) {
+            if (l.lay.fmt != gg::kFmtMXFP4) continue;   // (load_experts_mx's layers: a slice on the i-quant ones, whole on the others)
+            bool mapped = true;
+            for (int r = 0; r < 3; ++r)
+                mapped = mapped && l.mx_file[r] >= 0 && (size_t) l.mx_file[r] < pk.maps.size() && pk.maps[(size_t) l.mx_file[r]].first != nullptr;
+            if (!mapped) continue;
+            const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+            double sum = 0;
+            for (int e = 0; e < l.n_exp; ++e) sum += p[e];
+            for (int e = 0; e < l.n_exp; ++e) {
+                if (l.slot[(size_t) e] >= 0 || (!l.ram.empty() && l.ram[(size_t) e] >= 0)) continue;   // (VRAM, a RAM copy)
+                if (!rx_has.empty() && rx_has[(size_t) l.il * g.n_exp + e]) {
+                    ++n_rx;
+                    continue;
+                }
+                ws.push_back({sum > 0 ? p[e] / sum : 0.0, l.il, e});
+            }
+        }
+        std::stable_sort(ws.begin(), ws.end(), [](const W& a, const W& b) { return a.share > b.share; });
+        const auto& pf = dparts.files();
+        auto ranges = [&](const W& w, std::vector<Rg>& out) {
+            const Layer& l = L[(size_t) w.li];
+            const int ff0 = l.ep_ff0, ffn = l.ep_ffn < 0 ? g.ff - ff0 : l.ep_ffn;
+            const uint64_t eo[3] = {l.mx_off[0] + (uint64_t) w.e * l.mx_stride[0], l.mx_off[1] + (uint64_t) w.e * l.mx_stride[1],
+                                    l.mx_off[2] + (uint64_t) w.e * l.mx_stride[2]};
+            for (int r = 0; r < 2; ++r) {
+                const size_t rb = mx_row_b(l, r), o = (size_t) ff0 * rb;
+                out.push_back({pk.at(l.mx_file[r], eo[r]) + o, (size_t) ffn * rb, l.mx_file[r], eo[r] + o, os::kBadFd});
+            }
+            if (const DownParts* d = down_parts(l, ff0, ffn)) {   // (the expert's part whole: its dim rows d->rb apart)
+                const uint8_t* q = d->at[(size_t) w.e];
+                for (const auto& f : pf)
+                    if (f.map != nullptr && q >= f.map && q < f.map + f.bytes) {
+                        out.push_back({q, (size_t) g.dim * d->rb, -1, (uint64_t) (q - f.map), f.fd});
+                        return;
+                    }
+            }
+            out.push_back({pk.at(l.mx_file[2], eo[2]), mx_part_bytes(l, 2), l.mx_file[2], eo[2], os::kBadFd});
+        };
+        // the budget, the most-routed first; the ranges by expert, read side by side by 12 threads
+        std::vector<Rg> rg;
+        double gu = 0, dpb = 0, dwb = 0, b = 0;
+        size_t nw = 0;
+        for (; nw < ws.size(); ++nw) {
+            const size_t at = rg.size();
+            ranges(ws[nw], rg);
+            double eb = 0;
+            for (size_t i = at; i < rg.size(); ++i) eb += (double) rg[i].n;
+            if (b + eb > (double) warm_bytes) {
+                rg.resize(at);
+                break;
+            }
+            b += eb;
+            gu += (double) (rg[at].n + rg[at + 1].n);
+            (rg[at + 2].file < 0 ? dpb : dwb) += (double) rg[at + 2].n;
+        }
+        const double t0 = now_ms();
+        std::atomic<size_t> ri{0};
+        std::atomic<int> no_pop{0};
+        std::atomic<long long> by_read{0}, failed{0};
+        std::vector<std::thread> th;
+        for (int t = 0; t < 12 && !rg.empty(); ++t)
+            th.emplace_back([&] {
+                std::vector<uint8_t> buf;
+                for (size_t i; (i = ri.fetch_add(1)) < rg.size();) {
+                    const Rg& x = rg[i];
+                    if (no_pop.load(std::memory_order_relaxed) == 0) {
+                        const int r = os::populate(x.p, x.n);
+                        if (r == 1) continue;
+                        if (r == 0) no_pop.store(1, std::memory_order_relaxed);   // (not had here: pread from now on)
+                    }
+                    // (pread: the page cache filled, the page tables not - the lane's first read of a page faults)
+                    if (buf.size() < x.n) buf.resize(x.n);
+                    const bool ok = x.file >= 0 ? pk.read_at(x.file, x.off, x.n, buf.data()) : os::pread_full(x.fd, buf.data(), x.n, x.off);
+                    by_read.fetch_add(1);
+                    if (!ok) failed.fetch_add(1);
+                }
+            });
+        for (auto& t : th) t.join();
+        std::string how = no_pop.load() ? "read by pread (MADV_POPULATE_READ not had here): in the page cache, not mapped"
+                                         : "read in and mapped (MADV_POPULATE_READ)";
+        if (!no_pop.load() && by_read.load() > 0)
+            how += ", " + std::to_string(by_read.load()) + " ranges by pread after it failed on them (not mapped)";
+        if (failed.load() > 0) how += "; " + std::to_string(failed.load()) + " reads failed (those ranges left to the lane's faults)";
+        std::fprintf(stderr, "ds4: DS4_IQ_WARM=split: %zu of the CPU lane's experts read ahead in %.1f s (%.1f GB: the gate / up "
+                             "of their slices %.1f GB, downs %.1f GB from the parts and %.1f GB the pack's whole ones) - %s; "
+                             "left out: %zu past warm_bytes (%.1f GB), the expert server's %zu, and each one's rows past its "
+                             "slice (read only by the lane's fallback: neither read ahead nor dropped)\n",
+                     nw, (now_ms() - t0) / 1000.0, b / 1e9, gu / 1e9, dpb / 1e9, dwb / 1e9, how.c_str(), ws.size() - nw,
+                     warm_bytes / 1e9, n_rx);
+    }
     bool ep_slices_ok(std::string& err) const {
         if (!rx_slices_ok(err)) return false;
         for (const Layer& l : L)
@@ -2241,10 +2502,56 @@ struct Model::Impl {
         devs.resize(ids.size());
         u9::mask();       // (both print their state at load)
         attn_split();
+        // DS4_CUDA_SYNC=spin|yield|block: how this process's host threads wait on its GPUs (cudaStreamSynchronize and the
+        // like: a decode token's two - the head's, then sample()'s short one; the layers do not wait on the host, their
+        // routing goes through mapped memory the service thread polls). Unset: the driver's default,
+        // auto, which spins while the process's contexts are fewer than the CPUs - here the head's wait spins its whole
+        // time (Stats::head_cpu_ms), a busy thread on a CPU no one pinned it to, likely a lane core's sibling (the
+        // lane-bench's :spin=, slot-20261025T1948Z). block sleeps in the driver until the GPU's interrupt: the wait's CPU
+        // free, its return later by the wake-up (measured on an RTX 3070, Windows: +43 us a wait, the thread's cycles
+        // 0.1 M against spin's 6 M over 2 ms). yield spins too, giving the CPU to a ready thread between its polls. The
+        // flags are the primary context's (cudaInitDevice, CUDA 12+), read back after; not on HIP. The fill thread
+        // (ds4_rx_fill_link.cpp) has no switch: it does not spin (Conn spin_ms 0 - a poll() wait -, sleep_for between
+        // its pieces)
+        unsigned sched = 0;
+        const char* sync_env = std::getenv("DS4_CUDA_SYNC");
+        if (sync_env != nullptr) {
+            const std::string v = sync_env;
+            sched = v == "spin" ? cudaDeviceScheduleSpin : v == "yield" ? cudaDeviceScheduleYield
+                                                         : v == "block" ? cudaDeviceScheduleBlockingSync : 0u;
+            if (sched == 0) {
+                err = "DS4_CUDA_SYNC=" + v + ": spin, yield, block or unset";
+                return false;
+            }
+#if defined(STRATA_USE_HIP)
+            err = "DS4_CUDA_SYNC: CUDA only";
+            return false;
+#endif
+        }
         for (size_t i = 0; i < ids.size(); ++i) {
             Dev& d = devs[i];
             d.id = ids[i];
+#if !defined(STRATA_USE_HIP)
+            // (cudaInitDeviceFlagsAreValid: without it the call ignores sched and returns success - measured on CUDA 13)
+            if (sched != 0) CK(cudaInitDevice(d.id, sched, cudaInitDeviceFlagsAreValid));
+#endif
             CK(cudaSetDevice(d.id));
+#if !defined(STRATA_USE_HIP)
+            if (sched != 0) {
+                unsigned f = 0;
+                CK(cudaGetDeviceFlags(&f));
+                if ((f & cudaDeviceScheduleMask) != sched) {
+                    err = "DS4_CUDA_SYNC=" + std::string(sync_env) + ": CUDA" + std::to_string(d.id) + "'s flags are " +
+                          std::to_string(f) + ": the schedule was not applied";
+                    return false;
+                }
+                std::fprintf(stderr, "ds4: DS4_CUDA_SYNC=%s: CUDA%d's host waits %s (device flags 0x%x)\n", sync_env, d.id,
+                             sched == cudaDeviceScheduleSpin    ? "spin"
+                             : sched == cudaDeviceScheduleYield ? "spin, yielding the CPU between polls"
+                                                                : "block until the GPU's interrupt",
+                             f);
+            }
+#endif
             CK(cudaStreamCreateWithFlags(&d.st, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming));
             if (!x3::prepare(d.st) || (pk.gguf && !gg::prepare(d.st))) {
@@ -3100,6 +3407,10 @@ struct Model::Impl {
             c_yd.resize(S * E);
         }
         // the experts: VRAM slots in what each device has left, the rest on the host
+        if (iq_warm_env != nullptr && *iq_warm_env != '\0' && !iq_warm_split) {
+            err = std::string("DS4_IQ_WARM=") + iq_warm_env + ": split or unset";
+            return false;
+        }
         if (!place_experts(err)) return false;
         if (!load_experts(err)) return false;
         if (pk.gguf) make_pools();
@@ -3254,6 +3565,8 @@ struct Model::Impl {
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
         if (!ep_slices_ok(err)) return false;
+        if (!init_down_parts(err)) return false;
+        warm_split();
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         // U9 hc's side stream and events, made last: the plan, the read-ahead, the placement and the load's report all
         // read the free VRAM before them, as the old path's do
@@ -4615,8 +4928,8 @@ struct Model::Impl {
                              (now_ms() - t0) / 1000.0);
             return true;
         }
-        size_t nw = 0;
-        for (double b = 0; nw < warm.size() && b + (double) L[(size_t) warm[nw].layer].blob <= (double) warm_bytes; ++nw)
+        size_t nw = 0;   // (DS4_IQ_WARM=split: none here - warm_split, after the upload)
+        for (double b = 0; !iq_warm_split && nw < warm.size() && b + (double) L[(size_t) warm[nw].layer].blob <= (double) warm_bytes; ++nw)
             b += (double) L[(size_t) warm[nw].layer].blob;
         std::atomic<size_t> wi{0};
         std::vector<std::thread> wt;
@@ -5155,6 +5468,15 @@ struct Model::Impl {
             for (auto& p : pools) nthr += p->size();
             std::fprintf(stderr, "ds4: CPU lane: %d threads, MXFP4 rows %s (%s)\n", nthr, gg::mx_tier_name(gg::mx_tier()),
                          gg::mx_tier_report());
+            if (lane_prof)
+                std::fprintf(stderr, "ds4: DS4_LANE_PROF=1: the i-quant CPU lane's phases timed (%d threads)\n", cpu_threads());
+            if (iq_pf == 0) std::fprintf(stderr, "ds4: DS4_IQ_PF=0: the i-quant CPU lane's WILLNEED hints off\n");
+            else if (iq_pf == 1) std::fprintf(stderr, "ds4: DS4_IQ_PF=1: the i-quant CPU lane's WILLNEED hints on every range\n");
+            else if (iq_pf > 1)
+                std::fprintf(stderr, "ds4: DS4_IQ_PF=%d: the i-quant CPU lane's WILLNEED hints only on an expert the layer's "
+                                     "last %d calls did not take\n", iq_pf, iq_pf);
+            if (lane_tr != nullptr)
+                std::fprintf(stderr, "ds4: DS4_LANE_TRACE=%s: the i-quant CPU lane's calls written there\n", std::getenv("DS4_LANE_TRACE"));
         }
     }
 
@@ -6017,6 +6339,28 @@ struct Model::Impl {
         pools[0]->help();
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
     }
+    // (DS4_LANE_PROF) run_nodes timed: its wall time, its tail (the caller's wait once it ran out of jobs: the
+    // barrier's wait for the slowest worker's last job) and its jobs' time in all (busy), each added to its own
+    void run_nodes_prof(int n, const std::function<void(int)>* f, double& wall, double& tail, double& busy) {
+        std::atomic<int64_t> ns{0};
+        std::function<void(int)> g[4];
+        for (int X = 0; X < NH; ++X)
+            g[X] = [&, X](int j) {
+                const auto a = std::chrono::steady_clock::now();
+                f[X](j);
+                ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - a).count(),
+                             std::memory_order_relaxed);
+            };
+        const double t0 = now_ms();
+        for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, g[X]);
+        pools[0]->help();
+        const double th = now_ms();
+        for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
+        const double t1 = now_ms();
+        wall += t1 - t0;
+        tail += t1 - th;
+        busy += (double) ns.load(std::memory_order_relaxed) / 1e6;
+    }
 
     // a GGUF's MXFP4 experts on the CPU lane, read from the file's mapping or their copy in RAM (mx_part_ptr): each
     // node its rows of every matrix - the gate / up rows [X n_ff / NH, ..) of each entry (the swiglu into its h row),
@@ -6115,6 +6459,35 @@ struct Model::Impl {
             };
         run_nodes(ne * DB, f);
     }
+    // (DS4_IQ_PF > 1) the layer's call count, this call's; and whether expert e was not taken in the layer's last iq_pf
+    // calls (never, or longer ago), marked taken now - a layer past the counts' size: always
+    uint32_t pf_tick(const Layer& l) {
+        if (pf_calls.empty()) {
+            for (const Layer& x : L) pf_ne = std::max(pf_ne, (size_t) std::max(0, x.n_exp));
+            pf_calls.assign(L.size(), 0);
+            pf_seen.assign(L.size() * pf_ne, 0);
+        }
+        return l.il >= 0 && (size_t) l.il < pf_calls.size() ? ++pf_calls[(size_t) l.il] : 0;
+    }
+    bool pf_stale(const Layer& l, int e, uint32_t tick) {
+        if (tick == 0 || e < 0 || (size_t) e >= pf_ne) return true;
+        uint32_t& s = pf_seen[(size_t) l.il * pf_ne + (size_t) e];
+        const bool stale = s == 0 || tick - s > (uint32_t) iq_pf;
+        s = tick;
+        return stale;
+    }
+    // (DS4_LANE_TRACE) the call's record
+    void lane_trace(const Layer& l, const std::vector<Ent>& ents, int ff0, int ffn) {
+        const uint8_t hd[4] = {(uint8_t) l.il, (uint8_t) (ff0 / 256), (uint8_t) ((ff0 + ffn) / 256), (uint8_t) std::min<size_t>(255, ents.size())};
+        std::fwrite(hd, 1, 4, lane_tr);
+        for (size_t i = 0; i < (size_t) hd[3]; ++i) {
+            const int16_t e = (int16_t) ents[i].e;
+            const uint8_t n = (uint8_t) std::min(255, ents[i].n);
+            std::fwrite(&e, 2, 1, lane_tr);
+            std::fwrite(&n, 1, 1, lane_tr);
+        }
+        if (++lane_tr_n % 4096 == 0) std::fflush(lane_tr);
+    }
     // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
     // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same.
     // Over the n_ff slice [ff0, ff0 + ffn) (cpu_experts' caller's: the whole n_ff, or a split pick's share - H',
@@ -6156,20 +6529,48 @@ struct Model::Impl {
             return;
         }
         const float lim = g.lim;
-        {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
+        if (lane_tr != nullptr) {   // (a record a slice)
+            if (ns == 1) {
+                lane_trace(l, ents, ff0, ffn);
+            } else {
+                lane_trace(l, std::vector<Ent>(ents.begin(), ents.begin() + na), ff0, ffn);
+                lane_trace(l, std::vector<Ent>(ents.begin() + na, ents.end()), sb.ff0, sb.ffn);
+            }
+        }
+        const gg::IqCpu* fd[2] = {sliced[0] ? &fs[0] : &fm, sliced[1] ? &fs[1] : &fm};
+        // (DS4_IQ_DOWN_PARTS) the entries' down rows from the parts, contiguous - an expert read from the files only (a
+        // RAM-tier copy or the store keeps the pack's layout): dpart(e, s) its slice's row 0, fp the rows' stride - each
+        // slice's own (the parts serve a slice that ends where they end: the cut W picks' [0, cut) takes the pack's)
+        const DownParts* dp[2] = {nullptr, nullptr};
+        gg::IqCpu fp[2] = {*fd[0], *fd[1]};
+        for (int s = 0; s < ns; ++s) {
+            dp[s] = store ? nullptr : down_parts(l, rf0[s], rfn[s]);
+            if (dp[s] != nullptr) fp[s].d_stride = dp[s]->rb;
+        }
+        auto dpart = [&](int e, int s) -> const uint8_t* {
+            return dp[s] != nullptr && (l.ram.empty() || l.ram[(size_t) e] < 0) ? dpart_at(*dp[s], e, rf0[s]) : nullptr;
+        };
+        const double tp0 = lane_prof ? now_ms() : 0.0;   // (DS4_LANE_PROF: the prefetch and the x quant from here)
+        if (iq_pf != 0) {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
             // range, ~0.13 ms an IQ2_XXS expert, on the lane's critical path before the first entry computes.
             // off by default (the mmap path, owner PC: not faster in every pair); DS4_IQ_PF_COLD=1 turns it on)
+            const uint32_t tick = iq_pf > 1 ? pf_tick(l) : 0;
             std::vector<std::pair<const void*, size_t>> want;
             for (int q = 0; q < ne; ++q) {
                 const Ent& en = ents[(size_t) q];
                 const int s = set_of(q);
-                if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
-                    for (int r = 0; r < 3; ++r)   // (a slice's gate / up rows; the down's rows hold every slice)
+                if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0) && (iq_pf <= 1 || pf_stale(l, en.e, tick)))
+                    for (int r = 0; r < 3; ++r) {   // (a slice's gate / up rows; the down's rows hold every slice)
+                        if (r == 2 && dpart(en.e, s) != nullptr) {   // (the parts' rows of the slice)
+                            want.push_back({dpart(en.e, s), (size_t) (E - 1) * dp[s]->rb + fd[s]->d_row});
+                            continue;
+                        }
                         want.push_back({mx_mat(l, en.e, r) + (r < 2 ? (size_t) rf0[s] * mx_row_b(l, r) : 0),
                                         r < 2 ? (size_t) rfn[s] * mx_row_b(l, r) : mx_part_bytes(l, r)});
+                    }
             }
             static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
-            if (pf_all) os::prefetch(want);
+            if (pf_all || iq_pf > 0) os::prefetch(want);
             else os::prefetch_cold(want);
         }
         // the activations in c_xh's bytes, E 4 apart: token t's (t < kWin) at row t - quantized once, whatever number of
@@ -6190,48 +6591,66 @@ struct Model::Impl {
                     gg::iq_cpu_quant(fm.gu_act, x + (size_t) t * ldx, E, x_act(en, i));
                 }
         }
-        // the gate / up jobs: the first na entries' GB[0] each, then the others' GB[1]
-        const int ja = na * GB[0];
-        std::function<void(int)> f[4];
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const int s = j < ja ? 0 : 1, jj = s == 0 ? j : j - ja;
-                const Ent& en = ents[(size_t) ent_at(s == 0 ? jj / GB[0] : na + jj / GB[1])];
-                const int r0 = glo[s][X] + (jj % GB[s]) * RB, r1 = std::min(ghi[s][X], r0 + RB);
-                if (r0 >= r1) return;   // (a node with fewer of the slice's rows)
-                const void* ap[kEntMax];
-                float* hp[kEntMax];
-                for (int i = 0; i < en.n; ++i) {
-                    ap[i] = x_act(en, i);
-                    hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;   // (part X's rows of h)
-                }
-                // (part X's rows, from where they are: a copy's part on node X, or the file's - whole rows, so any
-                // block size of the type)
-                gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
-                                   r0 - X * FFh, r1 - X * FFh, lim);
-            };
-        run_nodes(ja + (ne - na) * GB[1], f);
-        for (int q = 0; q < ne; ++q) {
+        if (lane_prof) {
+            st.lp_prep_ms += now_ms() - tp0;
+            ++st.lp_calls;
+            st.lp_threads = cpu_threads();
+        }
+        // the jobs: the i-th entry computed's (ent_at) gate / up band b of part X, its h quantized, its down band b of
+        // part X - the first na entries' GB[0] gate / up bands each, then the others' GB[1]
+        const int ja = na * GB[0], jg = ja + (ne - na) * GB[1];
+        auto gu_job = [&](int X, int j) {
+            const int s = j < ja ? 0 : 1, jj = s == 0 ? j : j - ja;
+            const Ent& en = ents[(size_t) ent_at(s == 0 ? jj / GB[0] : na + jj / GB[1])];
+            const int r0 = glo[s][X] + (jj % GB[s]) * RB, r1 = std::min(ghi[s][X], r0 + RB);
+            if (r0 >= r1) return;   // (a node with fewer of the slice's rows)
+            const void* ap[kEntMax];
+            float* hp[kEntMax];
+            for (int i = 0; i < en.n; ++i) {
+                ap[i] = x_act(en, i);
+                hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;   // (part X's rows of h)
+            }
+            // (part X's rows, from where they are: a copy's part on node X, or the file's - whole rows, so any
+            // block size of the type)
+            gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
+                               r0 - X * FFh, r1 - X * FFh, lim);
+        };
+        auto h_quant = [&](int q) {
             const Ent& en = ents[(size_t) q];
             const int s = set_of(q);
             for (int i = 0; i < en.n; ++i)
                 gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF + rf0[s], rfn[s],
                                  aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+        };
+        auto dn_job = [&](int X, int i, int b) {
+            const int q = ent_at(i), s = set_of(q);
+            const Ent& en = ents[(size_t) q];
+            const int r0 = X * Eh + b * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
+            const void* hp[kEntMax];
+            float* yp[kEntMax];
+            for (int k = 0; k < en.n; ++k) {
+                hp[k] = aq + (size_t) (kWin + en.slot0 + k) * E * 4;
+                yp[k] = c_yd.data() + (size_t) (en.slot0 + k) * E + (size_t) X * Eh;   // (part X's rows of it)
+            }
+            if (const uint8_t* p = dpart(en.e, s))   // (the parts' rows: part X's from row X Eh)
+                gg::iq_cpu_down(fp[s], p + (size_t) (X * Eh) * dp[s]->rb, hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+            else
+                gg::iq_cpu_down(*fd[s], mx_part_ptr(l, en.e, 2, X) + d_off[s], hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+        };
+        std::function<void(int)> f[4];
+        for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { gu_job(X, j); };
+        if (lane_prof) {   // (DS4_LANE_PROF: the same calls, timed)
+            run_nodes_prof(jg, f, st.lp_gu_ms, st.lp_gu_tail_ms, st.lp_gu_busy_ms);
+            const double th = now_ms();
+            for (int q = 0; q < ne; ++q) h_quant(q);
+            st.lp_hq_ms += now_ms() - th;
+            for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { dn_job(X, j / DB, j % DB); };
+            run_nodes_prof(ne * DB, f, st.lp_dn_ms, st.lp_dn_tail_ms, st.lp_dn_busy_ms);
+            return;
         }
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const int q = ent_at(j / DB), s = set_of(q);
-                const Ent& en = ents[(size_t) q];
-                const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
-                const void* hp[kEntMax];
-                float* yp[kEntMax];
-                for (int i = 0; i < en.n; ++i) {
-                    hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
-                    yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
-                }
-                gg::iq_cpu_down(sliced[s] ? fs[s] : fm, mx_part_ptr(l, en.e, 2, X) + d_off[s], hp, en.n, yp, r0 - X * Eh,
-                                r1 - X * Eh);
-            };
+        run_nodes(jg, f);
+        for (int q = 0; q < ne; ++q) h_quant(q);
+        for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { dn_job(X, j / DB, j % DB); };
         run_nodes(ne * DB, f);
     }
 
@@ -7807,6 +8226,8 @@ struct Model::Impl {
         auto last = std::chrono::steady_clock::now();
         bool napped = false;
         std::vector<Ent> ents;
+        double lp_ans = 0.0;   // (DS4_LANE_PROF: the last answer's time and its layer)
+        int lp_li = -1;
         while (!quit.load(std::memory_order_relaxed)) {
             Req& r = reqs[next % kRing];
             if (*(volatile unsigned*) &r.seq != next) {
@@ -7828,6 +8249,8 @@ struct Model::Impl {
             napped = false;
             std::atomic_thread_fence(std::memory_order_acquire);
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
+            const double lp_req = lane_prof ? now_ms() : 0.0;
+            if (lane_prof && lp_ans > 0.0) (li == lp_li + 1 ? st.lp_wait_ms : st.lp_gap_ms) += lp_req - lp_ans;
             const bool ep = ep_of[next % kRing];   // (written before the request's launch: ep_of)
             Resp& rp = resps[next % kRing];
             const int T = std::max(1, std::min(kWin, r.T));
@@ -8063,6 +8486,7 @@ struct Model::Impl {
                 double bal_mb = 0.0;   // (this lane's bytes of the request: the balance's sample)
                 if (!ents.empty()) {
                     const double tc = now_ms();
+                    if (lane_prof) st.lp_plan_ms += tc - lp_req;
                     int ff0, ffn, wf0 = 0, wfn = 0;
                     rx::ff_range(mr, rx_nb, g.ff, ff0, ffn);
                     FfSplit wsb;
@@ -8080,6 +8504,7 @@ struct Model::Impl {
                         ++st.rx_cut_chk;
                         if (std::memcmp(y1.data(), c_yd.data(), (size_t) nslots * D * sizeof(float)) != 0) ++st.rx_cut_bad;
                     }
+                    const double ta = lane_prof ? now_ms() : 0.0;
                     const int D = g.dim;
                     for (int t = 0; t < T; ++t) {
                         bool any = false;
@@ -8094,6 +8519,7 @@ struct Model::Impl {
                         }
                         rp.cpu[t] = 1;
                     }
+                    if (lane_prof) st.lp_add_ms += now_ms() - ta;
                     const double tl = now_ms() - tc;
                     st.cpu_ms += tl;
                     if (T == 1 && sp.sent) {   // (by the request's CPU-lane picks: the lane's part at the same count)
@@ -8114,10 +8540,18 @@ struct Model::Impl {
                                          (double) std::max(1, rx_nb);
                     if (rx_on && whole > 0) rx_gate.pick_seen(T, tl / whole);
                 }
-                if (sp.sent) rx_finish(l, r, rp, T, next, rx_t0, rpicks, spicks, sp, wpicks, bal_mb, wcut);
+                if (sp.sent) {
+                    const double tr = lane_prof ? now_ms() : 0.0;
+                    rx_finish(l, r, rp, T, next, rx_t0, rpicks, spicks, sp, wpicks, bal_mb, wcut);
+                    if (lane_prof) st.lp_rx_ms += now_ms() - tr;
+                }
             }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;
+            if (lane_prof) {
+                lp_ans = now_ms();
+                lp_li = li;
+            }
             ++next;
             last = std::chrono::steady_clock::now();
         }
@@ -10049,9 +10483,7 @@ struct Model::Impl {
         eg_stats();
         Dev& d = devs[(size_t) head_dev];
         cudaSetDevice(d.id);
-        const double th = now_ms();
-        CK(cudaStreamSynchronize(d.st));
-        st.head_ms += now_ms() - th;
+        if (!head_wait(d.st, err)) return false;
         if (prof_chunk) {   // DS4_PROF: the run's GPU time by stage, every device's summed
             for (Dev& dv : devs) {
                 cudaSetDevice(dv.id);
@@ -10449,9 +10881,7 @@ struct Model::Impl {
         eg_stats();
         Dev& d = devs[(size_t) head_dev];
         cudaSetDevice(d.id);
-        const double th = now_ms();
-        CK(cudaStreamSynchronize(d.st));
-        st.head_ms += now_ms() - th;
+        if (!head_wait(d.st, err)) return false;
         if (ep_verify) {   // (the window's checks are in: its stream is done)
             CK(cudaMemcpy(st.ep_verify, v_err, sizeof(float) * (size_t) std::min(g.nl, 64), cudaMemcpyDeviceToHost));
             st.ep_verify_wrong = v_wrong;

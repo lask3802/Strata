@@ -36,6 +36,8 @@ expert is its parts in both (ds4_epparts.hpp assembles it back, byte for byte). 
   ep_parts.py PACK OUT --verify             re-read the index and the pack: every part, every whole expert, byte-exact
   ep_parts.py PACK OUT --pool-only --pool-gb 16   the pool's [0, 6) alone, a second index beside a worker's [6, 9)
                                             cut before (the expert server's DS4_RX_POOL=OUT, EP U5c)
+  ep_parts.py PACK OUT --down-only 0:6      one set of the down matrices alone, their [0, 6) of every expert (the main's
+                                            CPU lane: DS4_IQ_DOWN_PARTS=OUT reads its down slice there, rows contiguous)
 """
 import argparse
 import glob
@@ -277,14 +279,14 @@ class Entry:
         self.nbytes = rows * row_bytes
 
 
-def plan_set(pack, file, a, b, experts):
+def plan_set(pack, file, a, b, experts, kinds=(0, 1, 2)):
     """Where each part of the set [a, b) lands: ([Entry], file bytes).  The first page of a file is its header; the
-    writer and --dry-run share this."""
+    writer and --dry-run share this.  kinds: the matrices a set holds of each expert (--down-only: the down alone)."""
     if not (0 <= a < b <= pack.nb):
         raise ValueError("a set [%d, %d) is not inside [0, %d)" % (a, b, pack.nb))
     out, pos = [], HEADER
     for l, e in experts:
-        for kind in range(3):
+        for kind in kinds:
             m = pack.matrix(l, kind)
             rows, rb = m.part_shape(a, b)
             pos = align_up(pos)
@@ -384,23 +386,25 @@ def leftover_parts(out_dir, names):
 
 
 def write_parts(pack, out_dir, sets, order, log=None, nonce=None):
-    """sets: [(a, b, [(layer, expert)...])] (each in heat order).  Writes the files and the index; returns the entries.
+    """sets: [(a, b, [(layer, expert)...])] (each in heat order), or (a, b, experts, kinds) for a set of some matrices
+    only (--down-only: (2,)).  Writes the files and the index; returns the entries.
     Everything goes to .tmp names first (flushed to disk) and is renamed at the end, the index last: a reader that has a
     file mapped keeps the old bytes, and a run that stops half way leaves no index that matches the new files (the
     stamp says so, and the nonce keeps two runs' stamps apart whatever their weights).  Part files of an earlier run
     that this index does not name are left where they are and reported through `log`.  `nonce` is for tests."""
     os.makedirs(out_dir, exist_ok=True)
     phash = pack_hash(pack.dir)
-    names = [set_file_name(a, b) for a, b, _ in sets]
+    names = [set_file_name(s[0], s[1]) for s in sets]
     if len(set(names)) != len(names):
         raise ValueError("two sets with the same range")
     all_entries, file_info, plans = [], [], []
-    for fi, (a, b, experts) in enumerate(sets):
-        entries, size = plan_set(pack, fi, a, b, experts)
+    for fi, s in enumerate(sets):
+        a, b, experts = s[:3]
+        entries, size = plan_set(pack, fi, a, b, experts, s[3] if len(s) > 3 else (0, 1, 2))
         plans.append((a, b, entries, size))
         all_entries.extend(entries)
         file_info.append((names[fi], a, b, size))
-    held = {x for _, _, experts in sets for x in experts}
+    held = {x for s in sets for x in s[2]}
     listed = [(l, e, c) for l, e, c in order if (l, e) in held]     # the heat lines: every expert of any set
     lines = index_lines(pack, phash, file_info, all_entries, listed, secrets.randbits(64) if nonce is None else nonce)
     stamp = stamp_of(lines)
@@ -575,7 +579,7 @@ def verify(pack, out_dir, layers, log=print):
             if l not in layers:
                 continue
             for kind in range(3):
-                for p in ix.parts[(l, e, kind)]:
+                for p in ix.parts.get((l, e, kind), []):   # (a --down-only set has no gate / up parts)
                     n_parts += 1
                     if ix.read(p) != read_part(pack, l, e, kind, p.a, p.b):
                         log("FAIL part layer %d expert %d %s [%d,%d)" % (l, e, KINDS[kind], p.a, p.b))
@@ -690,6 +694,10 @@ def main(argv=None):
     ap.add_argument("--pool-only", action="store_true",
                     help="write the pool's set alone (no worker set, --tail ignored): an index beside a worker's parts "
                          "cut before, the expert server's DS4_RX_POOL (the hybrid, EP U5c)")
+    ap.add_argument("--down-only", metavar="A:B",
+                    help="one set instead of --tail / --pool: the down matrices' blocks [A, B) of every expert of --layers, "
+                         "rows back to back (the main's CPU lane reads its [0, k) of the down contiguous: in place in the "
+                         "pack each row's [0, k) is strided, and the prefetchers read the rest of the row as well)")
     ap.add_argument("--layers", default="all", help="layers to write, e.g. 3 or 0-9,12 (default all)")
     ap.add_argument("--profile", help="expert profile (default PACK/expert-profile.bin; 'none': index order)")
     ap.add_argument("--rank", choices=("per-byte", "count"), default="per-byte", help="heat order key (default per-byte)")
@@ -710,7 +718,11 @@ def run(ap, args, pack):
         layers = parse_layers(args.layers, pack.nl)
         tail = None if args.tail == "none" or args.pool_only else parse_range(args.tail, pack.nb)
         pool = parse_range(args.pool, pack.nb)
-        check_complementary(tail, pool, pack.nb, args.pool_only)
+        down = parse_range(args.down_only, pack.nb) if args.down_only else None
+        if down is not None and args.pool_only:
+            raise ValueError("--down-only and --pool-only: one set each run")
+        if down is None:
+            check_complementary(tail, pool, pack.nb, args.pool_only)
     except (argparse.ArgumentTypeError, ValueError) as ex:
         ap.error(str(ex))
     profile_path = args.profile if args.profile else os.path.join(args.pack, "expert-profile.bin")
@@ -722,6 +734,18 @@ def run(ap, args, pack):
     if profile is None:
         print("warning: no expert profile at %s: the heat order is (layer, expert)" % profile_path, file=sys.stderr)
     order = heat_order(pack, profile, layers, args.rank)
+    if down is not None:
+        allx = [(l, e) for l, e, _ in order]
+        size = plan_set(pack, 0, down[0], down[1], allx, (2,))[1]
+        if args.dry_run:
+            print("down-only [%d,%d) of all %d experts of %d layers: %s, %.2f GB (%.2f MB an expert)" %
+                  (down[0], down[1], len(allx), len(layers), set_file_name(*down), size / GB, size / len(allx) / 1e6))
+            return 0
+        if not args.out:
+            ap.error("OUT is needed (or --dry-run)")
+        entries = write_parts(pack, args.out, [(down[0], down[1], allx, (2,))], order, log=lambda s: print(s, file=sys.stderr))
+        print("wrote %d down parts [%d,%d) to %s" % (len(entries), down[0], down[1], args.out))
+        return 0
     pool_n = args.pool_experts
     pool_gb = None if pool_n is not None else args.pool_gb
     if args.dry_run:

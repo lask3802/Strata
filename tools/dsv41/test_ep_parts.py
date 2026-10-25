@@ -573,9 +573,36 @@ class Cli(Base):
         self.assertEqual([f[0] for f in ix.files], ["ep-parts-0-9.bin"])
         self.assertTrue(all(ix.whole(1, e) for _, e, _ in ix.heat))
 
+    def test_down_only_writes_the_down_slices_alone_and_verifies(self):
+        old, sys.stdout = sys.stdout, io.StringIO()
+        try:
+            self.assertEqual(ep.main([self.pack_dir, "--down-only", "0:6", "--layers", "0-2", "--dry-run"]), 0)
+            self.assertEqual(ep.main([self.pack_dir, self.out, "--down-only", "0:6", "--layers", "0-2"]), 0)
+            self.assertEqual(ep.main([self.pack_dir, self.out, "--verify", "--layers", "0-2"]), 0)
+            text = sys.stdout.getvalue()
+        finally:
+            sys.stdout = old
+        self.assertIn("down-only [0,6) of all 18 experts of 3 layers: ep-parts-0-6.bin", text)
+        self.assertIn("wrote 18 down parts [0,6)", text)
+        self.assertIn("verify: 18 parts compared, 0 whole experts assembled, 0 problems", text)
+        ix = ep.PartsIndex(self.out)
+        self.addCleanup(ix.close)
+        self.assertEqual({k[2] for k in ix.parts}, {2})
+        for (l, e, kind), ps in ix.parts.items():
+            self.assertEqual(len(ps), 1)
+            m = self.pack.matrix(l, kind)
+            self.assertEqual((ps[0].a, ps[0].b, ps[0].rows, ps[0].row_bytes), (0, 6, DIM, 6 * m.unit_bytes))
+            self.assertEqual(ix.read(ps[0]), naive_cut(m, self.orig[(l, e, kind)], 0, 6))
+            self.assertFalse(ix.whole(l, e))
+        # (the size --dry-run printed is the file's)
+        size = os.path.getsize(os.path.join(self.out, "ep-parts-0-6.bin"))
+        self.assertIn("%.2f GB" % (size / ep.GB), text)
+
     def test_bad_arguments(self):
         with self.assertRaises(SystemExit):
             ep.main([self.pack_dir, "--tail", "6:12", "--dry-run"])
+        with self.assertRaises(SystemExit):
+            ep.main([self.pack_dir, "--down-only", "6:12", "--dry-run"])
         with self.assertRaises(SystemExit):
             ep.main([self.pack_dir])
 
