@@ -1990,6 +1990,10 @@ int main(int argc, char** argv) {
                          "head wait %.2f, Engram reads %.2f\n",
                  (s.layer_ms - s0.layer_ms) / nt, (s.gpu_wait_ms - s0.gpu_wait_ms) / nt, (s.cpu_ms - s0.cpu_ms) / nt,
                  (s.head_ms - s0.head_ms) / nt, (s.engram_ms - s0.engram_ms) / nt);
+    if (s.lane_bytes > s0.lane_bytes)   // (the lane's effective rate: H' reads [0, k) of each split pick's rows in place)
+        std::fprintf(stderr, "decode CPU lane reads: %.1f MB a token of its experts' bytes, %.1f GB/s over its %.2f ms\n",
+                     (s.lane_bytes - s0.lane_bytes) / nt / 1e6,
+                     (s.lane_bytes - s0.lane_bytes) / 1e6 / std::max(1e-3, s.cpu_ms - s0.cpu_ms), (s.cpu_ms - s0.cpu_ms) / nt);
     std::fprintf(stderr, "%s", m.rx_lines(s0, nt).c_str());   // (--remote-experts)
     if (s.eg_rows > s0.eg_rows) {   // the Engram rows: how many the row cache served, the reads' time behind the layers
         const double rows = (double) (s.eg_rows - s0.eg_rows);

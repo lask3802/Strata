@@ -7688,6 +7688,7 @@ struct Model::Impl {
                     }
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
+                    st.lane_bytes += (double) ents.size() * (double) l.blob * (double) (ff1 - ff0) / (double) g.ff;
                     // (a pick's time whole: the slices computed [0, k) of nb blocks)
                     const double whole = (double) nslots * (double) (mr.b1 - mr.b0) / (double) std::max(1, rx_nb);
                     if (rx_on && whole > 0) rx_gate.pick_seen(T, (now_ms() - tc) / whole);

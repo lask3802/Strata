@@ -97,6 +97,7 @@ struct Stats {
     int64_t tokens = 0;
     int64_t experts = 0, cpu_experts = 0;   // routed experts run, and how many of them on the CPU lane
     double cpu_ms = 0.0, gpu_wait_ms = 0.0;   // the CPU lane's time; the host's waits for the routing
+    double lane_bytes = 0.0;   // the expert bytes that time read (an entry its blob, a slice's share of it: H')
     double layer_ms = 0.0, head_ms = 0.0, engram_ms = 0.0;   // the layers' host time in all; the head's wait; Engram reads
     int64_t eg_rows = 0, eg_hits = 0, eg_reads = 0;   // Engram rows asked for, served without a read, read from the files
     double eg_io_ms = 0.0;                            // the windows' Engram reads, issue to last done (mostly hidden)
