@@ -45,6 +45,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,6 +87,25 @@ double now_ms() {
 }
 
 size_t align256(size_t n) { return (n + 255) & ~(size_t) 255; }
+
+// printf onto the end of `out`, as long as it comes out (a stats line: no fixed buffer to cut it)
+#if defined(__GNUC__)
+__attribute__((format(printf, 2, 3)))
+#endif
+void add_f(std::string& out, const char* f, ...) {
+    va_list a, a2;
+    va_start(a, f);
+    va_copy(a2, a);
+    const int n = std::vsnprintf(nullptr, 0, f, a);
+    va_end(a);
+    if (n > 0) {
+        const size_t at = out.size();
+        out.resize(at + (size_t) n + 1);
+        std::vsnprintf(&out[at], (size_t) n + 1, f, a2);
+        out.resize(at + (size_t) n);
+    }
+    va_end(a2);
+}
 
 // part p of np of `whole` (a multiple of 128) in 128-blocks, as even as they go (whole / 128 % np parts a block more:
 // those from part rot on, cyclically - so a group's layers, each its own rot, even out what each member holds):
@@ -1131,7 +1151,7 @@ struct Model::Impl {
     // server holds ([layer][n_exp]), the per-request times (ms) for the percentiles
     std::unique_ptr<rx::Main> rx_link;
     std::vector<uint8_t> rx_has;
-    bool rx_on = false;
+    std::atomic<bool> rx_on{false};   // (rx_lost on the service thread clears it; the main thread's cache reads it)
     double rx_timeout_ms = 2.0;   // (counted from when the lane's own picks are done: until the lane's time a pick is
     bool rx_wait_fixed = false;   //  known, or always with DS4_RX_TIMEOUT_MS; rx::Gate::wait_ms)
     double rx_seed_ms = -1.0;     // (the load's warm-up requests: the round trip at 1 row the gate starts from; -1 none)
@@ -7160,7 +7180,6 @@ struct Model::Impl {
             }
         }
         auto pct = [](std::vector<float>& v, std::string& out) {
-            char b[96];
             if (v.empty()) {
                 out = "-";
                 return;
@@ -7168,9 +7187,9 @@ struct Model::Impl {
             std::sort(v.begin(), v.end());
             double sum = 0;
             for (float x : v) sum += x;
-            std::snprintf(b, sizeof b, "mean %.3f p50 %.3f p99 %.3f max %.3f", sum / (double) v.size(), v[v.size() / 2],
-                          v[std::min(v.size() - 1, (size_t) ((double) v.size() * 0.99))], v.back());
-            out = b;
+            out.clear();
+            add_f(out, "mean %.3f p50 %.3f p99 %.3f max %.3f", sum / (double) v.size(), v[v.size() / 2],
+                  v[std::min(v.size() - 1, (size_t) ((double) v.size() * 0.99))], v.back());
         };
         std::string rts, wts, ats, lts;
         pct(rt, rts);
@@ -7179,40 +7198,37 @@ struct Model::Impl {
         pct(lt, lts);
         const double req = (double) (st.rx_reqs - s0.rx_reqs), served = (double) (st.rx_picks - s0.rx_picks);
         const double local = (double) (st.cpu_experts - s0.cpu_experts);
-        char b[1024];
-        std::snprintf(b, sizeof b,
-                      "remote experts: %.1f%% of the CPU lane's picks served by the expert server (%.2f a token of %.2f), "
-                      "%.2f a token computed here after all (%lld late replies, %lld past the link's bound; the link "
-                      "idle %lld times after 8 of 64 past it, %lld requests kept here then%s); %.2f requests a token\n"
-                      "remote experts per request: round trip %s ms (the server's own %.3f ms; send to the reply's arrival "
-                      "in the kernel %s ms), the lane's wait after its part %s ms\n"
-                      "remote experts per token: the lane's own part %.2f ms + its wait %.2f ms + the late ones %.2f ms; the "
-                      "link %.1f KB out, %.1f KB in; the upload %lld experts, %.2f GB in %.1f s, %lld of them in this "
-                      "GPU's VRAM too now (the cache's: none but zero-copy ones, after the link was given up, or with "
-                      "DS4_SYNC)\n",
-                      local + served > 0 ? 100.0 * served / (local + served) : 0.0, served / nt, (local + served) / nt,
-                      (double) (st.rx_fallback - s0.rx_fallback) / nt, (long long) (st.rx_late - s0.rx_late),
-                      (long long) (st.rx_late_link - s0.rx_late_link), (long long) (st.rx_backoffs - s0.rx_backoffs),
-                      (long long) (st.rx_idle - s0.rx_idle),
-                      rx_on ? "" : ", the link given up", req / nt, rts.c_str(),
-                      (st.rx_srv_ms - s0.rx_srv_ms) / std::max<double>(1.0, (double) rt.size()), ats.c_str(), wts.c_str(),
-                      (st.cpu_ms - s0.cpu_ms) / nt, (st.rx_wait_ms - s0.rx_wait_ms) / nt,
-                      (st.rx_fallback_ms - s0.rx_fallback_ms) / nt,
-                      (double) (st.rx_bytes_out - s0.rx_bytes_out) / 1e3 / nt, (double) (st.rx_bytes_in - s0.rx_bytes_in) / 1e3 / nt,
-                      (long long) st.rx_held, (double) st.rx_upload_bytes / 1e9, st.rx_upload_ms / 1000.0,
-                      (long long) rx_in_vram());
-        std::string out = b;
-        std::snprintf(b, sizeof b,
-                      "remote experts' late replies that came after all: %lld (%lld read with a later reply, %lld with no "
-                      "kernel time: no time of their own); send to their arrival in the kernel %s ms",
-                      (long long) (st.rx_late_came - s0.rx_late_came), (long long) (st.rx_late_shared - s0.rx_late_shared),
-                      (long long) (st.rx_late_came - s0.rx_late_came - (st.rx_late_shared - s0.rx_late_shared) -
-                                   (st.rx_late_timed - s0.rx_late_timed)),
-                      lts.c_str());
-        out += b;
+        std::string out;
+        add_f(out,
+              "remote experts: %.1f%% of the CPU lane's picks served by the expert server (%.2f a token of %.2f), "
+              "%.2f a token computed here after all (%lld late replies, %lld past the link's bound; the link "
+              "idle %lld times after 8 of 64 past it, %lld requests kept here then%s); %.2f requests a token\n"
+              "remote experts per request: round trip %s ms (the server's own %.3f ms; send to the reply's arrival "
+              "in the kernel %s ms), the lane's wait after its part %s ms\n"
+              "remote experts per token: the lane's own part %.2f ms + its wait %.2f ms + the late ones %.2f ms; the "
+              "link %.1f KB out, %.1f KB in; the upload %lld experts, %.2f GB in %.1f s, %lld of them in this "
+              "GPU's VRAM too now (the cache's: none but zero-copy ones, after the link was given up, or with "
+              "DS4_SYNC)\n",
+              local + served > 0 ? 100.0 * served / (local + served) : 0.0, served / nt, (local + served) / nt,
+              (double) (st.rx_fallback - s0.rx_fallback) / nt, (long long) (st.rx_late - s0.rx_late),
+              (long long) (st.rx_late_link - s0.rx_late_link), (long long) (st.rx_backoffs - s0.rx_backoffs),
+              (long long) (st.rx_idle - s0.rx_idle),
+              rx_on ? "" : ", the link given up", req / nt, rts.c_str(),
+              (st.rx_srv_ms - s0.rx_srv_ms) / std::max<double>(1.0, (double) rt.size()), ats.c_str(), wts.c_str(),
+              (st.cpu_ms - s0.cpu_ms) / nt, (st.rx_wait_ms - s0.rx_wait_ms) / nt,
+              (st.rx_fallback_ms - s0.rx_fallback_ms) / nt,
+              (double) (st.rx_bytes_out - s0.rx_bytes_out) / 1e3 / nt, (double) (st.rx_bytes_in - s0.rx_bytes_in) / 1e3 / nt,
+              (long long) st.rx_held, (double) st.rx_upload_bytes / 1e9, st.rx_upload_ms / 1000.0,
+              (long long) rx_in_vram());
+        add_f(out,
+              "remote experts' late replies that came after all: %lld (%lld read with a later reply, %lld with no "
+              "kernel time: no time of their own); send to their arrival in the kernel %s ms",
+              (long long) (st.rx_late_came - s0.rx_late_came), (long long) (st.rx_late_shared - s0.rx_late_shared),
+              (long long) (st.rx_late_came - s0.rx_late_came - (st.rx_late_shared - s0.rx_late_shared) -
+                           (st.rx_late_timed - s0.rx_late_timed)),
+              lts.c_str());
         if (lt_layer >= 0) {
-            std::snprintf(b, sizeof b, " (the slowest %.3f ms at layer %d)", lt_max, lt_layer);
-            out += b;
+            add_f(out, " (the slowest %.3f ms at layer %d)", lt_max, lt_layer);
         }
         out += "; late by layer:";
         {
@@ -7223,8 +7239,7 @@ struct Model::Impl {
                 return x.first != y.first ? x.first > y.first : x.second < y.second;
             });
             for (size_t i = 0; i < bl.size() && i < 6; ++i) {
-                std::snprintf(b, sizeof b, " %d x%lld", bl[i].second, bl[i].first);
-                out += b;
+                add_f(out, " %d x%lld", bl[i].second, bl[i].first);
             }
             if (bl.empty()) out += " -";
         }
@@ -7236,37 +7251,33 @@ struct Model::Impl {
                 fs = rx_first;
             }
             if (rx_seed_ms >= 0)
-                std::snprintf(b, sizeof b, "remote experts' gate at 1 row: from the load's warm-up %.3f ms; ", rx_seed_ms);
+                add_f(out, "remote experts' gate at 1 row: from the load's warm-up %.3f ms; ", rx_seed_ms);
             else
-                std::snprintf(b, sizeof b, "remote experts' gate at 1 row: no warm-up start; ");
-            out += b;
+                add_f(out, "remote experts' gate at 1 row: no warm-up start; ");
             out += "the first samples (ms, the estimate after; - : an upper bound):";
             for (const auto& f : fs) {
-                std::snprintf(b, sizeof b, " %s%.3f/%.3f", f.first < 0 ? "-" : "", std::fabs(f.first), f.second);
-                out += b;
+                add_f(out, " %s%.3f/%.3f", f.first < 0 ? "-" : "", std::fabs(f.first), f.second);
             }
             const long long hn = st.rx_here - s0.rx_here, hc = st.rx_here_cold - s0.rx_here_cold;
             const double eb = st.rx_held > 0 ? (double) st.rx_upload_bytes / (double) st.rx_held : 0.0;
 #if defined(__linux__)
-            std::snprintf(b, sizeof b, "; the server's picks the lane computed (kept by the gate or idle, late, lost) "
-                                       "%lld (%.2f a token), their experts not in the page cache then (4 pages a matrix "
-                                       "sampled) %lld (%.1f MB a token at %.1f MB an expert)\n",
-                          hn, (double) hn / nt, hc, (double) hc * eb / 1e6 / nt, eb / 1e6);
+            add_f(out, "; the server's picks the lane computed (kept by the gate or idle, late, lost) "
+                       "%lld (%.2f a token), their experts not in the page cache then (4 pages a matrix "
+                       "sampled) %lld (%.1f MB a token at %.1f MB an expert)\n",
+                  hn, (double) hn / nt, hc, (double) hc * eb / 1e6 / nt, eb / 1e6);
 #else
             (void) hc, (void) eb;
-            std::snprintf(b, sizeof b, "; the server's picks the lane computed (kept by the gate or idle, late, lost) "
-                                       "%lld (%.2f a token)\n", hn, (double) hn / nt);
+            add_f(out, "; the server's picks the lane computed (kept by the gate or idle, late, lost) "
+                       "%lld (%.2f a token)\n", hn, (double) hn / nt);
 #endif
-            out += b;
         }
         out += "remote experts by T (requests / late / kept here by the send gate):";
         for (int t = 1; t <= kWin; ++t) {
             const long long q = st.rx_req_t[t] - s0.rx_req_t[t], la = st.rx_late_t[t] - s0.rx_late_t[t],
                             sk = st.rx_skip_t[t] - s0.rx_skip_t[t];
             if (q == 0 && sk == 0) continue;
-            std::snprintf(b, sizeof b, " T=%d %lld / %lld / %lld (EWMA: the round trip at %d rows %.3f ms, the lane %.3f "
-                          "ms a pick);", t, q, la, sk, t, rx_gate.rtt[t], rx_gate.pick[t]);
-            out += b;
+            add_f(out, " T=%d %lld / %lld / %lld (EWMA: the round trip at %d rows %.3f ms, the lane %.3f "
+                  "ms a pick);", t, q, la, sk, t, rx_gate.rtt[t], rx_gate.pick[t]);
         }
         out += "\n";
         out += ep_line(s0, nt);
@@ -7276,13 +7287,13 @@ struct Model::Impl {
     std::string ep_line(const Stats& s0, double nt) const {
         std::string sibs;
         for (int c : ep_sibs) sibs += " " + std::to_string(c);
-        char b[512];
-        std::snprintf(b, sizeof b,
-                      "remote experts' link: the service thread on CPU %d%s (the CPU lane's pools off CPUs%s); keep-awake "
-                      "%s: %lld Wakes sent (%.3f a token), %lld requests found the lane napping\n",
-                      ep_cpu, ep_cpu < 0 ? " (DS4_EP_CPU off: as without the link)" : "", sibs.empty() ? " -" : sibs.c_str(),
-                      ep_wake ? "on" : "off (DS4_EP_WAKE=0)", (long long) (st.rx_wakes - s0.rx_wakes),
-                      (double) (st.rx_wakes - s0.rx_wakes) / std::max(1.0, nt), (long long) (st.lane_nap_reqs - s0.lane_nap_reqs));
+        std::string b;
+        add_f(b,
+              "remote experts' link: the service thread on CPU %d%s (the CPU lane's pools off CPUs%s); keep-awake "
+              "%s: %lld Wakes sent (%.3f a token), %lld requests found the lane napping\n",
+              ep_cpu, ep_cpu < 0 ? " (DS4_EP_CPU off: as without the link)" : "", sibs.empty() ? " -" : sibs.c_str(),
+              ep_wake ? "on" : "off (DS4_EP_WAKE=0)", (long long) (st.rx_wakes - s0.rx_wakes),
+              (double) (st.rx_wakes - s0.rx_wakes) / std::max(1.0, nt), (long long) (st.lane_nap_reqs - s0.lane_nap_reqs));
         return b;
     }
 
