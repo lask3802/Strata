@@ -75,6 +75,9 @@ struct Session {
         if (e == cudaSuccess) spent += r;
         return e;
     }
+    Session() = default;
+    Session(const Session&) = delete;   // (it frees what it holds)
+    Session& operator=(const Session&) = delete;
     ~Session() {
         for (cudaEvent_t e : evt)
             if (e != nullptr) cudaEventDestroy(e);
@@ -174,7 +177,9 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     const char* bv = std::getenv("DS4_RX_TEST_VRAM_MIB");
     if (bv != nullptr && *bv != '\0') {
         ss.budget = (uint64_t) std::max(0LL, std::atoll(bv)) << 20;
-        std::fprintf(stderr, "expert server: test: %s MiB of VRAM (DS4_RX_TEST_VRAM_MIB)\n", bv);
+        if (ss.budget > 0)
+            std::fprintf(stderr, "expert server: test: %llu MiB of VRAM (DS4_RX_TEST_VRAM_MIB)\n",
+                         (unsigned long long) (ss.budget >> 20));
     }
     // the request buffers (kMaxDim: before the geometry) and events, so that the room read next is the blobs' alone (the
     // kernels are loaded: serve())
