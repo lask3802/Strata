@@ -1961,6 +1961,15 @@ int main(int argc, char** argv) {
     const long long io1 = io_read_bytes();
     if (io0 >= 0 && io1 >= 0)
         std::fprintf(stderr, "decode reads from the disk: %.1f MB a token\n", (double) (io1 - io0) / 1e6 / nt);
+#if defined(__linux__)
+    if (io0 >= 0 && io1 >= 0 && s.rx_held > 0) {   // (--remote-experts: the server's experts the lane read, the rest)
+        const double all = (double) (io1 - io0) / 1e6 / nt,
+                     held = (double) (s.rx_here_cold - s0.rx_here_cold) * ((double) s.rx_upload_bytes / s.rx_held) / 1e6 / nt;
+        std::fprintf(stderr, "decode reads from the disk, split: the server's experts the lane computed after all, not in "
+                             "the page cache then, %.1f MB a token (each whole: at most); all the others %.1f MB a token\n",
+                     held, all > held ? all - held : 0.0);
+    }
+#endif
     if (s.skipped > s0.skipped)   // STRATA_DS4_DISK_SKIP_W
         std::fprintf(stderr, "decode left out %.1f experts a token not in RAM (%.1f%% of the routed)\n",
                      (double) (s.skipped - s0.skipped) / nt,

@@ -342,6 +342,23 @@ inline bool resident(const void* p, size_t n) {
     return true;
 #endif
 }
+/// The bytes of [p, p + n) of a file's mapping not in the page cache, by whole 4 KiB pages (Linux mincore; elsewhere
+/// or on an error 0: not known)
+inline size_t cold_bytes(const void* p, size_t n) {
+#if defined(_WIN32)
+    (void) p, (void) n;
+    return 0;
+#else
+    const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
+    const size_t len = n + (a - b), np = (len + pg - 1) / pg;
+    thread_local std::vector<unsigned char> v;
+    if (v.size() < np) v.resize(np);
+    if (mincore((void*) b, len, v.data()) != 0) return 0;
+    size_t cold = 0;
+    for (size_t i = 0; i < np; ++i) cold += (v[i] & 1) == 0 ? 1 : 0;
+    return cold * pg;
+#endif
+}
 
 /// Whether a range of a file's mapping looks resident, so that prefetch() would only cost CPU time (it walks every page:
 /// ~50 ns a 4 KiB page on Windows - 0.34 ms for a 6.3 MB expert matrix on a Strix Halo): `samples` pages spread over

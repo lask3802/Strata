@@ -46,6 +46,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -189,6 +190,40 @@ uint64_t ram_avail() {
     }
     return avail;
 }
+
+// the remote experts' upload, before and after (Linux): the time (UTC), the cgroup's anon / file (this container's:
+// the namespace's root, /sys/fs/cgroup) and this process's RssAnon / RssFile, MB; -1 not there
+#if defined(__linux__)
+std::string rx_mem_note() {
+    long long an = -1, fi = -1, ra = -1, rf = -1;
+    {
+        std::istringstream st(read_file("/sys/fs/cgroup/memory.stat"));
+        std::string k;
+        long long v = 0;
+        while (st >> k >> v) {
+            if (k == "anon") an = v >> 20;
+            if (k == "file") fi = v >> 20;
+        }
+    }
+    {
+        std::istringstream st(read_file("/proc/self/status"));
+        std::string k;
+        long long kb = 0;
+        while (st >> k) {
+            if (k == "RssAnon:" && st >> kb) ra = kb >> 10;
+            else if (k == "RssFile:" && st >> kb) rf = kb >> 10;
+            st.ignore(256, '\n');
+        }
+    }
+    const std::time_t s = std::time(nullptr);
+    std::tm u{};
+    gmtime_r(&s, &u);
+    char b[160];
+    std::snprintf(b, sizeof b, "%02d:%02d:%02d UTC: the cgroup's anon %lld file %lld MB, this process's RssAnon %lld "
+                               "RssFile %lld MB", u.tm_hour, u.tm_min, u.tm_sec, an, fi, ra, rf);
+    return b;
+}
+#endif
 
 float bf16_to_f32(uint16_t b) {
     uint32_t u = (uint32_t) b << 16;
@@ -6596,6 +6631,26 @@ struct Model::Impl {
                              "lane's %zu experts (%.2f GB, %.1f%% of their routings in the profile)\n",
                      link->peer().c_str(), link->name().c_str(), (double) room / 1e9, pick.size(), cand.size(),
                      (double) used / 1e9, all_n > 0 ? 100.0 * sent_n / all_n : 0.0);
+        // (lead 2026-10-25: what the upload does to the page cache) the CPU lane's other experts not in it, before and
+        // after (4 pages a matrix sampled), the bytes the upload read from the disk, the memory around it
+#if defined(__linux__)
+        std::vector<uint8_t> picked((size_t) NL * g.n_exp, 0);
+        for (const Cand& c : pick) picked[(size_t) c.li * g.n_exp + c.e] = 1;
+        auto cold_others = [&]() {
+            long long n = 0;
+            for (const Cand& c : cand) {
+                if (picked[(size_t) c.li * g.n_exp + c.e]) continue;
+                const Layer& l = L[(size_t) c.li];
+                bool res = true;
+                for (int r = 0; r < 3 && res; ++r) res = os::resident_sampled(mx_mat(l, c.e, r), mx_part_bytes(l, r), 4);
+                n += res ? 0 : 1;
+            }
+            return n;
+        };
+        const long long cold0 = cold_others();
+        const std::string mem0 = rx_mem_note();
+#endif
+        uint64_t up_cold = 0;
         const double t0 = now_ms();
         if (!link->send_geo(gm, gl, e)) {
             std::fprintf(stderr, "ds4: remote experts: %s - the CPU lane computes all its experts\n", e.c_str());
@@ -6608,8 +6663,10 @@ struct Model::Impl {
             blob.assign((size_t) G.blob, 0);
             for (int r = 0; r < 3; ++r) {   // (each matrix whole: its NH parts in order, from wherever they are)
                 const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
-                for (int X = 0; X < NH; ++X)
+                for (int X = 0; X < NH; ++X) {
+                    up_cold += os::cold_bytes(mx_part_ptr(l, pick[i].e, r, X), nb);
                     std::memcpy(blob.data() + G.off[r] + (size_t) X * nb, mx_part_ptr(l, pick[i].e, r, X), nb);
+                }
             }
             if (!link->send_blob(pick[i].li, pick[i].e, blob.data(), blob.size(), e)) {
                 std::fprintf(stderr, "ds4: remote experts: %s - the CPU lane computes all its experts\n", e.c_str());
@@ -6633,6 +6690,15 @@ struct Model::Impl {
         st.rx_held = held;
         st.rx_upload_bytes = (int64_t) held_b;
         st.rx_upload_ms = now_ms() - t0;
+#if defined(__linux__)
+        std::fprintf(stderr, "ds4: remote experts: the upload read %.2f of its %.2f GB from the disk (not in the page "
+                             "cache before it); the CPU lane's other %zu experts not in the page cache (4 pages a matrix "
+                             "sampled): %lld before, %lld after; before %s; after %s\n",
+                     (double) up_cold / 1e9, (double) used / 1e9, cand.size() - pick.size(), cold0, cold_others(),
+                     mem0.c_str(), rx_mem_note().c_str());
+#else
+        (void) up_cold;
+#endif
         if (rx_wait_fixed)
             std::fprintf(stderr, "ds4: remote experts: %lld experts (%.2f GB) in the server's VRAM, uploaded in %.1f s (%.0f "
                                  "MB/s); a reply later than %.2f ms after the lane's own picks (DS4_RX_TIMEOUT_MS): its "
