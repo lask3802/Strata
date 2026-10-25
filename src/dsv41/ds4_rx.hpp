@@ -178,18 +178,26 @@ struct LateBook {
         e[seq % 64] = {seq, sent, bound, rows, layer, bound >= 0};
     }
     /// a request late for the lane's `deadline` in: open against its bound, or decided late at once when the deadline
-    /// was the bound already.  Its slot's entry still open (64 sends on, no reply, the bound not passed: a bound far
-    /// out): decided late.  The count decided late here
+    /// was the bound already.  Its slot's entry still open (64 lane requests on, no reply, the bound not passed: a bound
+    /// far out): decided late.  The count decided late here
     int add_late(uint32_t seq, double sent, int rows, int layer, double deadline, double bound) {
         const int n = e[seq % 64].open ? 1 : 0;
         const bool now = deadline >= bound;
         add(seq, sent, rows, layer, now ? -1.0 : bound);
         return n + (now ? 1 : 0);
     }
-    /// a late reply's lateness for the link: its kernel arrival (within its send and the read; a shared stamp is the
-    /// read's last reply's, an upper bound: past the bound counts late), else the time it was read
-    static bool past(double arrival, double sent, double read, double bound) {
-        return arrival >= sent && arrival <= read ? arrival > bound : read > bound;
+    /// a late reply's lateness for the link: its kernel arrival (within its send and the read), else the time it was
+    /// read.  A shared stamp (the read's last reply's: the next reply came in the same read) is an upper bound only:
+    /// not late - a reply past the short wait sits in the socket until the next request's wait reads it with that
+    /// one's, and a slow link's replies come apart (the next not in yet), or not at all (expire)
+    static bool past(double arrival, double sent, double read, double bound, bool shared = false) {
+        if (arrival < sent || arrival > read) return read > bound;
+        return !shared && arrival > bound;
+    }
+    /// a reply in time for the lane's deadline: late for the link only when that wait went past the bound (large T)
+    /// and it came after it
+    static bool in_time_past(double deadline, double bound, double arrival, double sent, double read) {
+        return deadline > bound && past(arrival, sent, read, bound);
     }
     /// seq's send time, rows and layer (false: not a late request here, or taken already); *open: its link lateness
     /// still to decide (against *bound)

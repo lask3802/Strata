@@ -6643,7 +6643,8 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: remote experts: %lld experts (%.2f GB) in the server's VRAM, uploaded in %.1f s (%.0f "
                                  "MB/s); a reply not in once the lane's own picks are done and as long again as the lane "
                                  "would take for its picks (%.1f ms at least; %.2f ms until the lane's time a pick is "
-                                 "known): its picks computed here\n",
+                                 "known and the link has given a kernel arrival time - always without them, Windows): "
+                                 "its picks computed here\n",
                          (long long) held, (double) held_b / 1e9, st.rx_upload_ms / 1000.0,
                          st.rx_upload_ms > 0 ? (double) held_b / 1e3 / st.rx_upload_ms : 0.0, rx::Gate::kMinWaitMs,
                          rx_timeout_ms);
@@ -6835,9 +6836,10 @@ struct Model::Impl {
             double lb = -1;
             if (!rx_late_book.take(late[i].first, ts, rw, &ly, &open, &lb)) continue;
             ++st.rx_late_came;
-            if (open) rx_back_seen(rx::LateBook::past(la, ts, t1, lb));   // (the link late: past its bound)
+            const bool shared = la == ta || (i + 1 < late.size() && late[i + 1].second == la);
+            if (open) rx_back_seen(rx::LateBook::past(la, ts, t1, lb, shared));   // (the link late: past its bound)
             if (la < ts || la > t1) continue;   // (no kernel time, or the realtime clock stepped)
-            if (la == ta || (i + 1 < late.size() && late[i + 1].second == la)) {
+            if (shared) {
                 ++st.rx_late_shared;
                 continue;
             }
@@ -6881,7 +6883,7 @@ struct Model::Impl {
             st.rx_rtt_ms += t1 - t0;
             st.rx_srv_ms += srv_us / 1000.0;
             rx_back.reply();   // (a long wait, past the bound: in time for the lane, late for the link)
-            rx_back_seen(deadline > bound && rx::LateBook::past(ta, t0, t1, bound));
+            rx_back_seen(rx::LateBook::in_time_past(deadline, bound, ta, t0, t1));
             return;
         }
         if (got == 0) {

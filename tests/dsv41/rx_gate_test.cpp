@@ -53,6 +53,8 @@ int main() {
         check(near(x.first, 14.0) && near(x.second, 14.0), "DS4_RX_TIMEOUT_MS set: the bound is the deadline");
         const auto y = g.deadlines(4, 2, 4, 10.0, 12.0, 2.0, false, true);
         check(near(y.first, 13.0) && near(y.second, 14.0), "T=4: its own time a pick, the bound still 2 ms");
+        const auto z = g.deadlines(4, 6, 4, 10.0, 12.0, 2.0, false, true);
+        check(near(z.first, 15.0) && near(z.second, 14.0), "6 picks at T=4: the lane waits 3 ms, past the bound");
     }
     {
         // (lead 2026-10-25) the gate's start: the load's pings seed it, and the clamp holds from the first sample (a
@@ -234,6 +236,19 @@ int main() {
         check(rx::LateBook::past(-1.0, 10.0, 16.0, 14.0), "no kernel time, read after the bound: late");
         check(!rx::LateBook::past(-1.0, 10.0, 13.9, 14.0), "no kernel time, read before the bound: not late");
         check(rx::LateBook::past(9.0, 10.0, 16.0, 14.0), "a stamp before the send (the clock stepped): the read's");
+        check(!rx::LateBook::past(17.0, 10.0, 13.9, 14.0), "a stamp after the read (the clock stepped): the read's");
+        check(!rx::LateBook::past(14.0, 10.0, 16.0, 14.0), "arrived at the bound itself: not late");
+        check(!rx::LateBook::past(15.0, 10.0, 16.0, 14.0, true), "a shared stamp past the bound: an upper bound, not late");
+        check(rx::LateBook::past(-1.0, 10.0, 16.0, 14.0, true), "shared but no kernel time: the read's");
+        rx::LateBook p;
+        p.add_late(40, 10.0, 1, 3, 12.3, 14.0);
+        check(p.expire(15.0) == 1 && p.add_late(104, 20.0, 1, 3, 22.3, 24.0) == 0,
+              "64 on, the slot's one expired already (not taken): not decided again");
+        // in time for the lane's deadline: late for the link only past the bound, when the lane's wait went past it
+        check(!rx::LateBook::in_time_past(13.0, 14.0, 13.5, 10.0, 13.6), "the lane's wait within the bound: not late");
+        check(!rx::LateBook::in_time_past(14.0, 14.0, -1.0, 10.0, 14.001), "the deadline the bound, read just after: not late");
+        check(rx::LateBook::in_time_past(15.0, 14.0, 14.5, 10.0, 14.6), "a 3 ms wait, arrived at 14.5: late for the link");
+        check(!rx::LateBook::in_time_past(15.0, 14.0, 13.5, 10.0, 14.6), "a 3 ms wait, arrived at 13.5: not late");
     }
     {
         // 8 late of the last 64 (lead 2026-10-25): the link idle for `hold` requests, then tried again with a clean count
