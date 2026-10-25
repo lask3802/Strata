@@ -7690,7 +7690,10 @@ struct Model::Impl {
                     }
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
-                    st.lane_bytes += (double) ents.size() * (double) l.blob * (double) ffn / (double) g.ff;
+                    // (an expert's bytes once: past ent_cap's tokens it takes more than one entry, side by side)
+                    size_t nexp = 0;
+                    for (size_t q = 0; q < ents.size(); ++q) nexp += q == 0 || ents[q].e != ents[q - 1].e;
+                    st.lane_bytes += (double) nexp * (double) l.blob * (double) ffn / (double) g.ff;
                     // (a pick's time whole: the slices computed [0, k) of nb blocks)
                     const double whole = (double) nslots * (double) (mr.b1 - mr.b0) / (double) std::max(1, rx_nb);
                     if (rx_on && whole > 0) rx_gate.pick_seen(T, (now_ms() - tc) / whole);
