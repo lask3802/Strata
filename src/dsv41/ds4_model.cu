@@ -1147,7 +1147,8 @@ struct Model::Impl {
     // mailbox part (the CPU lane's, and the remote experts' the lane adds to it); layer l + 1 waits for it after its
     // attention and adds it before its FFN (hc_late_add), the last layer before the head.  Only the head's add is exact
     // (up to the order of the float sums): layer l + 1's attention - its output, the KV it writes, and the hc
-    // coefficients computed from h - sees h without layer l's part.  That is the deferral's error, not a bug.
+    // coefficients computed from h - and an Engram layer's gate see h without layer l's part.  That is the deferral's
+    // error, not a bug.  (DS4_DUMP_H / DS4_DUMP_L rows then lack the part still out.)
     // late_slot: the mailbox slot whose part is still out (-1: none), late_seq its seq; never across a window
     bool ep_defer = false;
     int late_slot = -1;
@@ -9498,7 +9499,7 @@ struct Model::Impl {
         if (g.n_mtp > 0) why = "the DSpark drafter is loaded (--dspark none runs without it)";
         else if (par) why = "threads mode";
         else if (ranged || o.remote_stage || o.stage_worker) why = "a layer range or a remote stage";
-        else if (sync_decode) why = "DS4_SYNC";
+        else if (sync_decode || async_max_t < 1) why = "DS4_SYNC or DS4_ASYNC_T=0 (decode not on the async path)";
         else if (!moe_token_path) why = "DS4_MOE_TOKEN=0";
         for (int il = lo; il < hi && why == nullptr; ++il)
             if (L[(size_t) il].nm != 1 || L[(size_t) il].dev != L[(size_t) lo].dev) why = "the layers on more than one GPU";
@@ -10391,7 +10392,8 @@ struct Model::Impl {
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
-            if (late) {   // (f_post's own copy: the next layer's hc_split writes f_post again)
+            if (late) {   // (f_post's own copy: the next layer's FFN hc_split writes f_post only after its late_flush
+                          //  today; the copy keeps it so if that order changes)
                 CK(cudaMemcpyAsync(d.late_post, d.f_post, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
                 late_slot = slot;
                 late_seq = sq;
