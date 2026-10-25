@@ -33,7 +33,9 @@
 // Rates: lane GB/s = bytes / (prep + gu + hq + down); in-job GB/s = a batch's bytes over its busy time / threads (the
 // rate while the jobs run); a thread's GB/s = bytes / busy.  minflt a token: getrusage (Linux), the page faults (Windows).
 // Linux: the core's counters of this process's threads over the timed tokens (perf_event_open; root or
-// perf_event_paranoid <= 2 - "pmc: unavailable" otherwise): IPC, the dispatch stalls, the FP pipes, the L1D fills.
+// perf_event_paranoid <= 2 - "pmc: unavailable" otherwise): IPC, the dispatch stalls, the FP pipes, the L1D fills.  And
+// each variant's clock over its timed tokens (cpufreq's scaling_cur_freq every 50 ms, else /proc/cpuinfo): the mean MHz
+// of the lane's CPUs, the :spin= ones and the rest - a spinning neighbour's cost in the package's clock (its power limit)
 //   ds4_lane_bench --pack DIR [--layers 0-39] [--picks 4] [--k 6] [--pool 8] [--tokens 16] [--fresh-tokens 4]
 //                  [--threads N (every physical core)] [--variants file,file-nopf,..] [--dim 5120] [--ff 2304]
 //                  [--remap FROM=TO (the pack's paths: the host's view of a container's)] [--no-pmc]
@@ -763,6 +765,91 @@ struct Spin {
         for (auto& t : th) t.join();
     }
 };
+// (every variant, Linux) the CPUs' clock over the timed tokens: each one's cpufreq scaling_cur_freq (on x86 the kernel's
+// APERF / MPERF estimate since its last read) every 50 ms from a thread of its own, averaged over the lane's CPUs, the
+// :spin= ones and the rest - whether a busy neighbour off the lane's cores takes the package's clock down (its power
+// limit) rather than the lane's cores' time.  No cpufreq in sysfs: /proc/cpuinfo's "cpu MHz"; neither: "clock: unavailable"
+struct Clock {
+    std::atomic<bool> stop{false};
+    std::thread th;
+    std::vector<double> sum;   // (by CPU: kHz summed over the samples)
+    std::vector<char> has;     // (by CPU: its cpufreq file read at the start)
+    int n = 0;
+    bool ok = false;
+    static double khz(int c) {
+#if defined(__linux__)
+        char p[96];
+        std::snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c);
+        std::FILE* f = std::fopen(p, "r");
+        if (f == nullptr) return -1;
+        double v = -1;
+        if (std::fscanf(f, "%lf", &v) != 1) v = -1;
+        std::fclose(f);
+        return v;
+#else
+        (void) c;
+        return -1;
+#endif
+    }
+    // (no cpufreq: /proc/cpuinfo's "cpu MHz" lines, each CPU's in kHz; false: neither)
+    bool cpuinfo(std::vector<double>& v) const {
+        std::FILE* f = std::fopen("/proc/cpuinfo", "r");
+        if (f == nullptr) return false;
+        char ln[256];
+        int c = -1;
+        bool any = false;
+        while (std::fgets(ln, sizeof ln, f) != nullptr) {
+            double x;
+            if (std::sscanf(ln, "processor : %d", &c) == 1) continue;
+            if (std::strncmp(ln, "cpu MHz", 7) == 0 && c >= 0 && (size_t) c < v.size()) {
+                const char* p = std::strchr(ln, ':');
+                if (p != nullptr && std::sscanf(p + 1, "%lf", &x) == 1) v[(size_t) c] = x * 1000.0, any = true;
+            }
+        }
+        std::fclose(f);
+        return any;
+    }
+    bool proc = false;   // (the samples from /proc/cpuinfo)
+    explicit Clock(int ncpu) : sum((size_t) std::max(1, ncpu), 0.0), has(sum.size(), 0) {
+        for (size_t c = 0; c < sum.size(); ++c) ok |= (has[c] = khz((int) c) > 0) != 0;
+        if (!ok) {
+            std::vector<double> v(sum.size(), -1.0);
+            ok = proc = cpuinfo(v);
+            for (size_t c = 0; c < sum.size(); ++c) has[c] = v[c] > 0;
+        }
+        if (!ok) return;
+        th = std::thread([this] {
+            std::vector<double> v(sum.size(), -1.0);
+            while (!stop.load(std::memory_order_relaxed)) {
+                if (proc) cpuinfo(v);
+                for (size_t c = 0; c < sum.size(); ++c)
+                    if (has[c]) sum[c] += std::max(0.0, proc ? v[c] : khz((int) c));
+                ++n;
+                for (int i = 0; i < 10 && !stop.load(std::memory_order_relaxed); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        });
+    }
+    void end() {
+        stop.store(true);
+        if (th.joinable()) th.join();
+    }
+    ~Clock() { end(); }
+    double mhz(const std::vector<int>& cs) const {   // (the mean over those CPUs and the samples; -1: none)
+        double s = 0;
+        int k = 0;
+        for (int c : cs)
+            if (c >= 0 && (size_t) c < sum.size() && has[(size_t) c]) s += sum[(size_t) c], ++k;
+        return k > 0 && n > 0 ? s / k / n / 1000.0 : -1.0;
+    }
+    std::vector<int> rest(const std::vector<int>& a, const std::vector<int>& b) const {   // (the CPUs in neither)
+        std::vector<int> r;
+        for (int c = 0; c < (int) sum.size(); ++c)
+            if (has[(size_t) c] && std::find(a.begin(), a.end(), c) == a.end() && std::find(b.begin(), b.end(), c) == b.end())
+                r.push_back(c);
+        return r;
+    }
+};
 struct alignas(64) Slot {   // (:pool=fix) a thread's jobs' busy time, a line each
     int64_t ns = 0;
 };
@@ -1401,9 +1488,11 @@ int main(int argc, char** argv) {
 #endif
         std::unique_ptr<Spin> spin;   // (after the counters opened: they count the lane's threads alone)
         if (!v.spin.empty()) spin = std::make_unique<Spin>(v.spin);
+        Clock clk(256);
         const int64_t f0 = faults();
         for (int t = 0; t < nt; ++t) token(t, a);
         const int64_t f1 = faults();
+        clk.end();
         spin.reset();
 #if defined(__linux__)
         std::vector<std::vector<double>> pc;
@@ -1433,6 +1522,13 @@ int main(int argc, char** argv) {
             std::printf("); downs from the parts %.0f%%; experts hinted %.0f%%\n", 100.0 * (double) a.downs_dp / (double) std::max(1L, a.picks),
                         pf == kPfNone ? 0.0 : 100.0 * (double) a.hinted / (double) std::max(1L, a.picks));
         }
+        const std::vector<int> lcpus(cpus.begin(), cpus.begin() + thr);   // (the lane's threads' CPUs)
+        if (!clk.ok)
+            std::printf("  %s: clock: unavailable\n", v.name.c_str());
+        else   // (MHz, the mean over the timed tokens; -1: no such CPUs)
+            std::printf("  %s: clock MHz (%s, %d samples): lane %.0f, spin %.0f, the rest %.0f\n", v.name.c_str(),
+                        clk.proc ? "/proc/cpuinfo" : "cpufreq", clk.n, clk.mhz(lcpus), clk.mhz(v.spin),
+                        clk.mhz(clk.rest(lcpus, v.spin)));
 #if defined(__linux__)
         if (!pc.empty()) {   // (the counters over the timed tokens, every thread: spin waits included)
             // an event's total, and its group's cycles (for its share: both counted over the same time)
