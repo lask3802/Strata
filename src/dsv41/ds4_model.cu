@@ -6006,8 +6006,12 @@ struct Model::Impl {
     // tokens an entry holds: the i-quant GGUF experts take a whole window's tokens of an expert in one call (the CPU
     // lane's exact multi-token rows, 7+ tokens an expert: decoded once for all), the others (MXFP4, EXL3) up to 8
     // (cpu_experts' second slice: the entries from `from` on over n_ff values [ff0, ff0 + ffn) instead; from < 0: none)
+    // (constructors, not member initializers: gcc takes no `= {}` default argument of a nested class with them
+    // before the enclosing class ends)
     struct FfSplit {
-        int from = -1, ff0 = 0, ffn = 0;
+        int from, ff0, ffn;
+        FfSplit() : from(-1), ff0(0), ffn(0) {}
+        FfSplit(int f, int a, int n) : from(f), ff0(a), ffn(n) {}
     };
     static int ent_cap(const Layer& l) {
         return l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay) ? kEntMax : kc::kExl3CpuMaxN;
@@ -6026,7 +6030,7 @@ struct Model::Impl {
     // number of entries take it, and each job its band of h straight into the down's int8 input.
     // (ord: the order the entries are computed in - their slots, so the sums, stay the same; null: as they are)
     void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, int ff0,
-                        int ffn, FfSplit sb = {}) {
+                        int ffn, FfSplit sb = FfSplit()) {
         if (!gg::mx_experts(l.lay)) return cpu_experts_iq(l, x, ents, ldx, ord, ff0, ffn, sb);
         // (MXFP4 here: whole - a slice is the i-quants' alone, and only a layer that takes it is ever asked for one:
         // rx_split_l, ep_slices_ok)
@@ -6122,7 +6126,7 @@ struct Model::Impl {
     // each entry's yd then its part of the expert's output.  sb: the entries from sb.from on over sb's slice instead, in
     // the same rounds (the hybrid's cut W picks, [0, cut): one pass with the lane's own [0, k) - ord orders the others)
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, int ff0,
-                        int ffn, FfSplit sb = {}) {
+                        int ffn, FfSplit sb = FfSplit()) {
         constexpr int RB = 64;   // rows a job
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
         const int ne = (int) ents.size(), na = sb.from >= 0 && sb.from < ne ? sb.from : ne;   // (entries [na, ne): sb's)
@@ -6257,7 +6261,7 @@ struct Model::Impl {
     // for the picks a request just sent tagged slice (serve_lane) and [k, nb) for those of a reply late or lost (lane_add);
     // sb: the entries from sb.from on over its range (the i-quant lane in the same pass, else a call of their own)
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, int ff0,
-                     int ffn, FfSplit sb = {}) {
+                     int ffn, FfSplit sb = FfSplit()) {
         if (ldx == 0) ldx = (size_t) g.dim;
         if (sb.from >= (int) ents.size()) sb = FfSplit{};
         if (sb.from >= 0 && !(l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay))) {   // (one slice a call there)
