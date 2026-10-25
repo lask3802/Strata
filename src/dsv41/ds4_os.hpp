@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -322,6 +323,25 @@ inline void prefetch(const std::vector<std::pair<const void*, size_t>>& ranges) 
         const uintptr_t a = (uintptr_t) x.first, b = a & ~(pg - 1);
         madvise((void*) b, x.second + (a - b), MADV_WILLNEED);
     }
+#endif
+}
+
+/// [p, p + n) of a file's mapping read in and mapped now (Linux 5.14+ madvise MADV_POPULATE_READ: the page cache
+/// filled from the file where it has not the pages and this process's page tables set, so the first read of each page
+/// is no fault): 1 done, 0 not had here (EINVAL: a kernel without it; Windows), -1 failed otherwise (errno: a part of
+/// the range not mapped, an I/O error) - the caller reads it then (pread: the page cache, not the page tables)
+inline int populate(const void* p, size_t n) {
+#if defined(_WIN32)
+    (void) p, (void) n;
+    return 0;
+#else
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+    const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
+    int r;
+    while ((r = madvise((void*) b, n + (a - b), MADV_POPULATE_READ)) != 0 && errno == EINTR) {}
+    return r == 0 ? 1 : errno == EINVAL ? 0 : -1;
 #endif
 }
 

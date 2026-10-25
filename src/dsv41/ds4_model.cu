@@ -1109,6 +1109,17 @@ struct Model::Impl {
         std::vector<const uint8_t*> at;       // expert -> its part's row 0, block a (empty: the layer has none)
     };
     std::vector<DownParts> dpl;               // by layer index
+    // DS4_IQ_WARM=split: the load's read-ahead of the CPU lane's experts (load_experts_mx: each one whole, read into a
+    // buffer - the page cache warm, the lane's mapping not) left out, warm_split after the expert server's upload
+    // instead: of each CPU-lane expert only what the lane reads of a pick - its layer's slice [ep_ff0, ep_ff0 + ep_ffn)
+    // of the gate / up rows, the down from the parts where they serve that slice (DS4_IQ_DOWN_PARTS), else the pack's
+    // down whole - read in through the lane's own mapping (os::populate: the page cache and the page tables; pread where
+    // the kernel has no MADV_POPULATE_READ), the most-routed first, up to warm_bytes.  At k 6 with the parts that is 2/3
+    // of an expert's bytes: lane-bench-report.md section 13 - the whole read-ahead's 97 GB held 12559 of CT 580's 15229
+    // CPU-lane experts, and the parts, outside it, were pushed out by the arms before.  Unset or empty: as before; any
+    // other value fails the load
+    const char* iq_warm_env = std::getenv("DS4_IQ_WARM");
+    const bool iq_warm_split = iq_warm_env != nullptr && std::strcmp(iq_warm_env, "split") == 0;
     // DS4_LANE_TRACE=file: the i-quant CPU lane's calls as cpu_experts_iq gets them, for lane-bench --trace (its picks,
     // their n_ff slice and tokens): "LANETRC1", then a record a call - u8 layer, u8 ff0 / 256, u8 (ff0 + ffn) / 256,
     // u8 entries, then each entry's int16 expert and u8 tokens (flushed every 4096 calls and at the end)
@@ -2143,6 +2154,129 @@ struct Model::Impl {
         if (dpl.empty() || l.il < 0 || (size_t) l.il >= dpl.size() || L[(size_t) l.il].il != l.il) return nullptr;
         const DownParts& d = dpl[(size_t) l.il];
         return !d.at.empty() && ff0 % 256 == 0 && ff0 / 256 >= d.a && ff0 + ffn == 256 * d.b ? &d : nullptr;
+    }
+    // DS4_IQ_WARM=split (iq_warm_split above), at the end of the load (the server's upload, rx_split's slices and the
+    // parts known): what the CPU lane reads of each of its experts' picks read in and mapped, the most-routed first up
+    // to warm_bytes.  Neither read ahead nor dropped from the page cache (no POSIX_FADV_DONTNEED): a CPU-lane expert's
+    // rows past its layer's slice (its gate / up [k, 9); with the parts the pack's down), and the expert server's experts
+    // (rx_has).  The lane reads those only when it computes a pick's [k, 9), or a pick whole, after all - a late or lost
+    // reply, a pick the send gate keeps here, the link given up - and then they come in by page faults through the same
+    // mapping: from the page cache where something left them, else from the disk (such an expert's first fallback pick
+    // waits for its reads: ~2.9 MB of the pack's down, 1.9 MB of gate / up [6, 9) at k 6 on this pack).  No range of a
+    // CPU-lane expert is one the lane never reads, so none is dropped; the VRAM experts' pages are, as before
+    // (load_experts_mx)
+    void warm_split() {
+        if (!iq_warm_split) return;
+        if (!file_experts || ram_tier || warm_bytes == 0) {
+            std::fprintf(stderr, "ds4: DS4_IQ_WARM=split: nothing read ahead (%s)\n",
+                         !file_experts ? "the CPU lane's experts are not read in place"
+                         : ram_tier    ? "the RAM tier holds the CPU lane's hottest experts"
+                                       : "no RAM to keep them: warm_bytes 0");
+            return;
+        }
+        struct Rg {   // a range of the lane's mapping and where a pread reads it from: the pack's file, or the parts'
+            const uint8_t* p;
+            size_t n;
+            int file;     // (the pack's; -1: the parts', fd)
+            uint64_t off;
+            os::fd_t fd;
+        };
+        struct W {
+            double share;
+            int li, e;
+        };
+        std::vector<W> ws;
+        size_t n_rx = 0;
+        for (const Layer& l : L) {
+            if (l.lay.fmt != gg::kFmtMXFP4) continue;   // (load_experts_mx's layers: a slice on the i-quant ones, whole on the others)
+            bool mapped = true;
+            for (int r = 0; r < 3; ++r)
+                mapped = mapped && l.mx_file[r] >= 0 && (size_t) l.mx_file[r] < pk.maps.size() && pk.maps[(size_t) l.mx_file[r]].first != nullptr;
+            if (!mapped) continue;
+            const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+            double sum = 0;
+            for (int e = 0; e < l.n_exp; ++e) sum += p[e];
+            for (int e = 0; e < l.n_exp; ++e) {
+                if (l.slot[(size_t) e] >= 0 || (!l.ram.empty() && l.ram[(size_t) e] >= 0)) continue;   // (VRAM, a RAM copy)
+                if (!rx_has.empty() && rx_has[(size_t) l.il * g.n_exp + e]) {
+                    ++n_rx;
+                    continue;
+                }
+                ws.push_back({sum > 0 ? p[e] / sum : 0.0, l.il, e});
+            }
+        }
+        std::stable_sort(ws.begin(), ws.end(), [](const W& a, const W& b) { return a.share > b.share; });
+        const auto& pf = dparts.files();
+        auto ranges = [&](const W& w, std::vector<Rg>& out) {
+            const Layer& l = L[(size_t) w.li];
+            const int ff0 = l.ep_ff0, ffn = l.ep_ffn < 0 ? g.ff - ff0 : l.ep_ffn;
+            const uint64_t eo[3] = {l.mx_off[0] + (uint64_t) w.e * l.mx_stride[0], l.mx_off[1] + (uint64_t) w.e * l.mx_stride[1],
+                                    l.mx_off[2] + (uint64_t) w.e * l.mx_stride[2]};
+            for (int r = 0; r < 2; ++r) {
+                const size_t rb = mx_row_b(l, r), o = (size_t) ff0 * rb;
+                out.push_back({pk.at(l.mx_file[r], eo[r]) + o, (size_t) ffn * rb, l.mx_file[r], eo[r] + o, os::kBadFd});
+            }
+            if (const DownParts* d = down_parts(l, ff0, ffn)) {   // (the expert's part whole: its dim rows d->rb apart)
+                const uint8_t* q = d->at[(size_t) w.e];
+                for (const auto& f : pf)
+                    if (f.map != nullptr && q >= f.map && q < f.map + f.bytes) {
+                        out.push_back({q, (size_t) g.dim * d->rb, -1, (uint64_t) (q - f.map), f.fd});
+                        return;
+                    }
+            }
+            out.push_back({pk.at(l.mx_file[2], eo[2]), mx_part_bytes(l, 2), l.mx_file[2], eo[2], os::kBadFd});
+        };
+        // the budget, the most-routed first; the ranges by expert, read side by side by 12 threads
+        std::vector<Rg> rg;
+        double gu = 0, dpb = 0, dwb = 0, b = 0;
+        size_t nw = 0;
+        for (; nw < ws.size(); ++nw) {
+            const size_t at = rg.size();
+            ranges(ws[nw], rg);
+            double eb = 0;
+            for (size_t i = at; i < rg.size(); ++i) eb += (double) rg[i].n;
+            if (b + eb > (double) warm_bytes) {
+                rg.resize(at);
+                break;
+            }
+            b += eb;
+            gu += (double) (rg[at].n + rg[at + 1].n);
+            (rg[at + 2].file < 0 ? dpb : dwb) += (double) rg[at + 2].n;
+        }
+        const double t0 = now_ms();
+        std::atomic<size_t> ri{0};
+        std::atomic<int> no_pop{0};
+        std::atomic<long long> by_read{0}, failed{0};
+        std::vector<std::thread> th;
+        for (int t = 0; t < 12 && !rg.empty(); ++t)
+            th.emplace_back([&] {
+                std::vector<uint8_t> buf;
+                for (size_t i; (i = ri.fetch_add(1)) < rg.size();) {
+                    const Rg& x = rg[i];
+                    if (no_pop.load(std::memory_order_relaxed) == 0) {
+                        const int r = os::populate(x.p, x.n);
+                        if (r == 1) continue;
+                        if (r == 0) no_pop.store(1, std::memory_order_relaxed);   // (not had here: pread from now on)
+                    }
+                    // (pread: the page cache filled, the page tables not - the lane's first read of a page faults)
+                    if (buf.size() < x.n) buf.resize(x.n);
+                    const bool ok = x.file >= 0 ? pk.read_at(x.file, x.off, x.n, buf.data()) : os::pread_full(x.fd, buf.data(), x.n, x.off);
+                    by_read.fetch_add(1);
+                    if (!ok) failed.fetch_add(1);
+                }
+            });
+        for (auto& t : th) t.join();
+        std::string how = no_pop.load() ? "read by pread (MADV_POPULATE_READ not had here): in the page cache, not mapped"
+                                         : "read in and mapped (MADV_POPULATE_READ)";
+        if (!no_pop.load() && by_read.load() > 0)
+            how += ", " + std::to_string(by_read.load()) + " ranges by pread after it failed on them (not mapped)";
+        if (failed.load() > 0) how += "; " + std::to_string(failed.load()) + " reads failed (those ranges left to the lane's faults)";
+        std::fprintf(stderr, "ds4: DS4_IQ_WARM=split: %zu of the CPU lane's experts read ahead in %.1f s (%.1f GB: the gate / up "
+                             "of their slices %.1f GB, downs %.1f GB from the parts and %.1f GB the pack's whole ones) - %s; "
+                             "left out: %zu past warm_bytes (%.1f GB), the expert server's %zu, and each one's rows past its "
+                             "slice (read only by the lane's fallback: neither read ahead nor dropped)\n",
+                     nw, (now_ms() - t0) / 1000.0, b / 1e9, gu / 1e9, dpb / 1e9, dwb / 1e9, how.c_str(), ws.size() - nw,
+                     warm_bytes / 1e9, n_rx);
     }
     bool ep_slices_ok(std::string& err) const {
         if (!rx_slices_ok(err)) return false;
@@ -3206,6 +3340,10 @@ struct Model::Impl {
             c_yd.resize(S * E);
         }
         // the experts: VRAM slots in what each device has left, the rest on the host
+        if (iq_warm_env != nullptr && *iq_warm_env != '\0' && !iq_warm_split) {
+            err = std::string("DS4_IQ_WARM=") + iq_warm_env + ": split or unset";
+            return false;
+        }
         if (!place_experts(err)) return false;
         if (!load_experts(err)) return false;
         if (pk.gguf) make_pools();
@@ -3361,6 +3499,7 @@ struct Model::Impl {
         preload_store();
         if (!ep_slices_ok(err)) return false;
         if (!init_down_parts(err)) return false;
+        warm_split();
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         // U9 hc's side stream and events, made last: the plan, the read-ahead, the placement and the load's report all
         // read the free VRAM before them, as the old path's do
@@ -4722,8 +4861,8 @@ struct Model::Impl {
                              (now_ms() - t0) / 1000.0);
             return true;
         }
-        size_t nw = 0;
-        for (double b = 0; nw < warm.size() && b + (double) L[(size_t) warm[nw].layer].blob <= (double) warm_bytes; ++nw)
+        size_t nw = 0;   // (DS4_IQ_WARM=split: none here - warm_split, after the upload)
+        for (double b = 0; !iq_warm_split && nw < warm.size() && b + (double) L[(size_t) warm[nw].layer].blob <= (double) warm_bytes; ++nw)
             b += (double) L[(size_t) warm[nw].layer].blob;
         std::atomic<size_t> wi{0};
         std::vector<std::thread> wt;
