@@ -6,11 +6,14 @@
 #include "ds4_rx.hpp"
 
 #include "ds4_gguf.cuh"
+#include "ds4_os.hpp"   // (os::pin_thread: the fill thread)
+#include "ds4_rx_fill_link.hpp"
 #include "ds4_rx_lane.hpp"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -154,6 +157,140 @@ std::string warm_up(const Session& ss, const Bufs& b, cudaStream_t s, bool fault
         }
     }
     return "";
+}
+
+constexpr int kTabExp = 1024;   // (a layer's expert ids in the table: the engine's n_exp <= 1024)
+
+// The fills (protocol 3, ds4_rx_fill_link.hpp): the session's experts by (layer, id) as the requests look them up, and
+// the fill thread's state.  A fill takes `out`'s slot off the table first (a request that names it from then on gets
+// Stale), waits until every request that may have read it before has synced (req_done catches up with req_started as
+// it was then), loads `in` into the slot and publishes it - so a kernel never reads a slot being loaded.
+struct Fills {
+    std::vector<std::atomic<void*>> tab;
+    std::atomic<uint64_t> req_started{0}, req_done{0};
+    std::atomic<bool> stop{false};
+    net::ep::Conn c;
+    std::thread th;
+    int64_t stale = 0;                 // (the request thread's)
+    int64_t loaded = 0, refused = 0;   // (the fill thread's: read after end())
+    double load_ms = 0.0;
+    uint64_t bytes = 0;
+    void* at(int li, int e) const {
+        return e >= 0 && e < kTabExp ? tab[(size_t) li * kTabExp + (size_t) e].load(std::memory_order_acquire) : nullptr;
+    }
+    void end() {
+        stop = true;
+        if (th.joinable()) th.join();
+        c.close();
+    }
+    ~Fills() { end(); }
+};
+
+// one Fill (h, its payload p) into the session's table: 0 loaded, else why not (1 malformed, 2 `out` not held or `in`
+// already, 3 no part for in's [k, nb), 4 a CUDA error)
+uint16_t fill_one(const Session& ss, Fills& f, const SliceServer& sl, const net::ep::EpHdr& h, const std::vector<uint8_t>& p,
+                  uint8_t* stg, cudaStream_t fs) {
+    const GeoMsg& g = ss.geo;
+    const int li = h.layer, k = h.T, in = (int) h.aux, out = (int) h.epoch;
+    if (li >= g.n_layers || ss.layers[(size_t) li].K[0] == 0 || in < 0 || in >= kTabExp || out < 0 || out >= kTabExp ||
+        in == out)
+        return 1;
+    const GeoLayer& G = ss.layers[(size_t) li];
+    uint64_t rb[3];
+    for (int r = 0; r < 3; ++r) rb[r] = gg::type_row_bytes(G.K[r], r < 2 ? g.n_embd : g.n_ff);
+    const FillGeo fg(G, g.n_embd, g.n_ff, rb);
+    if (p.size() != fg.ship_bytes(k) || (fg.split(k) && !sl.on())) return 1;
+    std::atomic<void*>& to = f.tab[(size_t) li * kTabExp + (size_t) out];
+    if (to.load() == nullptr || f.at(li, in) != nullptr) return 2;
+    void* slot = to.exchange(nullptr);
+    if (slot == nullptr) return 2;
+    const uint64_t s0 = f.req_started.load();
+    // the main's [0, k) (or the whole blob) and the parts' [k, nb) into the staging blob (while the requests drain)
+    if (!fg.split(k)) {
+        std::memcpy(stg, p.data(), (size_t) fg.blob);
+    } else {
+        const ep::Parts& pa = sl.parts();
+        const uint64_t ub = rb[2] / (uint64_t) fg.nb;   // (a down row's bytes a block)
+        for (int r = 0; r < 3; ++r) {
+            const uint8_t* sp = p.data() + fg.ship_off(r, k);
+            uint8_t* d = stg + fg.off[r];
+            if (r < 2) std::memcpy(d, sp, (size_t) ((uint64_t) k * 256 * rb[r]));
+            else
+                for (int i = 0; i < g.n_embd; ++i) std::memcpy(d + (size_t) i * rb[2], sp + (size_t) i * k * ub, (size_t) (k * ub));
+            for (int kk = k; kk < fg.nb;) {
+                ep::View v;
+                if (!pa.view(li, in, r, kk, v) || v.type != G.K[r] || v.b <= kk) return 3;
+                if (r < 2) {
+                    if (v.row_bytes != rb[r]) return 3;
+                    std::memcpy(d + (uint64_t) kk * 256 * rb[r], v.data, (size_t) v.rows * v.row_bytes);
+                } else {
+                    if (v.rows != (uint32_t) g.n_embd || v.row_bytes != (uint64_t) (v.b - kk) * ub) return 3;
+                    for (int i = 0; i < g.n_embd; ++i)
+                        std::memcpy(d + (size_t) i * rb[2] + kk * ub, v.data + (size_t) i * v.stride, v.row_bytes);
+                }
+                kk = v.b;
+            }
+        }
+    }
+    while (f.req_done.load() < s0 && !f.stop.load()) std::this_thread::yield();   // (the requests that read the slot)
+    if (cudaMemcpyAsync(slot, stg, (size_t) fg.blob, cudaMemcpyHostToDevice, fs) != cudaSuccess ||
+        cudaStreamSynchronize(fs) != cudaSuccess) {
+        cudaGetLastError();
+        return 4;   // (the slot's bytes unknown: neither expert's any more)
+    }
+    f.tab[(size_t) li * kTabExp + (size_t) in].store(slot, std::memory_order_release);
+    return 0;
+}
+
+// the fill thread: Fills in, FillOks out, until the main closes the socket or the session ends
+void fill_loop(const Session& ss, Fills& f, const SliceServer& sl, int dev) {
+    cudaSetDevice(dev);
+    uint64_t mx = 0;
+    for (const GeoLayer& G : ss.layers) mx = std::max(mx, G.blob);
+    cudaStream_t fs = nullptr;
+    uint8_t* stg = nullptr;
+    if (cudaStreamCreateWithFlags(&fs, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaHostAlloc((void**) &stg, (size_t) mx, cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError();
+        std::fprintf(stderr, "expert server: fills: no stream or staging (%.1f MB): no fills\n", (double) mx / 1e6);
+        if (fs != nullptr) cudaStreamDestroy(fs);
+        f.c.close();
+        return;
+    }
+    net::ep::EpHdr h;
+    std::vector<uint8_t> p;
+    std::string err;
+    while (!f.stop.load()) {
+        const int got = f.c.recv(h, p, net::ep::now_ms() + 50.0, err);
+        if (got < 0) {
+            std::fprintf(stderr, "expert server: fills: the socket went (%s)\n", err.c_str());
+            break;
+        }
+        if (got == 0 || h.type != net::ep::Fill) continue;
+        const double t0 = now_ms();
+        const uint16_t st = fill_one(ss, f, sl, h, p, stg, fs);
+        f.load_ms += now_ms() - t0;
+        if (st == 0) {
+            ++f.loaded;
+            f.bytes += p.size();
+        } else if (++f.refused <= 20) {
+            std::fprintf(stderr, "expert server: fills: layer %d expert %u into %u's slot refused (%u)\n", h.layer, h.aux,
+                         h.epoch, st);
+        }
+        net::ep::EpHdr o;
+        o.type = net::ep::FillOk;
+        o.layer = h.layer;
+        o.seq = h.seq;
+        o.aux = h.aux;
+        o.epoch = h.epoch;
+        if (!f.c.send(o, &st, sizeof st, err)) {
+            std::fprintf(stderr, "expert server: fills: a FillOk did not go out (%s)\n", err.c_str());
+            break;
+        }
+    }
+    cudaStreamSynchronize(fs);
+    cudaStreamDestroy(fs);
+    cudaFreeHost(stg);
 }
 
 // one main process: 0 when it went away, -1 on a CUDA error
@@ -336,6 +473,10 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         }
         return 0;
     }
+    Fills fl;   // (the requests look the blobs up here: a fill changes which expert a slot is)
+    fl.tab = std::vector<std::atomic<void*>>((size_t) g.n_layers * kTabExp);
+    for (const auto& kv : ss.blobs)   // (an id past the table's: looked up in ss.blobs, never filled)
+        if ((kv.first & 0xFFFFu) < (uint32_t) kTabExp) fl.tab[(size_t) (kv.first >> 16) * kTabExp + (kv.first & 0xFFFFu)].store(kv.second);
     if (!c.send(BlobsOk, 0, (int32_t) ok.size(), 0, 0, ok.data(), ok.size(), err)) return 0;
     std::fprintf(stderr, "expert server: %zu blobs (%.2f GB) in VRAM in %.1f s, their warm-up done; serving\n",
                  ss.blobs.size(), (double) ss.used / 1e9, (now_ms() - t0) / 1000.0);
@@ -361,7 +502,8 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     double busy = 0, prep = 0, gpu = 0, lane = 0;
     const int errs0 = gg::launch_errors();
     for (;;) {
-        if (serve_next(c, h, p, pings, wakes, err) != 1) {
+        fl.req_done.store(fl.req_started.load());   // (the last request synced: its slots are free to fill)
+        if (serve_next(c, h, p, pings, wakes, err, true) != 1) {
             const double n = (double) std::max<int64_t>(1, served);
             std::fprintf(stderr, "expert server: main process %s gone (%s); %lld requests served, %.1f us each (the "
                                  "rows' prep %.1f, the GPU from the copy in to the copy out %.1f, bf16 and send %.1f)\n",
@@ -371,6 +513,13 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
                          (long long) wakes, (unsigned long long) c.polls, (unsigned long long) c.quickacks);
             if (pings > 0) std::fprintf(stderr, "expert server: %lld pings answered\n", (long long) pings);
             std::fprintf(stderr, "expert server: %lld requests over 2 ms here\n", (long long) slow);
+            if (fl.th.joinable()) {
+                fl.end();
+                std::fprintf(stderr, "expert server: fills: %lld loaded (%.2f GB), %lld refused, %.1f ms loading each; "
+                                     "%lld requests Stale\n", (long long) fl.loaded, (double) fl.bytes / 1e9,
+                             (long long) fl.refused, fl.load_ms / (double) std::max<int64_t>(1, fl.loaded + fl.refused),
+                             (long long) fl.stale);
+            }
             if (sliced > 0)
                 std::fprintf(stderr, "expert server: %lld requests with slice picks, the CPU lane %.1f us each (%.2f GB read, "
                                      "%.1f GB/s in the lane)\n", (long long) sliced, lane * 1000.0 / (double) sliced,
@@ -390,6 +539,25 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
                 }
             break;
         }
+        if (h.type == BulkHello) {   // (DS4_RX_FILL=1 on the main: dial its fills' socket, the fill thread)
+            uint64_t sid = 0;
+            std::string fe;
+            if (p.size() == sizeof sid) std::memcpy(&sid, p.data(), sizeof sid);
+            if (fl.th.joinable() || p.size() != sizeof sid) {
+                std::fprintf(stderr, "expert server: fills: a second or malformed BulkHello, dropped\n");
+            } else if (!fill_dial(fl.c, c.peer(), h.a, sid, token, fe)) {
+                std::fprintf(stderr, "expert server: fills: the main's port %d did not take us (%s): no fills\n", h.a,
+                             fe.c_str());
+            } else {
+                fl.c.cancel = &fl.stop;
+                const int fc = fill_cpu();
+                fl.th = std::thread([&ss, &fl, &sl, dev] { fill_loop(ss, fl, sl, dev); });
+                if (fc >= 0) os::pin_thread(fl.th, fc);
+                std::fprintf(stderr, "expert server: fills: on (port %d; the fill thread on CPU %d)\n", h.a, fc);
+            }
+            continue;
+        }
+        fl.req_started.fetch_add(1);   // (before the table is read: a fill waits for this request's sync)
         const double tr = now_ms();
         const int li = h.a, nr = h.b;
         bucket = nr == 1 ? 0 : nr == 4 ? 1 : 2;
@@ -418,8 +586,8 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         float* dx = cp == Copy::One ? (float*) ((char*) ds + xoff) : cp == Copy::Map ? dm : b.d_x;
         float* hy = cp == Copy::Map ? (float*) hm + (size_t) kMaxRows * D : b.h_y;
         float* dy = cp == Copy::Map ? dm + (size_t) kMaxRows * D : b.d_y;
-        bool any_slice = false;
-        for (int j = 0; why.empty() && j < nr; ++j) {
+        bool any_slice = false, stale = false;
+        for (int j = 0; why.empty() && !stale && j < nr; ++j) {
             ReqRow& rw = rws[j];
             std::memcpy(&rw, p.data() + (size_t) j * per, sizeof rw);
             if (!(why = row_refusal(rw, h.c, sl.slices())).empty()) break;
@@ -427,12 +595,19 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
             nw[j] = 0;   // (the plan: the row's whole picks first, in their order; a slice pick is the lane's)
             for (int i = 0; i < rw.n; ++i) {
                 if ((rw.slice >> i) & 1) continue;
-                auto it = ss.blobs.find((uint32_t) li << 16 | (uint32_t) (uint16_t) rw.e[i]);
-                if (it == ss.blobs.end()) {
+                void* bp = fl.at(li, rw.e[i]);
+                if (rw.e[i] < 0 || rw.e[i] >= kTabExp) {
+                    auto it = ss.blobs.find((uint32_t) li << 16 | (uint32_t) (uint16_t) rw.e[i]);
+                    bp = it != ss.blobs.end() ? it->second : nullptr;
+                } else if (bp == nullptr && fl.th.joinable()) {
+                    stale = true;   // (a fill took its slot, or one is loading it: the main computes the picks)
+                    break;
+                }
+                if (bp == nullptr) {
                     why = "layer " + std::to_string(li) + " expert " + std::to_string(rw.e[i]) + " is not here";
                     break;
                 }
-                hp[j * 8 + nw[j]] = (unsigned long long) it->second;
+                hp[j * 8 + nw[j]] = (unsigned long long) bp;
                 hw[j * 8 + nw[j]] = rw.w[i];
                 ++nw[j];
             }
@@ -448,6 +623,11 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
             (void) c.send(Error, h.seq, 0, 0, 0, why.data(), why.size(), err);
             std::fprintf(stderr, "expert server: %s\n", why.c_str());
             break;
+        }
+        if (stale) {
+            ++fl.stale;
+            if (!c.send(Stale, h.seq, nr, 0, 0, nullptr, 0, err)) break;
+            continue;
         }
         const double tg = now_ms();
         prep += tg - tr;

@@ -18,6 +18,9 @@
 //                checked against the CPU lane's [K, 9) - the two sets of kReqSets apart, kReqWrong's [K - 1, 9); K below
 //                the server's lo: the request refused, exit 0)]  [--parts-hash HEX (another pack's: refused at the Geo, 3)]
 //               (no --parts-k against a server with parts: the Geo's k 9, pack_hash 0 - taken, the server warns; U4)
+//               [--fills N (EP U5b: then N fills - experts --experts .. + N - 1, of their own bytes, each into a held
+//                one's slot; with --parts-k only their [0, K) shipped, the server's parts the rest (a --write-parts with
+//                the same --fills).  A request naming an evicted one: Stale; the filled ones' replies against the CPU lane)]
 //   (STRATA_STAGE_TOKEN: the same as the server's)
 // Exit 0 all good, 1 a failure, 3 the server refused the blobs with an Error (the engine drops it at load).  Two cases
 // of the server's load: a full room (the server with DS4_RX_TEST_VRAM_MIB=600 --expert-server-reserve-mib 0, this
@@ -27,17 +30,20 @@
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_iq.cuh"
 #include "../../src/dsv41/ds4_rx.hpp"
+#include "../../src/dsv41/ds4_rx_fill_link.hpp"
 #include "ep_parts_write.hpp"
 
 #include "ggml.h"   // ggml_get_type_traits(type)->to_float: the double reference's weights
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace iq = strata::ds4::gguf::iq;
@@ -75,12 +81,13 @@ struct Layer {
     rx::GeoLayer geo;
     gg::IqCpu fm;
     std::vector<std::vector<uint8_t>> blobs;
+    std::vector<std::vector<uint8_t>> xblobs;   // (--fills: the experts n_exp .. n_exp + N - 1, sent by fills only)
 };
 
 int main(int argc, char** argv) {
     std::string at = "7861", layers_s = "29/29,16/16,17/17,16/17";
     int n_exp = 8, n_req = 200, n_rtt = 1000, picks = 6, n_ref = 24, rtt_only = 0, n_ping = 0, fill = 0, bad_geo = 0,
-        early = 0, parts_a = 8, parts_k = 0, parts_reqs = 60;
+        early = 0, parts_a = 8, parts_k = 0, parts_reqs = 60, fills = 0;
     std::string parts_dir;
     uint64_t parts_hash = 0x5eed00000000abcdull;
     for (int i = 1; i + 1 < argc; i += 2) {
@@ -101,6 +108,7 @@ int main(int argc, char** argv) {
         else if (a == "--parts-k") parts_k = std::atoi(v.c_str());
         else if (a == "--parts-reqs") parts_reqs = std::atoi(v.c_str());
         else if (a == "--parts-hash") parts_hash = std::strtoull(v.c_str(), nullptr, 16);
+        else if (a == "--fills") fills = std::max(0, std::atoi(v.c_str()));
         else if (a == "--picks") picks = std::max(1, std::min(rx::kMaxPicks, std::atoi(v.c_str())));
         else { std::printf("unknown option %s\n", a.c_str()); return 2; }
     }
@@ -146,14 +154,28 @@ int main(int argc, char** argv) {
             l.blobs.push_back(std::move(blob));
         }
     }
+    std::mt19937_64 xrng(4242);   // (the fills' experts from their own seed: the others' bytes as without --fills)
+    for (Layer& l : L)
+        for (int j = 0; j < fills; ++j) {
+            std::vector<uint8_t> blob(l.geo.blob, 0);
+            for (int r = 0; r < 3; ++r)
+                fill_blocks(xrng, l.geo.K[r], blob.data() + l.geo.off[r],
+                            r < 2 ? (size_t) FF * l.fm.gu_row : (size_t) E * l.fm.d_row);
+            l.xblobs.push_back(std::move(blob));
+        }
+    // expert e's bytes: its own (a fill's), else content e % n_exp (--fill: more ids than contents)
+    auto blob_of = [&](const Layer& l, int e) -> const uint8_t* {
+        return e >= n_exp && e - n_exp < (int) l.xblobs.size() ? l.xblobs[(size_t) (e - n_exp)].data()
+                                                                : l.blobs[(size_t) (e % n_exp)].data();
+    };
     const int NB = FF / 256;
     if (!parts_dir.empty()) {   // (the same blobs each run: seed 42, the same --layers and --experts)
         ep_test::PartsSrc s;
         s.dim = E;
         s.n_ff = FF;
         s.layers = (int) L.size();
-        s.experts = n_exp;
-        s.mat = [&](int l, int e, int kind) { return L[(size_t) l].blobs[(size_t) e].data() + L[(size_t) l].geo.off[kind]; };
+        s.experts = n_exp + fills;
+        s.mat = [&](int l, int e, int kind) { return blob_of(L[(size_t) l], e) + L[(size_t) l].geo.off[kind]; };
         s.row_bytes = [&](int l, int kind) { return kind < 2 ? L[(size_t) l].fm.gu_row : L[(size_t) l].fm.d_row; };
         s.type = [&](int l, int kind) { return L[(size_t) l].geo.K[kind]; };
         std::vector<int> all;
@@ -163,11 +185,15 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::printf("parts pack: n_ff blocks [%d, %d) of %zu layers x %d experts in %s (pack_hash %016llx)\n", parts_a, NB,
-                    L.size(), n_exp, parts_dir.c_str(), (unsigned long long) parts_hash);
+                    L.size(), n_exp + fills, parts_dir.c_str(), (unsigned long long) parts_hash);
         return 0;
     }
     if (parts_k > 0 && (fill || rtt_only || parts_k >= NB)) {
         std::printf("--parts-k: 1 .. %d, and not with --fill or --rtt-only (the parts hold experts 0 .. --experts - 1)\n", NB - 1);
+        return 2;
+    }
+    if (fills > 0 && (fill || rtt_only || n_exp + fills > 1024)) {
+        std::printf("--fills: not with --fill or --rtt-only, and --experts + --fills at most 1024\n");
         return 2;
     }
     if (parts_k > 0) gm.pack_hash = parts_hash;
@@ -262,7 +288,7 @@ int main(int argc, char** argv) {
         gg::iq_cpu_quant(l.fm.gu_act, xb.data(), E, act.data());
         std::vector<float> h(FF), yo(E);
         for (int i = 0; i < rw.n; ++i) {
-            const uint8_t* b = l.blobs[(size_t) (rw.e[i] % n_exp)].data();
+            const uint8_t* b = blob_of(l, rw.e[i]);
             const void* ap[1] = {act.data()};
             float* hp[1] = {h.data()};
             gg::iq_cpu_gate_up(l.fm, b + l.geo.off[0], b + l.geo.off[1], ap, 1, hp, 0, FF, lim);
@@ -281,7 +307,7 @@ int main(int argc, char** argv) {
         std::vector<float> wr((size_t) E);
         std::vector<double> h((size_t) FF);
         for (int i = 0; i < rw.n; ++i) {
-            const uint8_t* b = l.blobs[(size_t) (rw.e[i] % n_exp)].data();
+            const uint8_t* b = blob_of(l, rw.e[i]);
             for (int r = 0; r < FF; ++r) {
                 double gu[2];
                 for (int q = 0; q < 2; ++q) {
@@ -409,7 +435,7 @@ int main(int argc, char** argv) {
             gg::iq_cpu_quant(l.fm.gu_act, xb.data(), E, act.data());
             for (int i = 0; i < rw.n; ++i) {
                 if (!((mask >> i) & 1)) continue;
-                const uint8_t* b = l.blobs[(size_t) (rw.e[i] % n_exp)].data();
+                const uint8_t* b = blob_of(l, rw.e[i]);
                 const void* ap[1] = {act.data()};
                 float* hp[1] = {h.data()};
                 gg::iq_cpu_gate_up(l.fm, b + l.geo.off[0], b + l.geo.off[1], ap, 1, hp, ff0, ff0 + ffn, lim);
@@ -514,6 +540,101 @@ int main(int argc, char** argv) {
                     parts_k - 1 >= lo ? "" : ", twice", n_rows, w_whole, w_slice, w_sum, n_empty_w, n_empty_s,
                     parts_reqs ? lane_us_sum / parts_reqs : 0.0, n_bad ? "FAIL" : "ok");
         fails += n_bad;
+    }
+
+    // ---- fills (--fills N, EP U5b): the fills' socket, N fills (layer j % layers: expert n_exp + j into the slot of
+    // the layer's held expert j / layers), every FillOk 0; then a request naming an evicted expert must be Stale, and
+    // requests whose first pick is a filled expert must match the CPU lane's sums of its own bytes (with --parts-k:
+    // the server's blob from the shipped [0, K) and its parts' [K, 9))
+    if (fills > 0) {
+        rx::FillLink fl;
+        if (!fl.open(m, at, 0, tv != nullptr ? tv : "", 2e9, -1, 5000, err)) {
+            std::printf("FAILED: fills: %s\n", err.c_str());
+            return 1;
+        }
+        const double tf = rx::now_ms();
+        std::vector<std::pair<int, int>> filled, evicted;   // (layer, expert)
+        uint64_t shipped = 0;
+        for (int j = 0; j < fills; ++j) {
+            const int li = j % (int) L.size(), slot = j / (int) L.size();
+            if (slot >= (int) ids_of[(size_t) li].size() - picks) {
+                std::printf("FAILED: fills: layer %d holds too few experts for %d fills\n", li, fills);
+                return 1;
+            }
+            const Layer& l = L[(size_t) li];
+            const uint64_t rb[3] = {(uint64_t) l.fm.gu_row, (uint64_t) l.fm.gu_row, (uint64_t) l.fm.d_row};
+            rx::FillLink::Job jb;
+            jb.seq = (uint32_t) j + 1;
+            jb.layer = li;
+            jb.in = n_exp + j;
+            jb.out = ids_of[(size_t) li][(size_t) slot];
+            jb.k = parts_k;
+            jb.geo = rx::FillGeo(l.geo, E, FF, rb);
+            for (int r = 0; r < 3; ++r) jb.src[r] = blob_of(l, jb.in) + l.geo.off[r];
+            shipped += jb.geo.ship_bytes(jb.k);
+            fl.queue(jb);
+            filled.push_back({li, jb.in});
+            evicted.push_back({li, jb.out});
+        }
+        std::vector<rx::FillLink::Done> dn;
+        while ((int) dn.size() < fills && fl.up() && rx::now_ms() - tf < 10000.0) {
+            for (const auto& d : fl.take()) dn.push_back(d);
+            if ((int) dn.size() < fills) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const double t_fill = rx::now_ms() - tf;
+        int bad_ok = 0;
+        for (const auto& d : dn) bad_ok += d.status != 0;
+        const bool all_in = (int) dn.size() == fills && bad_ok == 0;
+        std::printf("fills: %d of %d FillOks (%d not loaded) in %.1f ms, %.1f MB shipped (%s)%s -> %s\n", (int) dn.size(),
+                    fills, bad_ok, t_fill, (double) shipped / 1e6, parts_k > 0 ? "the main's [0, K)" : "whole blobs",
+                    fl.up() ? "" : (", the socket: " + fl.why()).c_str(), all_in ? "ok" : "FAIL");
+        if (!all_in) return 1;
+        for (size_t i = 0; i < filled.size(); ++i) {   // (the held ids now: out gone, in there)
+            std::vector<int>& id = ids_of[(size_t) filled[i].first];
+            id.erase(std::find(id.begin(), id.end(), evicted[i].second));
+            id.push_back(filled[i].second);
+        }
+        // an evicted expert: Stale, not an Error (the link stays)
+        make_req(evicted[0].first, 1, 1, rows, xs);
+        rows[0].e[0] = (int16_t) evicted[0].second;
+        const uint16_t* y = nullptr;
+        int us = 0;
+        if (!m.send_req(seq, evicted[0].first, 1, rows.data(), ptrs(xs), err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
+        const int gs = m.wait_resp(seq, 1, rx::now_ms() + 5000.0, &y, us, err);
+        ++seq;
+        const bool stale_ok = gs == 0 && m.last_stale();
+        std::printf("fills: a request naming evicted expert %d of layer %d: %s -> %s\n", evicted[0].second, evicted[0].first,
+                    gs == 0 ? (m.last_stale() ? "Stale" : "no reply") : gs == 1 ? "answered" : err.c_str(),
+                    stale_ok ? "ok" : "FAIL");
+        if (!stale_ok) return 1;
+        // the filled experts' replies: each filled one first in a row's picks, T 1 .. 4
+        double fworst = 0;
+        int fbad = 0, frows = 0;
+        for (size_t i = 0; i < filled.size() * 3; ++i, ++seq) {
+            const int li = filled[i % filled.size()].first, T = 1 + (int) (i % 4), k = 1 + (int) (i % (size_t) picks);
+            make_req(li, T, k, rows, xs);
+            for (int t = 0; t < T; ++t) {
+                rx::ReqRow& rw = rows[(size_t) t];
+                for (int q = 1; q < rw.n; ++q)
+                    if (rw.e[q] == filled[i % filled.size()].second) rw.e[q] = rw.e[0];
+                rw.e[0] = (int16_t) filled[i % filled.size()].second;
+            }
+            if (!m.send_req(seq, li, T, rows.data(), ptrs(xs), err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
+            const int got = m.wait_resp(seq, T, rx::now_ms() + 5000.0, &y, us, err);
+            if (got != 1) { std::printf("FAILED: fills: request %u: %s\n", seq, got == 0 ? "no reply" : err.c_str()); return 1; }
+            for (int t = 0; t < T; ++t, ++frows) {
+                std::vector<double> lane, srv((size_t) E);
+                cpu_row(L[(size_t) li], rows[(size_t) t], xs[(size_t) t], lane);
+                for (int c = 0; c < E; ++c) srv[(size_t) c] = (double) rx::bf2f(y[(size_t) t * E + c]);
+                const double rel = rel_err(srv.data(), lane);
+                fworst = std::max(fworst, rel);
+                fbad += !(rel < 0.15);
+            }
+        }
+        std::printf("fills: %d rows with a filled expert first: relative error to the CPU lane's max %.2e (< 0.15) -> %s\n",
+                    frows, fworst, fbad ? "FAIL" : "ok");
+        fails += fbad;
+        fl.close();
     }
 
     // ---- a late reply is skipped: a request whose deadline has passed, then one that must get its own reply.  Two are

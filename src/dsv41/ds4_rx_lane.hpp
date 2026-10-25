@@ -119,6 +119,7 @@ public:
              std::string& err);
     double last_ms() const { return last_ms_; }   // the last run's time in the lane
     const SliceLane& lane() const { return lane_; }
+    const ep::Parts& parts() const { return parts_; }   // (a fill's [k, nb) beside the main's [0, k): ds4_rx_server.cu)
 
 private:
     ep::Parts parts_;

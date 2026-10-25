@@ -32,6 +32,12 @@
 // from the parts in place while the main's computes [0, k) (DS4_EP_K).  Its hello says the lowest k its parts take (lo),
 // the Geo carries the main's pack_hash (another pack: refused at the Geo, the main runs alone), a request's row marks its
 // slice picks (ReqRow::slice) and the header's c their k; the reply is the same one sum a row (whole + slice picks).
+//
+// Fills (protocol 3, EP U5b, DS4_RX_FILL=1 on the main; ds4_rx_fill_link.hpp): the server's set follows the main's heat.
+// The main sends BulkHello (a = the port of a second, paced socket it listens on, payload the session); the server dials
+// it (ep::Conn), and Fills come on it - an expert's bytes into the slot of one the server holds, FillOk back.  A request
+// that names an expert whose slot is being filled (a late one: the main stops naming `out` before the Fill leaves) gets
+// Stale, not an Error: the main computes its picks on the lane, as for a late reply.
 #pragma once
 
 #include <cstddef>
@@ -43,7 +49,7 @@
 namespace strata::ds4::rx {
 
 constexpr uint32_t kMagic = 0x58524453u;   // "SDRX"
-constexpr uint32_t kProto = 2;             // (2: H' - the hello's lo, the Geo's pack_hash, the slice picks)
+constexpr uint32_t kProto = 3;             // (2: H' - the hello's lo, the Geo's pack_hash, the slice picks; 3: fills)
 constexpr int kMaxRows = 16;               // a request's rows at most (kWin)
 constexpr int kMaxPicks = 8;               // picks a row at most (kPicks)
 // a Req's c: the slice picks' first n_ff block k (0: none), and flags
@@ -68,6 +74,8 @@ enum Msg : uint32_t {
     Pong = 11,      // (a = the Wakes the server took, b = its waits in poll (the low 31 bits), c = the one CPU its
                     // serve loop may run on, -1: not pinned)
     Wake = 12,      // main -> server: no payload, no reply; a window starts (its bytes restart the server's spin)
+    BulkHello = 13, // main -> server: a = the fills' port (the main's host), payload uint64 session; the server dials it
+    Stale = 14,     // server -> main: seq; the request named an expert whose slot a fill is taking (no reply rows)
 };
 
 constexpr double kSpinMs = 200.0;      // a receive spins while bytes came or went this recently, then waits in poll
@@ -429,6 +437,11 @@ public:
     /// ms; it is skipped when it comes); -1: the link failed (err)
     int wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y, int& srv_us, std::string& err,
                   int sets = 1, int* lane_us = nullptr);
+    /// the last wait_resp's 0 was the server's Stale for it (an expert mid-fill), not a deadline
+    bool last_stale() const { return stale_; }
+    uint64_t stales = 0;   // Stale replies seen (the awaited request's and late ones')
+    /// fills (protocol 3): the server is to dial `port` on this end's host with `session`
+    bool bulk_hello(int port, uint64_t session, std::string& err);
     /// the last reply's arrival in the kernel (Conn::arrival_ms: steady ms, -1 unknown)
     double arrival_ms() const { return c_.arrival_ms(); }
     /// the replies wait_resp skipped since the last call (late ones, their picks computed here): seq and the kernel's
@@ -462,6 +475,7 @@ private:
     std::vector<uint8_t> tx_, rx_;
     std::vector<std::pair<uint32_t, double>> late_;   // (take_late)
     std::vector<uint16_t> xb_;
+    bool stale_ = false;
 };
 
 /// The expert server (--expert-server-connect): dials `host_port` (again each second until a main process takes it),
@@ -477,9 +491,11 @@ int serve_cpu(const std::string& host_port, const std::string& token, bool once,
 /// Either server's parts.  serve_loop: dial `host_port` (again each second until a main process takes it), run
 /// `session` on the connection (0: the main went away; < 0: an error, returned as 1), again unless `once`; the calling
 /// thread on link_cpu() meanwhile (its mask restored at the return).  serve_next: the next request (1, in h / p),
-/// answering Pings and taking Wakes on the way (the counts in *wakes); -1: the link went (err)
+/// answering Pings and taking Wakes on the way (the counts in *wakes); -1: the link went (err).  bulk: a BulkHello is
+/// returned too (a server that takes fills), else dropped (the main's wait for the fills' socket times out)
 int serve_loop(const std::string& host_port, bool once, const char* what, int (*session)(Conn&, void*), void* arg);
-int serve_next(Conn& c, Hdr& h, std::vector<uint8_t>& p, int64_t& pings, int64_t& wakes, std::string& err);
+int serve_next(Conn& c, Hdr& h, std::vector<uint8_t>& p, int64_t& pings, int64_t& wakes, std::string& err,
+               bool bulk = false);
 /// A server's refusal at the Geo: the Error with `why`, then whatever the main still sends read and dropped until it
 /// closes the link (it stops at the Error: Main::send_blob), sends its BlobsEnd (a main that does not look: the Error is
 /// its answer), or is silent for 30 s - closed at once, the unread blobs would reset the link and the main's send

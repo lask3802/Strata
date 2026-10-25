@@ -445,6 +445,7 @@ bool Main::send_req(uint32_t seq, int layer, int nrows, const ReqRow* rows, cons
 
 int Main::wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y, int& srv_us, std::string& err, int sets,
                     int* lane_us) {
+    stale_ = false;
     for (;;) {
         Hdr h;
         const int got = c_.recv(h, rx_, deadline, err);
@@ -453,6 +454,12 @@ int Main::wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y
             err = "expert server: " + std::string(rx_.begin(), rx_.end());
             c_.close();
             return -1;
+        }
+        if (h.type == Stale) {   // (an expert mid-fill: no rows - the lane computes them; a late one's: dropped)
+            ++stales;
+            if (h.seq != seq) continue;
+            stale_ = true;
+            return 0;
         }
         if (h.type != Resp) continue;
         if (h.seq != seq) {   // (an earlier request's, late: its picks were computed here; take_late has its arrival)
@@ -487,6 +494,10 @@ int Main::ping(uint32_t seq, size_t bytes, double deadline, std::string& err, in
             return rx_.size() == bytes ? 1 : -1;
         }
     }
+}
+
+bool Main::bulk_hello(int port, uint64_t session, std::string& err) {
+    return c_.send(BulkHello, 0, port, 0, 0, &session, sizeof session, err);
 }
 
 bool Main::wake(std::string& err) {
@@ -541,7 +552,7 @@ int serve_loop(const std::string& host_port, bool once, const char* what, int (*
     return rc;
 }
 
-int serve_next(Conn& c, Hdr& h, std::vector<uint8_t>& p, int64_t& pings, int64_t& wakes, std::string& err) {
+int serve_next(Conn& c, Hdr& h, std::vector<uint8_t>& p, int64_t& pings, int64_t& wakes, std::string& err, bool bulk) {
     for (;;) {
         if (c.recv(h, p, -1, err) != 1) return -1;
         if (h.type == Ping) {
@@ -555,7 +566,7 @@ int serve_next(Conn& c, Hdr& h, std::vector<uint8_t>& p, int64_t& pings, int64_t
             ++wakes;
             continue;
         }
-        if (h.type == Req) return 1;
+        if (h.type == Req || (bulk && h.type == BulkHello)) return 1;
     }
 }
 

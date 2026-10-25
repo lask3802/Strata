@@ -813,7 +813,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                    src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
                    src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp
                    src/net/stage_link.cpp src/dsv41/ds4_rx.cpp src/dsv41/ds4_rx_server.cu src/dsv41/ds4_rx_cpu.cpp
-                   src/dsv41/ds4_rx_lane.cpp)
+                   src/dsv41/ds4_rx_lane.cpp src/dsv41/ds4_rx_fill_link.cpp src/net/ep_link.cpp)
     if(WIN32)
       target_link_libraries(strata-dsv41 PRIVATE ws2_32)   # the remote stage's sockets (src/net/stage_link.cpp)
     endif()
@@ -927,7 +927,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # the remote experts (ds4_rx.hpp): this is the main process's end, an expert server (strata-dsv41
       # --expert-server-connect, a GPU) the other; its replies against the CPU lane's sums of the same random experts
       set_source_files_properties(tests/dsv41/rx_test.cpp PROPERTIES LANGUAGE ${_ds4_test_lang})
-      add_executable(ds4_rx_test tests/dsv41/rx_test.cpp src/dsv41/ds4_rx.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
+      add_executable(ds4_rx_test tests/dsv41/rx_test.cpp src/dsv41/ds4_rx.cpp src/dsv41/ds4_rx_fill_link.cpp src/net/ep_link.cpp
+                     src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
                      src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp)
       target_include_directories(ds4_rx_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
                                  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
