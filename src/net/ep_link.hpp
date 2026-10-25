@@ -115,6 +115,7 @@ uint16_t f2bf(float f);   // round to nearest even, as the GPU kernels round (a 
 float bf2f(uint16_t b);
 double now_ms();          // steady clock
 uint64_t now_ns();
+int64_t wall_ns();   // CLOCK_REALTIME ns (the clock of the kernel's rx stamps)
 void relax();             // a spin-wait's pause
 
 /// The hello checks, as pure functions (the tests call them; the handshakes below use them).  "" when the peer is
@@ -149,6 +150,11 @@ public:
     int recv(EpHdr& h, std::vector<uint8_t>& payload, double deadline, std::string& err);
     /// SO_BUSY_POLL us on this socket (Linux; false and why elsewhere or when refused)
     bool busy_poll(int us, std::string& err);
+    /// the kernel's receive time on each read (SO_TIMESTAMPNS, software rx; Linux; false and why elsewhere)
+    bool rx_stamps(std::string& err);
+    /// with rx_stamps: the kernel's CLOCK_REALTIME ns for the read that completed the last frame recv returned
+    /// (the frame's arrival, not the moment this thread got to it); 0 without
+    int64_t last_rx_ns() const { return last_rx_ns_; }
     size_t buffered() const { return rb_.size() - rd_; }   // bytes read, not yet a whole frame
     /// bytes as they are, no header (tests: a peer that breaks the framing)
     bool send_bytes(const void* p, size_t len, std::string& err) { return send_raw_((const uint8_t*) p, len, err); }
@@ -165,7 +171,10 @@ public:
 
 private:
     bool send_raw_(const uint8_t* p, size_t len, std::string& err);
+    int read_(uint8_t* p, size_t len);   // (::recv, or recvmsg taking the rx stamp)
     std::intptr_t fd_ = -1;
+    bool stamps_ = false;
+    int64_t rx_ns_ = 0, last_rx_ns_ = 0;   // (the last read's stamp; the last frame's)
     std::string peer_;
     std::vector<uint8_t> rb_, tx_;
     size_t rd_ = 0;            // rb_'s consumed bytes

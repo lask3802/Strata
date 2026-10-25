@@ -31,6 +31,8 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -53,6 +55,10 @@ double now_ms() {
 }
 uint64_t now_ns() {
     return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+int64_t wall_ns() {
+    return (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
 void relax() {
@@ -219,6 +225,8 @@ void Conn::close() {
     fd_ = -1;
     rb_.clear();
     rd_ = 0;
+    stamps_ = false;
+    rx_ns_ = last_rx_ns_ = 0;
 }
 
 void Conn::adopt(std::intptr_t fd, const std::string& peer) {
@@ -297,6 +305,49 @@ bool Conn::busy_poll(int us, std::string& err) {
 #endif
 }
 
+bool Conn::rx_stamps(std::string& err) {
+#if defined(SO_TIMESTAMPNS)
+    if (fd_ < 0) {
+        err = "not connected";
+        return false;
+    }
+    const int on = 1;
+    if (setsockopt((sock_t) fd_, SOL_SOCKET, SO_TIMESTAMPNS, (const char*) &on, sizeof on) != 0) {
+        err = err_text("SO_TIMESTAMPNS");
+        return false;
+    }
+    stamps_ = true;
+    return true;
+#else
+    err = "no SO_TIMESTAMPNS on this system";
+    return false;
+#endif
+}
+
+int Conn::read_(uint8_t* p, size_t len) {
+#if defined(SO_TIMESTAMPNS)
+    if (stamps_) {   // (TCP gives the stamp of the last segment this read took)
+        iovec iov{p, len};
+        alignas(cmsghdr) char ctl[CMSG_SPACE(sizeof(timespec))];
+        msghdr m{};
+        m.msg_iov = &iov;
+        m.msg_iovlen = 1;
+        m.msg_control = ctl;
+        m.msg_controllen = sizeof ctl;
+        const int k = (int) ::recvmsg((sock_t) fd_, &m, kRecvFlags);
+        if (k > 0)
+            for (cmsghdr* c = CMSG_FIRSTHDR(&m); c != nullptr; c = CMSG_NXTHDR(&m, c))
+                if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPNS) {
+                    timespec ts;
+                    std::memcpy(&ts, CMSG_DATA(c), sizeof ts);
+                    rx_ns_ = (int64_t) ts.tv_sec * 1000000000 + ts.tv_nsec;
+                }
+        return k;
+    }
+#endif
+    return (int) ::recv((sock_t) fd_, (char*) p, (int) len, kRecvFlags);
+}
+
 bool Conn::send_raw_(const uint8_t* p, size_t len, std::string& err) {
     const double t0 = now_ms(), give_up = t0 + 30000.0;   // (a full buffer for 30 s: the peer is gone)
     size_t sent = 0;
@@ -370,10 +421,11 @@ int Conn::recv(EpHdr& h, std::vector<uint8_t>& payload, double deadline, std::st
                 }
                 ++stat.frames_in;
                 last_frame_ = now_ms();
+                last_rx_ns_ = rx_ns_;
                 return 1;
             }
         }
-        const int k = (int) ::recv((sock_t) fd_, (char*) tmp, (int) sizeof tmp, kRecvFlags);
+        const int k = read_(tmp, sizeof tmp);
         if (k > 0) {
             if (rd_ > 0 && rd_ == rb_.size()) {
                 rb_.clear();

@@ -13,7 +13,9 @@
 //                                     both ends spinning or both waiting in poll (blocking), with SO_BUSY_POLL off and at
 //                                     US on the far end; p50 / p90 / p99 / max.  --load N: N busy threads on each side
 //                                     (the CPU lanes); --pin CPU: the link's thread on CPU (both sides), the busy
-//                                     threads off it and its SMT siblings
+//                                     threads off it and its SMT siblings.  Arrival times come from the kernel's
+//                                     rx stamps (SO_TIMESTAMPNS, Linux), never from a read that waits behind other
+//                                     work: wire (send -> the reply in the kernel) apart from each end's wake-up
 //
 // The cases: the hello accepted, and refused for the pack, the slice table (a range, a type), the token, the protocol,
 // the geometry, a bulk socket's session; a request's reply (y = 2x, exact in bf16); the seq rules and two outstanding;
@@ -601,8 +603,8 @@ void case_bulk_session() {
 // ---------------------------------------------------------------------------------------------------- the probe
 struct ProbeCfg {   // the probe's settings for the far end, in a Ping of aux kCfg (its Pong: the same, results filled)
     int32_t spin = 1, busy_us = 0, load = 0, pin = -1;
-    int32_t busy_ok = 0, cpus = 0;
-    char note[104] = {};
+    int32_t busy_ok = 0, cpus = 0, stamps_ok = 0;
+    char note[100] = {};
 };
 constexpr uint32_t kCfg = 0x100;
 
@@ -696,13 +698,22 @@ int serve(const std::string& at, double for_s) {
             continue;
         }
         w.start(me);
+        std::string se;
+        const bool stamps = w.req.rx_stamps(se);
         w.on_ping = [&](const EpHdr& h, std::vector<uint8_t>& p) {
-            if ((h.aux & kCfg) == 0 || p.size() != sizeof(ProbeCfg)) return;
+            if ((h.aux & kCfg) == 0) {   // (a probe's ping: the first 8 bytes back say how long it sat in the kernel here)
+                const int64_t rx = w.req.last_rx_ns();
+                const int64_t wait = stamps && rx > 0 ? wall_ns() - rx : -1;
+                if (p.size() >= sizeof wait) std::memcpy(p.data(), &wait, sizeof wait);
+                return;
+            }
+            if (p.size() != sizeof(ProbeCfg)) return;
             ProbeCfg c;
             std::memcpy(&c, p.data(), sizeof c);
             w.req.spin_ms = c.spin ? kSpinMs : 0.0;
             std::string e;
             c.busy_ok = w.req.busy_poll(c.busy_us, e) ? 1 : 0;
+            c.stamps_ok = stamps ? 1 : 0;
             std::snprintf(c.note, sizeof c.note, "%s", c.busy_ok ? "" : e.c_str());
             load.start(c.load, c.pin);
             pin_to(c.pin);
@@ -719,8 +730,13 @@ int serve(const std::string& at, double for_s) {
     return 0;
 }
 
+// rtt: send -> this thread has the Pong (steady clock).  With the kernel's rx stamps (SO_TIMESTAMPNS, both ends):
+// wire = send -> the Pong's arrival in the kernel here, so it holds no wait of this thread (the far end's wake and
+// held are in it: the network's own share is wire - there - held); here / there = arrival ->
+// the link thread has the frame (the Pong here, the Ping on the far end): the thread's own wake-up, what the busy
+// threads can stretch.  held: the far end's Ping in hand -> its Pong sent.
 struct Arm {
-    std::vector<double> rtt, held;
+    std::vector<double> rtt, held, wire, here, there;
 };
 void report(const char* name, Arm& a) {
     auto pct = [](std::vector<double> v, double q) {
@@ -728,9 +744,13 @@ void report(const char* name, Arm& a) {
         std::sort(v.begin(), v.end());
         return v[std::min(v.size() - 1, (size_t) (q * (double) (v.size() - 1) + 0.5))];
     };
-    std::printf("  %-36s n %4zu  p50 %.3f  p90 %.3f  p99 %.3f  max %.3f ms   far end held p50 %.1f us\n", name, a.rtt.size(),
-                pct(a.rtt, 0.5), pct(a.rtt, 0.9), pct(a.rtt, 0.99), a.rtt.empty() ? 0.0 : *std::max_element(a.rtt.begin(), a.rtt.end()),
-                pct(a.held, 0.5));
+    auto mx = [](const std::vector<double>& v) { return v.empty() ? 0.0 : *std::max_element(v.begin(), v.end()); };
+    std::printf("  %-36s n %4zu  rtt p50 %.3f  p90 %.3f  p99 %.3f  max %.3f ms   far end held p50 %.1f us\n", name, a.rtt.size(),
+                pct(a.rtt, 0.5), pct(a.rtt, 0.9), pct(a.rtt, 0.99), mx(a.rtt), pct(a.held, 0.5));
+    if (!a.wire.empty())
+        std::printf("  %-36s wire p50 %.3f  p99 %.3f  max %.3f ms   wake here p50 %.1f p99 %.1f max %.1f us   there p50 %.1f p99 %.1f max %.1f us\n",
+                    "", pct(a.wire, 0.5), pct(a.wire, 0.99), mx(a.wire), pct(a.here, 0.5), pct(a.here, 0.99), mx(a.here),
+                    pct(a.there, 0.5), pct(a.there, 0.99), mx(a.there));
     std::fflush(stdout);
 }
 
@@ -749,6 +769,8 @@ int probe(const std::string& host, int load_n, int pin, int busy_us, int rounds,
         return 2;
     }
     m.start(me);
+    std::string se;
+    const bool stamps = m.req.rx_stamps(se);
     pin_to(pin);
     Load load;
     load.start(load_n, pin);
@@ -757,6 +779,8 @@ int probe(const std::string& host, int load_n, int pin, int busy_us, int rounds,
     std::printf("ds4_ep_link_test --probe %s: frames of %zu bytes each way; busy threads %d here and there; link thread on CPU %d\n",
                 at.c_str(), kPay + sizeof(EpHdr), load_n, pin);
     std::printf("  (the reference: ping -A of 10,240 bytes CT 580 -> 10.10.10.2, 0.060 / 0.067 / 0.101 ms; adaptive-rx.txt)\n");
+    std::printf("  kernel rx stamps here: %s\n", stamps ? "on (wire / wake columns)" : se.c_str());
+    std::vector<uint8_t> buf(kPay);
     int rc = 0;
     for (const int bp : {0, busy_us}) {
         if (bp == 0 && busy_us == 0 && rc == 1) break;
@@ -775,17 +799,30 @@ int probe(const std::string& host, int load_n, int pin, int busy_us, int rounds,
             }
             std::memcpy(&c, v.data(), sizeof c);
             m.req.spin_ms = spin ? kSpinMs : 0.0;
-            std::printf("arm: %s, SO_BUSY_POLL %d us on the far end (%s), far end %d CPUs\n",
+            std::printf("arm: %s, SO_BUSY_POLL %d us on the far end (%s), far end %d CPUs, rx stamps there %s\n",
                         spin ? "both ends spin (keep-awake)" : "both ends wait in poll (blocking recv)", bp,
-                        bp == 0 ? "off" : c.busy_ok ? "set" : c.note, c.cpus);
+                        bp == 0 ? "off" : c.busy_ok ? "set" : c.note, c.cpus, c.stamps_ok ? "on" : "off");
             sleep_ms(200);   // (the far end's busy threads up)
             auto one = [&](Arm& a) {
                 uint32_t hu = 0;
+                std::fill(buf.begin(), buf.end(), (uint8_t) 0);
+                buf.resize(kPay);
+                const int64_t w0 = wall_ns();
                 const double t0 = now_ms();
-                const int got = m.ping(++seq, kPay, t0 + 1000.0, hu, err);
+                const int got = m.ping(++seq, kPay, t0 + 1000.0, hu, err, &buf);
+                const double t1 = now_ms();
+                const int64_t w1 = wall_ns();
                 if (got == 1) {
-                    a.rtt.push_back(now_ms() - t0);
+                    a.rtt.push_back(t1 - t0);
                     a.held.push_back((double) hu / 1000.0);
+                    const int64_t rx = m.req.last_rx_ns();
+                    int64_t there = -1;
+                    if (buf.size() >= sizeof there) std::memcpy(&there, buf.data(), sizeof there);
+                    if (stamps && rx > 0 && c.stamps_ok && there >= 0) {
+                        a.wire.push_back((double) (rx - w0) / 1.0e6);
+                        a.here.push_back((double) (w1 - rx) / 1.0e3);
+                        a.there.push_back((double) there / 1.0e3);
+                    }
                 }
                 return got >= 0;
             };
