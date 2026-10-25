@@ -490,6 +490,16 @@ inline void pin_self(int cpu) {
     }
 #endif
 }
+/// Whether the calling thread may run on `cpu` (Linux: its mask - a container's cpuset is in it; Windows: the process's)
+inline bool cpu_allowed(int cpu) {
+#if defined(_WIN32)
+    DWORD_PTR proc = 0, sys = 0;
+    return cpu >= 0 && cpu < 64 && GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) && ((proc >> cpu) & 1);
+#else
+    cpu_set_t s;
+    return cpu >= 0 && cpu < CPU_SETSIZE && sched_getaffinity(0, sizeof s, &s) == 0 && CPU_ISSET(cpu, &s);
+#endif
+}
 /// The one logical CPU the calling thread may run on (-1: more than one, or not known)
 inline int pinned_cpu() {
     int one = -1;
@@ -518,7 +528,7 @@ inline std::vector<int> cpu_siblings(int cpu) {
     std::vector<uint8_t> b(len);
     if (cpu >= 0 && cpu < 64 && len > 0 &&
         GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) b.data(), &len))
-        for (size_t o = 0; o < b.size() && v.empty();) {
+        for (size_t o = 0; o < (size_t) len && v.empty();) {
             auto* e = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) (b.data() + o);
             const KAFFINITY m = e->Processor.GroupCount > 0 && e->Processor.GroupMask[0].Group == 0
                                     ? e->Processor.GroupMask[0].Mask : 0;

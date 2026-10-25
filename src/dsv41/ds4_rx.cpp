@@ -351,7 +351,7 @@ int Conn::recv(Hdr& h, std::vector<uint8_t>& payload, double deadline, std::stri
             in_at_ = at;
 #if defined(TCP_QUICKACK)
             int one = 1;   // (the kernel turns it off again by itself: after each read)
-            if (setsockopt((sock_t) fd_, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof one) == 0) ++quickacks;
+            if (setsockopt((sock_t) fd_, IPPROTO_TCP, TCP_QUICKACK, (const char*) &one, sizeof one) == 0) ++quickacks;
 #endif
             continue;
         }
@@ -362,7 +362,8 @@ int Conn::recv(Hdr& h, std::vector<uint8_t>& payload, double deadline, std::stri
         }
         const double now = now_ms();
         if (deadline >= 0 && now > deadline) return 0;
-        if (now - last_in_ > kSpinMs) {   // quiet: sleep in poll (a reply's wait in decode stays a spin)
+        // quiet both ways: sleep in poll (a reply's wait right after its request stays a spin, after a gap too)
+        if (now - std::max(last_in_, last_out_) > kSpinMs) {
             const int ms = deadline < 0 ? 50 : (int) std::min(50.0, deadline - now) + 1;
             ++polls;
             (void) wait_sock((sock_t) fd_, true, ms);
@@ -487,8 +488,10 @@ bool Main::wake(std::string& err) {
 int link_cpu() {
     const char* v = std::getenv("DS4_EP_CPU");
     if (v != nullptr && (std::strcmp(v, "off") == 0 || std::strcmp(v, "none") == 0)) return -1;
-    const int cpu = v != nullptr && *v != '\0' ? std::atoi(v) : 2;
-    return cpu >= 0 && cpu < (int) std::thread::hardware_concurrency() ? cpu : -1;
+    char* end = nullptr;
+    const long cpu = v != nullptr && *v != '\0' ? std::strtol(v, &end, 10) : 2;
+    if (end != nullptr && *end != '\0') return -1;   // (not a number)
+    return cpu >= 0 && cpu < (long) std::thread::hardware_concurrency() && os::cpu_allowed((int) cpu) ? (int) cpu : -1;
 }
 
 std::vector<int> off_link(const std::vector<int>& cores, const std::vector<int>& link) {

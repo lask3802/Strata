@@ -114,6 +114,7 @@ int cpu_session(Conn& c, void* arg) {
         const size_t per = sizeof(ReqRow) + (size_t) D * 2;
         std::string why;
         if (li < 0 || li >= g.n_layers || nr < 1 || nr > kMaxRows || p.size() != (size_t) nr * per) why = "a malformed request";
+        else if (!takes[(size_t) li]) why = "layer " + std::to_string(li) + " is not served here";
         for (int j = 0; why.empty() && j < nr; ++j) {
             ReqRow rw;
             std::memcpy(&rw, p.data() + (size_t) j * per, sizeof rw);

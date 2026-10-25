@@ -9,12 +9,15 @@
 //   - a killed server: the wait ends at once with -1 (no hang), the picks computed here;
 //   - --expert-server-once: the server exits 0 when the main leaves;
 //   - keep-awake: a Wake (only after kWakeQuietMs without a send) keeps the server's receive spinning (its waits in
-//     poll do not move), and without one they do; the server takes them;
+//     poll do not move), and without one they do; the server takes them; the main's wait for a reply right after its
+//     request spins after a long gap too;
 //   - the link core: the server's serve loop on DS4_EP_CPU; os::pin_self(-1) restores the mask; os::cpu_siblings;
-//     rx::off_link takes the core's CPUs out; rx::link_cpu's env; serve_lane's nap rule (rx::lane_naps);
+//     rx::off_link takes the core's CPUs out; rx::link_cpu's env and its CPU's check; the nap rule (rx::lane_naps);
 //   - Linux: TCP_QUICKACK after each read.
+// What it does not reach: serve_lane's own use of these (the Wake flag, the naps, the pools off the link core, the
+// service thread's pin) - the engine's, checked in the GPU slot (ep-u4-slot.sh: ep against ep-nowake, the stats line).
 // No GPU, no model.
-//   ds4_rx_loop_test [PORT (27893; PORT + 1 too)]
+//   ds4_rx_loop_test [PORT (27893; PORT + 1 and PORT + 2 too)]
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_os.hpp"
 #include "../../src/dsv41/ds4_rx.hpp"
@@ -37,6 +40,9 @@
 #include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
+#if defined(__linux__)
+#include <sys/prctl.h>
 #endif
 
 namespace gg = strata::ds4::gguf;
@@ -93,6 +99,9 @@ struct Child {
 #else
         pid = fork();
         if (pid == 0) {
+#if defined(__linux__)
+            prctl(PR_SET_PDEATHSIG, SIGKILL);   // (this test gone - killed by a timeout too: the server with it)
+#endif
             execl(exe.c_str(), exe.c_str(), "--child", p.c_str(), (char*) nullptr);
             _exit(127);
         }
@@ -213,16 +222,18 @@ static double norm(const std::vector<float>& a) {
     return std::sqrt(s);
 }
 
-// a main process up to the blobs: false (and why) when it did not get there
-static bool connect(rx::Main& m, int port, const std::vector<Layer>& L, std::string& err) {
+// a main process up to the blobs (`unserved` more layers in the geometry with no types: not the server's): false (and
+// why) when it did not get there
+static bool connect(rx::Main& m, int port, const std::vector<Layer>& L, std::string& err, int unserved = 0) {
     if (!m.accept("127.0.0.1:" + std::to_string(port), kToken, 30, err)) return false;
     rx::GeoMsg gm;
     gm.n_embd = E;
     gm.n_ff = FF;
-    gm.n_layers = (int) L.size();
+    gm.n_layers = (int) L.size() + unserved;
     gm.limit = kLim;
     std::vector<rx::GeoLayer> gl;
     for (const Layer& l : L) gl.push_back(l.geo);
+    gl.resize(gl.size() + (size_t) unserved);
     if (!m.send_geo(gm, gl, err)) return false;
     int nb = 0;
     for (size_t li = 0; li < L.size(); ++li)
@@ -254,9 +265,11 @@ static void case_rules() {
     const int one = rx::link_cpu();
     set_env("DS4_EP_CPU", "100000");
     const int big = rx::link_cpu();
+    set_env("DS4_EP_CPU", "2x");
+    const int junk = rx::link_cpu();
     set_env("DS4_EP_CPU", nullptr);
-    check(d == (hw > 2 ? 2 : -1) && off == -1 && one == (hw > 1 ? 1 : -1) && big == -1,
-          "link_cpu: 2 by default, off: -1, 1: 1, a CPU this PC has not: -1");
+    check(d == (hw > 2 ? 2 : -1) && off == -1 && one == (hw > 1 ? 1 : -1) && big == -1 && junk == -1,
+          "link_cpu: 2 by default, off: -1, 1: 1, a CPU this PC has not: -1, not a number: -1");
     // the siblings: each CPU among its own, the relation symmetric; Linux: as many as the kernel lists
     bool own = true, sym = true;
     for (int a = 0; a < std::min(hw, 64); ++a) {
@@ -268,6 +281,34 @@ static void case_rules() {
         }
     }
     check(own && sym, "cpu_siblings: every CPU among its core's, the relation symmetric");
+#if defined(_WIN32)
+    {
+        std::vector<std::vector<int>> sets;   // (the distinct cores: one a physical core, as node_cores says)
+        for (int a = 0; a < std::min(hw, 64); ++a) {
+            const std::vector<int> s = os::cpu_siblings(a);
+            if (std::find(sets.begin(), sets.end(), s) == sets.end()) sets.push_back(s);
+        }
+        size_t phys = 0;
+        for (const auto& n : os::node_cores(false)) phys += n.size();
+        check(phys == 0 || sets.size() == phys, "cpu_siblings: " + std::to_string(sets.size()) + " cores, as node_cores (" +
+                                                    std::to_string(phys) + ")");
+    }
+#else
+    if (hw > 2) {   // (a thread on CPUs 0 and 1 may not run on 2: no link core there)
+        int got = -2;
+        std::thread([&] {
+            cpu_set_t s;
+            CPU_ZERO(&s);
+            CPU_SET(0, &s);
+            CPU_SET(1, &s);
+            if (sched_setaffinity(0, sizeof s, &s) != 0) return;
+            set_env("DS4_EP_CPU", "2");
+            got = rx::link_cpu();
+            set_env("DS4_EP_CPU", nullptr);
+        }).join();
+        if (got != -2) check(got == -1, "link_cpu: a CPU this thread may not run on (a cpuset without it): -1");
+    }
+#endif
     const std::vector<int> s2 = os::cpu_siblings(hw > 2 ? 2 : 0);
     std::string sl;
     for (int x : s2) sl += " " + std::to_string(x);
@@ -357,6 +398,10 @@ static void case_quickack(int port) {
 }
 
 int child_main(int port) {
+    std::thread([] {   // (a test that died before it took this server: the server does not dial for ever)
+        std::this_thread::sleep_for(std::chrono::seconds(300));
+        std::_Exit(3);
+    }).detach();
     const char* tv = std::getenv("STRATA_STAGE_TOKEN");
     return rx::serve_cpu("127.0.0.1:" + std::to_string(port), tv != nullptr ? tv : "", true);
 }
@@ -374,7 +419,7 @@ int main(int argc, char** argv) {
     set_env("STRATA_STAGE_TOKEN", kToken);
     set_env("DS4_EP_CPU", lc >= 0 ? std::to_string(lc).c_str() : "off");
     std::vector<Layer> L;
-    if (!make_layers(L, {{16, 16}, {16, 17}}, 4)) return 2;
+    if (!make_layers(L, {{16, 16}, {16, 17}}, 5)) return 2;
 
     // ---- the server: requests, a late one, keep-awake, --expert-server-once
     Child ch;
@@ -402,25 +447,26 @@ int main(int argc, char** argv) {
     uint32_t seq = 100;
     for (int it = 0; it < 12; ++it) {
         const int li = it % 2, T = it % 3 == 0 ? 4 : 1;
-        // T rows, 4 picks each (experts 0..3 in a random order): those of experts 0, 1 to the server, the rest here
+        // T rows, 5 picks each (experts 0..4 in a random order): those of experts 0, 1, 2 to the server (three: their
+        // sum's order shows), the rest here
         std::vector<rx::ReqRow> all((size_t) T), rem((size_t) T);
         std::vector<std::vector<float>> x((size_t) T, std::vector<float>((size_t) E)), xb = x;
         std::vector<const float*> xp((size_t) T);
         for (int t = 0; t < T; ++t) {
-            int ord[4] = {0, 1, 2, 3};
-            std::shuffle(ord, ord + 4, rng);
+            int ord[5] = {0, 1, 2, 3, 4};
+            std::shuffle(ord, ord + 5, rng);
             rx::ReqRow& a = all[(size_t) t];
             a.t = (uint8_t) t;
-            a.n = 4;
-            for (int i = 0; i < 4; ++i) {
+            a.n = 5;
+            for (int i = 0; i < 5; ++i) {
                 a.e[i] = (int16_t) ord[i];
                 a.w[i] = uw(rng);
             }
             rx::ReqRow& r = rem[(size_t) t];   // (the server's picks first, in their order; the others after)
             r.t = (uint8_t) t;
             r.n = 0;
-            for (int i = 0; i < 4; ++i)
-                if (a.e[i] < 2) {
+            for (int i = 0; i < 5; ++i)
+                if (a.e[i] < 3) {
                     r.e[r.n] = a.e[i];
                     r.w[r.n++] = a.w[i];
                 }
@@ -448,13 +494,13 @@ int main(int argc, char** argv) {
             // here: the other picks (x unrounded); the split sum against all of them here
             rx::ReqRow loc = all[(size_t) t];
             loc.n = 0;
-            for (int i = 0; i < 4; ++i)
-                if (all[(size_t) t].e[i] >= 2) {
+            for (int i = 0; i < 5; ++i)
+                if (all[(size_t) t].e[i] >= 3) {
                     loc.e[loc.n] = all[(size_t) t].e[i];
                     loc.w[loc.n++] = all[(size_t) t].w[i];
                 }
             lane_sum(l, loc, 0, loc.n, x[(size_t) t].data(), here);
-            lane_sum(l, all[(size_t) t], 0, 4, x[(size_t) t].data(), ref);
+            lane_sum(l, all[(size_t) t], 0, 5, x[(size_t) t].data(), ref);
             std::vector<float> diff((size_t) E), part((size_t) E);
             for (int c = 0; c < E; ++c) {
                 part[(size_t) c] = rx::bf2f(y[(size_t) t * E + c]);
@@ -518,6 +564,23 @@ int main(int argc, char** argv) {
                                              " waits)");
     }
 
+    // the main's wait for a reply right after its request: a spin, after a gap past kSpinMs too (no wait in poll)
+    {
+        rx::ReqRow r;
+        r.n = 1;
+        r.e[0] = 0;
+        r.w[0] = 1.0f;
+        std::vector<float> x((size_t) E, 0.5f);
+        const float* xp[1] = {x.data()};
+        const uint16_t* y = nullptr;
+        int us = 0;
+        sleep_ms(300);
+        const uint64_t q0 = m.polls();
+        const bool ok = m.send_req(600, 0, 1, &r, xp, err) && m.wait_resp(600, 1, rx::now_ms() + 20000.0, &y, us, err) == 1;
+        check(ok && m.polls() == q0, "after 300 ms quiet, the wait for a reply spins (this end's waits in poll: " +
+                                      std::to_string(m.polls() - q0) + ")");
+    }
+
     // --expert-server-once: the main leaves, the server exits 0
     m.close();
     const int rc = ch.wait(10000);
@@ -532,7 +595,7 @@ int main(int argc, char** argv) {
         std::vector<Layer> L1;
         make_layers(L1, {{16, 16}}, 2);
         Child c2;
-        c2.start(port + 1);
+        check(c2.start(port + 1), "a second CPU expert server started");
         rx::Main m2;
         std::string e2;
         const bool up2 = connect(m2, port + 1, L1, e2);
@@ -557,6 +620,36 @@ int main(int argc, char** argv) {
         } else {
             c2.kill();
             c2.wait(5000);
+        }
+    }
+    // ---- a request for a layer the server does not serve: its Error, the link closed, the server still exits 0
+    {
+        std::vector<Layer> L1;
+        make_layers(L1, {{16, 16}}, 1);
+        Child c3;
+        check(c3.start(port + 1), "a third CPU expert server started");
+        rx::Main m3;
+        std::string e3;
+        const bool up3 = connect(m3, port + 1, L1, e3, 1);
+        check(up3, "a third server taken, its geometry with a layer it does not serve (" + e3 + ")");
+        if (up3) {
+            rx::ReqRow r;
+            r.n = 1;
+            r.e[0] = 0;
+            r.w[0] = 1.0f;
+            std::vector<float> x((size_t) E, 0.25f);
+            const float* xp[1] = {x.data()};
+            const uint16_t* y = nullptr;
+            int us = 0;
+            const int g = m3.send_req(1, 1, 1, &r, xp, e3) ? m3.wait_resp(1, 1, rx::now_ms() + 10000.0, &y, us, e3) : -2;
+            check(g == -1 && e3.find("not served") != std::string::npos,
+                  "a request for the layer it does not serve: its Error (" + e3 + ")");
+        }
+        const int rc3 = c3.wait(10000);
+        check(rc3 == 0, "and it exited 0 (" + std::to_string(rc3) + ")");
+        if (rc3 < 0) {
+            c3.kill();
+            c3.wait(5000);
         }
     }
     if (fails == 0) std::printf("ALL OK\n");

@@ -54,11 +54,12 @@ enum Msg : uint32_t {
     Wake = 12,      // main -> server: no payload, no reply; a window starts (its bytes restart the server's spin)
 };
 
-constexpr double kSpinMs = 200.0;      // a receive spins while bytes came this recently, then waits in poll
+constexpr double kSpinMs = 200.0;      // a receive spins while bytes came or went this recently, then waits in poll
 constexpr double kWakeQuietMs = 100.0; // a Wake goes out only when the main sent nothing for this long (half the spin)
 
-/// The link core (DS4_EP_CPU, 2 by default; -1 or "off": none): the logical CPU the thread that drives the link runs
-/// on, on either PC - the main's service thread, the server's serve loop.  -1 also where this PC has no such CPU
+/// The link core (DS4_EP_CPU, 2 by default; -1, "off" or not a number: none): the logical CPU the thread that drives
+/// the link runs on, on either PC - the main's service thread, the server's serve loop.  -1 also where this PC has no
+/// such CPU, or this process may not run on it (a container's cpuset)
 int link_cpu();
 /// `cores` less the link CPU's core (`link`: its SMT siblings, os::cpu_siblings), in their order: the CPU lane's
 /// workers stay off the core the link thread spins on
@@ -212,8 +213,8 @@ double now_ms();          // steady clock
 void relax();             // a spin-wait's pause
 
 /// One TCP connection, either end.  Sends block (a full socket buffer waits for room); receives poll the socket
-/// (non-blocking) until a whole message is in, spinning while bytes came in the last 200 ms (a link that has gone quiet
-/// waits in poll, so an idle server does not burn a core), until a deadline.
+/// (non-blocking) until a whole message is in, spinning while bytes came or went in the last kSpinMs (a link that has
+/// gone quiet waits in poll, so an idle server does not burn a core), until a deadline.
 class Conn {
 public:
     Conn() = default;
@@ -286,6 +287,7 @@ public:
     bool ok() const { return c_.ok(); }
     uint64_t bytes_out() const { return c_.bytes_out; }
     uint64_t bytes_in() const { return c_.bytes_in; }
+    uint64_t polls() const { return c_.polls; }   // (this end's receives' waits in poll)
 
 private:
     static size_t strnlen_(const char* s, size_t n) {
