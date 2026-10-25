@@ -2111,13 +2111,32 @@ struct Model::Impl {
                                   std::to_string(d.b) + ") of the layer's type " + std::to_string(td) + " and row layout");
                 d.at[(size_t) e] = v.data;
             }
+            // (the parts' bytes against the pack's, read through dpart_at as the lane reads them: experts 0 and the last,
+            // the slices from a and from b - 1, every row - an offset or a stride wrong fails the load, not the tokens)
+            const size_t rowb = gg::type_row_bytes(td, g.ff);
+            if (l.mx_file[2] < 0 || (size_t) l.mx_file[2] >= pk.maps.size() || pk.maps[(size_t) l.mx_file[2]].first == nullptr)
+                return refuse(ln + ": its downs are not in a mapped file of the pack (the lane reads no expert in place)");
+            for (int e : {0, l.n_exp - 1})
+                for (int f : {d.a, d.b - 1}) {
+                    const uint8_t* p = dpart_at(d, e, 256 * f);
+                    const uint8_t* q = pk.at(l.mx_file[2], l.mx_off[2] + (uint64_t) e * l.mx_stride[2]) + (size_t) f * ub;
+                    for (int r = 0; r < g.dim; ++r)
+                        if (std::memcmp(p + (size_t) r * d.rb, q + (size_t) r * rowb, (size_t) (d.b - f) * ub) != 0)
+                            return refuse(ln + " expert " + std::to_string(e) + ": the parts' row " + std::to_string(r) +
+                                          " of blocks [" + std::to_string(f) + ", " + std::to_string(d.b) + ") is not the pack's");
+                }
             ++on;
             a0 = d.a, b0 = d.b;
         }
         if (on == 0) return refuse("it covers none of the i-quant layers of the CPU lane");
-        std::fprintf(stderr, "ds4: DS4_IQ_DOWN_PARTS: %d layers' down slices [%d, %d) (and [k, %d) of them) from %s, rows contiguous\n",
+        std::fprintf(stderr, "ds4: DS4_IQ_DOWN_PARTS: %d layers' down slices [%d, %d) (and [k, %d) of them) from %s, rows contiguous "
+                             "(each layer's first and last expert byte for byte the pack's)\n",
                      on, a0, b0, b0, dir);
         return true;
+    }
+    // expert e's down rows from n_ff value ff0 (a block's start in [a, b)) in its parts: row 0's, the rows d.rb apart
+    static const uint8_t* dpart_at(const DownParts& d, int e, int ff0) {
+        return d.at[(size_t) e] + (size_t) (ff0 / 256 - d.a) * d.ub;
     }
     // the layer's down parts when they serve the slice [ff0, ff0 + ffn) (it ends where they end), else null
     const DownParts* down_parts(const Layer& l, int ff0, int ffn) const {
@@ -6288,8 +6307,7 @@ struct Model::Impl {
         gg::IqCpu fp = fd;
         if (dp != nullptr) fp.d_stride = dp->rb;
         auto dpart = [&](int e) -> const uint8_t* {
-            return dp != nullptr && (l.ram.empty() || l.ram[(size_t) e] < 0) ? dp->at[(size_t) e] + (size_t) (ff0 / 256 - dp->a) * dp->ub
-                                                                             : nullptr;
+            return dp != nullptr && (l.ram.empty() || l.ram[(size_t) e] < 0) ? dpart_at(*dp, e, ff0) : nullptr;
         };
         const double tp0 = lane_prof ? now_ms() : 0.0;   // (DS4_LANE_PROF: the prefetch and the x quant from here)
         if (iq_pf != 0) {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
