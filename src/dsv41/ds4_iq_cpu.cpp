@@ -700,7 +700,7 @@ bool iq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err
     f.gu_act = n.gu_act;
     f.d_act = n.d_act;
     f.gu_row = n.gu_row;
-    f.d_row = n.d_row;
+    f.d_row = f.d_stride = n.d_row;
     f.act_bytes = n.act_bytes;
     f.h_bytes = n.h_bytes;
     return true;
@@ -748,7 +748,7 @@ void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int
         thread_local std::vector<float*> o;
         o.resize((size_t) nt);
         for (int t = 0; t < nt; ++t) o[(size_t) t] = out[t] + r0;
-        own_rows(f.td, down, f.d_row, f.n_ff, hq, nt, o.data(), r0, r1);
+        own_rows(f.td, down, f.d_stride, f.n_ff, hq, nt, o.data(), r0, r1);
         return;
     }
     kc::native_down_rows_split(native(f), down, hq, nt, out, r0, r1);

@@ -25,10 +25,29 @@ struct IqCpu {
     int tg = 0, td = 0, n_embd = 0, n_ff = 0;
     int gu_act = 0, d_act = 0;                 // the activations' ggml types
     size_t gu_row = 0, d_row = 0;              // bytes a weight row
+    size_t d_stride = 0;                       // bytes from a down row to the next (d_row; more for a K-slice in place)
     size_t act_bytes = 0, h_bytes = 0;         // bytes of x (n_embd) and of h (n_ff) as those
 };
 /// The layer's geometry; false (err) when this build or ggml-cpu cannot take it.
 bool iq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err);
+/// A K-slice [ff0, ff0 + ffn) of an expert's n_ff, read in place (expert parallelism: each side its part of n_ff):
+/// gate / up rows [ff0, ..) as they are, the down rows' values [ff0, ..) at down + d_off, f.d_stride apart; the slice's
+/// h (ffn values) quantized alone is the same blocks as h whole's [ff0, ..), so the slices' down outputs sum to the
+/// whole one up to the float order.  Whole 256-value blocks only (every type here, Q8_K, the trellis' 128s divide it).
+inline bool iq_cpu_slice(const IqCpu& f, int ff0, int ffn, IqCpu& s, size_t& d_off, std::string& err) {
+    if (f.n_ff % 256 != 0 || ff0 < 0 || ffn <= 0 || ff0 % 256 != 0 || ffn % 256 != 0 || ff0 + ffn > f.n_ff) {
+        err = "n_ff slice [" + std::to_string(ff0) + ", +" + std::to_string(ffn) + ") of " + std::to_string(f.n_ff) +
+              ": not whole 256-value blocks inside it";
+        return false;
+    }
+    const size_t nb = (size_t) f.n_ff / 256, db = f.d_row / nb, hb = f.h_bytes / nb;   // (bytes a 256 values: rows are blocks)
+    s = f;
+    s.n_ff = ffn;
+    s.d_row = db * (size_t) (ffn / 256);
+    s.h_bytes = hb * (size_t) (ffn / 256);
+    d_off = db * (size_t) (ff0 / 256);
+    return true;
+}
 /// x (k values) as the activation type `act` (f.gu_act / f.d_act) into dst.
 void iq_cpu_quant(int act, const float* x, int k, void* dst);
 /// ff[t][r] = clamped swiglu(gate_r . a[t], up_r . a[t]) for rows [r0, r1) (limit 0: no clamp), nt tokens.

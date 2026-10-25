@@ -18,12 +18,14 @@
 #include "ds4_gguf.cuh"
 #include "ds4_iq.cuh"
 #include "ds4_gguf_cpu.hpp"
+#include "ds4_ffslice.hpp"
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
 #include "ds4_rx.hpp"
 #include "ds4_stage.hpp"
 #include "ds4_store.hpp"
+#include "ds4_u9.hpp"
 #include "ds4_vision.cuh"
 #include "strata/dsv41/exl3_cpu.hpp"
 #include "strata/dsv41/exl3.hpp"
@@ -497,6 +499,9 @@ struct Dev {
     int id = 0;
     cudaStream_t st = nullptr;
     cudaEvent_t ev = nullptr;
+    // U9 hc: a sublayer's hc_mix / hc_split beside st (forked after the residual is final, joined before its hc_post)
+    cudaStream_t st2 = nullptr;
+    cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
     size_t free0 = 0, total = 0, weights = 0, experts = 0, caches = 0, scratch = 0;
     std::vector<void*> allocs;
     // a window's scratch, rows of up to kWin tokens (the routed experts' rows: kWin * kPicks)
@@ -657,6 +662,12 @@ struct Layer {
     x3::ExpertLayout hlay;
     size_t hblob = 0;
     int ff0 = 0, ffn = 0;     // this member's FFN columns [ff0, ff0 + ffn) (split128 of n_ff; the whole one alone)
+    // expert parallelism: the routed experts' n_ff slice [ep_ff0, ep_ff0 + ep_ffn) this process's CPU lane computes in an
+    // EP window (decode, a draft's verification: WinPlan::ep, on either lane -> the GGUF i-quant experts' cpu_experts_iq,
+    // a partial sum of each expert's output; the prompt's windows and calibrate_paths compute them whole) - ep_ffn -1:
+    // the whole n_ff (resolved at load, ep_resolve); a slice on a layer whose experts another path computes is refused
+    // there (ep_slices_ok)
+    int ep_ff0 = 0, ep_ffn = -1;
     // this member's heads [ah0, ah0 + ahn) and wo_a groups [og0, og0 + ogn) - all of them alone; in a group of more
     // members than the heads split among evenly (head_members: 9, 7 or 6 over 64 heads), the first ones none: their
     // attention adds nothing to the sum
@@ -680,6 +691,7 @@ struct Layer {
           *gate_bias_vl = nullptr;   // (the image tokens' routing bias, with the vision tower)
     uint16_t* i_wproj = nullptr;
     float* gate_w = nullptr;   // the router's weights, F32 (DeepSeek's inference computes the gate in F32)
+    uint16_t* gate_bf = nullptr;   // U9 route: instead, a BF16 file's rows as they are (gemv_bf16 widens them: the same F32)
     uint8_t* win = nullptr;                     // [win] rows of kKvFp8 (kv_row_bytes)
     float *c_kv = nullptr, *c_score = nullptr;  // the compressor's partial group (ratio > 1)
     // a run of chunks' mid-run checkpoint (feed_mark): the ring and the partial group as they were before a row
@@ -819,7 +831,10 @@ constexpr int kMaxL = 64;   // layers (the trunk's and the drafter's) a window p
 // mailbox seq of each layer (async: the device publishes its routing), the indexer's selection sizes and the candidate
 // blocks as each layer sees them, the window's hand-off seq
 struct WinPlan {
+    // (no default: whoever makes a plan says whether it is an EP window)
+    explicit WinPlan(bool ep_window) : ep(ep_window) {}
     bool par = false, async = false;
+    bool ep;                // an EP window (decode, a draft's verification): the layers' n_ff slices (Layer::ep_ff0)
     unsigned win = 0;
     int k = 0;              // (a run of chunks) the chunk's index: its hand-off slot k % 2
     int snap_t = -1;        // (a run of chunks) the chunk's row whose state before it the layers keep (-1: none)
@@ -995,7 +1010,7 @@ struct Model::Impl {
     static constexpr int kPickMax = 2048;   // (from here on the flow: windows' work grows with every 16 tokens)
     static constexpr double kPickRes = 0.9;  // (this share of the CPU-lane experts in RAM: windows if predicted faster)
     std::atomic<int> lm_layers{0};           // (layer-major) the layers every chunk went through
-    WinPlan wplan;
+    WinPlan wplan{false};                    // (plan_window sets each window's kind)
     int head_dev = 0;
     x3::Mat head;
     float* norm_w = nullptr;          // on the head device
@@ -1097,6 +1112,10 @@ struct Model::Impl {
     Resp* resps = nullptr;
     unsigned seq_issued = 0;
     std::atomic<int> layer_of[kRing];
+    // the seq's window an EP window (WinPlan::ep).  Written with its layer_of before the layer's kernels are launched;
+    // serve_lane reads both only once the device has written that request's seq - the launch, not layer_of's release /
+    // acquire (the slot's previous store may hold the same layer), orders them, as it does layer_of
+    bool ep_of[kRing] = {};
     std::thread service;
     std::atomic<bool> quit{false};
     // remote experts (--remote-experts, ds4_rx.hpp): the link (the service thread's after the load), the experts the
@@ -1283,7 +1302,8 @@ struct Model::Impl {
     std::mutex dump_mu;
     // DS4_PROF: the GPU's time a decoded token by stage - events in stream order at a layer's start, after its
     // attention, after the routing and the shared expert, after the experts' gate / up, after the wait for the CPU
-    // lane, after the down pass and the post - read after the token's sync, each the time since the mark before it
+    // lane, after the down pass and the post - read after the token's sync, each the time since the mark before it.
+    // (U9 tail moves the device experts' down into the gate / up stage: compare such runs by their totals, not by stage)
     bool prof_on = std::getenv("DS4_PROF") != nullptr;
     // DS4_PRED_DUMP=file (predictor data, the chunked prompt path): per layer and chunk u8 layer, u16 T, T x 384 fp16 router
     // logits, T x 256 fp16 projection of the router input.  DS4_XIN_DUMP=file (expert similarity inputs): u8 layer, u16 T,
@@ -1407,6 +1427,9 @@ struct Model::Impl {
             for (void* p : d.allocs) cudaFree(p);
             if (d.st) cudaStreamDestroy(d.st);
             if (d.ev) cudaEventDestroy(d.ev);
+            if (d.st2) cudaStreamDestroy(d.st2);
+            if (d.ev_fork) cudaEventDestroy(d.ev_fork);
+            if (d.ev_join) cudaEventDestroy(d.ev_join);
         }
         for (void* p : host_allocs) cudaFreeHost(p);
         for (Layer& l : L)
@@ -1724,6 +1747,37 @@ struct Model::Impl {
         CK(cudaMemcpy(p, v.data(), n * 4, cudaMemcpyHostToDevice));
         return true;
     }
+    // the router's weights: F32 on the device (f32), or with U9 route a BF16 file's rows as they are (half the bytes
+    // read a token; gemv_bf16 gives gemv_f32's bits)
+    bool gate_load(Dev& d, const std::string& name, Layer& l, std::string& err, size_t* acct) {
+        const size_t want = (size_t) l.n_exp * g.dim;
+        const Tensor* t = pk.get(name);
+        if (t == nullptr || t->dtype != "BF16" || t->bytes != want * 2 || g.dim % 128 != 0 || !u9::on(u9::kRoute))
+            return f32(d, name, l.gate_w, err, acct, want);
+        std::vector<uint8_t> raw(t->bytes);
+        if (!pk.read(*t, raw.data())) {
+            err = name + ": read failed";
+            return false;
+        }
+        // (allocated at the F32 copy's size: the same cudaMalloc sizes as the F32 path, so the same VRAM is left for the
+        // experts - the driver's granules make a smaller buffer free more than its bytes; the second half stays unused)
+        if (!dalloc(d, l.gate_bf, want * 2, err, acct)) return false;
+        cudaSetDevice(d.id);
+        CK(cudaMemcpy(l.gate_bf, raw.data(), t->bytes, cudaMemcpyHostToDevice));
+        return true;
+    }
+    // the router's logits of layer l's gate on x (T rows, D apart) into y (rows 1024 apart)
+    void gate_gemv(const Layer& l, const float* x, int T, float* y, cudaStream_t s) {
+        if (l.gate_bf == nullptr) {
+            gemv_f32(l.gate_w, x, l.n_exp, g.dim, T, y, 1024, s);
+            return;
+        }
+        GemvBf16 gb = {};
+        gb.w[0] = l.gate_bf;
+        gb.y[0] = y;
+        gb.n[0] = l.n_exp;
+        gemv_bf16(gb, 1, x, g.dim, T, 1024, s);
+    }
     bool f16raw(Dev& d, const std::string& name, uint16_t*& p, std::string& err, size_t* acct) {
         const Tensor* t = pk.get(name);
         if (t != nullptr && (t->dtype == "F32" || t->dtype == "BF16" || t->dtype == "Q8_0")) {   // (a GGUF's)
@@ -1886,23 +1940,45 @@ struct Model::Impl {
     }
     void mx_blob_to_half(const Layer& l, const uint8_t* blob, int m, uint8_t* dst) const {
         const int ffh = g.ff / l.nm;
-        const size_t gr = gg::type_row_bytes(gg::expert_type(l.lay, 0), g.dim),
-                     dr = gg::type_row_bytes(gg::expert_type(l.lay, 2), g.ff),
-                     dh = gg::type_row_bytes(gg::expert_type(l.lay, 2), ffh);
-        for (int r = 0; r < 2; ++r)
-            std::memcpy(dst + l.hlay.trellis[r], blob + l.lay.trellis[r] + (size_t) m * ffh * gr, (size_t) ffh * gr);
-        for (size_t row = 0; row < (size_t) g.dim; ++row)
-            std::memcpy(dst + l.hlay.trellis[2] + row * dh, blob + l.lay.trellis[2] + row * dr + (size_t) m * dh, dh);
+        mx_blob_to_slice(l, blob, m * ffh, ffh, l.hlay.trellis, dst);
     }
     void mx_half_to_blob(const Layer& l, const uint8_t* src, int m, uint8_t* blob) const {
         const int ffh = g.ff / l.nm;
-        const size_t gr = gg::type_row_bytes(gg::expert_type(l.lay, 0), g.dim),
-                     dr = gg::type_row_bytes(gg::expert_type(l.lay, 2), g.ff),
-                     dh = gg::type_row_bytes(gg::expert_type(l.lay, 2), ffh);
-        for (int r = 0; r < 2; ++r)
-            std::memcpy(blob + l.lay.trellis[r] + (size_t) m * ffh * gr, src + l.hlay.trellis[r], (size_t) ffh * gr);
-        for (size_t row = 0; row < (size_t) g.dim; ++row)
-            std::memcpy(blob + l.lay.trellis[2] + row * dr + (size_t) m * dh, src + l.hlay.trellis[2] + row * dh, dh);
+        mx_slice_to_blob(l, src, m * ffh, ffh, l.hlay.trellis, blob);
+    }
+    // expert parallelism's n_ff slices: every layer with one must be a trunk layer with its experts on the i-quant CPU lane
+    // alone (no VRAM tier, no GPU-visible store slots), in a process that is no remote stage's worker and skips no expert
+    // by its RAM (STRATA_DS4_DISK_SKIP_W) - false (err) otherwise.  At load, and again by whatever sets a slice later
+    bool ep_slices_ok(std::string& err) const {
+        for (const Layer& l : L)
+            if (const char* why = ep_slice_refusal(l.ep_ff0, l.ep_ffn, g.ff, l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay),
+                                                   l.n_slots > 0, !l.zc.empty(), l.mtp, o.stage_worker,
+                                                   disk_skip_w > 0.0f)) {
+                err = "expert parallelism: layer " + std::to_string(l.il) + "'s n_ff slice [" + std::to_string(l.ep_ff0) + ", " +
+                      std::to_string(l.ep_ff0 + l.ep_ffn) + "): " + why;
+                return false;
+            }
+        return true;
+    }
+    // the same for any slice [ff0, ff0 + ffn) of n_ff in whole blocks of the experts' types (ds4_ffslice.hpp), the slice's
+    // matrices at so[3]: a tensor parallel member's even share, an expert parallel side's part of n_ff
+    FfSlice mx_slice(const Layer& l, int ff0, int ffn) const {
+        const int td = gg::expert_type(l.lay, 2);
+        FfSlice s;
+        s.dim = g.dim;
+        s.ff0 = ff0;
+        s.ffn = ffn;
+        s.gr = gg::type_row_bytes(gg::expert_type(l.lay, 0), g.dim);
+        s.dr = gg::type_row_bytes(td, g.ff);
+        s.ds = gg::type_row_bytes(td, ffn);
+        s.d_off = gg::type_row_bytes(td, ff0);
+        return s;
+    }
+    void mx_blob_to_slice(const Layer& l, const uint8_t* blob, int ff0, int ffn, const size_t so[3], uint8_t* dst) const {
+        ff_blob_to_slice(mx_slice(l, ff0, ffn), blob, l.lay.trellis, dst, so);
+    }
+    void mx_slice_to_blob(const Layer& l, const uint8_t* src, int ff0, int ffn, const size_t so[3], uint8_t* blob) const {
+        ff_slice_to_blob(mx_slice(l, ff0, ffn), src, so, blob, l.lay.trellis);
     }
 
     bool expert_layout(Layer& l, std::string& err) {
@@ -2062,6 +2138,8 @@ struct Model::Impl {
         if (ids.empty())
             for (int i = 0; i < ndev; ++i) ids.push_back(i);
         devs.resize(ids.size());
+        u9::mask();       // (both print their state at load)
+        attn_split();
         for (size_t i = 0; i < ids.size(); ++i) {
             Dev& d = devs[i];
             d.id = ids[i];
@@ -2405,6 +2483,7 @@ struct Model::Impl {
         for (Layer& l : L) {
             l.ff0 = 0;
             l.ffn = g.ff;
+            ep_resolve(l.ep_ff0, l.ep_ffn, g.ff);
             l.ah0 = l.og0 = 0;
             l.ahn = g.heads;
             l.ogn = g.o_groups;
@@ -3057,7 +3136,17 @@ struct Model::Impl {
         calibrate_paths();
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
+        if (!ep_slices_ok(err)) return false;
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
+        // U9 hc's side stream and events, made last: the plan, the read-ahead, the placement and the load's report all
+        // read the free VRAM before them, as the old path's do
+        if (u9::on(u9::kHc))
+            for (Dev& d : devs) {
+                CK(cudaSetDevice(d.id));
+                CK(cudaStreamCreateWithFlags(&d.st2, cudaStreamNonBlocking));
+                CK(cudaEventCreateWithFlags(&d.ev_fork, cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&d.ev_join, cudaEventDisableTiming));
+            }
         reset();
         return true;
     }
@@ -3880,7 +3969,7 @@ struct Model::Impl {
                       f32(d, P + "hc_attn_base", l.hca_base, err, acct) && f32(d, P + "hc_ffn_fn", l.hcf_fn, err, acct) &&
                       f32(d, P + "hc_ffn_scale", l.hcf_scale, err, acct) &&
                       f32(d, P + "hc_ffn_base", l.hcf_base, err, acct) &&
-                      f32(d, P + "ffn.gate.weight", l.gate_w, err, acct, (size_t) l.n_exp * g.dim) &&
+                      gate_load(d, P + "ffn.gate.weight", l, err, acct) &&
                       f32(d, P + "ffn.gate.bias", l.gate_bias, err, acct, (size_t) l.n_exp) &&
                       (l.mtp || img_tok < 0 || pk.get(P + "ffn.gate.bias_vl") == nullptr ||
                        f32(d, P + "ffn.gate.bias_vl", l.gate_bias_vl, err, acct, (size_t) l.n_exp)) &&
@@ -5810,8 +5899,12 @@ struct Model::Impl {
     // them, exact integer sums a block; every CPU tier the same bits): each token's input quantized once, whatever
     // number of entries take it, and each job its band of h straight into the down's int8 input.
     // (ord: the order the entries are computed in - their slots, so the sums, stay the same; null: as they are)
-    void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
-        if (!gg::mx_experts(l.lay)) return cpu_experts_iq(l, x, ents, ldx, ord);
+    void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, bool ep) {
+        if (!gg::mx_experts(l.lay)) {   // (ep: an EP window, the layer's slice; false: the whole n_ff - ep_range)
+            int ff0, ffn;
+            ep_range(ep, l.ep_ff0, l.ep_ffn, g.ff, ff0, ffn);
+            return cpu_experts_iq(l, x, ents, ldx, ord, ff0, ffn);
+        }
         constexpr int RB = 64;   // rows a job (whole blocks of h: RB % 32 == 0)
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
         const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
@@ -5898,15 +5991,27 @@ struct Model::Impl {
         run_nodes(ne * DB, f);
     }
     // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
-    // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same
-    void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
+    // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same.
+    // Over the n_ff slice [ff0, ff0 + ffn) (an EP window, on either lane: the layer's ep_ff0 / ep_ffn; any other window
+    // the whole n_ff - ep_range): the gate / up rows of the slice, and the down over the slice's values in place (gg::iq_cpu_slice) -
+    // each entry's yd then its part of the expert's output
+    void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, int ff0,
+                        int ffn) {
         constexpr int RB = 64;   // rows a job
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
-        const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
-        gg::IqCpu fm;
+        const bool sliced = ff0 != 0 || ffn != FF;
+        int glo[4], ghi[4], gmax = 0;   // node X's gate / up rows: its part's [X FFh, ..) within the slice
+        for (int X = 0; X < NH; ++X) {
+            glo[X] = std::max(X * FFh, ff0);
+            ghi[X] = std::min(X * FFh + FFh, ff0 + ffn);
+            gmax = std::max(gmax, ghi[X] - glo[X]);
+        }
+        const int GB = (gmax + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
+        gg::IqCpu fm, fs;
+        size_t d_off = 0;
         std::string ferr;
         if (!gg::iq_cpu_fmt(gg::expert_type(l.lay, 0), gg::expert_type(l.lay, 2), E, FF, fm, ferr) ||
-            fm.act_bytes > (size_t) E * 4 || fm.h_bytes > (size_t) E * 4) {
+            fm.act_bytes > (size_t) E * 4 || fm.h_bytes > (size_t) E * 4 || (sliced && !gg::iq_cpu_slice(fm, ff0, ffn, fs, d_off, ferr))) {
             static std::atomic<bool> said{false};
             if (!said.exchange(true)) std::fprintf(stderr, "ds4: layer %d's CPU-lane experts: %s\n", l.il, ferr.c_str());
             for (const Ent& en : ents) std::memset(c_yd.data() + (size_t) en.slot0 * E, 0, (size_t) en.n * E * 4);
@@ -5919,7 +6024,9 @@ struct Model::Impl {
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
                 if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
-                    for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
+                    for (int r = 0; r < 3; ++r)   // (a slice's gate / up rows; the down's rows hold every slice)
+                        want.push_back({mx_mat(l, en.e, r) + (r < 2 ? (size_t) ff0 * mx_row_b(l, r) : 0),
+                                        r < 2 ? (size_t) ffn * mx_row_b(l, r) : mx_part_bytes(l, r)});
             static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
             if (pf_all) os::prefetch(want);
             else os::prefetch_cold(want);
@@ -5946,7 +6053,8 @@ struct Model::Impl {
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
-                const int r0 = X * FFh + (j % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
+                const int r0 = glo[X] + (j % GB) * RB, r1 = std::min(ghi[X], r0 + RB);
+                if (r0 >= r1) return;   // (a node with fewer of the slice's rows)
                 const void* ap[kEntMax];
                 float* hp[kEntMax];
                 for (int i = 0; i < en.n; ++i) {
@@ -5961,8 +6069,9 @@ struct Model::Impl {
         run_nodes(ne * GB, f);
         for (const Ent& en : ents)
             for (int i = 0; i < en.n; ++i)
-                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
+                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF + ff0, ffn,
                                  aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+        const gg::IqCpu& fd = sliced ? fs : fm;
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
@@ -5973,7 +6082,7 @@ struct Model::Impl {
                     hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
                     yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
                 }
-                gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+                gg::iq_cpu_down(fd, mx_part_ptr(l, en.e, 2, X) + d_off, hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
             };
         run_nodes(ne * DB, f);
     }
@@ -5996,12 +6105,11 @@ struct Model::Impl {
             if (m) m->store->release(layer, es.data(), (int) es.size(), ok);
         }
     };
-    void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
-                     const int* ord = nullptr) {
+    void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord, bool ep) {
         if (ldx == 0) ldx = (size_t) g.dim;
         if (l.lay.fmt == gg::kFmtMXFP4) {
             StoreHold hold(this, l, ents);
-            return cpu_experts_mx(l, x, ents, ldx, ord);
+            return cpu_experts_mx(l, x, ents, ldx, ord, ep);
         }
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, GQ = E / 256, DQ = FF / 128;
         const int GB = FFh / 128, DB = Eh / 128, EB = E / 128, FB = FF / 128;
@@ -6505,8 +6613,8 @@ struct Model::Impl {
         const int j = l0.il + a, end = l0.mtp ? g.nl + g.n_mtp : g.nl;
         if (j >= end || j >= (int) L.size()) return nullptr;
         const Layer& n = L[(size_t) j];
-        if (n.dev != l0.dev || n.mtp != l0.mtp || n.lay.fmt != gg::kFmtMXFP4 || n.gate_w == nullptr || n.n_exp > 1024 ||
-            (int) n.slot.size() < n.n_exp)
+        if (n.dev != l0.dev || n.mtp != l0.mtp || n.lay.fmt != gg::kFmtMXFP4 ||
+            (n.gate_w == nullptr && n.gate_bf == nullptr) || n.n_exp > 1024 || (int) n.slot.size() < n.n_exp)
             return nullptr;
         for (int e = 0; e < n.n_exp; ++e)
             if (file_read(n, e)) return &n;
@@ -6827,7 +6935,7 @@ struct Model::Impl {
             }
             ents.push_back(en);
         }
-        cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim);
+        cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, nullptr, false);   // (whole: no slices with the remote experts)
         const int D = g.dim;
         for (int t = 0; t < T; ++t)
             for (int sl = 0; sl < nslots; ++sl) {
@@ -7122,6 +7230,7 @@ struct Model::Impl {
             }
             std::atomic_thread_fence(std::memory_order_acquire);
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
+            const bool ep = ep_of[next % kRing];   // (written before the request's launch: ep_of)
             Resp& rp = resps[next % kRing];
             const int T = std::max(1, std::min(kWin, r.T));
             for (int t = 0; t < T; ++t) rp.cpu[t] = 0;
@@ -7278,7 +7387,7 @@ struct Model::Impl {
                 }
                 if (!ents.empty()) {
                     const double tc = now_ms();
-                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
+                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, ep);   // (an EP window: the layer's slice)
                     const int D = g.dim;
                     for (int t = 0; t < T; ++t) {
                         bool any = false;
@@ -7440,11 +7549,12 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, d.st));
         embed(d.emb_rows, T, d.h, D, H, d.st);
         init_pre(d.pre, T, d.st);
-        WinPlan dp;   // (window attention alone: the mailbox seqs)
+        WinPlan dp(false);   // (window attention alone: the mailbox seqs; the drafter's layers: the main's alone, whole)
         dp.async = !sync_decode && T <= async_max_t;
         for (int i = 0; i < g.n_mtp && dp.async; ++i) {
             const int il = g.nl + i;
             dp.seq[il] = ++seq_issued;
+            ep_of[dp.seq[il] % kRing] = dp.ep;
             layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
         }
         const size_t hs = (size_t) T * H * D, rs = (size_t) g.win * g.hd;
@@ -7607,7 +7717,7 @@ struct Model::Impl {
         for (int i = 0; i < n; ++i) tk[i + 1] = drafts[(size_t) i];
         spec_win = true;
         const double tv = now_ms();
-        const bool ok = forward(tk, T, T, err, 0);
+        const bool ok = forward(tk, T, T, true, err, 0);
         st.verify_ms += now_ms() - tv;
         spec_win = false;
         if (!ok) return false;
@@ -7713,7 +7823,7 @@ struct Model::Impl {
     }
 
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
-    bool step(int token, bool want_logits, std::string& err) { return forward(&token, 1, want_logits ? 1 : 0, err); }
+    bool step(int token, bool want_logits, std::string& err) { return forward(&token, 1, want_logits ? 1 : 0, true, err); }
 
 
     // layer L0 for a chunk of T tokens at p0 as group member mi: layer()'s arithmetic over the chunk's rows (the
@@ -7964,7 +8074,7 @@ struct Model::Impl {
         hc_split(c.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, c.f_pre, c.f_post, c.f_comb, s);
         hc_pre_norm(c.h, c.a_pre, l.ffn_norm, D, H, T, g.eps, c.x, s);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
-        gemv_f32(l.gate_w, c.x, l.n_exp, D, T, c.glog, 1024, s);   // (F32 x: the token path's bits)
+        gate_gemv(l, c.x, T, c.glog, s);   // (F32 x: the token path's bits)
         for (int r0 = 0; r0 < T; r0 += kVlRows) {   // (route()'s image bits cover kVlRows rows a call)
             const int nr = std::min(kVlRows, T - r0);
             VlBits vb;
@@ -8329,7 +8439,7 @@ struct Model::Impl {
                 const int64_t p0 = run.p0[(size_t) k];
                 const int T = run.T[(size_t) k], slot = k % 2;
                 const bool last_k = k + 1 == nk;
-                WinPlan wp;
+                WinPlan wp(false);   // (a prompt's chunk: whole)
                 wp.par = true;
                 wp.async = true;
                 wp.win = run.seq[(size_t) k];
@@ -8494,7 +8604,7 @@ struct Model::Impl {
                 if (d.mi == 0) st.engram_ms += now_ms() - te;
                 if (k + 1 < nk) eg_next = std::async(std::launch::async, read_eg, k + 1);
             }
-            WinPlan wp;
+            WinPlan wp(false);   // (a prompt's chunk: whole)
             wp.par = true;
             wp.async = true;
             wp.win = run.seq[(size_t) k];
@@ -8716,12 +8826,12 @@ struct Model::Impl {
             for (size_t i = 0; i < x.size(); ++i) x[i] = 0.02f * std::sin(0.37f * (float) i);
             const double bytes = (double) ents.size() * (double) l.blob;
             double a = now_ms();
-            cpu_experts(l, x.data(), ents, (size_t) g.dim);
+            cpu_experts(l, x.data(), ents, (size_t) g.dim, nullptr, false);   // (whole: the main's speed)
             const double t_first = now_ms() - a;
             double t_warm = 1e30;
             for (int rep = 0; rep < 2; ++rep) {
                 a = now_ms();
-                cpu_experts(l, x.data(), ents, (size_t) g.dim);
+                cpu_experts(l, x.data(), ents, (size_t) g.dim, nullptr, false);
                 t_warm = std::min(t_warm, now_ms() - a);
             }
             pm.cpu = bytes / std::max(1e-3, t_warm / 1000.0);
@@ -8851,7 +8961,7 @@ struct Model::Impl {
         logits_all = false;
         for (int a = 0; a < n; a += kWin) {
             const int T = std::min(kWin, n - a);
-            if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, err)) return false;
+            if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, false, err)) return false;   // (a prompt's: whole)
         }
         return true;
     }
@@ -9354,9 +9464,11 @@ struct Model::Impl {
     }
 
     // the window's plan, in window order (the indexer's and the candidate source's sizes carry from window to window)
-    void plan_window(int64_t p0, int T, WinPlan& wp) {
+    // (ep: an EP window - decode, a draft's verification - whichever lane async picks for it)
+    void plan_window(int64_t p0, int T, bool ep, WinPlan& wp) {
         wp.par = par;
         wp.async = par || (!sync_decode && T <= async_max_t);
+        wp.ep = ep;
         wp.vl = 0;
         for (int t = 0; t < T && !imgs.empty(); ++t)
             if (in_image(p0 + t)) wp.vl |= 1u << t;
@@ -9380,6 +9492,7 @@ struct Model::Impl {
             }
             if (wp.async && !elsewhere(l)) {   // (the service thread answers the seqs in order: only the layers run here)
                 wp.seq[il] = ++seq_issued;
+                ep_of[wp.seq[il] % kRing] = wp.ep;
                 layer_of[wp.seq[il] % kRing].store(il, std::memory_order_release);
             }
         }
@@ -9478,7 +9591,8 @@ struct Model::Impl {
         return true;
     }
 
-    bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
+    // (ep: an EP window - decode, a draft's verification - its layers' n_ff slices; false: the prompt's, whole)
+    bool forward(const int* tk, int T, int logits_rows, bool ep, std::string& err, int seed_rows = -1) {
         if (T < 1 || T > kWin) {
             err = "a window of " + std::to_string(T) + " tokens";
             return false;
@@ -9517,7 +9631,7 @@ struct Model::Impl {
         const int D = g.dim;
         for (int t = 0; t < T && !o.stage_worker; ++t)   // (h_emb is written again by the next window, after this one's last sync)
             std::memcpy(h_emb + (size_t) t * D, emb_row(p0 + t, tk[t]), (size_t) D * 2);
-        plan_window(p0, T, wplan);
+        plan_window(p0, T, ep, wplan);
         prof_window = prof_on && T == 1;
         n_logits = std::min(logits_rows, T);
         const double tl = now_ms();
@@ -9802,6 +9916,10 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+        // U9 hc: a sublayer's hc_mix / hc_split on st2, beside its other kernels (the pre-norm reads the previous
+        // sublayer's pre, so only hc_post needs them: it waits for ev_join)
+        const bool hc2 = nm == 1 && d.st2 != nullptr;   // (made when kHc is on)
+        cudaStream_t sx = hc2 ? d.st2 : s;
         prof_mark(d, 0);
         // Engram
         if (l.eg >= 0) {
@@ -9821,8 +9939,13 @@ struct Model::Impl {
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
         }
         // attention
-        hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
-        hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, s);
+        if (hc2) {
+            CK(cudaEventRecord(d.ev_fork, s));
+            CK(cudaStreamWaitEvent(d.st2, d.ev_fork, 0));
+        }
+        hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, sx);
+        hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, sx);
+        if (hc2) CK(cudaEventRecord(d.ev_join, d.st2));
         hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
         {
             x3::MvJob j[4];
@@ -9927,7 +10050,16 @@ struct Model::Impl {
                                               (size_t) ng * ik_rb(), l.dev, err))
                         return false;
                 }
-                if (clen_max > 0) {
+                // U9 ixfast: every query keeps all its compressed rows (n <= index_topk, no candidate restriction):
+                // topk's answer is then 0 .. n - 1 whatever the scores, so the query rows, the weights and the scores
+                // are skipped (not on the candidate source layer: its scores pick the candidate blocks)
+                bool keep_all = clen_max > 0 && u9::on(u9::kIxfast) && !l.cand_src;
+                for (int t = 0; keep_all && t < T; ++t)
+                    keep_all = lim.k[t] >= lim.n[t] &&
+                               !(l.uses_cand && (lim.n[t] + g.cand_blk - 1) / g.cand_blk > g.cand_topk);
+                if (keep_all) {
+                    topk(d.scores, (long long) o.max_context + 64, T, lim, nullptr, 0, 1, d.topk, (int) topk_stride(), s);
+                } else if (clen_max > 0) {
                     if (!mv(d, {job(l.i_wq_b, d.qr, d.iq, T, g.q_lora, (size_t) g.ix_heads * g.ix_hd)}, err)) return false;
                     Finish fi;
                     fi.rd = g.rd;
@@ -10030,36 +10162,85 @@ struct Model::Impl {
             if (!mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err)) return false;
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+        if (hc2) CK(cudaStreamWaitEvent(s, d.ev_join, 0));
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
         prof_mark(d, 1);
         // the MoE
-        hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
-        hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, s);
+        if (hc2) {
+            CK(cudaEventRecord(d.ev_fork, s));
+            CK(cudaStreamWaitEvent(d.st2, d.ev_fork, 0));
+        }
+        hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, sx);
+        hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, sx);
+        if (hc2) CK(cudaEventRecord(d.ev_join, d.st2));
         hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
             // router made), and waits for the answer only before the experts' sum
-            gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0;
             int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
-            for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
-                const Layer* nx = ahead_layer(L0, a);
-                if (nx == nullptr) break;
-                const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
-                float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
-                gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
-                                                                         // weights instead: the same hit rate)
-                route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
-                na[a - 1] = m;
+            if (u9::on(u9::kRoute)) {   // U9 route: the gates in one GEMV, the lookahead and the routing in one launch
+                const Layer* nx[2] = {nullptr, nullptr};
+                int nn = 0;
+                for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
+                    nx[a - 1] = ahead_layer(L0, a);
+                    if (nx[a - 1] == nullptr) break;
+                    na[a - 1] = a == 1 ? std::max(1, std::min(kAhead1, nx[0]->k_exp + ahead_extra))
+                                       : std::min(kPicks, nx[1]->k_exp);
+                    nn = a;
+                }
+                bool bf = l.gate_bf != nullptr;
+                for (int a = 0; a < nn; ++a) bf = bf && nx[a]->gate_bf != nullptr;
+                if (bf) {
+                    GemvBf16 gb = {};
+                    gb.w[0] = l.gate_bf;
+                    gb.y[0] = d.glog;
+                    gb.n[0] = l.n_exp;
+                    for (int a = 0; a < nn; ++a) {
+                        gb.w[1 + a] = nx[a]->gate_bf;
+                        gb.y[1 + a] = d.glog_a + (size_t) a * kWin * 1024;
+                        gb.n[1 + a] = nx[a]->n_exp;
+                    }
+                    gemv_bf16(gb, 1 + nn, d.x, D, T, 1024, s);
+                } else {
+                    gate_gemv(l, d.x, T, d.glog, s);
+                    for (int a = 0; a < nn; ++a) gate_gemv(*nx[a], d.x, T, d.glog_a + (size_t) a * kWin * 1024, s);
+                }
+                RouteAhead ra = {};
+                int nra = 0;
+                for (int a = 0; a < nn; ++a)
+                    if (na[a] > 0 && T > 0 && nx[a]->n_exp <= 1024 && a * kAhead1 + na[a] <= kAhead) {   // (route_ahead's)
+                        ra.logits[nra] = d.glog_a + (size_t) a * kWin * 1024;
+                        ra.bias[nra] = nx[a]->gate_bias;
+                        ra.n[nra] = nx[a]->n_exp;
+                        ra.m[nra] = na[a];
+                        ra.off[nra] = a * kAhead1;
+                        ++nra;
+                    }
+                route_fused(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
+                            d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
+                            na[1], ra, nra);
+            } else {
+                gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
+                for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
+                    const Layer* nx = ahead_layer(L0, a);
+                    if (nx == nullptr) break;
+                    const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
+                    float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
+                    gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
+                                                                             // weights instead: the same hit rate)
+                    route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
+                    na[a - 1] = m;
+                }
+                route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
+                              d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
+                              na[1]);
             }
-            route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
-                          d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1]);
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
@@ -10081,10 +10262,16 @@ struct Model::Impl {
                     zc_stage(d.plan_ptr, d.ridx, l.zc_tab, l.k_exp, zc_stage_buf, zc_stride, l.blob, s);
                 if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
                 else x3::moe_gate_up(ma, d.x, d.xg, s);
+                // U9 tail: the device experts' down before the wait (it reads the plan, not the answer; DS4_PROF's
+                // gate/up stretch then holds it)
+                const bool early = mx && u9::on(u9::kTail);
+                const bool down_ok = early && gg::moe_down_experts(ma, d.xg, s);   // (false: printed, as moe_down)
                 prof_mark(d, 3);
                 if (lead) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
-                if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                if (early) {
+                    if (down_ok) gg::moe_down_combine(ma, d.sh_out, d.moe_out, s);
+                } else if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
             } else {   // each distinct expert read once for the window's tokens
                 gf::MoeWin mw;
@@ -10128,6 +10315,7 @@ struct Model::Impl {
             }
             if (lead) st.experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+            if (hc2) CK(cudaStreamWaitEvent(s, d.ev_join, 0));
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
@@ -10139,7 +10327,7 @@ struct Model::Impl {
             return false;
         }
         // (glog rows are 1024 apart: route reads them so)
-        gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
+        gate_gemv(l, d.x, T, d.glog, s);
         VlBits vb = {};
         vb.w[0] = l.mtp ? 0u : wp.vl;
         route(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, d.ridx, d.rw, s, l.gate_bias_vl,
@@ -10234,7 +10422,7 @@ struct Model::Impl {
         }
         if (!ents.empty()) {
             const double tc = now_ms();
-            cpu_experts(l, h_x, ents);
+            cpu_experts(l, h_x, ents, 0, nullptr, wp.ep);   // (the window's kind, as serve_lane would take it)
             std::fill(h_part, h_part + (size_t) T * D, 0.0f);
             for (int sl = 0; sl < nslots; ++sl) {
                 float* o = h_part + (size_t) cpu_rows[(size_t) sl].first * D;
@@ -10246,6 +10434,7 @@ struct Model::Impl {
             CK(cudaMemcpyAsync(d.cpu_part, h_part, (size_t) T * D * 4, cudaMemcpyHostToDevice, s));
         }
         combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
+        if (hc2) CK(cudaStreamWaitEvent(s, d.ev_join, 0));
         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
@@ -10507,7 +10696,7 @@ bool Model::stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err
     }
     p.stage_t = 0;
     p.spec_win = T > 1;   // (a window of 2 or more rows may be a draft's check: its layers keep their backups)
-    const bool ok = p.forward(tk.data(), T, 0, err);
+    const bool ok = p.forward(tk.data(), T, 0, false, err);   // (the link carries no window kind: no slices here, ep_slices_ok)
     p.spec_win = false;
     if (!ok) return false;
     if (T > 1) p.stage_t = T;

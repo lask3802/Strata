@@ -891,6 +891,22 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       if(STRATA_ENABLE_HIP)
         target_compile_options(ds4_iq_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
       endif()
+      # expert parallelism's n_ff slices on the CPU lane (gg::iq_cpu_slice, ds4_ffslice.hpp): the slices of an expert read
+      # in place sum to the whole one, in place == copied out, blob -> slices -> blob; no GPU (--pack: a pack's experts, read only)
+      add_executable(ds4_ep_slice_test tests/dsv41/ep_slice_test.cpp src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp
+                     src/dsv41/ds4_tq_cpu.cpp)
+      target_include_directories(ds4_ep_slice_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
+      target_link_libraries(ds4_ep_slice_test PRIVATE strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(ds4_ep_slice_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+      if(STRATA_ENABLE_CUDA)
+        # the decode GPU-part changes (ds4_u9.hpp) against the path they replace, bit for bit; needs a GPU, no model
+        add_executable(ds4_u9_test tests/dsv41/u9_bits_test.cu src/dsv41/ds4_gguf.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq.cu
+                       src/dsv41/ds4_kernels.cu)
+        target_include_directories(ds4_u9_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+        target_link_libraries(ds4_u9_test PRIVATE ${_strata_gpu_runtime_target})
+      endif()
       # the remote experts (ds4_rx.hpp): this is the main process's end, an expert server (strata-dsv41
       # --expert-server-connect, a GPU) the other; its replies against the CPU lane's sums of the same random experts
       set_source_files_properties(tests/dsv41/rx_test.cpp PROPERTIES LANGUAGE ${_ds4_test_lang})
@@ -929,6 +945,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(ds4_stage_test PRIVATE Threads::Threads)
       if(WIN32)
         target_link_libraries(ds4_stage_test PRIVATE ws2_32)
+      endif()
+      # the EP parts pack's read side (ds4_epparts.hpp; tools/dsv41/ep_parts.py writes it): parts -> whole byte for byte,
+      # the slice views, the refusals; with PACK PARTS arguments the same against a real pack.  No GPU, no model
+      add_executable(ds4_epparts_test tests/dsv41/epparts_test.cpp src/net/stage_link.cpp)
+      target_include_directories(ds4_epparts_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      target_compile_features(ds4_epparts_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_epparts_test PRIVATE Threads::Threads)
+      if(WIN32)
+        target_link_libraries(ds4_epparts_test PRIVATE ws2_32)
       endif()
     endif()
     if(STRATA_ENABLE_HIP)
