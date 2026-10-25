@@ -7762,9 +7762,10 @@ struct Model::Impl {
                     rpicks.clear();
                     want = false;
                 }
-                // (the lane's picks in the gate's local cost: in a layer that splits, each its (nb - k) / nb share)
+                // (the lane's picks whole in the gate's local cost, split or not: sent, the lane's [0, k) of them hides
+                // the round trip - U4's rule; slice_share is the deadline's)
                 if (want && !rx_gate.send(T, rx_nrows(rpicks, spl ? picks : std::vector<std::pair<int, int>>()), rpicks.size(),
-                                          spl ? rx::slice_share(picks.size(), rx_k, rx_nb) : picks.size())) {
+                                          picks.size())) {
                     rx_here_note(l, rpicks);
                     picks.insert(picks.end(), rpicks.begin(), rpicks.end());   // (the round trip would cost more)
                     ++st.rx_skip_t[T];
