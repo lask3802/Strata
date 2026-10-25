@@ -315,7 +315,7 @@ std::string SliceServer::geo(const GeoMsg& g, const std::vector<GeoLayer>& layer
         slices_ = true;
         return "";
     }
-    if (g.k >= 1 && g.k < parts_.blocks()) return why;   // (the main splits: it needs these parts)
+    if (g.k >= 1 && g.k < g.n_ff / 256) return why;   // (the main splits - k below its own nb: it needs these parts)
     warn = why + " - the main does not split (k " + std::to_string(g.k) + "): whole picks only";
     return "";
 }

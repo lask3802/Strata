@@ -419,6 +419,33 @@ int main() {
         CHECK(!lane.init(p, types, E, FF, kLim, 0, {}, 50, err));
         std::printf("  refused, a down type not the layer's: %s\n", err.c_str());
     }
+    // ---- SliceServer::geo: parts that do not serve a Geo (here another pack) refuse a main that splits (k below its
+    // own nb); a main that does not (k 0, or its nb - also one whose nb is below the parts' blocks) is taken, warned,
+    // with no slice picks
+    {
+        rx::SliceServer sv;
+        std::string err;
+        CHECK(sv.open((root / "a6").string(), -1, err) && sv.lo() == 6);
+        rx::GeoMsg g;
+        g.n_embd = E;
+        g.n_layers = NL;
+        g.limit = kLim;
+        g.pack_hash = 0xab;   // (the parts': 0xaa)
+        const std::vector<rx::GeoLayer> gl((size_t) NL);
+        struct Case {
+            int n_ff, k;
+            bool refused;
+        };
+        const Case cs[4] = {{FF, 6, true}, {FF, NB, false}, {FF, 0, false}, {FF - 256, NB - 1, false}};
+        for (const Case& c : cs) {
+            g.n_ff = c.n_ff;
+            g.k = c.k;
+            std::string warn;
+            const std::string why = sv.geo(g, gl, warn);
+            CHECK(!why.empty() == c.refused && warn.empty() == c.refused && !sv.slices());
+            std::printf("  geo, n_ff %d, k %d: %s\n", c.n_ff, c.k, c.refused ? ("refused: " + why).c_str() : ("taken, warned: " + warn).c_str());
+        }
+    }
     std::error_code ec;
     fs::remove_all(root, ec);
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
