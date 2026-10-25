@@ -519,6 +519,19 @@ inline int pinned_cpu() {
 #endif
     return one;
 }
+/// A kernel CPU list ("3,19", "3-4", "0-1,8-9") as its CPUs, in its order; it ends at anything else
+inline std::vector<int> cpu_list(const char* s) {
+    std::vector<int> v;
+    for (const char* p = s; *p >= '0' && *p <= '9';) {
+        char* q = nullptr;
+        const int lo = (int) std::strtol(p, &q, 10);
+        int hi = lo;
+        if (*q == '-') hi = (int) std::strtol(q + 1, &q, 10);
+        for (int c = lo; c <= hi && c - lo < 1024; ++c) v.push_back(c);
+        p = *q == ',' ? q + 1 : q;
+    }
+    return v;
+}
 /// The logical CPUs of `cpu`'s physical core, `cpu` among them, ascending ({cpu} where the OS does not say)
 inline std::vector<int> cpu_siblings(int cpu) {
     std::vector<int> v;
@@ -545,14 +558,7 @@ inline std::vector<int> cpu_siblings(int cpu) {
         if (std::fgets(s, sizeof s, f) == nullptr) s[0] = '\0';
         std::fclose(f);
     }
-    for (const char* p = s; *p >= '0' && *p <= '9';) {   // "3,19" or "3-4"
-        char* q = nullptr;
-        const int lo = (int) std::strtol(p, &q, 10);
-        int hi = lo;
-        if (*q == '-') hi = (int) std::strtol(q + 1, &q, 10);
-        for (int c = lo; c <= hi && c - lo < 1024; ++c) v.push_back(c);
-        p = *q == ',' ? q + 1 : q;
-    }
+    v = cpu_list(s);   // "3,19" or "3-4"
 #endif
     if (std::find(v.begin(), v.end(), cpu) == v.end()) v.assign(1, cpu);
     std::sort(v.begin(), v.end());

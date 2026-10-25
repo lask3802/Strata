@@ -272,6 +272,10 @@ static void case_rules() {
     set_env("DS4_EP_CPU", nullptr);
     check(d == (hw > 2 ? 2 : -1) && off == -1 && one == (hw > 1 ? 1 : -1) && big == -1 && junk == -1 && wrap == -1,
           "link_cpu: 2 by default, off: -1, 1: 1, a CPU this PC has not: -1, not a number or 2 + 2^32: -1");
+    // the kernel's list form (Linux's siblings come through it): commas and ranges, the newline ends it
+    check(os::cpu_list("2,18") == std::vector<int>{2, 18} && os::cpu_list("2-3") == std::vector<int>{2, 3} &&
+              os::cpu_list("0-1,8-9\n") == std::vector<int>{0, 1, 8, 9} && os::cpu_list("").empty(),
+          "cpu_list: 2,18 / 2-3 / 0-1,8-9 / nothing");
     // the siblings: each CPU among its own, the relation symmetric; Linux: as many as the kernel lists
     bool own = true, sym = true;
     for (int a = 0; a < std::min(hw, 64); ++a) {
@@ -318,9 +322,8 @@ static void case_rules() {
 #if !defined(_WIN32)
     std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(hw > 2 ? 2 : 0) + "/topology/thread_siblings_list");
     std::string raw;
-    if (f >> raw && raw.find('-') == std::string::npos)
-        check((size_t) std::count(raw.begin(), raw.end(), ',') + 1 == s2.size(),
-              "cpu_siblings: the kernel's list (" + raw + ")");
+    if (f >> raw)
+        check(os::cpu_list(raw.c_str()) == s2, "cpu_siblings: the kernel's list (" + raw + ")");
 #endif
 }
 
