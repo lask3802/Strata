@@ -86,17 +86,28 @@ static_assert(sizeof(HelloMsg) == 128, "the hello's size");
 struct Gate {
     double rtt[kMaxRows + 1] = {}, pick[kMaxRows + 1] = {};
     int run[kMaxRows + 1] = {}, seen[kMaxRows + 1] = {}, over[kMaxRows + 1] = {};
+    double run_lo[kMaxRows + 1] = {}, run_hi[kMaxRows + 1] = {};   // (the clamped run's first and last send, ms)
+    static constexpr double kSlowerMs = 50.0;
     static void ew(double& a, double v) { a = a > 0.0 ? 0.9 * a + 0.1 * v : v; }
     // a reply's round trip: from the kernel's arrival time where there is one (Linux; a late reply's too, when it
     // comes), else a reply the lane waited for (a late one: the time waited, a lower bound).  Without it, one already
     // there when the lane finished its own part says only that the round trip was at most that long - the time is the
     // lane's, not the link's -: it may lower the estimate, never raise it.  After 4 samples a sample counts as 3 x the
     // estimate at most (one spike moves it by 20%; the late count is the reply's own time), but not after 4 in a row
-    // were: then the link did get slower, and the sample counts as it is (before 8 of 64 late idle the link)
-    void rtt_seen(int rows, double ms, bool waited = true) {
+    // were and their sends span kSlowerMs or more: then the link did get slower, and the sample counts as it is
+    // (before 8 of 64 late idle the link).  A stall bunches its replies within a few ms: those stay clamped.  sent < 0
+    // (no send time): the count alone
+    void rtt_seen(int rows, double ms, bool waited = true, double sent = -1.0) {
         if (!waited && rtt[rows] > 0.0 && ms >= rtt[rows]) return;
         if (seen[rows] >= 4 && ms > 3.0 * rtt[rows]) {
-            if (over[rows] < 4) {
+            if (over[rows] == 0) {
+                run_lo[rows] = run_hi[rows] = sent;
+            } else if (sent >= 0.0) {
+                run_lo[rows] = run_lo[rows] < 0.0 || sent < run_lo[rows] ? sent : run_lo[rows];
+                run_hi[rows] = sent > run_hi[rows] ? sent : run_hi[rows];
+            }
+            const bool spans = sent < 0.0 || run_hi[rows] - run_lo[rows] >= kSlowerMs;
+            if (over[rows] < 4 || !spans) {
                 ms = 3.0 * rtt[rows];
                 ++over[rows];
             } else {

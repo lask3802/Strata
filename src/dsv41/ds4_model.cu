@@ -6744,15 +6744,15 @@ struct Model::Impl {
                 ++st.rx_late_shared;
                 continue;
             }
-            rx_gate.rtt_seen(rw, la - ts);
+            rx_gate.rtt_seen(rw, la - ts, true, ts);
             std::lock_guard<std::mutex> lk(rx_mu);
             ++st.rx_late_timed;
             if (rx_late_arr.size() < (size_t(1) << 20)) rx_late_arr.push_back({(float) (la - ts), ly});
         }
         if (ta >= 0) rx_kts = true;
-        if (ta >= t0 && ta <= t1) rx_gate.rtt_seen(rows, ta - t0);   // (outside: the realtime clock stepped)
+        if (ta >= t0 && ta <= t1) rx_gate.rtt_seen(rows, ta - t0, true, t0);   // (outside: the realtime clock stepped)
         else if (got == 1 || (got == 0 && !rx_kts))   // (late, with the kernel's times: its reply, if it comes, says)
-            rx_gate.rtt_seen(rows, t1 - t0, t1 - tw > 0.05);   // (read within 50 us of the lane's part: there already)
+            rx_gate.rtt_seen(rows, t1 - t0, t1 - tw > 0.05, t0);   // (read within 50 us of the lane's part: there already)
         if (got == 0) rx_late_book.add(seq, t0, rows, l.il);
         st.rx_wait_ms += t1 - tw;
         st.rx_bytes_out = (int64_t) rx_link->bytes_out();

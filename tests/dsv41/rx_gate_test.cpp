@@ -85,15 +85,16 @@ int main() {
         check(near(f.rtt[1], 0.9 * 0.8 + 2.7), "the second sample is taken as it is");
     }
     {
-        // the link gets slower for good (0.8 -> 8 ms): 4 samples in a row clamped, then the 5th counts as it is
+        // the link gets slower for good (0.8 -> 8 ms): 4 samples in a row clamped, then the 5th counts as it is (sent
+        // 20 ms apart: the run spans 80 ms)
         rx::Gate g;
-        for (int i = 0; i < 10; ++i) g.rtt_seen(1, 0.8);
-        for (int i = 0; i < 4; ++i) g.rtt_seen(1, 8.0);
+        for (int i = 0; i < 10; ++i) g.rtt_seen(1, 0.8, true, 10.0 * i);
+        for (int i = 0; i < 4; ++i) g.rtt_seen(1, 8.0, true, 200.0 + 20.0 * i);
         const double four = 0.8 * 1.2 * 1.2 * 1.2 * 1.2;
         check(std::fabs(g.rtt[1] - four) < 1e-9, "4 slow samples in a row: each clamped, the estimate 0.8 x 1.2^4");
-        g.rtt_seen(1, 8.0);
+        g.rtt_seen(1, 8.0, true, 280.0);
         check(std::fabs(g.rtt[1] - (0.9 * four + 0.8)) < 1e-9, "the 5th in a row counts as it is: the link did get slower");
-        g.rtt_seen(1, 30.0);
+        g.rtt_seen(1, 30.0, true, 300.0);
         check(g.rtt[1] < 0.9 * (0.9 * four + 0.8) + 0.3 * (0.9 * four + 0.8) + 1e-9, "and the run starts again: clamped");
         rx::Gate h;   // (a sample within 3 x between ends the run)
         for (int i = 0; i < 10; ++i) h.rtt_seen(1, 0.8);
@@ -102,6 +103,22 @@ int main() {
         const double r = h.rtt[1];
         h.rtt_seen(1, 8.0);
         check(std::fabs(h.rtt[1] - 1.2 * r) < 1e-9, "4 slow (clamped), one fast, one slow: the fast one ends the run, the slow one is clamped again");
+        // (lead 2026-10-25) a stall bunches its replies: 5 clamped sent within 10 ms stay clamped; 5 over 60 ms: the
+        // 5th counts as it is
+        const double five = four * 1.2;
+        rx::Gate s;
+        for (int i = 0; i < 10; ++i) s.rtt_seen(1, 0.8, true, 10.0 * i);
+        for (int i = 0; i < 5; ++i) s.rtt_seen(1, 27.0 - i, true, 1000.0 + 2.5 * i);
+        check(std::fabs(s.rtt[1] - five) < 1e-9, "a stall: 5 slow sent within 10 ms, all 5 clamped (0.8 x 1.2^5)");
+        rx::Gate w;
+        for (int i = 0; i < 10; ++i) w.rtt_seen(1, 0.8, true, 10.0 * i);
+        for (int i = 0; i < 5; ++i) w.rtt_seen(1, 8.0, true, 1000.0 + 15.0 * i);
+        check(std::fabs(w.rtt[1] - (0.9 * four + 0.8)) < 1e-9, "a slower link: 5 slow sent over 60 ms, the 5th as it is");
+        rx::Gate o;   // (a late reply's sample comes after later sends': the span is of the sends, any order)
+        for (int i = 0; i < 10; ++i) o.rtt_seen(1, 0.8, true, 10.0 * i);
+        const double so[5] = {1030.0, 1045.0, 1060.0, 1015.0, 1000.0};
+        for (double x : so) o.rtt_seen(1, 8.0, true, x);
+        check(std::fabs(o.rtt[1] - (0.9 * four + 0.8)) < 1e-9, "sends out of order over 60 ms: the 5th as it is");
     }
     {
         // a late request's reply that comes after all (lead's Q3): the book gives its send and rows once
