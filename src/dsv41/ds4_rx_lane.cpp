@@ -93,10 +93,11 @@ bool SliceLane::init_(const ep::Parts& parts, const std::vector<Types>& types, i
     }
     if (!any) lo_ = nb_;
     aq_.assign((size_t) kLaneMaxRows * (size_t) n_embd * 4, 0);
-    h_.assign((size_t) kLaneMaxRows * kLaneMaxPicks * (size_t) n_ff, 0.0f);
-    hq_.assign((size_t) kLaneMaxRows * kLaneMaxPicks * (size_t) n_ff * 4, 0);
-    yd_.assign((size_t) kLaneMaxRows * kLaneMaxPicks * (size_t) n_embd, 0.0f);
-    ents_.reserve((size_t) kLaneMaxRows * kLaneMaxPicks);
+    const size_t slots = (size_t) kLaneMaxSets * kLaneMaxRows * kLaneMaxPicks;   // (run_sets: a slot a set's pick)
+    h_.assign(slots * (size_t) n_ff, 0.0f);
+    hq_.assign(slots * (size_t) n_ff * 4, 0);
+    yd_.assign(slots * (size_t) n_embd, 0.0f);
+    ents_.reserve(slots);
     pool_ = std::make_unique<Pool>(std::max(0, threads), cpus, spin_us);
     return true;
 }
@@ -128,79 +129,115 @@ bool SliceLane::run(int layer, int k, const SlicePick* picks, int np, int nr, co
 
 bool SliceLane::run_range(int layer, int k0, int k1, const ep::Parts& from, const SlicePick* picks, int np, int nr,
                           const float* x, size_t ldx, float* y, size_t ldy, bool help, std::string& err) {
+    const LaneSet s{k0, k1, &from, picks, np};
+    return run_sets(layer, &s, 1, nr, x, ldx, y, ldy, help, err);
+}
+
+bool SliceLane::run_sets(int layer, const LaneSet* sets, int ns, int nr, const float* x, size_t ldx, float* y, size_t ldy,
+                         bool help, std::string& err) {
     if (layer < 0 || layer >= (int) fmt_.size() || !fmt_[(size_t) layer].on) {
         err = "layer " + std::to_string(layer) + " is not served here";
         return false;
     }
-    if (k0 < 0 || k0 >= k1 || k1 > nb_) {
-        err = "n_ff blocks [" + std::to_string(k0) + ", " + std::to_string(k1) + ") outside [0, " + std::to_string(nb_) + ")";
+    if (ns < 1 || ns > kLaneMaxSets) {
+        err = std::to_string(ns) + " sets of picks in a run";
         return false;
     }
-    if (nr < 1 || nr > kLaneMaxRows || np < 0 || np > nr * kLaneMaxPicks) {
-        err = "a request of " + std::to_string(nr) + " rows and " + std::to_string(np) + " slice picks";
-        return false;
-    }
-    if (np == 0) return true;
-    for (int i = 0; i < np; ++i)
-        if (picks[i].t < 0 || picks[i].t >= nr || picks[i].e < 0 || picks[i].e >= from.experts()) {
-            err = "a slice pick of row " + std::to_string(picks[i].t) + ", expert " + std::to_string(picks[i].e);
+    int np_all = 0;
+    for (int s = 0; s < ns; ++s) {
+        const LaneSet& st = sets[s];
+        if (st.k0 < 0 || st.k0 >= st.k1 || st.k1 > nb_ || st.from == nullptr) {
+            err = "n_ff blocks [" + std::to_string(st.k0) + ", " + std::to_string(st.k1) + ") outside [0, " + std::to_string(nb_) + ")";
             return false;
         }
+        if (nr < 1 || nr > kLaneMaxRows || st.np < 0 || st.np > nr * kLaneMaxPicks) {
+            err = "a request of " + std::to_string(nr) + " rows and " + std::to_string(st.np) + " slice picks";
+            return false;
+        }
+        for (int i = 0; i < st.np; ++i)
+            if (st.picks[i].t < 0 || st.picks[i].t >= nr || st.picks[i].e < 0 || st.picks[i].e >= st.from->experts()) {
+                err = "a slice pick of row " + std::to_string(st.picks[i].t) + ", expert " + std::to_string(st.picks[i].e);
+                return false;
+            }
+        np_all += st.np;
+    }
+    if (np_all == 0) return true;
     const double t0 = lane_ms_now();
     const gg::IqCpu& fm = fmt_[(size_t) layer].fm;
     const int cap = fmt_[(size_t) layer].cap;
-    const int E = dim_, ff0 = 256 * k0, ffn = (k1 >= nb_ ? ff_ : 256 * k1) - ff0;
-    gg::IqCpu fs;
+    const int E = dim_;
+    // each set's slice: its n_ff values [ff0, ff0 + ffn) and their rows' format; its gate / up jobs an entry
+    gg::IqCpu fs[kLaneMaxSets];
+    int ffn[kLaneMaxSets], GB[kLaneMaxSets], base[kLaneMaxSets];
     size_t d_off = 0;
-    if (!gg::iq_cpu_slice(fm, ff0, ffn, fs, d_off, err)) return false;
-    // the entries: the picks by expert, then row (more than cap of one expert: the next entry); a row picks an expert
-    // once and kLaneMaxPicks experts at most
-    std::vector<int> ord((size_t) np);
-    int per_row[kLaneMaxRows] = {};
-    for (int i = 0; i < np; ++i) {
-        ord[(size_t) i] = i;
-        if (++per_row[picks[i].t] > kLaneMaxPicks) {
-            err = "row " + std::to_string(picks[i].t) + ": more than " + std::to_string(kLaneMaxPicks) + " slice picks";
-            return false;
-        }
+    for (int s = 0; s < ns; ++s) {
+        const int ff0 = 256 * sets[s].k0;
+        ffn[s] = (sets[s].k1 >= nb_ ? ff_ : 256 * sets[s].k1) - ff0;
+        if (!gg::iq_cpu_slice(fm, ff0, ffn[s], fs[s], d_off, err)) return false;
+        GB[s] = (ffn[s] + kRb - 1) / kRb;
+        base[s] = s == 0 ? 0 : base[s - 1] + sets[s - 1].np;   // (the set's first slot)
     }
-    std::sort(ord.begin(), ord.end(),
-              [&](int a, int b) { return picks[a].e != picks[b].e ? picks[a].e < picks[b].e : picks[a].t < picks[b].t; });
-    for (size_t i = 1; i < ord.size(); ++i)
-        if (picks[ord[i]].e == picks[ord[i - 1]].e && picks[ord[i]].t == picks[ord[i - 1]].t) {
-            err = "row " + std::to_string(picks[ord[i]].t) + " picks expert " + std::to_string(picks[ord[i]].e) + " twice";
-            return false;
-        }
-    std::vector<int> slot_of((size_t) np);
+    // the entries, set by set: the picks by expert, then row (more than cap of one expert: the next entry); a row
+    // picks an expert once in a set and kLaneMaxPicks experts at most
+    std::vector<int> slot_of((size_t) np_all), slot_set((size_t) np_all);
     ents_.clear();
-    for (size_t a = 0; a < ord.size();) {
-        Ent en;
-        en.e = picks[ord[a]].e;
-        en.slot0 = (int) a;
-        // (a part to k1: two that overlap, the first one found may end before it)
-        if (!views(from, layer, en.e, k0, k1, en.v) || fm.d_row / (size_t) nb_ * (size_t) (k1 - k0) != fs.d_row) {
-            err = "layer " + std::to_string(layer) + " expert " + std::to_string(en.e) + ": no part holds blocks [" + std::to_string(k0) +
-                  ", " + std::to_string(k1) + ") of the layer's type and layout";
-            return false;
+    bool used[kLaneMaxRows] = {};
+    for (int s = 0; s < ns; ++s) {
+        const LaneSet& st = sets[s];
+        const SlicePick* picks = st.picks;
+        std::vector<int> ord((size_t) st.np);
+        int per_row[kLaneMaxRows] = {};
+        for (int i = 0; i < st.np; ++i) {
+            ord[(size_t) i] = i;
+            used[picks[i].t] = true;
+            if (++per_row[picks[i].t] > kLaneMaxPicks) {
+                err = "row " + std::to_string(picks[i].t) + ": more than " + std::to_string(kLaneMaxPicks) + " slice picks";
+                return false;
+            }
         }
-        while (a < ord.size() && picks[ord[a]].e == en.e && en.n < cap) {
-            slot_of[(size_t) ord[a]] = (int) a;
-            en.tok[en.n++] = picks[ord[a]].t;
-            ++a;
+        std::sort(ord.begin(), ord.end(),
+                  [&](int a, int b) { return picks[a].e != picks[b].e ? picks[a].e < picks[b].e : picks[a].t < picks[b].t; });
+        for (size_t i = 1; i < ord.size(); ++i)
+            if (picks[ord[i]].e == picks[ord[i - 1]].e && picks[ord[i]].t == picks[ord[i - 1]].t) {
+                err = "row " + std::to_string(picks[ord[i]].t) + " picks expert " + std::to_string(picks[ord[i]].e) + " twice";
+                return false;
+            }
+        for (size_t a = 0; a < ord.size();) {
+            Ent en;
+            en.e = picks[ord[a]].e;
+            en.slot0 = base[s] + (int) a;
+            en.set = s;
+            // (a part to k1: two that overlap, the first one found may end before it)
+            if (!views(*st.from, layer, en.e, st.k0, st.k1, en.v) || fm.d_row / (size_t) nb_ * (size_t) (st.k1 - st.k0) != fs[s].d_row) {
+                err = "layer " + std::to_string(layer) + " expert " + std::to_string(en.e) + ": no part holds blocks [" +
+                      std::to_string(st.k0) + ", " + std::to_string(st.k1) + ") of the layer's type and layout";
+                return false;
+            }
+            while (a < ord.size() && picks[ord[a]].e == en.e && en.n < cap) {
+                slot_of[(size_t) base[s] + (size_t) ord[a]] = base[s] + (int) a;
+                slot_set[(size_t) base[s] + a] = s;
+                en.tok[en.n++] = picks[ord[a]].t;
+                ++a;
+            }
+            ents_.push_back(en);
         }
-        ents_.push_back(en);
     }
     // each row's x as the gate / up activation, once
-    bool used[kLaneMaxRows] = {};
-    for (int i = 0; i < np; ++i) used[picks[i].t] = true;
     for (int t = 0; t < nr; ++t)
         if (used[t]) gg::iq_cpu_quant(fm.gu_act, x + (size_t) t * ldx, E, aq_.data() + (size_t) t * E * 4);
-    const int ne = (int) ents_.size(), GB = (ffn + kRb - 1) / kRb, DB = (E + kRb - 1) / kRb;
+    const int ne = (int) ents_.size(), DB = (E + kRb - 1) / kRb;
     const std::vector<Ent>& ents = ents_;
+    // the gate / up jobs: an entry's GB of its set's, back to back (job_ent: the entry of each job, j0 its first)
+    std::vector<int> job_ent, job0((size_t) ne);
+    for (int q = 0; q < ne; ++q) {
+        job0[(size_t) q] = (int) job_ent.size();
+        job_ent.insert(job_ent.end(), (size_t) GB[ents[(size_t) q].set], q);
+    }
     const float lim = lim_;
     std::function<void(int)> f = [&](int j) {   // the slice's gate / up rows, the swiglu into each slot's h
-        const Ent& en = ents[(size_t) (j / GB)];
-        const int r0 = (j % GB) * kRb, r1 = std::min(ffn, r0 + kRb);
+        const int q = job_ent[(size_t) j];
+        const Ent& en = ents[(size_t) q];
+        const int r0 = (j - job0[(size_t) q]) * kRb, r1 = std::min(ffn[en.set], r0 + kRb);
         const void* ap[kLaneMaxRows];
         float* hp[kLaneMaxRows];
         for (int i = 0; i < en.n; ++i) {
@@ -214,11 +251,11 @@ bool SliceLane::run_range(int layer, int k0, int k1, const ep::Parts& from, cons
         if (help || pool_->size() == 1) pool_->help();
         pool_->wait();
     };
-    go(ne * GB);
-    f = [&](int s) {   // each slot's h quantized alone
-        gg::iq_cpu_quant(fm.d_act, h_.data() + (size_t) s * ff_, ffn, hq_.data() + (size_t) s * ff_ * 4);
+    go((int) job_ent.size());
+    f = [&](int sl) {   // each slot's h quantized alone
+        gg::iq_cpu_quant(fm.d_act, h_.data() + (size_t) sl * ff_, ffn[slot_set[(size_t) sl]], hq_.data() + (size_t) sl * ff_ * 4);
     };
-    go(np);
+    go(np_all);
     f = [&](int j) {   // the down rows over the slice's values, at the stored part's stride
         const Ent& en = ents[(size_t) (j / DB)];
         const int r0 = (j % DB) * kRb, r1 = std::min(E, r0 + kRb);
@@ -228,23 +265,24 @@ bool SliceLane::run_range(int layer, int k0, int k1, const ep::Parts& from, cons
             hp[i] = hq_.data() + (size_t) (en.slot0 + i) * ff_ * 4;
             yp[i] = yd_.data() + (size_t) (en.slot0 + i) * E;
         }
-        gg::IqCpu fe = fs;   // (the slice's rows, at the stored part's stride: the part holds [a, nb) of each row)
+        gg::IqCpu fe = fs[en.set];   // (the slice's rows, at the stored part's stride: the part holds [a, nb) of each row)
         fe.d_stride = en.v[2].stride;
         gg::iq_cpu_down(fe, en.v[2].data, hp, en.n, yp, r0, r1);
     };
     go(ne * DB);
     const int SC = (E + kSumCols - 1) / kSumCols;
-    f = [&](int j) {   // each row's weighted sum, its picks in their order (a job its columns: the same order)
+    f = [&](int j) {   // each row's weighted sum, set by set, its picks in their order (a job its columns: the same order)
         const int c0 = j * kSumCols, c1 = std::min(E, c0 + kSumCols);
-        for (int i = 0; i < np; ++i) {
-            const float w = picks[i].w;
-            const float* yd = yd_.data() + (size_t) slot_of[(size_t) i] * E;
-            float* yo = y + (size_t) picks[i].t * ldy;
-            for (int c = c0; c < c1; ++c) yo[c] += w * yd[c];
-        }
+        for (int s = 0; s < ns; ++s)
+            for (int i = 0; i < sets[s].np; ++i) {
+                const float w = sets[s].picks[i].w;
+                const float* yd = yd_.data() + (size_t) slot_of[(size_t) base[s] + (size_t) i] * E;
+                float* yo = y + (size_t) sets[s].picks[i].t * ldy;
+                for (int c = c0; c < c1; ++c) yo[c] += w * yd[c];
+            }
     };
     go(SC);
-    bytes_ += (uint64_t) ents.size() * (2 * (uint64_t) ffn * fm.gu_row + (uint64_t) E * fs.d_row);
+    for (const Ent& en : ents) bytes_ += 2 * (uint64_t) ffn[en.set] * fm.gu_row + (uint64_t) E * fs[en.set].d_row;
     busy_ms_ += lane_ms_now() - t0;
     ++runs_;
     (void) d_off;
@@ -491,12 +529,14 @@ bool SliceServer::run(int layer, int32_t c, const ReqRow* rows, int nr, const fl
         wrong_said_ = true;
     }
     const double t0 = lane_ms_now();
-    for (int r = 0; r < times; ++r)
-        if (!lane_.run(layer, k, pk.data(), (int) pk.size(), nr, x, ldx, ys, ldy, false, err)) return false;
-    if (!wk_.empty()) {
-        if (!lane_.run_range(layer, 0, c & kReqK, pool_, wk_.data(), (int) wk_.size(), nr, x, ldx, ys, ldy, false, err))
-            return false;
+    if (!wk_.empty()) {   // (one pass: the slice picks' [k, nb) from the parts, W's [0, k) from the pool)
+        const LaneSet s[2] = {{k, parts_.blocks(), &parts_, pk.data(), (int) pk.size()},
+                              {0, c & kReqK, &pool_, wk_.data(), (int) wk_.size()}};
+        if (!lane_.run_sets(layer, s, 2, nr, x, ldx, ys, ldy, false, err)) return false;
         pool_picks_ += (int64_t) wk_.size();
+    } else {
+        for (int r = 0; r < times; ++r)
+            if (!lane_.run(layer, k, pk.data(), (int) pk.size(), nr, x, ldx, ys, ldy, false, err)) return false;
     }
     last_ms_ = lane_ms_now() - t0;
     return true;

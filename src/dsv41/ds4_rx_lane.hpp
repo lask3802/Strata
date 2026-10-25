@@ -23,11 +23,20 @@ namespace strata::ds4::rx {
 
 constexpr int kLaneMaxRows = 16;    // a request's rows at most (ds4_rx.hpp kMaxRows)
 constexpr int kLaneMaxPicks = 8;    // picks a row at most (kMaxPicks)
+constexpr int kLaneMaxSets = 2;     // ranges a run_sets at most (the hybrid: the slice picks' [k, nb), W's [0, k))
 
 /// One slice pick of a request: its row (the window's token), the expert, the route weight.
 struct SlicePick {
     int t = 0, e = 0;
     float w = 0.0f;
+};
+
+/// One range of a run_sets: np picks over the n_ff blocks [k0, k1) of `from`'s parts
+struct LaneSet {
+    int k0 = 0, k1 = 0;
+    const ep::Parts* from = nullptr;
+    const SlicePick* picks = nullptr;
+    int np = 0;
 };
 
 class SliceLane {
@@ -61,6 +70,11 @@ public:
     /// the pool, beside run's [k, nb) - the two sum to it whole).  False (err), y untouched, as run's; also a part missing
     bool run_range(int layer, int k0, int k1, const ep::Parts& from, const SlicePick* picks, int np, int nr, const float* x,
                    size_t ldx, float* y, size_t ldy, bool help, std::string& err);
+    /// run_range over ns (<= kLaneMaxSets) sets in one pass - the four steps (gate / up, h quantized, down, the sums)
+    /// once for all of them, so one wait on the pool a step, not one a set; y += the sets' sums in set order, each set's
+    /// picks in their order (the same bits as run_range set by set into one y).  False (err), y untouched, as run_range's
+    bool run_sets(int layer, const LaneSet* sets, int ns, int nr, const float* x, size_t ldx, float* y, size_t ldy, bool help,
+                  std::string& err);
     /// whether run_range would take expert e of the layer over [k0, k1) from `from` (the layer served, its parts there)
     bool takes(const ep::Parts& from, int layer, int e, int k0, int k1) const {
         ep::View v[3];
@@ -85,7 +99,7 @@ private:
         gguf::IqCpu fm;
     };
     struct Ent {
-        int e = 0, n = 0, slot0 = 0;
+        int e = 0, n = 0, slot0 = 0, set = 0;
         int tok[kLaneMaxRows] = {};
         ep::View v[3];
     };

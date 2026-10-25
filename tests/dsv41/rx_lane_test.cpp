@@ -435,6 +435,31 @@ int main() {
             }
         CHECK(dw < 1e-4 && dm < 1e-6);
         std::printf("  the pool's [0, 6) through run_range: against the slice in place %.2e, with [6, 9) against whole %.2e\n", dm, dw);
+        // run_sets: the slice picks' [6, 9) and some of them (W) [0, 6) in one pass - the bits of run then run_range
+        // into one y; with 0 / 2 workers, 1-16 rows
+        bool same_bits = true;
+        int sets_runs = 0;
+        for (int threads : {0, 2}) {
+            rx::SliceLane ln;
+            CHECK(ln.init(tail, types, E, FF, kLim, threads, {}, 50, err));
+            for (int l = 0; l < NL; ++l)
+                for (int nr : {1, 3, 16}) {
+                    const Req q = make_req(rng, nr);
+                    std::vector<rx::SlicePick> wpk;
+                    for (size_t i = 0; i < q.picks.size(); i += 2) wpk.push_back(q.picks[i]);
+                    std::vector<float> ya((size_t) nr * E, 0.0f), yb((size_t) nr * E, 0.0f);
+                    CHECK(ln.run(l, 6, q.picks.data(), (int) q.picks.size(), nr, q.x.data(), E, ya.data(), E, true, err));
+                    CHECK(ln.run_range(l, 0, 6, pool, wpk.data(), (int) wpk.size(), nr, q.x.data(), E, ya.data(), E, true, err));
+                    const rx::LaneSet s[2] = {{6, 9, &tail, q.picks.data(), (int) q.picks.size()},
+                                              {0, 6, &pool, wpk.data(), (int) wpk.size()}};
+                    CHECK(ln.run_sets(l, s, 2, nr, q.x.data(), E, yb.data(), E, true, err));
+                    same_bits = same_bits && std::memcmp(ya.data(), yb.data(), ya.size() * sizeof(float)) == 0;
+                    ++sets_runs;
+                }
+        }
+        CHECK(same_bits);
+        std::printf("  run_sets ([6, 9) and W's [0, 6) in one pass) against run + run_range: %s in %d runs\n",
+                    same_bits ? "the same bits" : "DIFFER", sets_runs);
         CHECK(lane.takes(pool, 0, 3, 0, 6) && !lane.takes(pool, 0, 3, 0, 7) && !lane.takes(pool, NL, 3, 0, 6));
         CHECK(lane.takes(pool0, 0, 3, 0, 6) && !lane.takes(pool0, 1, 3, 0, 6));
         const Req q = make_req(rng, 1);
