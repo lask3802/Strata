@@ -42,6 +42,8 @@ inline void ep_resolve(int& ff0, int& ffn, int n_ff) {
         ffn = n_ff;
     }
 }
+/// (U2's rule, kept for its test; the engine no longer calls it - H' gives each cpu_experts call its range by the pick's
+/// lane, ds4_rx_split.hpp, so the host-routed path and the fallback never take a layer's slice from its fields)
 /// The n_ff range a call of the CPU lane computes: the layer's EP slice in an EP window (ep: decode, a draft's
 /// verification - both PCs' slices sum to the whole), the whole n_ff in every other (the prompt's windows and chunks,
 /// feed_mark's last token, calibrate_paths: the main's alone until prompts split too), whatever the layer's fields say.
@@ -59,9 +61,11 @@ inline void ep_range(bool ep, int ep_ff0, int ep_ffn, int n_ff, int& ff0, int& f
 /// PC's part would then add a second time - so a layer with one of them is refused at setup until it takes slices too.
 /// So are the drafter's layers (mtp: they run on the main alone), a remote stage's worker (stage_worker: the link does not
 /// say a window's kind) and STRATA_DS4_DISK_SKIP_W (disk_skip: it drops experts by what is in this PC's RAM, which the
-/// other PC's differs from)
+/// other PC's differs from).  tagged (H', DS4_EP_K: the lane slices only a pick it sent tagged slice in the same request,
+/// ds4_rx_split.hpp): a VRAM tier or the store's GPU-visible slots are no reason - their picks are never sent, so never
+/// sliced; computed whole on the device, they are added once
 inline const char* ep_slice_refusal(int ff0, int ffn, int n_ff, bool iq_cpu_lane, bool vram_tier, bool store_zc, bool mtp,
-                                    bool stage_worker, bool disk_skip) {
+                                    bool stage_worker, bool disk_skip, bool tagged = false) {
     ep_resolve(ff0, ffn, n_ff);   // (fields the load has not resolved yet: -1 is the whole)
     if (ff0 == 0 && ffn == n_ff) return nullptr;
     if (n_ff % 256 != 0 || ff0 < 0 || ffn <= 0 || ff0 % 256 != 0 || ffn % 256 != 0 || ff0 + ffn > n_ff)
@@ -70,8 +74,8 @@ inline const char* ep_slice_refusal(int ff0, int ffn, int n_ff, bool iq_cpu_lane
     if (stage_worker) return "a remote stage's worker: the link does not carry a window's kind (EP or whole) yet";
     if (disk_skip) return "STRATA_DS4_DISK_SKIP_W skips experts by this PC's RAM, which the other PC's differs from";
     if (!iq_cpu_lane) return "its CPU lane computes these experts whole (MXFP4 / EXL3: only the GGUF i-quants take slices)";
-    if (vram_tier) return "its VRAM tier computes experts whole (--vram-experts 0 for the layers that take slices)";
-    if (store_zc) return "the RAM store's GPU-visible slots are computed whole on the device";
+    if (vram_tier && !tagged) return "its VRAM tier computes experts whole (--vram-experts 0 for the layers that take slices)";
+    if (store_zc && !tagged) return "the RAM store's GPU-visible slots are computed whole on the device";
     return nullptr;
 }
 

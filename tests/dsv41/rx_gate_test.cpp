@@ -4,6 +4,7 @@
 // its part and 1.5 x the round trip expected at the request's rows.  No GPU, no socket.  The numbers are the 3070's
 // over 1 GbE (rx-poc-report.md): T=1 0.66 ms (1 pick), T=4 2.17 ms; the lane 0.26 ms a pick.
 #include "../../src/dsv41/ds4_rx.hpp"
+#include "../../src/dsv41/ds4_rx_split.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -80,6 +81,19 @@ int main() {
         q.seed(1, 0.7);
         q.rtt_seen(1, 100.0, true, 1000.0);
         check(near(q.rtt[1], 0.9 * 0.7 + 0.1 * 2.1), "a seed after 4 clamped: the run starts again, clamped");
+    }
+    {   // H' (ep-u6-plan.md 3a): a slice pick counts its [k, nb) share of a pick in the gate's local cost
+        rx::Gate g;
+        g.rtt_seen(1, 0.66);
+        g.pick_seen(1, 0.26);
+        check(rx::slice_share(4, 8, 9) == 1 && rx::slice_share(4, 3, 9) == 3 && rx::slice_share(9, 6, 9) == 3 &&
+                  rx::slice_share(0, 6, 9) == 0 && rx::slice_share(4, 9, 9) == 0,
+              "slice_share: 4 slice picks at k 8 are 1 pick's worth (rounded up), at k 3 3; 9 at k 6 3; none, or k nb: 0");
+        check(!g.send(1, 1, 0, rx::slice_share(4, 8, 9)), "T=1, 4 slice picks at k 8, no whole: 0.66 > 0.26 ms, kept here");
+        check(g.send(1, 1, 0, 4), "  (the same 4 counted whole: 0.66 <= 1.04 ms, out)");
+        check(g.send(1, 1, 0, rx::slice_share(4, 3, 9)), "T=1, 4 slice picks at k 3: 0.66 <= 0.78 ms, out");
+        check(!g.send(1, 1, 1, rx::slice_share(4, 8, 9)), "T=1, 1 whole remote pick and 4 slice picks at k 8: 0.66 > 0.52 "
+                                                           "ms, kept here");
     }
     {
         rx::Gate g;

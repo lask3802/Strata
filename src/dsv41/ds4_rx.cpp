@@ -430,7 +430,8 @@ bool Main::end_blobs(int n, std::vector<uint8_t>& ok, double timeout_ms, std::st
     return true;
 }
 
-bool Main::send_req(uint32_t seq, int layer, int nrows, const ReqRow* rows, const float* const* x, std::string& err) {
+bool Main::send_req(uint32_t seq, int layer, int nrows, const ReqRow* rows, const float* const* x, std::string& err,
+                    int32_t c) {
     const size_t per = sizeof(ReqRow) + (size_t) n_embd_ * 2;
     tx_.resize((size_t) nrows * per);
     for (int j = 0; j < nrows; ++j) {
@@ -439,10 +440,11 @@ bool Main::send_req(uint32_t seq, int layer, int nrows, const ReqRow* rows, cons
         uint16_t* xb = (uint16_t*) (o + sizeof(ReqRow));
         for (int i = 0; i < n_embd_; ++i) xb[i] = f2bf(x[j][i]);
     }
-    return c_.send(Req, seq, layer, nrows, 0, tx_.data(), tx_.size(), err);
+    return c_.send(Req, seq, layer, nrows, c, tx_.data(), tx_.size(), err);
 }
 
-int Main::wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y, int& srv_us, std::string& err) {
+int Main::wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y, int& srv_us, std::string& err, int sets,
+                    int* lane_us) {
     for (;;) {
         Hdr h;
         const int got = c_.recv(h, rx_, deadline, err);
@@ -457,13 +459,14 @@ int Main::wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y
             if (late_.size() < 256) late_.push_back({h.seq, c_.arrival_ms()});
             continue;
         }
-        if (h.a != nrows || rx_.size() != (size_t) nrows * (size_t) n_embd_ * 2) {
+        if (h.a != nrows || rx_.size() != (size_t) sets * (size_t) nrows * (size_t) n_embd_ * 2) {
             err = "a reply of the wrong size";
             c_.close();
             return -1;
         }
         *y = (const uint16_t*) rx_.data();
         srv_us = h.c;
+        if (lane_us != nullptr) *lane_us = h.b;
         return 1;
     }
 }

@@ -751,6 +751,12 @@ void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int
         own_rows(f.td, down, f.d_stride, f.n_ff, hq, nt, o.data(), r0, r1);
         return;
     }
+    if (f.d_stride != f.d_row) {   // (a K-slice in place: native() has no stride, so a row at a time - it reads row r at
+        // base + r d_row, the base put so that this is down + r d_stride; not built here: ds4_iq_cpu.cpp:9 undefines it)
+        for (int r = r0; r < r1; ++r)
+            kc::native_down_rows_split(native(f), down + (size_t) r * f.d_stride - (size_t) r * f.d_row, hq, nt, out, r, r + 1);
+        return;
+    }
     kc::native_down_rows_split(native(f), down, hq, nt, out, r0, r1);
 }
 
