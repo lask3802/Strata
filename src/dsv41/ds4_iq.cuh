@@ -69,6 +69,9 @@ struct Args {
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s);
 /// grid (n_embd / 8, groups): part of every entry.
 bool down(const Args& a, int groups, int ne_max, cudaStream_t s);
+/// Whether gate_up / down have a kernel for the type (false: Q5_K / Q6_K, supported() for the dense GEMVs only); a type
+/// they take refuses only a geometry its kernels do not cover.
+bool token_kernel(int type);
 /// Loads gate_up's and down's kernels of every type for ne_max 1 (cudaFuncGetAttributes: CUDA's lazy loading takes
 /// their memory now).  false: one failed.
 bool load_moe_kernels();

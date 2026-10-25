@@ -514,7 +514,10 @@ bool load_moe_kernels() {
                        cudaFuncGetAttributes(&fa, down_kernel<K, C, false>) == cudaSuccess
         DS4_TQ_SWITCH(t, LK_)
 #undef LK_
-        if (!ok) return false;
+        if (!ok) {
+            std::fprintf(stderr, "ds4 tq: the %s token kernels did not load (%s)\n", name(t), cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
     }
 #endif
     return true;

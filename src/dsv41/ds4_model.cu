@@ -6619,10 +6619,11 @@ struct Model::Impl {
             if (l.cpu_hits.empty()) continue;
             std::vector<int> hits;
             hits.swap(l.cpu_hits);
-            // (the expert server's experts never in: there they cost the lane nothing, so the slot would be lost - the
-            // prompt's hits and the settle after it list them, the decode's serve_lane does not; a zero-copy one is this
-            // GPU's work, so it may)
-            int best = rx::cache_in(hits, l.slot.data(), l.heat.data(), rx_row(l), l.zc.empty() ? nullptr : l.zc.data()),
+            // (the expert server's experts not in after a window it serves, nor at the settle (T 0, for the decode):
+            // there they cost the lane nothing, so the slot would be lost - serve_lane lists none of them, the settle
+            // and a chunked prompt's do.  After a window it does not serve (DS4_SYNC, T past async_max_t: rx_row null)
+            // the lane computed them, so they may; a zero-copy one is this GPU's work, so it may)
+            int best = rx::cache_in(hits, l.slot.data(), l.heat.data(), rx_row(l, T), l.zc.empty() ? nullptr : l.zc.data()),
                 vin = -1;
             if (best >= 0 && l.spare_vram >= 0 && !l.swap_pending && sw_inflight < c_inflight) {   // VRAM: the hottest in
                 int cold = -1;
@@ -6950,10 +6951,12 @@ struct Model::Impl {
         rx_wait.reserve(1 << 20);
         rx_arr.reserve(1 << 20);
     }
-    // layer l's experts the expert server holds ([n_exp]; null: none, or the link given up - the lane's again - or
-    // DS4_SYNC, whose decode computes them all here)
-    const uint8_t* rx_row(const Layer& l) const {
-        return rx_on && !sync_decode && !l.mtp && l.n_exp == g.n_exp && (size_t) (l.il + 1) * g.n_exp <= rx_has.size()
+    // layer l's experts the expert server holds, for the hits of a window of T rows (0: the settle) ([n_exp]; null:
+    // none, the link given up - the lane's again -, or a window the server does not serve: DS4_SYNC, T past
+    // async_max_t - rx::lane_serves - whose CPU lane computed them itself)
+    const uint8_t* rx_row(const Layer& l, int T) const {
+        return rx_on && rx::lane_serves(T, par, sync_decode, async_max_t) && !l.mtp && l.n_exp == g.n_exp &&
+                       (size_t) (l.il + 1) * g.n_exp <= rx_has.size()
                    ? rx_has.data() + (size_t) l.il * g.n_exp
                    : nullptr;
     }
@@ -7222,8 +7225,8 @@ struct Model::Impl {
               "in the kernel %s ms), the lane's wait after its part %s ms\n"
               "remote experts per token: the lane's own part %.2f ms + its wait %.2f ms + the late ones %.2f ms; the "
               "link %.1f KB out, %.1f KB in; the upload %lld experts, %.2f GB in %.1f s, %lld of them in this "
-              "GPU's VRAM too now (the cache's: none but zero-copy ones, after the link was given up, or with "
-              "DS4_SYNC)\n",
+              "GPU's VRAM too now (the cache's: none but zero-copy ones, after the link was given up, or after "
+              "windows the server does not serve: DS4_SYNC, T past DS4_ASYNC_T)\n",
               local + served > 0 ? 100.0 * served / (local + served) : 0.0, served / nt, (local + served) / nt,
               (double) (st.rx_fallback - s0.rx_fallback) / nt, (long long) (st.rx_late - s0.rx_late),
               (long long) (st.rx_late_link - s0.rx_late_link), (long long) (st.rx_backoffs - s0.rx_backoffs),

@@ -1552,6 +1552,15 @@ bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
     return true;
 }
 
+bool token_kernel(int t) {
+    if (is_tq(t)) return true;   // (every trellis type is one of DS4_TQ_SWITCH's)
+    bool ok = false;
+#define TK_(T) ok = true
+    DS4_IQ_SWITCH(t, TK_)
+#undef TK_
+    return ok;
+}
+
 bool load_moe_kernels() {
 #if !defined(STRATA_USE_HIP)
     // (DS4_IQ_SWITCH's types; one missing from this list loads at its first launch)
@@ -1562,7 +1571,10 @@ bool load_moe_kernels() {
                     cudaFuncGetAttributes(&fa, down_kernel<T, 1>) == cudaSuccess
         DS4_IQ_SWITCH(t, LK_)
 #undef LK_
-        if (!ok) return false;
+        if (!ok) {
+            std::fprintf(stderr, "ds4 iq: the %s token kernels did not load (%s)\n", name(t), cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
     }
 #endif
     return tq::load_moe_kernels();

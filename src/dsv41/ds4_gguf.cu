@@ -17,8 +17,10 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 namespace strata::ds4::gguf {
 namespace {
@@ -1057,6 +1059,34 @@ bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq:
     }
     return true;
 }
+// iq::gate_up / down refusing a token's experts (who 0: gate / up, 1: down): h / part not written, a launch error each
+// time, but every layer of the type fails every token - so the first of a (who, type) is printed, with why, and the
+// count at exit (MoeArgs carries no layer: the line is the first such layer's)
+struct NoToken {
+    std::mutex mu;
+    std::map<std::pair<int, int>, long> n;   // (who, type) -> refusals
+    ~NoToken() {
+        for (const auto& e : n)
+            if (e.second > 1)
+                std::fprintf(stderr, "ds4 gguf %s: %s experts refused %ld times (the first printed)\n",
+                             e.first.first == 0 ? "moe_gate_up" : "moe_down", type_name(e.first.second), e.second);
+    }
+};
+NoToken g_no_token;
+void no_token(int who, int type, int n_embd, int n_ff) {
+    g_errors.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(g_no_token.mu);
+        if (++g_no_token.n[{who, type}] > 1) return;
+    }
+    const char* w = who == 0 ? "moe_gate_up" : "moe_down";
+    if (!iq::token_kernel(type))   // (Q5_K / Q6_K: the device takes them for the dense GEMVs, not as token experts)
+        std::fprintf(stderr, "ds4 gguf %s: %s experts have no token kernel (%s not written; later ones counted)\n", w,
+                     type_name(type), who == 0 ? "h" : "part");
+    else
+        std::fprintf(stderr, "ds4 gguf %s: the %s token kernel does not cover n_embd %d, n_ff %d (later ones counted)\n",
+                     w, type_name(type), n_embd, n_ff);
+}
 template <int NC>
 void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
@@ -1295,7 +1325,7 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
         ia.xd = sc->xd;
         q8_quant(x, (size_t) a.n_embd, 1, a.n_embd, sc->xq, sc->xd, s);
         if (!iq::gate_up(ia, a.k, 1, s)) {   // (Q5_K / Q6_K: supported, but no token kernel; h was left as it was)
-            fail("moe_gate_up: the experts' type has no token kernel");
+            no_token(0, ia.tg, a.n_embd, a.n_ff);
             return;
         }
         check("moe_gate_up");
@@ -1335,7 +1365,7 @@ bool moe_down_experts(const x3::MoeArgs& a, const float* h, cudaStream_t s) {
         ia.hq = sc->hq;
         ia.hd = sc->hd;
         if (!iq::down(ia, a.k, 1, s)) {
-            fail("moe_down: the experts' type has no token kernel");
+            no_token(1, ia.td, a.n_embd, a.n_ff);
             return false;
         }
     } else {

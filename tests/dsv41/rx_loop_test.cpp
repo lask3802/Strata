@@ -8,6 +8,7 @@
 //     own reply and the late one is in take_late;
 //   - a killed server: the wait ends at once with -1 (no hang), the picks computed here;
 //   - --expert-server-once: the server exits 0 when the main leaves;
+//   - a blob layout the server refuses at the Geo (blob_refusal): its Error reaches the main before the last blob;
 //   - keep-awake: a Wake (only after kWakeQuietMs without a send) keeps the server's receive spinning (its waits in
 //     poll do not move), and without one they do; the server takes them; the main's wait for a reply right after its
 //     request spins after a long gap too;
@@ -223,8 +224,9 @@ static double norm(const std::vector<float>& a) {
 }
 
 // a main process up to the blobs (`unserved` more layers in the geometry with no types: not the server's): false (and
-// why) when it did not get there
-static bool connect(rx::Main& m, int port, const std::vector<Layer>& L, std::string& err, int unserved = 0) {
+// why) when it did not get there; `sent`: the blobs that went out
+static bool connect(rx::Main& m, int port, const std::vector<Layer>& L, std::string& err, int unserved = 0,
+                    int* sent = nullptr) {
     if (!m.accept("127.0.0.1:" + std::to_string(port), kToken, 30, err)) return false;
     rx::GeoMsg gm;
     gm.n_embd = E;
@@ -237,8 +239,10 @@ static bool connect(rx::Main& m, int port, const std::vector<Layer>& L, std::str
     if (!m.send_geo(gm, gl, err)) return false;
     int nb = 0;
     for (size_t li = 0; li < L.size(); ++li)
-        for (size_t e = 0; e < L[li].blobs.size(); ++e, ++nb)
+        for (size_t e = 0; e < L[li].blobs.size(); ++e, ++nb) {
             if (!m.send_blob((int) li, (int) e, L[li].blobs[e].data(), L[li].blobs[e].size(), err)) return false;
+            if (sent != nullptr) *sent = nb + 1;
+        }
     std::vector<uint8_t> ok;
     if (!m.end_blobs(nb, ok, 60000.0, err)) return false;
     for (uint8_t v : ok)
@@ -270,8 +274,11 @@ static void case_rules() {
     set_env("DS4_EP_CPU", "4294967298");   // (2 + 2^32: not CPU 2 as an int)
     const int wrap = rx::link_cpu();
     set_env("DS4_EP_CPU", nullptr);
-    check(d == (hw > 2 ? 2 : -1) && off == -1 && one == (hw > 1 ? 1 : -1) && big == -1 && junk == -1 && wrap == -1,
-          "link_cpu: 2 by default, off: -1, 1: 1, a CPU this PC has not: -1, not a number or 2 + 2^32: -1");
+    // (2 and 1 where this process may run on them: a cpuset or an affinity mask without them makes them -1)
+    const int d_want = os::cpu_allowed(2) ? 2 : -1, one_want = os::cpu_allowed(1) ? 1 : -1;
+    check(d == d_want && off == -1 && one == one_want && big == -1 && junk == -1 && wrap == -1,
+          "link_cpu: 2 by default (" + std::to_string(d) + "), off: -1, 1: 1 (" + std::to_string(one) +
+              "), a CPU this PC has not: -1, not a number or 2 + 2^32: -1");
     // the kernel's list form (Linux's siblings come through it): commas and ranges, the newline ends it
     check(os::cpu_list("2,18") == std::vector<int>{2, 18} && os::cpu_list("2-3") == std::vector<int>{2, 3} &&
               os::cpu_list("0-1,8-9\n") == std::vector<int>{0, 1, 8, 9} && os::cpu_list("").empty(),
@@ -419,8 +426,7 @@ int main(int argc, char** argv) {
     case_pin();
     case_quickack(port + 2);
 
-    const int hw = (int) std::thread::hardware_concurrency();
-    const int lc = hw > 2 ? 2 : hw > 1 ? 1 : -1;   // (the children's link core)
+    const int lc = os::cpu_allowed(2) ? 2 : os::cpu_allowed(1) ? 1 : -1;   // (the children's link core)
     set_env("STRATA_STAGE_TOKEN", kToken);
     set_env("DS4_EP_CPU", lc >= 0 ? std::to_string(lc).c_str() : "off");
     std::vector<Layer> L;
@@ -550,19 +556,31 @@ int main(int argc, char** argv) {
     {
         int32_t p0[3], p1[3], q0[3], q1[3];
         std::string e;
+        // (each Wake the moment kWakeQuietMs has passed: kSpinMs - kWakeQuietMs = 100 ms of slack for this end's
+        // timing - fixed 120 ms sleeps left 80, thin under CT 532's CI load)
+        double t = 0, gap = 0;
+        auto wake_quiet = [&] {
+            for (const double end = rx::now_ms() + 1000.0; rx::now_ms() < end; std::this_thread::yield())
+                if (m.wake(e)) {
+                    const double n = rx::now_ms();
+                    gap = std::max(gap, n - t);
+                    t = n;
+                    return true;
+                }
+            return false;
+        };
         const bool a0 = m.ping(10, 56, rx::now_ms() + 5000.0, e, p0) == 1;
+        const double t0 = t = rx::now_ms();
         const bool early = m.wake(e);   // (just sent: not quiet for kWakeQuietMs)
-        sleep_ms(120);
-        const bool w1 = m.wake(e);
-        sleep_ms(120);
-        const bool w2 = m.wake(e);
-        sleep_ms(120);
+        const bool w1 = wake_quiet(), w2 = wake_quiet(), w3 = wake_quiet();
+        const double span = rx::now_ms() - t0;
         const bool a1 = m.ping(11, 56, rx::now_ms() + 5000.0, e, p1) == 1;
         check(!early, "no Wake right after a send (kWakeQuietMs)");
-        check(a0 && a1 && w1 && w2 && p1[0] == p0[0] + 2, "two Wakes 120 ms apart sent and taken (" +
-                                                             std::to_string(p1[0] - p0[0]) + ")");
-        check(a0 && a1 && p1[1] == p0[1], "with them the server's receive kept spinning for 360 ms (waits in poll: " +
-                                              std::to_string(p1[1] - p0[1]) + ")");
+        check(a0 && a1 && w1 && w2 && w3 && p1[0] == p0[0] + 3,
+              "three Wakes, each as kWakeQuietMs passed (" + std::to_string((int) gap) + " ms apart at most), sent and taken (" +
+                  std::to_string(p1[0] - p0[0]) + ")");
+        check(a0 && a1 && p1[1] == p0[1], "with them the server's receive kept spinning for ~" + std::to_string((int) span) +
+                                              " ms, past kSpinMs (waits in poll: " + std::to_string(p1[1] - p0[1]) + ")");
         const bool c0 = m.ping(12, 56, rx::now_ms() + 5000.0, e, q0) == 1;
         sleep_ms(360);
         const bool c1 = m.ping(13, 56, rx::now_ms() + 5000.0, e, q1) == 1;
@@ -582,9 +600,14 @@ int main(int argc, char** argv) {
         int us = 0;
         sleep_ms(300);
         const uint64_t q0 = m.polls();
-        const bool ok = m.send_req(600, 0, 1, &r, xp, err) && m.wait_resp(600, 1, rx::now_ms() + 20000.0, &y, us, err) == 1;
+        // (a ping: its pong comes at once - a request's reply is the CPU lane's work, which past kSpinMs under load
+        // would add waits of its own)
+        int32_t pg[3];
+        const bool ok = m.ping(600, 56, rx::now_ms() + 20000.0, err, pg) == 1;
         check(ok && m.polls() == q0, "after 300 ms quiet, the wait for a reply spins (this end's waits in poll: " +
                                       std::to_string(m.polls() - q0) + ")");
+        check(m.send_req(601, 0, 1, &r, xp, err) && m.wait_resp(601, 1, rx::now_ms() + 20000.0, &y, us, err) == 1,
+              "and a request after it answered");
     }
 
     // --expert-server-once: the main leaves, the server exits 0
@@ -656,6 +679,27 @@ int main(int argc, char** argv) {
         if (rc3 < 0) {
             c3.kill();
             c3.wait(5000);
+        }
+    }
+    // ---- a geometry whose blob layout the server refuses (blob_refusal at the Geo): its Error reaches the main before
+    // the last blob - send_blob looks for it before each one - and the server still exits 0
+    {
+        std::vector<Layer> L1;
+        make_layers(L1, {{16, 16}}, 8);   // (8 blobs of 9 MB: more than the link's buffers)
+        L1[0].geo.off[2] = L1[0].geo.blob - 256;   // (down past the blob's end)
+        Child c4;
+        check(c4.start(port + 1), "a fourth CPU expert server started");
+        rx::Main m4;
+        std::string e4;
+        int sent = 0;
+        const bool up4 = connect(m4, port + 1, L1, e4, 0, &sent);
+        check(!up4 && e4.rfind("expert server: ", 0) == 0 && e4.find("past the blob") != std::string::npos && sent < 8,
+              "a blob layout past its blob: the server's refusal after " + std::to_string(sent) + " of 8 blobs (" + e4 + ")");
+        const int rc4 = c4.wait(10000);
+        check(rc4 == 0, "and it exited 0 (" + std::to_string(rc4) + ")");
+        if (rc4 < 0) {
+            c4.kill();
+            c4.wait(5000);
         }
     }
     if (fails == 0) std::printf("ALL OK\n");
