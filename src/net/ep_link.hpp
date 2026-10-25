@@ -10,12 +10,16 @@
 //   - the main sends at most two requests ahead (n+1 deferral), the worker serves them in order, and a reply that
 //     misses its deadline is computed on the main instead (the late reply is dropped when it comes) - the main never
 //     waits on the worker past the deadline and never aborts a request for it.  The link is down after three requests
-//     in a row dropped at their deadline, or when the oldest one out is over a second old (a worker gone without a
-//     FIN); no room for a third request is not a miss (the late replies free the slots when they come);
+//     in a row dropped at their deadline, or when one dropped at its deadline has had no reply for over a second (a
+//     worker gone without a FIN); no room for a third request is not a miss (the late replies free the slots when
+//     they come);
 //   - a Wake (a Ping that wants no Pong) gets the worker spinning again before a window's first request;
 //   - placement fills (Fill / FillOk, epochs: section 3.7) go on a second, paced socket, so a 9 MB expert never sits
 //     in front of a layer's request.  One epoch is one batch of fills, each Fill "i of n"; the worker acks an epoch,
-//     and the main counts it ready, only when every fill of its batch loaded.
+//     and the main counts it ready, only when every fill of its batch loaded.  A batch holds one fill a layer (a
+//     layer has one spare slot), and the worker loads a batch's fills only after the request tagged with the epoch
+//     before it was read (the slots of the epoch before that are free then).  A queued batch cannot be abandoned
+//     midway: the fills go out and are answered, or the link goes down and is started again.
 //
 // Both sides say hello first (EpHello, a fixed 256 bytes so an older peer's is read whole and refused for its
 // protocol): the same pack (pack_hash), the same geometry, the shared secret (STRATA_STAGE_TOKEN, never printed; none:
@@ -23,9 +27,11 @@
 // [k, n_ff / block) it will be asked for.  The worker dials, the main listens: one worker per listener (v1), whose
 // bulk socket is matched by the session its hello names.
 //
-// Threads: the main's link is driven by one thread (the decode thread: requests, replies, Wakes, queueing fills) and
-// a fill thread MainLink owns (the bulk socket's sends and FillOks).  The worker's request socket and bulk socket are
-// each driven by a thread of their own; the epochs they share are atomic.
+// Threads: the main's link is driven by one thread (the decode thread: requests, replies, Wakes, queueing fills,
+// accept_bulk, start, bye) and a fill thread MainLink owns (the bulk socket's sends and FillOks).  Any thread may
+// read the atomic getters (up, epoch_ready, fills_pending) and st's atomic counters; on_fill_ok runs on the fill
+// thread and may use only those.  The worker's request socket and bulk socket are each driven by a thread of their
+// own; the epochs they share are atomic.
 //
 // Not wired into the engine here (U4).  Tests and the token-shaped probe: tests/dsv41/ep_link_test.cpp.
 #pragma once
@@ -44,14 +50,16 @@
 namespace strata::net::ep {
 
 constexpr uint32_t kMagic = 0x4b4c5045u;   // "EPLK" as the bytes go on the wire
-constexpr uint32_t kProto = 1;
+constexpr uint32_t kProto = 2;             // (2: EpFill grew from 8 to 14 bytes - i, n, pad; a protocol 1 peer reads its blobs 6 bytes off)
 constexpr int kMaxT = 16;                  // a frame's rows at most (the engine's kWin)
 constexpr int kMaxLayers = 64;
 constexpr int kOutstanding = 2;            // requests the main may have out at once
 constexpr double kTimeoutMs = 50.0;        // a reply's deadline by default (DS4_EP_TIMEOUT_MS; a normal one: 0.4-0.7)
 constexpr double kSpinMs = 50.0;           // a receiver's spin budget after the last frame, either way
 constexpr int kDownAfter = 3;              // requests in a row dropped at their deadline: the link is down
-constexpr double kStaleMs = 1000.0;        // the oldest request out older than this: the link is down
+constexpr double kStaleMs = 1000.0;        // a request dropped at its deadline with no reply this long after: the link is down
+constexpr double kFillWaitMs = 1000.0;     // the worker's fill waits this long for the request that frees its slots
+constexpr double kBulkHelloMs = 200.0;     // accept_bulk waits this long for a connection's hello (a silent one is closed)
 constexpr size_t kBulkFrame = (size_t) 1 << 26;   // a bulk frame's payload at most (a fill: an expert's blob, ~9 MB)
 constexpr uint16_t kDefaultPort = 7870;    // (not the stage link's 7840 / 7841, nor the agent's 7850)
 
@@ -123,6 +131,7 @@ struct EpFill {
 static_assert(sizeof(EpHdr) == 32, "the header's size");
 static_assert(sizeof(EpPick) == 8, "a pick's size");
 static_assert(sizeof(EpSlice) == 20, "a slice row's size");
+static_assert(sizeof(EpFill) == 14, "a fill header's size (protocol 2: e_in, e_out, i, n, pad)");
 // one size across protocols: an older peer's hello is read whole and refused for its protocol, not as malformed
 static_assert(sizeof(EpHello) == 256, "the hello's size");
 
@@ -154,9 +163,10 @@ struct FillBatch {
     uint32_t epoch = 0;
     int n = 0, next = 0;
     bool bad = false;
-    /// a Fill (epoch e, i of n) given the epoch acked so far: "" taken (i == 0 starts the batch, a retry of a failed
-    /// one included), else why not
-    std::string take(uint32_t e, int i, int nn, uint32_t acked);
+    uint64_t layers = 0;   // the layers the batch has filled so far (a layer has one spare slot: one fill a batch)
+    /// a Fill (epoch e, i of n, for `layer`) given the epoch acked so far: "" taken (i == 0 starts the batch, a retry
+    /// of a failed one included), else why not
+    std::string take(uint32_t e, int i, int nn, uint32_t acked, int layer);
     /// the taken fill's outcome: true when it completed its batch with every fill loaded (the epoch may be acked)
     bool done(bool loaded);
 };
@@ -189,12 +199,18 @@ public:
     int64_t last_rx_ns() const { return last_rx_ns_; }
     size_t buffered() const { return rb_.size() - rd_; }   // bytes read, not yet a whole frame
     size_t held() const { return rb_.size(); }              // the read buffer's bytes, consumed ones included (tests)
+    /// without taking them: the first n bytes of what is read (waiting until n are in, or the deadline).  The count
+    /// buffered, at most n (< n: the deadline came); -1 the link failed (err; closed)
+    int peek(uint8_t* out, size_t n, double deadline, std::string& err);
     /// bytes as they are, no header (tests: a peer that breaks the framing)
     bool send_bytes(const void* p, size_t len, std::string& err) { return send_raw_((const uint8_t*) p, len, err); }
     /// close with a reset (SO_LINGER 0): the peer reads ECONNRESET, not an orderly close (tests)
     void reset();
     double last_frame_ms() const { return last_frame_; }
 
+    /// a send fails ("cancelled", closed) once *cancel is set - a stalled peer must not hold the thread that ends it
+    /// (a full buffer is waited on for 30 s otherwise); set by whoever owns the Conn, before a thread uses it
+    const std::atomic<bool>* cancel = nullptr;
     double spin_ms = kSpinMs;      // spin this long after the last frame either way, then wait in poll (0: always poll)
     size_t max_frame = 1u << 22;   // payload bytes a frame may carry (the bulk socket: kBulkFrame)
     double pace_bps = 0.0;         // send at most this many bytes a second, 64 KB at a time (0: no pacing; the bulk socket)
@@ -208,6 +224,7 @@ public:
 private:
     bool send_raw_(const uint8_t* p, size_t len, std::string& err);
     int read_(uint8_t* p, size_t len);   // (::recv, or recvmsg taking the rx stamp)
+    int more_(double deadline, std::string& err);   // 1 bytes read into rb_; 2 none yet (spun or waited once); 0 deadline; -1 failed
     std::intptr_t fd_ = -1;
     bool stamps_ = false;
     int64_t rx_ns_ = 0, last_rx_ns_ = 0;   // (the last read's stamp; the last frame's)
@@ -218,16 +235,18 @@ private:
 };
 
 /// A listening socket (the main's): connections are taken one at a time.  Another process on the same port is
-/// refused (SO_EXCLUSIVEADDRUSE on Windows, as stage_link).
+/// refused (SO_EXCLUSIVEADDRUSE on Windows, as stage_link).  The socket is non-blocking: when two threads wake on one
+/// connection the loser waits again, to its own deadline, instead of blocking in accept.
 class Listener {
 public:
     ~Listener();
     /// [BIND:]PORT, BIND an IPv4 or a bracketed IPv6 address (PORT 0: any free one, port() says which)
     bool open(const std::string& at, std::string& err);
     int port() const { return port_; }
-    /// the next connection within wait_ms into c; false (err) when none came
+    /// the next connection within wait_ms into c; false (err) when none came in that time
     bool accept(Conn& c, int wait_ms, std::string& err);
     void close();
+    void (*after_wait)() = nullptr;   // (a test seam: runs between the wait and the accept, to make two threads wake on one connection)
 
 private:
     std::intptr_t fd_ = -1;
@@ -274,12 +293,16 @@ public:
     /// after hello_main on req: the geometry the frames are sized by, a clean state (a previous fill thread ended)
     void start(const EpHello& mine);
     /// the bulk socket of this link's session from ls within wait_ms, then the fill thread.  A connection that is not
-    /// it gets an Error ("a worker is already connected", "another session", ...) and the wait goes on.
+    /// it gets an Error ("a worker is already connected", "another session", ...) and the wait goes on; one that
+    /// says nothing is closed after kBulkHelloMs.
     bool accept_bulk(Listener& ls, int wait_ms, std::string& err);
     /// one worker per listener: a connection waiting on ls (within wait_ms) is answered "a worker is already
-    /// connected" and closed; true when one was (any thread may call it)
-    static bool refuse_extra(Listener& ls, int wait_ms);
-    bool up() const { return up_ && !bulk_failed_.load(std::memory_order_acquire); }
+    /// connected" (when its hello carries `mine`'s token; else the reason it is refused) and closed; true when one
+    /// was.  Not while accept_bulk runs on the same listener (both would take the connection the other waits for);
+    /// otherwise any thread may call it.
+    static bool refuse_extra(Listener& ls, const EpHello& mine, int wait_ms);
+    /// (any thread)
+    bool up() const { return up_.load(std::memory_order_acquire) && !bulk_failed_.load(std::memory_order_acquire); }
     /// seq's request (T rows of k_picks picks, then T x n_embd bf16 x): 1 sent; 0 not sent - compute it here (two out
     /// already, the link down (or going down now: the oldest out over kStaleMs), an epoch not loaded or before the last
     /// one sent, a seq not after the last one sent: err says which); -1 the send failed (the link is down now)
@@ -297,16 +320,21 @@ public:
     int outstanding() const { return (int) out_.size(); }
 
     /// queue fill i of epoch `epoch`'s batch of n: (layer, e_in into e_out's slot), blob bytes long (0: the worker
-    /// loads it from its pool).  The blob must stay valid until its FillOk (on_fill_ok) or the link's end.  Refused
-    /// here (false, err): the link down, no bulk socket, a layer out of range, a fill out of its batch's order, a new
-    /// batch while the last one is still out, an epoch not the next one, or epoch n + 2 before a request tagged n + 1
-    /// was sent (the worker frees the slots of n only then)
+    /// loads it from its pool).  The blob must stay valid until its FillOk (on_fill_ok); if the link goes down first,
+    /// until start(), bye() or the destructor has returned (the fill thread may still be copying it).  Refused here
+    /// (false, err): the link down, no bulk socket, a layer out of range, a second fill for a layer in one batch, a
+    /// blob that is null or over a bulk frame, a fill out of its batch's order, a new batch while the last one is
+    /// still out, an epoch not the next one, or epoch n + 2 before a request tagged n + 1 was sent (the worker frees
+    /// the slots of n only then).  A queued batch is not taken back: it is sent and answered, or the link goes down.
     bool queue_fill(int layer, int e_in, int e_out, uint32_t epoch, int i, int n, const void* blob, size_t bytes,
                     std::string& err);
     /// the newest epoch every fill of which the worker loaded: the epoch requests may be tagged with
     uint32_t epoch_ready() const { return ready_.load(std::memory_order_acquire); }
-    int fills_pending() const { return pending_.load(std::memory_order_acquire); }   // queued or out, no FillOk yet
-    /// each FillOk, on the fill thread (status 0: loaded), after epoch_ready was advanced for it
+    /// queued or out, no FillOk yet.  After the link went down it stays > 0 until start(): the fills it abandoned
+    /// get no on_fill_ok
+    int fills_pending() const { return pending_.load(std::memory_order_acquire); }
+    /// each FillOk, on the fill thread (status 0: loaded), after epoch_ready was advanced for it.  It may use only the
+    /// atomic getters above (up, epoch_ready, fills_pending)
     std::function<void(int layer, int e_in, uint32_t epoch, uint16_t status)> on_fill_ok;
 
     struct Stats {
@@ -319,7 +347,7 @@ private:
         uint32_t seq = 0;
         int T = 0;
         bool dropped = false;
-        double t_sent = 0.0;
+        double t_sent = 0.0, t_drop = 0.0;
     };
     struct Job {
         int layer = 0, e_in = -1, e_out = -1, i = 0, n = 1;
@@ -335,7 +363,8 @@ private:
     void fail_(const std::string& why);   // (the fill thread) the bulk socket failed
     void stop_fills_();                   // end the fill thread and wait for it
     std::deque<Out> out_;
-    bool up_ = false, any_sent_ = false;
+    std::atomic<bool> up_{false};
+    bool any_sent_ = false;
     uint32_t last_seq_ = 0, last_epoch_ = 0;
     int in_a_row_ = 0, n_embd_ = 0, k_ = 0, n_layers_ = 0;
     std::vector<uint8_t> tx_, rx_;
@@ -343,6 +372,7 @@ private:
     // the batch being queued (the decode thread's)
     uint32_t q_epoch_ = 0;
     int q_n_ = 0, q_next_ = 0;
+    uint64_t q_layers_ = 0;               // the layers of the batch so far (one fill a layer)
     // the fill thread and what it shares
     std::thread fill_th_;
     std::mutex mu_;
@@ -377,7 +407,10 @@ public:
     std::function<void()> on_wake;
     std::function<void(const EpHdr&, std::vector<uint8_t>&)> on_ping;   // may rewrite the Pong's payload
     /// the bulk socket's loop body: a Fill to `load` (status 0: loaded), its FillOk.  1 one handled, 0 none by the
-    /// deadline, -1 failed (err): an epoch not the next one, a fill out of its batch's order (FillBatch)
+    /// deadline, -1 failed (err): an epoch not the next one, a fill out of its batch's order or a second one for a
+    /// layer (FillBatch), or no request tagged with the epoch before this fill's read within kFillWaitMs (the loader
+    /// may overwrite the slots of the epoch before that only after one was: the Fill waits for it).  Failing, it
+    /// sends the bulk socket an Error and closes it; the main takes the link down.
     using Loader = std::function<uint16_t(int layer, int e_in, int e_out, uint32_t epoch, const uint8_t* blob, size_t n)>;
     int serve_fill(double deadline, const Loader& load, std::string& err);
     std::atomic<uint32_t> epoch_acked{0};   // the newest epoch whose whole batch loaded (the bulk thread sets it)

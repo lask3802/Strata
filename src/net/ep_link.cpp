@@ -251,19 +251,24 @@ bool split_host_port(const std::string& at, std::string& host, std::string& port
     return p >= 0 && p < 65536;
 }
 
-std::string FillBatch::take(uint32_t e, int i, int nn, uint32_t acked) {
+std::string FillBatch::take(uint32_t e, int i, int nn, uint32_t acked, int layer) {
     if (e != acked + 1)
         return "a fill for epoch " + std::to_string(e) + " (acked " + std::to_string(acked) + ": only " + std::to_string(acked + 1) + " is filled)";
     if (nn < 1 || i < 0 || i >= nn) return "a fill " + std::to_string(i) + " of " + std::to_string(nn);
+    if (i != 0 && (e != epoch || nn != n || i != next))
+        return "fill " + std::to_string(i) + " of " + std::to_string(nn) + " for epoch " + std::to_string(e) + " out of its batch's order (next: " +
+               std::to_string(next) + " of " + std::to_string(n) + " for epoch " + std::to_string(epoch) + ")";
+    const uint64_t bit = layer >= 0 && layer < 64 ? (uint64_t) 1 << layer : 0;
+    if (i != 0 && (layers & bit) != 0)   // (a layer has one spare slot: one fill of it a batch)
+        return "a second fill for layer " + std::to_string(layer) + " in epoch " + std::to_string(e) + "'s batch (one spare slot a layer)";
     if (i == 0) {   // (a batch starts: the first, or a retry of one that did not load whole)
         epoch = e;
         n = nn;
         next = 0;
         bad = false;
-    } else if (e != epoch || nn != n || i != next) {
-        return "fill " + std::to_string(i) + " of " + std::to_string(nn) + " for epoch " + std::to_string(e) + " out of its batch's order (next: " +
-               std::to_string(next) + " of " + std::to_string(n) + " for epoch " + std::to_string(epoch) + ")";
+        layers = 0;
     }
+    layers |= bit;
     return "";
 }
 
@@ -419,14 +424,21 @@ int Conn::read_(uint8_t* p, size_t len) {
 bool Conn::send_raw_(const uint8_t* p, size_t len, std::string& err) {
     const double t0 = now_ms(), give_up = t0 + 30000.0;   // (a full buffer for 30 s: the peer is gone)
     size_t sent = 0;
+    auto cancelled = [this] { return cancel != nullptr && cancel->load(std::memory_order_relaxed); };
     while (sent < len) {
+        if (cancelled()) {   // (the owner is ending this link: a stalled peer must not hold it up)
+            err = "send cancelled";
+            close();
+            return false;
+        }
         size_t want = len - sent;
         if (pace_bps > 0.0) {   // (a paced socket: 64 KB at a time, never ahead of the rate)
             want = std::min<size_t>(want, (size_t) 64 << 10);
             const double due = t0 + 1000.0 * (double) sent / pace_bps;
-            for (double now = now_ms(); now < due; now = now_ms())
+            for (double now = now_ms(); now < due && !cancelled(); now = now_ms())
                 if (due - now > 2.0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 else relax();
+            if (cancelled()) continue;
         }
         const int k = (int) ::send((sock_t) fd_, (const char*) p + sent, (int) std::min<size_t>(want, (size_t) 1 << 30), kSendFlags);
         if (k > 0) {
@@ -435,7 +447,7 @@ bool Conn::send_raw_(const uint8_t* p, size_t len, std::string& err) {
             continue;
         }
         if (k < 0 && would_block(last_err()) && now_ms() < give_up) {
-            (void) wait_sock((sock_t) fd_, false, 100);
+            (void) wait_sock((sock_t) fd_, false, cancel != nullptr ? 20 : 100);
             continue;
         }
         err = k == 0 ? "the link closed" : err_text("send");
@@ -468,7 +480,6 @@ int Conn::recv(EpHdr& h, std::vector<uint8_t>& payload, double deadline, std::st
         err = "not connected";
         return -1;
     }
-    uint8_t tmp[64 * 1024];
     for (;;) {
         const size_t have = rb_.size() - rd_;
         if (have >= sizeof(EpHdr)) {
@@ -493,37 +504,65 @@ int Conn::recv(EpHdr& h, std::vector<uint8_t>& payload, double deadline, std::st
                 return 1;
             }
         }
-        const int k = read_(tmp, sizeof tmp);
-        if (k > 0) {
-            if (rd_ > 0 && rd_ == rb_.size()) {
-                rb_.clear();
-                rd_ = 0;
-            } else if (rd_ >= kCompactAt) {   // (reads that end inside a frame, one after another: drop what was taken)
-                rb_.erase(rb_.begin(), rb_.begin() + (std::ptrdiff_t) rd_);
-                rd_ = 0;
-            }
-            rb_.insert(rb_.end(), tmp, tmp + k);
-            stat.bytes_in += (uint64_t) k;
+        const int r = more_(deadline, err);
+        if (r <= 0) return r;
+    }
+}
+
+// one step of reading: 1 bytes came into rb_; 2 none yet (it spun or waited once); 0 the deadline; -1 the link failed
+int Conn::more_(double deadline, std::string& err) {
+    uint8_t tmp[64 * 1024];
+    const int k = read_(tmp, sizeof tmp);
+    if (k > 0) {
+        if (rd_ > 0 && rd_ == rb_.size()) {
+            rb_.clear();
+            rd_ = 0;
+        } else if (rd_ >= kCompactAt) {   // (reads that end inside a frame, one after another: drop what was taken)
+            rb_.erase(rb_.begin(), rb_.begin() + (std::ptrdiff_t) rd_);
+            rd_ = 0;
+        }
+        rb_.insert(rb_.end(), tmp, tmp + k);
+        stat.bytes_in += (uint64_t) k;
 #if defined(TCP_QUICKACK)
-            set_opt<int>((sock_t) fd_, IPPROTO_TCP, TCP_QUICKACK, 1);   // (the kernel turns it off again by itself)
+        set_opt<int>((sock_t) fd_, IPPROTO_TCP, TCP_QUICKACK, 1);   // (the kernel turns it off again by itself)
 #endif
-            continue;
+        return 1;
+    }
+    if (k == 0 || !would_block(last_err())) {
+        err = (k < 0 ? err_text("recv") : std::string("the link closed")) + (buffered() > 0 ? " mid-frame" : "");
+        close();
+        return -1;
+    }
+    const double now = now_ms();
+    if (deadline >= 0 && now >= deadline) return 0;
+    if (spin_ms > 0 && now - last_frame_ < spin_ms) {   // (inside the budget: spin, the core stays awake)
+        ++stat.spins;
+        relax();
+        return 2;
+    }
+    ++stat.polls;   // (quiet: wait in poll, at most 50 ms at a time)
+    const double left = deadline < 0 ? 50.0 : std::min(50.0, deadline - now);
+    (void) wait_sock((sock_t) fd_, true, (int) std::max(0.0, left + 0.999));
+    return 2;
+}
+
+int Conn::peek(uint8_t* out, size_t n, double deadline, std::string& err) {
+    if (fd_ < 0) {
+        err = "not connected";
+        return -1;
+    }
+    for (;;) {
+        const size_t have = rb_.size() - rd_;
+        if (have >= n) {
+            std::memcpy(out, rb_.data() + rd_, n);
+            return (int) n;
         }
-        if (k == 0 || !would_block(last_err())) {
-            err = (k < 0 ? err_text("recv") : std::string("the link closed")) + (buffered() > 0 ? " mid-frame" : "");
-            close();
-            return -1;
+        const int r = more_(deadline, err);
+        if (r < 0) return -1;
+        if (r == 0) {
+            if (have > 0) std::memcpy(out, rb_.data() + rd_, have);
+            return (int) have;
         }
-        const double now = now_ms();
-        if (deadline >= 0 && now >= deadline) return 0;
-        if (spin_ms > 0 && now - last_frame_ < spin_ms) {   // (inside the budget: spin, the core stays awake)
-            ++stat.spins;
-            relax();
-            continue;
-        }
-        ++stat.polls;   // (quiet: wait in poll, at most 50 ms at a time)
-        const double left = deadline < 0 ? 50.0 : std::min(50.0, deadline - now);
-        (void) wait_sock((sock_t) fd_, true, (int) std::max(0.0, left + 0.999));
     }
 }
 
@@ -561,6 +600,7 @@ bool Listener::open(const std::string& at, std::string& err) {
         return false;
     }
     set_opt<int>(l, SOL_SOCKET, kListenOpt, 1);
+    nonblock(l);   // (two threads may wake on one connection: the loser must not block in accept)
     const bool bound = ::bind(l, res->ai_addr, (int) res->ai_addrlen) == 0 && ::listen(l, 4) == 0;
     freeaddrinfo(res);
     if (!bound) {
@@ -581,16 +621,24 @@ bool Listener::accept(Conn& c, int wait_ms, std::string& err) {
         err = "not listening";
         return false;
     }
-    if (!wait_sock((sock_t) fd_, true, wait_ms)) {
-        err = "no connection on port " + std::to_string(port_) + " in " + std::to_string(wait_ms) + " ms";
-        return false;
-    }
+    const double end = now_ms() + wait_ms;
     sockaddr_storage sa{};
-    socklen_t sl = sizeof sa;
-    const sock_t s = ::accept((sock_t) fd_, (sockaddr*) &sa, &sl);
-    if (s == kBad) {
-        err = err_text("accept");
-        return false;
+    sock_t s = kBad;
+    for (;;) {
+        const double left = end - now_ms();
+        if (!wait_sock((sock_t) fd_, true, left > 0.0 ? (int) std::ceil(left) : 0)) {
+            err = "no connection on port " + std::to_string(port_) + " in " + std::to_string(wait_ms) + " ms";
+            return false;
+        }
+        if (after_wait != nullptr) after_wait();
+        socklen_t sl = sizeof sa;
+        s = ::accept((sock_t) fd_, (sockaddr*) &sa, &sl);
+        if (s != kBad) break;
+        if (!would_block(last_err())) {
+            err = err_text("accept");
+            return false;
+        }
+        // (another thread took the connection that woke this one: wait for the next, to this call's own deadline)
     }
     char hb[64] = {};
     if (sa.ss_family == AF_INET) inet_ntop(AF_INET, &((sockaddr_in*) &sa)->sin_addr, hb, sizeof hb);
@@ -617,10 +665,35 @@ int read_hello(Conn& c, uint16_t want, EpHello& hello, std::vector<EpSlice>* tab
                std::string& err) {
     EpHdr h;
     std::vector<uint8_t> p;
-    const size_t cap = c.max_frame;
+    const double deadline = now_ms() + timeout_ms;
+    struct Restore {   // (the cap is for this hello only)
+        Conn& c;
+        size_t v;
+        ~Restore() { c.max_frame = v; }
+    } restore{c, c.max_frame};
+    // a frame larger than a hello is never read (a peer no token admitted yet): its magic and protocol, the first bytes
+    // after the header, say whose it is
     c.max_frame = kMaxHello;
-    const int got = c.recv(h, p, now_ms() + timeout_ms, err);
-    c.max_frame = cap;
+    uint8_t peeked[sizeof(EpHdr) + 8] = {};
+    const int have = c.peek(peeked, sizeof(EpHdr), deadline, err);
+    if (have < 0) return 0;
+    if (have == (int) sizeof(EpHdr)) {
+        std::memcpy(&h, peeked, sizeof h);
+        if (h.magic == kMagic && h.bytes > kMaxHello) {
+            const int more = c.peek(peeked, sizeof peeked, std::min(deadline, now_ms() + 100.0), err);
+            uint32_t pm = 0, pp = 0;
+            if (more == (int) sizeof peeked) {
+                std::memcpy(&pm, peeked + sizeof(EpHdr), 4);
+                std::memcpy(&pp, peeked + sizeof(EpHdr) + 4, 4);
+            }
+            if (more == (int) sizeof peeked && pm != kMagic) err = std::string("not an EP link's hello from ") + who;
+            else if (more == (int) sizeof peeked && pp != kProto)
+                err = "EP protocol " + std::to_string(pp) + ", this side speaks " + std::to_string(kProto);
+            else err = "a hello frame of " + std::to_string(h.bytes) + " bytes from " + who + ", over " + std::to_string(kMaxHello);
+            return 2;
+        }
+    }
+    const int got = c.recv(h, p, deadline, err);
     if (got == 0) err = std::string("no hello from ") + who + " in " + std::to_string((int) timeout_ms) + " ms";
     if (got != 1) return 0;
     if (h.type == Error) {
@@ -736,7 +809,8 @@ bool bulk_main(Conn& c, const EpHello& mine, std::string& err, double timeout_ms
     }
     EpHello b = mine;
     b.channel = 1;
-    std::string why = w.channel == 0 && w.magic == kMagic ? "a worker is already connected" : common_check(b, w);
+    // ("already connected" is for a peer that holds the token; any other is refused as common_check says)
+    std::string why = w.channel == 0 && w.magic == kMagic && same_token(b, w) ? "a worker is already connected" : common_check(b, w);
     if (why.empty() && w.session != mine.session) why = "unknown session (the bulk socket names another link's)";
     if (!why.empty()) return refuse(c, why, "bulk socket from " + c.peer() + " refused: ", err);
     c.max_frame = kBulkFrame;   // (FillOks only come in, but both ends agree)
@@ -762,6 +836,7 @@ void MainLink::start(const EpHello& mine) {
     in_a_row_ = 0;
     q_epoch_ = 0;
     q_n_ = q_next_ = 0;
+    q_layers_ = 0;
     jobs_.clear();
     bulk_why_.clear();
     stop_ = false;
@@ -780,6 +855,7 @@ void MainLink::stop_fills_() {
 }
 
 bool MainLink::accept_bulk(Listener& ls, int wait_ms, std::string& err) {
+    if (up_ && !bulk_ok_(err)) return false;   // (a fill thread that failed: the link is down now)
     if (!up_) {
         err = "the link is down";
         return false;
@@ -800,22 +876,25 @@ bool MainLink::accept_bulk(Listener& ls, int wait_ms, std::string& err) {
             if (!last.empty()) err += " (last: " + last + ")";
             return false;
         }
-        // (each connection's hello within what is left; a stranger's costs the wait, never the link)
-        if (bulk_main(bulk, mine_, last, std::max(1.0, std::min(10000.0, end - now_ms())))) break;
+        // (each connection's hello within kBulkHelloMs and what is left: a silent stranger costs that, never the link)
+        if (bulk_main(bulk, mine_, last, std::max(1.0, std::min(kBulkHelloMs, end - now_ms())))) break;
     }
+    bulk.cancel = &stop_;
     stop_ = false;
     fill_th_ = std::thread([this] { fill_loop_(); });
     return true;
 }
 
-bool MainLink::refuse_extra(Listener& ls, int wait_ms) {
+bool MainLink::refuse_extra(Listener& ls, const EpHello& mine, int wait_ms) {
     Conn c;
     std::string e;
     if (!ls.accept(c, wait_ms, e)) return false;
     EpHello h;
     std::vector<EpSlice> t;
-    (void) read_hello(c, Hello, h, &t, 1000.0, "another worker", e);   // (read first: closing on unread bytes is a reset)
-    (void) send_error(c, "a worker is already connected");
+    // (read first: closing on unread bytes is a reset.  Only a peer that holds the token is told a worker is here)
+    const int got = read_hello(c, Hello, h, &t, 1000.0, "another worker", e);
+    if (got == 1) (void) send_error(c, same_token(mine, h) ? "a worker is already connected" : "wrong token (STRATA_STAGE_TOKEN)");
+    else if (got == 2) (void) send_error(c, e);
     c.close();
     return true;
 }
@@ -905,10 +984,12 @@ int MainLink::send_req(uint32_t seq, int layer, int T, uint32_t epoch, uint32_t 
         return 0;
     }
     if (up_ && drain_(err) < 0) return -1;   // (late replies that came in since: their room back)
-    // (a worker that holds the oldest request this long is gone, FIN or not: no reply will free the slots)
-    if (up_ && !out_.empty() && now_ms() - out_.front().t_sent > kStaleMs) {
-        down_("the oldest request out (seq " + std::to_string(out_.front().seq) + ") is over " + std::to_string((int) kStaleMs) +
-                  " ms old",
+    // (a request dropped at its deadline that gets no reply for this long afterwards: the worker is gone, FIN or not,
+    // and no reply will free the slots.  One still awaited is not judged here: its caller's deadline is.  A reply
+    // already in was taken by drain_ above)
+    if (up_ && !out_.empty() && out_.front().dropped && now_ms() - out_.front().t_drop > kStaleMs) {
+        down_("request seq " + std::to_string(out_.front().seq) + ", dropped at its deadline, has had no reply for over " +
+                  std::to_string((int) kStaleMs) + " ms",
               err);
         ++st.not_sent;
         return 0;
@@ -963,7 +1044,10 @@ int MainLink::wait_resp(uint32_t seq, double deadline, Reply& r, std::string& er
         if (got < 0) return -1;
         if (got == 0) {
             for (Out& x : out_)
-                if (x.seq == seq) x.dropped = true;   // (computed here now; its reply is dropped when it comes)
+                if (x.seq == seq) {   // (computed here now; its reply is dropped when it comes)
+                    if (!x.dropped) x.t_drop = now_ms();
+                    x.dropped = true;
+                }
             ++st.timeouts;
             if (++in_a_row_ >= kDownAfter) {
                 down_(std::to_string(kDownAfter) + " requests in a row dropped at their deadline", err);
@@ -995,6 +1079,7 @@ bool MainLink::wake(std::string& err) {
 
 int MainLink::ping(uint32_t seq, size_t bytes, double deadline, uint32_t& held_ns, std::string& err,
                    std::vector<uint8_t>* payload, uint32_t aux) {
+    if (up_ && !bulk_ok_(err)) return -1;
     if (!up_ || !out_.empty()) {
         err = !up_ ? "the link is down" : "a request is out";
         return -1;
@@ -1044,15 +1129,21 @@ void MainLink::bye() {
 bool MainLink::queue_fill(int layer, int e_in, int e_out, uint32_t epoch, int i, int n, const void* blob, size_t bytes,
                           std::string& err) {
     if (up_ && !bulk_ok_(err)) return false;
+    // (pending first: when none is, the FillOk that cleared it advanced epoch_ready before, and the read below is final)
+    const int pend = fills_pending();
     const uint32_t ready = epoch_ready();
     if (!up_) err = "the link is down";
     else if (!fill_th_.joinable()) err = "no bulk socket";
     else if (layer < 0 || layer >= n_layers_) err = "a fill for layer " + std::to_string(layer) + " (the link has " + std::to_string(n_layers_) + ")";
     else if (n < 1 || n > 0xffff || i < 0 || i >= n) err = "a fill " + std::to_string(i) + " of " + std::to_string(n);
+    else if (blob == nullptr && bytes > 0) err = "a fill's blob is null (" + std::to_string(bytes) + " bytes)";
+    else if (bytes > kBulkFrame - sizeof(EpFill)) err = "a fill's blob of " + std::to_string(bytes) + " bytes, over what a bulk frame carries";
     else if (i > 0 && (q_epoch_ != epoch || q_n_ != n || q_next_ != i))
         err = "fill " + std::to_string(i) + " of " + std::to_string(n) + " for epoch " + std::to_string(epoch) + " out of its batch's order";
+    else if (i > 0 && ((q_layers_ >> layer) & 1) != 0)
+        err = "a second fill for layer " + std::to_string(layer) + " in epoch " + std::to_string(epoch) + "'s batch (one spare slot a layer)";
     else if (i == 0 && q_next_ < q_n_) err = "a new batch while fill " + std::to_string(q_next_) + " of " + std::to_string(q_n_) + " is still to come";
-    else if (i == 0 && fills_pending() > 0) err = "a new batch while the last one's fills are out";
+    else if (i == 0 && pend > 0) err = "a new batch while the last one's fills are out";
     else if (i == 0 && epoch != ready + 1)
         err = "a fill for epoch " + std::to_string(epoch) + " while " + std::to_string(ready) + " is loaded (only " + std::to_string(ready + 1) + " is filled)";
     else if (i == 0 && epoch > last_epoch_ + 1)
@@ -1062,7 +1153,9 @@ bool MainLink::queue_fill(int layer, int e_in, int e_out, uint32_t epoch, int i,
         if (i == 0) {
             q_epoch_ = epoch;
             q_n_ = n;
+            q_layers_ = 0;
         }
+        q_layers_ |= (uint64_t) 1 << layer;
         q_next_ = i + 1;
         Job j;
         j.layer = layer;
@@ -1126,7 +1219,7 @@ void MainLink::fill_loop_() {
             f.i = (uint16_t) j.i;
             f.n = (uint16_t) j.n;
             if (!bulk.send(h, &f, sizeof f, err, j.blob, j.bytes)) {
-                fail_(err);
+                if (!stop_.load()) fail_(err);   // (stop_: the link is ending anyway)
                 break;
             }
             if (out.empty()) last_ok = now_ms();
@@ -1279,7 +1372,20 @@ int WorkerLink::serve_fill(double deadline, const Loader& load, std::string& err
     std::string why;
     if (h.type != Fill || brx_.size() < sizeof fm) why = "not a fill on the bulk socket";
     else if (h.layer >= n_layers_) why = "a fill for layer " + std::to_string(h.layer);
-    else why = batch_.take(h.epoch, fm.i, fm.n, epoch_acked.load(std::memory_order_acquire));
+    else why = batch_.take(h.epoch, fm.i, fm.n, epoch_acked.load(std::memory_order_acquire), h.layer);
+    if (why.empty()) {
+        // (the slots of epoch e - 2 are free once a request tagged e - 1 was read: the loader must not overwrite one a
+        // request still reads.  The request socket has its own thread, so that request may be in the socket still)
+        const double until = now_ms() + kFillWaitMs;
+        while (epoch_used.load(std::memory_order_acquire) + 1 < h.epoch) {
+            if (now_ms() >= until) {
+                why = "a fill for epoch " + std::to_string(h.epoch) + " waited " + std::to_string((int) kFillWaitMs) +
+                      " ms for a request tagged " + std::to_string(h.epoch - 1) + " (in use " + std::to_string(epoch_used.load()) + ")";
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    }
     if (!why.empty()) {
         err = why;
         (void) send_error(bulk, why);
