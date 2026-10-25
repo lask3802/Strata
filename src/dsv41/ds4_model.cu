@@ -6492,6 +6492,10 @@ struct Model::Impl {
     // in, its coldest VRAM expert out) until nothing is worth moving or DS4_SETTLE_MS (6000) is spent
     void cache_settle() {
         psettle.settled();
+        ++st.prompt_settles;
+        if (o.verbose && rx_on)   // (the CT's check: settles == prompts)
+            std::fprintf(stderr, "ds4: expert cache: settle %lld (one a prompt with the expert server)\n",
+                         (long long) st.prompt_settles);
         if (!o.expert_cache || cache_ths.empty()) return;
         static const double budget = env_f("DS4_SETTLE_MS", 6000.0f);
         if (budget <= 0.0) return;
@@ -9111,7 +9115,8 @@ struct Model::Impl {
         // once a prompt (rx::PromptSettle: the feed that asks for logits, unless the prompt's chunked part settled
         // already).  Before U5a nothing settled after a window prompt, and its ticks (serve_T = T: past async_max_t
         // the lane's) put the server's experts into this GPU's VRAM (slot 20261025T1243Z's ep2 arm: no settle line, 9
-        // server experts in VRAM); win_prompt keeps them the server's now.  Without the server as before
+        // server experts in VRAM); win_prompt keeps them the server's now, as the decode's (rx::lane_serves(0, ..):
+        // unless DS4_SYNC).  Without the server as before
         if (psettle.after_feed(rx_on, logits_rows) && (!o.stage_worker || stage_last)) cache_settle();
         return true;
     }
