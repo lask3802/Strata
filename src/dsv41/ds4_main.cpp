@@ -33,6 +33,7 @@
 // `pin=N` on a GEN marks the first N prompt tokens as a start other requests share (a system prompt and its tools): the
 // read stops there for a checkpoint, so a request behind the same start - another agent - goes back to it instead of
 // reading it again (also without slots).  STRATA_DS4_REUSE=0 turns every reuse off (each request reads its whole prompt).
+#include "ds4_force.hpp"
 #include "ds4_model.hpp"
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
@@ -1804,6 +1805,10 @@ int main(int argc, char** argv) {
             m.set_stage_chunks(std::move(sc));
         }
     }
+    if (const char* ff = std::getenv("DS4_FORCE_TOKENS");
+        ff != nullptr && *ff != 0 && (serve_mode || !prof_ids.empty() || !spec_ids.empty() || !score_ids.empty()))
+        std::fprintf(stderr, "maya-ds4: DS4_FORCE_TOKENS is the CLI decode's (--ids ... --n N): not this mode's, left "
+                             "out\n");
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
     const int window_given = window;
     if (window == 0) window = 16;   // (the scoring / profiling runs; the plain run below takes the model's feed unit)
@@ -1844,6 +1849,15 @@ int main(int argc, char** argv) {
         ids_s = ss.str();
     }
     const std::vector<int> ids = parse_ids(ids_s);
+    strata::ds4::ForcedTokens forced;   // (DS4_FORCE_TOKENS: the decode emits a file's ids - ds4_force.hpp)
+    if (const char* ff = std::getenv("DS4_FORCE_TOKENS"); ff != nullptr && *ff != 0 && n > 0) {
+        if (!forced.load(ff, n, err)) {
+            std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "forced tokens: the decode emits the first %d of the %zu ids in %s (plain decode, no "
+                             "drafts)\n", n, forced.ids.size(), ff);
+    }
     if (!images.empty()) {   // --images: a GENI file's pictures, for the prompt's spans
         std::vector<Pic> pics;
         if (!read_pics(images, pics, err)) {
@@ -1895,6 +1909,7 @@ int main(int argc, char** argv) {
     bool cool = false;
     if (n > 0) {
         int tok = m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++);
+        if (forced.on()) tok = forced.take(0, tok);
         std::vector<int> got;
         for (;;) {
             out.push_back(tok);
@@ -1908,7 +1923,7 @@ int main(int argc, char** argv) {
             if ((tok == 1 && std::getenv("DS4_NO_EOS") == nullptr) || (int) out.size() >= n) break;   // (DS4_NO_EOS: decode n tokens whatever)
             if (got.empty()) {
                 int off = 0, acc = 0;
-                const bool try_spec = spec && !cool;
+                const bool try_spec = spec && !cool && !forced.on();
                 if (!round(m, tok, n - (int) out.size(), try_spec, o.dspark_conf, temp, 1.0f, temp > 0 ? 64 : 1, 0.0f,
                            cli_seed, counter, got, off, acc, err)) {
                     std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
@@ -1922,8 +1937,12 @@ int main(int argc, char** argv) {
             }
             tok = got.back();
             got.pop_back();
+            if (forced.on()) tok = forced.take(out.size(), tok);
         }
         std::printf("\n");
+        if (forced.on())
+            std::fprintf(stderr, "forced tokens: %lld of the decode's %zu own picks were not the file's (the first at "
+                                 "position %lld)\n", forced.differed, out.size(), forced.first);
         if (df != nullptr && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
     }
     if (spec && rounds > 0) {
@@ -1966,6 +1985,19 @@ int main(int argc, char** argv) {
     const long long io1 = io_read_bytes();
     if (io0 >= 0 && io1 >= 0)
         std::fprintf(stderr, "decode reads from the disk: %.1f MB a token\n", (double) (io1 - io0) / 1e6 / nt);
+#if defined(__linux__)
+    if (io0 >= 0 && io1 >= 0 && s.rx_held > 0) {   // (--remote-experts: the server's experts the lane read, the rest)
+        const double eb = (double) s.rx_upload_bytes / (double) s.rx_held / 1e6, all = (double) (io1 - io0) / 1e6 / nt,
+                     here = (double) (s.rx_here_cold - s0.rx_here_cold) * eb / nt,
+                     ahead = (double) (s.rx_ahead_cold - s0.rx_ahead_cold) * eb / nt;
+        std::fprintf(stderr, "decode reads from the disk, split (estimates: a whole %.1f MB expert each one sampled out of "
+                             "the page cache): the server's experts the lane computed after all %.1f MB a token, the "
+                             "server's experts the lookahead asked for early %.1f MB a token (%.1f asked a token), all the "
+                             "others %.1f MB a token\n",
+                     eb, here, ahead, (double) (s.rx_ahead - s0.rx_ahead) / nt,
+                     all > here + ahead ? all - here - ahead : 0.0);
+    }
+#endif
     if (s.skipped > s0.skipped)   // STRATA_DS4_DISK_SKIP_W
         std::fprintf(stderr, "decode left out %.1f experts a token not in RAM (%.1f%% of the routed)\n",
                      (double) (s.skipped - s0.skipped) / nt,

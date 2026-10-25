@@ -1,8 +1,8 @@
 // Strata. The remote experts' send gate and reply deadline (rx::Gate, src/dsv41/ds4_rx.hpp): the main process sends a
 // window's remote picks only when the expert server's round trip is expected to end no later than the CPU lane
-// computing them with its own, and waits for a reply until the later of DS4_RX_TIMEOUT_MS after the lane's part and
-// 1.5 x the round trip expected at the request's rows.  No GPU, no socket.  The numbers are the 3070's over 1 GbE
-// (rx-poc-report.md): T=1 0.66 ms (1 pick), T=4 2.17 ms; the lane 0.26 ms a pick.
+// computing them with its own, and waits for a reply until the later of the lane's time for the remote picks after
+// its part and 1.5 x the round trip expected at the request's rows.  No GPU, no socket.  The numbers are the 3070's
+// over 1 GbE (rx-poc-report.md): T=1 0.66 ms (1 pick), T=4 2.17 ms; the lane 0.26 ms a pick.
 #include "../../src/dsv41/ds4_rx.hpp"
 
 #include <cmath>
@@ -26,6 +26,60 @@ int main() {
         check(near(g.rtt[1], 0.66), "the first round trip is the estimate");
         g.rtt_seen(1, 1.66);
         check(near(g.rtt[1], 0.76), "then an EWMA of 0.1");
+    }
+    {
+        // (lead 2026-10-25) the wait after the lane's part: as long as the lane would take for the remote picks
+        rx::Gate g;
+        check(near(g.wait_ms(1, 2, 2.0, false), 2.0), "the lane's time a pick not known yet: the fixed 2 ms");
+        g.pick_seen(1, 0.26);
+        check(near(g.wait_ms(1, 1, 2.0, false), 0.26), "1 remote pick at 0.26 ms a pick: wait 0.26 ms");
+        check(near(g.wait_ms(1, 3, 2.0, false), 0.78), "3 remote picks: 0.78 ms");
+        check(near(g.wait_ms(1, 3, 2.0, true), 2.0), "DS4_RX_TIMEOUT_MS set: the fixed wait");
+        rx::Gate f;
+        f.pick_seen(1, 0.03);
+        check(near(f.wait_ms(1, 1, 2.0, false), rx::Gate::kMinWaitMs), "a fast lane: 0.1 ms at least");
+        g.pick_seen(4, 0.5);
+        check(near(g.wait_ms(4, 2, 2.0, false), 1.0), "T=4: its own time a pick (2 x 0.5 ms)");
+        g.rtt_seen(1, 0.7);
+        check(near(g.deadline(10.0, 11.0, g.wait_ms(1, 1, 2.0, false), 1), 11.26), "the lane's part + 0.26 ms is the later");
+        g.rtt_seen(1, 3.0);   // (0.93 ms: 1.5 x is 1.395 after the send)
+        check(near(g.deadline(10.0, 11.0, g.wait_ms(1, 1, 2.0, false), 1), 10.0 + 1.5 * 0.93), "1.5 x the round trip is");
+        // the lane's deadline and the link's bound (rx::Backoff counts against the fixed wait's, not the lane's)
+        const auto d = g.deadlines(1, 1, 1, 10.0, 12.0, 2.0, false, true);
+        check(near(d.first, 12.26) && near(d.second, 14.0), "the lane's deadline 0.26 ms after its part, the bound 2 ms");
+        const auto w = g.deadlines(1, 1, 1, 10.0, 12.0, 2.0, false, false);
+        check(near(w.first, 14.0) && near(w.second, 14.0), "no kernel arrival times: the fixed wait, the bound is it");
+        const auto x = g.deadlines(1, 1, 1, 10.0, 12.0, 2.0, true, true);
+        check(near(x.first, 14.0) && near(x.second, 14.0), "DS4_RX_TIMEOUT_MS set: the bound is the deadline");
+        const auto y = g.deadlines(4, 2, 4, 10.0, 12.0, 2.0, false, true);
+        check(near(y.first, 13.0) && near(y.second, 14.0), "T=4: its own time a pick, the bound still 2 ms");
+        const auto z = g.deadlines(4, 6, 4, 10.0, 12.0, 2.0, false, true);
+        check(near(z.first, 15.0) && near(z.second, 14.0), "6 picks at T=4: the lane waits 3 ms, past the bound");
+    }
+    {
+        // (lead 2026-10-25) the gate's start: the load's pings seed it, and the clamp holds from the first sample (a
+        // cold server's first reply took 178 ms in a slot, and the gate kept 936 windows here until probes brought it
+        // down)
+        rx::Gate cold;
+        cold.rtt_seen(1, 178.0);
+        check(near(cold.rtt[1], 178.0), "no seed: a cold first reply is the estimate");
+        rx::Gate s;
+        s.seed(1, 0.7);
+        check(near(s.rtt[1], 0.7), "seeded: the warm-up requests' median is the estimate");
+        s.rtt_seen(1, 178.0, true, 0.0);
+        check(near(s.rtt[1], 0.9 * 0.7 + 0.1 * 2.1), "seeded: the cold first reply counts as 3 x the seed");
+        s.pick_seen(1, 0.26);
+        check(s.send(1, 1, 1, 3), "and the next window goes out (0.84 ms against 4 picks x 0.26)");
+        rx::Gate z;
+        z.seed(1, 0.0);
+        z.rtt_seen(1, 5.0);
+        check(near(z.rtt[1], 5.0), "a seed of 0 (no warm-up): nothing seeded");
+        rx::Gate q;   // (a seed ends a clamped run)
+        q.seed(1, 0.7);
+        for (int i = 0; i < 4; ++i) q.rtt_seen(1, 100.0, true, 100.0 * i);
+        q.seed(1, 0.7);
+        q.rtt_seen(1, 100.0, true, 1000.0);
+        check(near(q.rtt[1], 0.9 * 0.7 + 0.1 * 2.1), "a seed after 4 clamped: the run starts again, clamped");
     }
     {
         rx::Gate g;
@@ -154,6 +208,47 @@ int main() {
         int ly = -2;
         b.add(9, 3.0, 1, 17);
         check(b.take(9, s, rows, &ly) && ly == 17, "and its layer");
+        // late for the lane's wait, the link's lateness decided against its bound (lead 2026-10-25: the short wait
+        // must not drive the backoff)
+        rx::LateBook c;
+        bool op = false;
+        double bd = -1;
+        c.add(20, 10.0, 1, 3, 13.0);
+        c.add(21, 11.0, 1, 3, 14.0);
+        c.add(22, 12.0, 1, 3, -1.0);   // (decided at once: its deadline was the bound)
+        check(c.expire(13.5) == 1, "past seq 20's bound, not 21's: one decided late");
+        check(c.expire(13.6) == 0, "and once only");
+        check(c.take(20, s, rows, nullptr, &op, &bd) && !op, "seq 20's reply after: already decided");
+        check(c.take(21, s, rows, nullptr, &op, &bd) && op && near(bd, 14.0), "seq 21's reply: open, against 14 ms");
+        check(c.expire(100.0) == 0, "taken: nothing left to expire");
+        check(c.take(22, s, rows, nullptr, &op, &bd) && !op, "decided at once: not open");
+        rx::LateBook a;
+        check(a.add_late(30, 10.0, 1, 3, 12.3, 14.0) == 0, "late for the lane's deadline, before the bound: open");
+        check(a.expire(14.0) == 0 && a.expire(14.01) == 1, "decided late only once the bound has passed");
+        check(a.add_late(31, 10.0, 1, 3, 14.0, 14.0) == 1, "the deadline was the bound: decided late at once");
+        check(a.take(31, s, rows, nullptr, &op, &bd) && !op, "and not open");
+        check(a.add_late(32, 10.0, 1, 3, 12.3, 90.0) == 0, "a bound far out: open");
+        check(a.add_late(96, 11.0, 1, 3, 12.3, 14.0) == 1, "64 sends on, its slot still open: decided late");
+        check(a.take(96, s, rows, nullptr, &op, &bd) && op && near(bd, 14.0), "and the newer one open in it");
+        // a late reply that came: its kernel arrival against its bound, else its read time
+        check(!rx::LateBook::past(13.5, 10.0, 16.0, 14.0), "arrived before the bound (read after): not late");
+        check(rx::LateBook::past(14.5, 10.0, 16.0, 14.0), "arrived after the bound: late");
+        check(rx::LateBook::past(-1.0, 10.0, 16.0, 14.0), "no kernel time, read after the bound: late");
+        check(!rx::LateBook::past(-1.0, 10.0, 13.9, 14.0), "no kernel time, read before the bound: not late");
+        check(rx::LateBook::past(9.0, 10.0, 16.0, 14.0), "a stamp before the send (the clock stepped): the read's");
+        check(!rx::LateBook::past(17.0, 10.0, 13.9, 14.0), "a stamp after the read (the clock stepped): the read's");
+        check(!rx::LateBook::past(14.0, 10.0, 16.0, 14.0), "arrived at the bound itself: not late");
+        check(!rx::LateBook::past(15.0, 10.0, 16.0, 14.0, true), "a shared stamp past the bound: an upper bound, not late");
+        check(rx::LateBook::past(-1.0, 10.0, 16.0, 14.0, true), "shared but no kernel time: the read's");
+        rx::LateBook p;
+        p.add_late(40, 10.0, 1, 3, 12.3, 14.0);
+        check(p.expire(15.0) == 1 && p.add_late(104, 20.0, 1, 3, 22.3, 24.0) == 0,
+              "64 on, the slot's one expired already (not taken): not decided again");
+        // in time for the lane's deadline: late for the link only past the bound, when the lane's wait went past it
+        check(!rx::LateBook::in_time_past(13.0, 14.0, 13.5, 10.0, 13.6), "the lane's wait within the bound: not late");
+        check(!rx::LateBook::in_time_past(14.0, 14.0, -1.0, 10.0, 14.001), "the deadline the bound, read just after: not late");
+        check(rx::LateBook::in_time_past(15.0, 14.0, 14.5, 10.0, 14.6), "a 3 ms wait, arrived at 14.5: late for the link");
+        check(!rx::LateBook::in_time_past(15.0, 14.0, 13.5, 10.0, 14.6), "a 3 ms wait, arrived at 13.5: not late");
     }
     {
         // 8 late of the last 64 (lead 2026-10-25): the link idle for `hold` requests, then tried again with a clean count
@@ -189,6 +284,14 @@ int main() {
         s.idle();
         for (int i = 0; i < 7; ++i) s.seen(true);
         check(s.seen(true) == B::Silent, "8 late again and no reply at all since the spell: given up");
+    }
+    {
+        // the remote experts beside expert parallelism's n_ff slices (U2): refused (lead 2026-10-25, U4a)
+        check(rx::slice_refusal(true, 0, -1, 2304) == nullptr, "the whole n_ff (unresolved, -1): taken");
+        check(rx::slice_refusal(true, 0, 2304, 2304) == nullptr, "the whole n_ff: taken");
+        check(rx::slice_refusal(true, 0, 1024, 2304) != nullptr, "a slice [0, 1024): refused");
+        check(rx::slice_refusal(true, 1024, 1280, 2304) != nullptr, "a slice [1024, 2304): refused");
+        check(rx::slice_refusal(false, 0, 1024, 2304) == nullptr, "no --remote-experts: the slice is not ours to refuse");
     }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;

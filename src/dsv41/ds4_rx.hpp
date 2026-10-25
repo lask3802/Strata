@@ -11,11 +11,13 @@
 // by its profile that are neither in its own VRAM nor on a CPU-only layer, as many as fit, once.  In decode, per layer
 // request of the CPU lane (serve_lane): the picks the server holds go out as soon as the routing is known (T rows of
 // x in bf16, up to 8 picks and weights each), the lane computes the others, then waits for the reply (T rows of
-// sum_i w_i expert_i(x) in bf16) and adds it to the same part before the answer's seq.  A reply later than
-// DS4_RX_TIMEOUT_MS (2) after the lane's own picks are done: those picks are computed on the lane (the late reply is
-// skipped when it comes); 8 late replies of the last 64: the lane computes everything for the next DS4_RX_BACKOFF (256)
-// requests, then the link is tried again with a clean count; a lost link, or no reply at all from one such idle spell
-// to the next: the lane computes everything from then on.
+// sum_i w_i expert_i(x) in bf16) and adds it to the same part before the answer's seq.  A reply not in once the lane's
+// own picks are done and as long again as the lane would take for the server's picks (0.1 ms at least; 2 ms until the
+// lane's time a pick is known, or always DS4_RX_TIMEOUT_MS when it is set): those picks are computed on the lane (the
+// late reply is skipped when it comes, its round trip still taken; without the kernel's arrival times, Windows: the 2
+// ms always); 8 of the last 64 replies past the link's bound (that fixed wait's deadline, not the lane's): the lane
+// computes everything for the next DS4_RX_BACKOFF (256) requests, then the link is tried again with a clean count; a
+// lost link, or no reply at all from one such idle spell to the next: the lane computes everything from then on.
 // Never a hang.
 // Keep-awake: each end's receive spins while bytes came in the last kSpinMs; a window's start sends a Wake when the
 // link has been quiet for kWakeQuietMs (the server's spin restarts before the window's first request), and serve_lane
@@ -102,14 +104,25 @@ static_assert(sizeof(HelloMsg) == 128, "the hello's size");
 /// The main's send gate and a reply's deadline, from EWMAs (0: none yet) of the round trip at a request's rows and of
 /// the CPU lane's time a pick at the window's T.  A window's remote picks go out only when the round trip is expected
 /// to end no later than the lane computing them with its own (none learned yet: out; every 32nd window kept in a row
-/// at a T: out anyway, a probe that keeps the estimate current).  The deadline: timeout_ms after the lane's own part,
-/// but not before 1.5 x the round trip expected at those rows.
+/// at a T: out anyway, a probe that keeps the estimate current).  The deadline: after the lane's own part, as long as
+/// the lane would take to compute the remote picks itself (n x its time a pick at T, kMinWaitMs at least; fixed_ms
+/// until that is learned, or always when fixed_ms is forced: the regret of a wait is at most 2 x the local cost), but
+/// not before 1.5 x the round trip expected at those rows.
 struct Gate {
     double rtt[kMaxRows + 1] = {}, pick[kMaxRows + 1] = {};
     int run[kMaxRows + 1] = {}, seen[kMaxRows + 1] = {}, over[kMaxRows + 1] = {};
     double run_lo[kMaxRows + 1] = {}, run_hi[kMaxRows + 1] = {};   // (the clamped run's first and last send, ms)
-    static constexpr double kSlowerMs = 50.0;
+    static constexpr double kSlowerMs = 50.0, kMinWaitMs = 0.1;
+    static constexpr int kClampAfter = 4;   // (samples before the clamp applies; a seed counts as that many)
     static void ew(double& a, double v) { a = a > 0.0 ? 0.9 * a + 0.1 * v : v; }
+    /// the round trip at `rows` measured before decode (the load's warm-up requests): the estimate, and the clamp
+    /// from the first sample against it (a cold server's first reply, 178 ms in a slot, moves it by 20% only)
+    void seed(int rows, double ms) {
+        if (ms <= 0.0) return;
+        rtt[rows] = ms;
+        seen[rows] = kClampAfter;
+        over[rows] = 0;
+    }
     // a reply's round trip: from the kernel's arrival time where there is one (Linux; a late reply's too, when it
     // comes), else a reply the lane waited for (a late one: the time waited, a lower bound).  Without it, one already
     // there when the lane finished its own part says only that the round trip was at most that long - the time is the
@@ -120,7 +133,7 @@ struct Gate {
     // replies within a few ms: those stay clamped.  sent < 0 (no send time): the count alone
     void rtt_seen(int rows, double ms, bool waited = true, double sent = -1.0) {
         if (!waited && rtt[rows] > 0.0 && ms >= rtt[rows]) return;
-        if (seen[rows] >= 4 && ms > 3.0 * rtt[rows]) {
+        if (seen[rows] >= kClampAfter && ms > 3.0 * rtt[rows]) {
             if (over[rows] == 0) {
                 run_lo[rows] = run_hi[rows] = sent;
             } else if (sent >= 0.0) {
@@ -149,32 +162,97 @@ struct Gate {
         }
         return false;
     }
-    double deadline(double sent, double lane_done, double timeout_ms, int rows) const {
-        const double a = lane_done + timeout_ms, b = sent + 1.5 * rtt[rows];
+    /// the wait after the lane's own part for n_remote picks at T (see the struct)
+    double wait_ms(int T, size_t n_remote, double fixed_ms, bool forced) const {
+        if (forced || pick[T] <= 0.0) return fixed_ms;
+        const double w = (double) n_remote * pick[T];
+        return w > kMinWaitMs ? w : kMinWaitMs;
+    }
+    double deadline(double sent, double lane_done, double wait, int rows) const {
+        const double a = lane_done + wait, b = sent + 1.5 * rtt[rows];
         return a > b ? a : b;
+    }
+    /// a request's two deadlines: the lane's (the wait for its n_remote picks at T) and the link's bound (the fixed
+    /// wait's, what rx::Backoff counts against).  kts = false (no kernel arrival times: a late reply's time is its read,
+    /// in the next request's wait, past any bound): the fixed wait, the bound is the deadline
+    std::pair<double, double> deadlines(int T, size_t n_remote, int rows, double sent, double lane_done, double fixed_ms,
+                                        bool forced, bool kts) const {
+        const double bound = deadline(sent, lane_done, fixed_ms, rows);
+        if (!kts) return {bound, bound};
+        return {deadline(sent, lane_done, wait_ms(T, n_remote, fixed_ms, forced), rows), bound};
     }
 };
 
-/// The main's late requests (seq mod 64: a later one 64 on takes the slot): a reply that comes after all gives the gate the round trip it had
+/// The main's late requests (seq mod 64: a later one 64 on takes the slot): a reply that comes after all gives the
+/// gate the round trip it had.  Late here is past the lane's wait (the policy's deadline); whether the link was late
+/// (rx::Backoff's count) is decided against the link's bound `bound` (the fixed wait's deadline): by the reply's
+/// arrival when it comes (take: open), or as late once the bound has passed without it (expire)
 struct LateBook {
     struct E {
         uint32_t seq = 0;
-        double sent = -1;
+        double sent = -1, bound = -1;
         int rows = 0, layer = -1;
+        bool open = false;   // (the link's lateness not decided yet)
     };
     E e[64];
-    void add(uint32_t seq, double sent, int rows, int layer = -1) { e[seq % 64] = {seq, sent, rows, layer}; }
-    /// seq's send time, rows and layer (false: not a late request here, or taken already)
-    bool take(uint32_t seq, double& sent, int& rows, int* layer = nullptr) {
+    void add(uint32_t seq, double sent, int rows, int layer = -1, double bound = -1) {
+        e[seq % 64] = {seq, sent, bound, rows, layer, bound >= 0};
+    }
+    /// a request late for the lane's `deadline` in: open against its bound, or decided late at once when the deadline
+    /// was the bound already.  Its slot's entry still open (64 lane requests on, no reply, the bound not passed: a bound
+    /// far out): decided late.  The count decided late here
+    int add_late(uint32_t seq, double sent, int rows, int layer, double deadline, double bound) {
+        const int n = e[seq % 64].open ? 1 : 0;
+        const bool now = deadline >= bound;
+        add(seq, sent, rows, layer, now ? -1.0 : bound);
+        return n + (now ? 1 : 0);
+    }
+    /// a late reply's lateness for the link: its kernel arrival (within its send and the read), else the time it was
+    /// read.  A shared stamp (the read's last reply's: the next reply came in the same read) is an upper bound only:
+    /// not late - a reply past the short wait sits in the socket until the next request's wait reads it with that
+    /// one's, and a slow link's replies come apart (the next not in yet), or not at all (expire)
+    static bool past(double arrival, double sent, double read, double bound, bool shared = false) {
+        if (arrival < sent || arrival > read) return read > bound;
+        return !shared && arrival > bound;
+    }
+    /// a reply in time for the lane's deadline: late for the link only when that wait went past the bound (large T)
+    /// and it came after it
+    static bool in_time_past(double deadline, double bound, double arrival, double sent, double read) {
+        return deadline > bound && past(arrival, sent, read, bound);
+    }
+    /// seq's send time, rows and layer (false: not a late request here, or taken already); *open: its link lateness
+    /// still to decide (against *bound)
+    bool take(uint32_t seq, double& sent, int& rows, int* layer = nullptr, bool* open = nullptr, double* bound = nullptr) {
         E& x = e[seq % 64];
         if (x.sent < 0 || x.seq != seq) return false;
         sent = x.sent;
         rows = x.rows;
         if (layer != nullptr) *layer = x.layer;
+        if (open != nullptr) *open = x.open;
+        if (bound != nullptr) *bound = x.bound;
         x.sent = -1;
+        x.open = false;
         return true;
     }
+    /// the open ones whose bound is before now: decided late (their count); their replies may still come (take)
+    int expire(double now) {
+        int n = 0;
+        for (E& x : e)
+            if (x.open && x.bound < now) {
+                x.open = false;
+                ++n;
+            }
+        return n;
+    }
 };
+
+/// The remote experts beside expert parallelism's n_ff slice [ff0, ff0 + ffn) of a layer (Layer::ep_ff0 / ep_ffn; ffn -1:
+/// the whole n_ff): refused - the server computes each expert whole, an EP window's lane a slice of it, and the other
+/// PC's part would add the rest a second time.  The reason, or nullptr
+inline const char* slice_refusal(bool remote, int ff0, int ffn, int n_ff) {
+    if (!remote || ffn < 0 || (ff0 == 0 && ffn == n_ff)) return nullptr;
+    return "the remote experts (--remote-experts) compute each expert whole";
+}
 
 /// The late replies of the main's last 64 requests: 8 of them idle the link for the next `hold` requests (the lane
 /// computes their picks), then it is tried again with a clean count.  Given up for good only when no reply at all
