@@ -398,6 +398,10 @@ public:
     /// (--remote-experts) the remote experts' lines since s0 (per token of nt): picks served there, the round trips
     /// and the lane's waits (mean, p50, p99), bytes; "" without an expert server
     std::string rx_lines(const Stats& s0, double nt) const;
+    /// (--remote-experts, DS4_RX_HELD_SAVE) the experts the expert server holds now into `path`, for a later run's
+    /// DS4_RX_HELD_LOAD (the load's set: these first, then the profile's); false without a server or when the file
+    /// cannot be written (`note` says why; on success its count)
+    bool rx_held_save(const std::string& path, std::string& note) const;
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.
     std::vector<std::string> info_lines() const;

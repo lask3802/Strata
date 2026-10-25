@@ -7431,6 +7431,18 @@ struct Model::Impl {
                 }
         }
         std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.n > b.n; });
+        // DS4_RX_HELD_LOAD=FILE (a set DS4_RX_HELD_SAVE wrote): its experts first, in its order, the room left by the
+        // profile - the server starts from the set an earlier run's fills reached, not the profile's
+        const char* hl = std::getenv("DS4_RX_HELD_LOAD");
+        std::vector<int> hrank;   // [NL * n_exp] the file's order, -1 not in it
+        std::string hnote;
+        const int hn = hl != nullptr && *hl != '\0' ? rx_held_read(hl, gm.pack_hash, NL, hrank, hnote) : -1;
+        if (hn > 0)
+            std::stable_sort(cand.begin(), cand.end(), [&](const Cand& a, const Cand& b) {
+                const int ra = hrank[(size_t) a.li * g.n_exp + a.e], rb = hrank[(size_t) b.li * g.n_exp + b.e];
+                if ((ra >= 0) != (rb >= 0)) return ra >= 0;
+                return ra >= 0 && ra < rb;   // (neither in it: the profile's order, kept)
+            });
         const uint64_t room = link->room();
         uint64_t used = 0;
         double sent_n = 0;
@@ -7447,6 +7459,15 @@ struct Model::Impl {
                              "lane's %zu experts (%.2f GB, %.1f%% of their routings in the profile)\n",
                      link->peer().c_str(), link->name().c_str(), (double) room / 1e9, pick.size(), cand.size(),
                      (double) used / 1e9, all_n > 0 ? 100.0 * sent_n / all_n : 0.0);
+        if (hn > 0) {
+            size_t lane = 0, sent = 0;
+            for (const Cand& c : cand) lane += hrank[(size_t) c.li * g.n_exp + c.e] >= 0;
+            for (const Cand& c : pick) sent += hrank[(size_t) c.li * g.n_exp + c.e] >= 0;
+            std::fprintf(stderr, "ds4: DS4_RX_HELD_LOAD=%s: %d experts in it, %zu of them the CPU lane's here, %zu of them "
+                                 "sent first; the other %zu by the profile\n", hl, hn, lane, sent, pick.size() - sent);
+        } else if (hn == 0 || (hn < 0 && hl != nullptr && *hl != '\0')) {
+            std::fprintf(stderr, "ds4: DS4_RX_HELD_LOAD=%s not used (%s) - the profile's set\n", hl, hnote.c_str());
+        }
         // (lead 2026-10-25: what the upload does to the page cache) the CPU lane's other experts not in it, before and
         // after (4 pages a matrix sampled), the bytes the upload read from the disk, the memory around it
 #if defined(__linux__)
@@ -7581,6 +7602,69 @@ struct Model::Impl {
         rx_rtt.reserve(1 << 20);
         rx_wait.reserve(1 << 20);
         rx_arr.reserve(1 << 20);
+    }
+    // the held set's file (DS4_RX_HELD_SAVE / _LOAD): "strata-dsv41 held set 1", "pack <hash> layers <NL> experts
+    // <n_exp>", then a "<layer> <expert>" line an expert, the hottest first.  rank[li * n_exp + e]: its line, or -1;
+    // the experts read (0: none, -1: the file not used, `note` says why)
+    int rx_held_read(const char* path, uint64_t pack, int NL, std::vector<int>& rank, std::string& note) const {
+        std::FILE* f = std::fopen(path, "r");
+        if (f == nullptr) {
+            note = "cannot open it";
+            return -1;
+        }
+        char ln[256];
+        unsigned long long ph = 0;
+        int nl = 0, ne = 0;
+        const bool head = std::fgets(ln, sizeof ln, f) != nullptr && std::strncmp(ln, "strata-dsv41 held set 1", 23) == 0 &&
+                          std::fgets(ln, sizeof ln, f) != nullptr &&
+                          std::sscanf(ln, "pack %llx layers %d experts %d", &ph, &nl, &ne) == 3;
+        if (!head || (uint64_t) ph != pack || nl != NL || ne != g.n_exp) {
+            std::fclose(f);
+            note = !head ? "not a held set" : "another pack's or another geometry's";
+            return -1;
+        }
+        rank.assign((size_t) NL * g.n_exp, -1);
+        int n = 0, li = 0, e = 0;
+        while (std::fgets(ln, sizeof ln, f) != nullptr)
+            if (std::sscanf(ln, "%d %d", &li, &e) == 2 && li >= 0 && li < NL && e >= 0 && e < g.n_exp &&
+                rank[(size_t) li * g.n_exp + e] < 0)
+                rank[(size_t) li * g.n_exp + e] = n++;
+        std::fclose(f);
+        if (n == 0) note = "no experts in it";
+        return n;
+    }
+    // (DS4_RX_HELD_SAVE) the experts the server holds now, or whose fill is under way, into `path` (a temporary
+    // beside it, then renamed), the hottest here first
+    bool rx_held_save(const std::string& path, std::string& note) const {
+        if (rx_has.empty() || !rx_link) {
+            note = "no expert server";
+            return false;
+        }
+        const int NL = (int) (rx_has.size() / (size_t) g.n_exp);
+        std::vector<std::pair<float, std::pair<int, int>>> h;
+        for (int li = 0; li < NL; ++li)
+            for (int e = 0; e < g.n_exp; ++e)
+                if (rx_has[(size_t) li * g.n_exp + e] != 0)   // (kHeld, or kFilling: chosen, its fill under way)
+                    h.push_back({li < (int) L.size() && e < (int) L[(size_t) li].heat.size() ? L[(size_t) li].heat[(size_t) e] : 0.0f,
+                                 {li, e}});
+        std::stable_sort(h.begin(), h.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        const std::string tmp = path + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "w");
+        if (f == nullptr) {
+            note = "cannot write " + tmp;
+            return false;
+        }
+        std::fprintf(f, "strata-dsv41 held set 1\npack %llx layers %d experts %d\n",
+                     (unsigned long long) stage::pack_hash(o.pack), NL, g.n_exp);
+        for (const auto& x : h) std::fprintf(f, "%d %d\n", x.second.first, x.second.second);
+        const bool ok = std::fclose(f) == 0;
+        std::remove(path.c_str());   // (Windows' rename does not replace)
+        if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
+            note = "cannot write " + path;
+            return false;
+        }
+        note = std::to_string(h.size()) + " experts";
+        return true;
     }
     // (DS4_RX_FILL=1) the fills' socket after the upload: DS4_RX_FILL_PACE GB/s (0.6), DS4_RX_FILL_R fills a token (6),
     // DS4_RX_FILL_Q pending (2), DS4_RX_FILL_PORT (the rx port + 1).  A server that takes none: the set stays the load's
@@ -12097,6 +12181,7 @@ const Stats& Model::stats() const {
 }
 std::string Model::describe() const { return p_->describe(); }
 std::string Model::rx_lines(const Stats& s0, double nt) const { return p_->rx_lines(s0, nt); }
+bool Model::rx_held_save(const std::string& path, std::string& note) const { return p_->rx_held_save(path, note); }
 std::vector<std::string> Model::info_lines() const { return p_->info_lines(); }
 
 }  // namespace strata::ds4
