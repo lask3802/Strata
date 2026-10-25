@@ -1925,6 +1925,40 @@ int main(int argc, char** argv) {
     unsigned long long counter = 0;
     long long d_off = 0, d_acc = 0, rounds = 0;
     bool cool = false;
+    // DS4_WIN_STATS=N (--verbose: 64; 0 none): a line every N decode tokens - the window's tok/s, the expert server's
+    // share of the CPU lane's picks, the lane's own picks and ms a token, the fills loaded and sent (the server's set
+    // converging against the text's own routing). DS4_RX_HELD_SAVE=FILE: the server's held set into FILE at the
+    // decode's end, and every DS4_RX_HELD_EVERY tokens (0: the end alone), for a later run's DS4_RX_HELD_LOAD
+    const char* wv = std::getenv("DS4_WIN_STATS");
+    const int win = wv != nullptr && *wv != '\0' ? std::max(0, std::atoi(wv)) : o.verbose ? 64 : 0;
+    const char* hsv = std::getenv("DS4_RX_HELD_SAVE");
+    const std::string held_save = hsv != nullptr ? hsv : "";
+    const char* hev = std::getenv("DS4_RX_HELD_EVERY");
+    const int held_every = held_save.empty() || hev == nullptr ? 0 : std::max(0, std::atoi(hev));
+    strata::ds4::Stats sw = s0;
+    double tw = t1;
+    size_t w_from = 1;
+    auto window_line = [&]() {
+        const strata::ds4::Stats s1 = m.stats();
+        const double tn = now_ms(), k = (double) std::max<int64_t>(1, s1.tokens - sw.tokens);
+        const double served = (double) (s1.rx_picks - sw.rx_picks), local = (double) (s1.cpu_experts - sw.cpu_experts);
+        std::fprintf(stderr, "decode window %zu-%zu: %.2f tok/s (%lld tokens); the expert server %.1f%% of the CPU lane's "
+                             "picks (%.1f a token), the lane's own %.1f a token, %.2f ms a token; fills %lld loaded, %.1f "
+                             "MB sent\n",
+                     w_from, out.size(), tn > tw ? 1000.0 * (double) (s1.tokens - sw.tokens) / (tn - tw) : 0.0,
+                     (long long) (s1.tokens - sw.tokens), local + served > 0 ? 100.0 * served / (local + served) : 0.0,
+                     served / k, local / k, (s1.cpu_ms - sw.cpu_ms) / k, (long long) (s1.rx_fill_ok - sw.rx_fill_ok),
+                     (double) (s1.rx_fill_bytes - sw.rx_fill_bytes) / 1e6);
+        sw = s1;
+        tw = tn;
+        w_from = out.size() + 1;
+    };
+    auto save_held = [&](const char* when) {
+        std::string note;
+        const bool ok = m.rx_held_save(held_save, note);
+        std::fprintf(stderr, "ds4: DS4_RX_HELD_SAVE=%s %s: %s\n", held_save.c_str(), when,
+                     ok ? (note + " written").c_str() : ("not written - " + note).c_str());
+    };
     if (n > 0) {
         int tok = m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++);
         if (forced.on()) tok = forced.take(0, tok);
@@ -1938,6 +1972,8 @@ int main(int argc, char** argv) {
             }
             std::printf("%d,", tok);
             std::fflush(stdout);
+            if (win > 0 && out.size() % (size_t) win == 0) window_line();
+            if (held_every > 0 && out.size() % (size_t) held_every == 0) save_held(("at token " + std::to_string(out.size())).c_str());
             if ((tok == 1 && std::getenv("DS4_NO_EOS") == nullptr) || (int) out.size() >= n) break;   // (DS4_NO_EOS: decode n tokens whatever)
             if (got.empty()) {
                 int off = 0, acc = 0;
@@ -1958,6 +1994,7 @@ int main(int argc, char** argv) {
             if (forced.on()) tok = forced.take(out.size(), tok);
         }
         std::printf("\n");
+        if (win > 0 && out.size() >= w_from) window_line();   // (the last window's rest)
         if (forced.on())
             std::fprintf(stderr, "forced tokens: %lld of the decode's %zu own picks were not the file's (the first at "
                                  "position %lld)\n", forced.differed, out.size(), forced.first);
@@ -2040,6 +2077,7 @@ int main(int argc, char** argv) {
                      (double) (s.lp_calls - s0.lp_calls) / nt, s.lp_threads);
     }
     std::fprintf(stderr, "%s", m.rx_lines(s0, nt).c_str());   // (--remote-experts)
+    if (!held_save.empty()) save_held("at the decode's end");
     if (s.eg_rows > s0.eg_rows) {   // the Engram rows: how many the row cache served, the reads' time behind the layers
         const double rows = (double) (s.eg_rows - s0.eg_rows);
         std::fprintf(stderr, "Engram per token: %.0f rows, %.1f%% without a read (the row cache holds %lld of %lld), "
