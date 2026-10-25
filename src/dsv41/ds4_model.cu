@@ -5264,6 +5264,13 @@ struct Model::Impl {
                          gg::mx_tier_report());
             if (lane_prof)
                 std::fprintf(stderr, "ds4: DS4_LANE_PROF=1: the i-quant CPU lane's phases timed (%d threads)\n", cpu_threads());
+            if (iq_pf == 0) std::fprintf(stderr, "ds4: DS4_IQ_PF=0: the i-quant CPU lane's WILLNEED hints off\n");
+            else if (iq_pf == 1) std::fprintf(stderr, "ds4: DS4_IQ_PF=1: the i-quant CPU lane's WILLNEED hints on every range\n");
+            else if (iq_pf > 1)
+                std::fprintf(stderr, "ds4: DS4_IQ_PF=%d: the i-quant CPU lane's WILLNEED hints only on an expert the layer's "
+                                     "last %d calls did not take\n", iq_pf, iq_pf);
+            if (lane_tr != nullptr)
+                std::fprintf(stderr, "ds4: DS4_LANE_TRACE=%s: the i-quant CPU lane's calls written there\n", std::getenv("DS4_LANE_TRACE"));
         }
     }
 
