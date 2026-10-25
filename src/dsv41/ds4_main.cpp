@@ -1999,6 +1999,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "decode CPU lane reads: %.1f MB a token of its experts' bytes, %.1f GB/s over its %.2f ms\n",
                      (s.lane_bytes - s0.lane_bytes) / nt / 1e6,
                      (s.lane_bytes - s0.lane_bytes) / 1e6 / std::max(1e-3, s.cpu_ms - s0.cpu_ms), (s.cpu_ms - s0.cpu_ms) / nt);
+    if (s.flow_calls > s0.flow_calls)   // (DS4_LANE_FLOW=1 only)
+        std::fprintf(stderr, "decode lane flow (DS4_LANE_FLOW): %.1f calls a token, %.0f down jobs a token, %.2f%% of them "
+                             "waited for their entry's h\n",
+                     (s.flow_calls - s0.flow_calls) / nt, (s.flow_downs - s0.flow_downs) / nt,
+                     100.0 * (double) (s.flow_waits - s0.flow_waits) / std::max<double>(1.0, (double) (s.flow_downs - s0.flow_downs)));
     std::fprintf(stderr, "%s", m.rx_lines(s0, nt).c_str());   // (--remote-experts)
     if (s.eg_rows > s0.eg_rows) {   // the Engram rows: how many the row cache served, the reads' time behind the layers
         const double rows = (double) (s.eg_rows - s0.eg_rows);

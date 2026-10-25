@@ -19,6 +19,7 @@
 #include "ds4_iq.cuh"
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_ffslice.hpp"
+#include "ds4_flow.hpp"
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
@@ -1084,6 +1085,10 @@ struct Model::Impl {
     uint16_t* embed_pinned = nullptr;
     std::vector<float> freqs_win, freqs_comp;
     std::vector<std::unique_ptr<Pool>> pools;   // one per NUMA node, its workers on that node's cores
+    // DS4_LANE_FLOW=1: the i-quant CPU lane's gate / up and down jobs in one batch a call, an entry's down jobs as soon
+    // as its h is quantized (no barrier between them: ds4_flow.hpp; the same bits)
+    const bool lane_flow = std::getenv("DS4_LANE_FLOW") != nullptr && std::atoi(std::getenv("DS4_LANE_FLOW")) != 0;
+    LaneFlow flow;
     std::vector<std::vector<int>> cores;        // each node's physical cores
     int NH = 1;                                 // the CPU lane's parts of an expert (the NUMA nodes)
     // the CPU lane's experts read in place from the model's files (one part, the files' layout; the page cache keeps
@@ -5136,6 +5141,9 @@ struct Model::Impl {
             for (auto& p : pools) nthr += p->size();
             std::fprintf(stderr, "ds4: CPU lane: %d threads, MXFP4 rows %s (%s)\n", nthr, gg::mx_tier_name(gg::mx_tier()),
                          gg::mx_tier_report());
+            if (lane_flow)
+                std::fprintf(stderr, "ds4: DS4_LANE_FLOW=1: the i-quant CPU lane's gate / up and down jobs in one batch a "
+                                     "call, an entry's down jobs once its h is quantized (no barrier between them)\n");
         }
     }
 
@@ -6151,41 +6159,52 @@ struct Model::Impl {
                     gg::iq_cpu_quant(fm.gu_act, x + (size_t) t * ldx, E, x_act(en, i));
                 }
         }
-        std::function<void(int)> f[4];
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
-                const int r0 = glo[X] + (j % GB) * RB, r1 = std::min(ghi[X], r0 + RB);
-                if (r0 >= r1) return;   // (a node with fewer of the slice's rows)
-                const void* ap[kEntMax];
-                float* hp[kEntMax];
-                for (int i = 0; i < en.n; ++i) {
-                    ap[i] = x_act(en, i);
-                    hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;   // (part X's rows of h)
-                }
-                // (part X's rows, from where they are: a copy's part on node X, or the file's - whole rows, so any
-                // block size of the type)
-                gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
-                                   r0 - X * FFh, r1 - X * FFh, lim);
-            };
-        run_nodes(ne * GB, f);
-        for (const Ent& en : ents)
+        // the jobs: entry q's (ents[ord[q]]) gate / up band b of part X, its h quantized, its down band b of part X
+        auto gu_job = [&](int X, int q, int b) {
+            const Ent& en = ents[(size_t) (ord != nullptr ? ord[q] : q)];
+            const int r0 = glo[X] + b * RB, r1 = std::min(ghi[X], r0 + RB);
+            if (r0 >= r1) return;   // (a node with fewer of the slice's rows)
+            const void* ap[kEntMax];
+            float* hp[kEntMax];
+            for (int i = 0; i < en.n; ++i) {
+                ap[i] = x_act(en, i);
+                hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;   // (part X's rows of h)
+            }
+            // (part X's rows, from where they are: a copy's part on node X, or the file's - whole rows, so any
+            // block size of the type)
+            gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
+                               r0 - X * FFh, r1 - X * FFh, lim);
+        };
+        auto h_quant = [&](const Ent& en) {
             for (int i = 0; i < en.n; ++i)
                 gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF + ff0, ffn,
                                  aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+        };
         const gg::IqCpu& fd = sliced ? fs : fm;
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
-                const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
-                const void* hp[kEntMax];
-                float* yp[kEntMax];
-                for (int i = 0; i < en.n; ++i) {
-                    hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
-                    yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
-                }
-                gg::iq_cpu_down(fd, mx_part_ptr(l, en.e, 2, X) + d_off, hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
-            };
+        auto dn_job = [&](int X, int q, int b) {
+            const Ent& en = ents[(size_t) (ord != nullptr ? ord[q] : q)];
+            const int r0 = X * Eh + b * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
+            const void* hp[kEntMax];
+            float* yp[kEntMax];
+            for (int i = 0; i < en.n; ++i) {
+                hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
+                yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
+            }
+            gg::iq_cpu_down(fd, mx_part_ptr(l, en.e, 2, X) + d_off, hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+        };
+        if (lane_flow) {   // DS4_LANE_FLOW=1: the same jobs without the barrier between gate / up and down (ds4_flow.hpp)
+            flow.run(pools, NH, ne, GB, DB, gu_job, [&](int q) { h_quant(ents[(size_t) (ord != nullptr ? ord[q] : q)]); },
+                     dn_job);
+            st.flow_calls = flow.calls.load(std::memory_order_relaxed);
+            st.flow_downs = flow.downs.load(std::memory_order_relaxed);
+            st.flow_waits = flow.waits.load(std::memory_order_relaxed);
+            return;
+        }
+        std::function<void(int)> f[4];
+        for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { gu_job(X, j / GB, j % GB); };
+        run_nodes(ne * GB, f);
+        for (const Ent& en : ents) h_quant(en);
+        for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { dn_job(X, j / DB, j % DB); };
         run_nodes(ne * DB, f);
     }
 

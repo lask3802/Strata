@@ -939,6 +939,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # the remote experts' send gate and reply deadline (rx::Gate, ds4_rx.hpp): no GPU, no socket
       add_executable(ds4_rx_gate_test tests/dsv41/rx_gate_test.cpp)
       target_compile_features(ds4_rx_gate_test PRIVATE cxx_std_17)
+      # DS4_LANE_FLOW's batch (ds4_flow.hpp): the CPU lane's gate / up and down jobs without the barrier between them,
+      # synthetic jobs on the engine's Pool; no GPU, no model
+      add_executable(ds4_flow_test tests/dsv41/flow_test.cpp)
+      target_compile_features(ds4_flow_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_flow_test PRIVATE Threads::Threads)
       # the remote experts' fills (ds4_rx_fill.hpp, EP U5): the remote tier's choice, the fill budget, the RAM tier's
       # rule; no GPU, no socket
       add_executable(ds4_rx_fill_test tests/dsv41/rx_fill_test.cpp)
