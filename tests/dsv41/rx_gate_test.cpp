@@ -38,6 +38,8 @@ int main() {
         rx::Gate f;
         f.pick_seen(1, 0.03);
         check(near(f.wait_ms(1, 1, 2.0, false), rx::Gate::kMinWaitMs), "a fast lane: 0.1 ms at least");
+        g.pick_seen(4, 0.5);
+        check(near(g.wait_ms(4, 2, 2.0, false), 1.0), "T=4: its own time a pick (2 x 0.5 ms)");
         g.rtt_seen(1, 0.7);
         check(near(g.deadline(10.0, 11.0, g.wait_ms(1, 1, 2.0, false), 1), 11.26), "the lane's part + 0.26 ms is the later");
         g.rtt_seen(1, 3.0);   // (0.93 ms: 1.5 x is 1.395 after the send)
@@ -60,7 +62,13 @@ int main() {
         rx::Gate z;
         z.seed(1, 0.0);
         z.rtt_seen(1, 5.0);
-        check(near(z.rtt[1], 5.0), "a seed of 0 (no pings): nothing seeded");
+        check(near(z.rtt[1], 5.0), "a seed of 0 (no warm-up): nothing seeded");
+        rx::Gate q;   // (a seed ends a clamped run)
+        q.seed(1, 0.7);
+        for (int i = 0; i < 4; ++i) q.rtt_seen(1, 100.0, true, 100.0 * i);
+        q.seed(1, 0.7);
+        q.rtt_seen(1, 100.0, true, 1000.0);
+        check(near(q.rtt[1], 0.9 * 0.7 + 0.1 * 2.1), "a seed after 4 clamped: the run starts again, clamped");
     }
     {
         rx::Gate g;
@@ -189,6 +197,20 @@ int main() {
         int ly = -2;
         b.add(9, 3.0, 1, 17);
         check(b.take(9, s, rows, &ly) && ly == 17, "and its layer");
+        // late for the lane's wait, the link's lateness decided against its bound (lead 2026-10-25: the short wait
+        // must not drive the backoff)
+        rx::LateBook c;
+        bool op = false;
+        double bd = -1;
+        c.add(20, 10.0, 1, 3, 13.0);
+        c.add(21, 11.0, 1, 3, 14.0);
+        c.add(22, 12.0, 1, 3, -1.0);   // (decided at once: its deadline was the bound)
+        check(c.expire(13.5) == 1, "past seq 20's bound, not 21's: one decided late");
+        check(c.expire(13.6) == 0, "and once only");
+        check(c.take(20, s, rows, nullptr, &op, &bd) && !op, "seq 20's reply after: already decided");
+        check(c.take(21, s, rows, nullptr, &op, &bd) && op && near(bd, 14.0), "seq 21's reply: open, against 14 ms");
+        check(c.expire(100.0) == 0, "taken: nothing left to expire");
+        check(c.take(22, s, rows, nullptr, &op, &bd) && !op, "decided at once: not open");
     }
     {
         // 8 late of the last 64 (lead 2026-10-25): the link idle for `hold` requests, then tried again with a clean count

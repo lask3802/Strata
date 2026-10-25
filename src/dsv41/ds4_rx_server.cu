@@ -357,14 +357,8 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         }
         busy += dt;
         ++served;
-        if (const double tq = now_ms(); tq - tr > 2.0) {   // a slow one, its parts (a late reply: here or the network)
-            if (++slow <= 100)
-                std::fprintf(stderr, "expert server: slow request %s UTC seq %u layer %d rows %d: %.2f ms (the rows' prep "
-                                     "%.2f, the GPU %.2f, bf16 %.2f, the send %.2f; %.1f ms after the last one's end)%s\n",
-                             utc_now().c_str(), h.seq, li, nr, tq - tr, tg - tr, ts - tg, tr + dt - ts, tq - tr - dt,
-                             last_end > 0 ? tr - last_end : -1.0, slow == 100 ? " (the last one said; the count at the end)" : "");
-        }
-        last_end = now_ms();
+        const double tq = now_ms(), gap = last_end > 0 ? tr - last_end : -1.0;
+        last_end = tq;
         if (diag) {
             const double tz = now_ms();
             keep(kPrep, tg - tr);
@@ -391,6 +385,11 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
             keep(kYOut, el(ne - 2, ne - 1));
             keep(kSpan, el(0, ne - 1));
         }
+        if (tq - tr > 2.0 && ++slow <= 100)   // a slow one, its parts (a late reply: here or the network); said after
+            std::fprintf(stderr, "expert server: slow request %s UTC seq %u layer %d rows %d: %.2f ms (the rows' prep "
+                                 "%.2f, the GPU %.2f, bf16 %.2f, the send %.2f; %.1f ms after the last one's end)%s\n",
+                         utc_now().c_str(), h.seq, li, nr, tq - tr, tg - tr, ts - tg, tr + dt - ts, tq - tr - dt, gap,
+                         slow == 100 ? " (the last one said; the count at the end)" : "");
     }
     cudaStreamSynchronize(s);
     if (evs)

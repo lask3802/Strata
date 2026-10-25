@@ -140,6 +140,7 @@ struct Stats {
     // the server's picks the lane computed after all (kept here by the send gate or an idle spell, late replies, a lost
     // link), and their experts that were not all in the page cache then (Linux: mincore; read from the disk)
     int64_t rx_here = 0, rx_here_cold = 0;
+    int64_t rx_late_link = 0;   // (late replies past the link's bound, the fixed wait's deadline: rx::Backoff's count)
     // by the window's T (1..16): requests sent, late replies, and windows the send gate kept here (the server's round
     // trip at that T expected to cost more than the lane computing its picks)
     int64_t rx_req_t[17] = {}, rx_late_t[17] = {}, rx_skip_t[17] = {};

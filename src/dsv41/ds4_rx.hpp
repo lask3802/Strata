@@ -93,8 +93,8 @@ struct Gate {
     static constexpr double kSlowerMs = 50.0, kMinWaitMs = 0.1;
     static constexpr int kClampAfter = 4;   // (samples before the clamp applies; a seed counts as that many)
     static void ew(double& a, double v) { a = a > 0.0 ? 0.9 * a + 0.1 * v : v; }
-    /// the round trip at `rows` measured before any request (the load's pings): the estimate, and the clamp from the
-    /// first sample against it (a cold server's first reply, 178 ms in a slot, moves it by 20% only)
+    /// the round trip at `rows` measured before decode (the load's warm-up requests): the estimate, and the clamp
+    /// from the first sample against it (a cold server's first reply, 178 ms in a slot, moves it by 20% only)
     void seed(int rows, double ms) {
         if (ms <= 0.0) return;
         rtt[rows] = ms;
@@ -152,24 +152,44 @@ struct Gate {
     }
 };
 
-/// The main's late requests (seq mod 64: a later one 64 on takes the slot): a reply that comes after all gives the gate the round trip it had
+/// The main's late requests (seq mod 64: a later one 64 on takes the slot): a reply that comes after all gives the
+/// gate the round trip it had.  Late here is past the lane's wait (the policy's deadline); whether the link was late
+/// (rx::Backoff's count) is decided against the link's bound `bound` (the fixed wait's deadline): by the reply's
+/// arrival when it comes (take: open), or as late once the bound has passed without it (expire)
 struct LateBook {
     struct E {
         uint32_t seq = 0;
-        double sent = -1;
+        double sent = -1, bound = -1;
         int rows = 0, layer = -1;
+        bool open = false;   // (the link's lateness not decided yet)
     };
     E e[64];
-    void add(uint32_t seq, double sent, int rows, int layer = -1) { e[seq % 64] = {seq, sent, rows, layer}; }
-    /// seq's send time, rows and layer (false: not a late request here, or taken already)
-    bool take(uint32_t seq, double& sent, int& rows, int* layer = nullptr) {
+    void add(uint32_t seq, double sent, int rows, int layer = -1, double bound = -1) {
+        e[seq % 64] = {seq, sent, bound, rows, layer, bound >= 0};
+    }
+    /// seq's send time, rows and layer (false: not a late request here, or taken already); *open: its link lateness
+    /// still to decide (against *bound)
+    bool take(uint32_t seq, double& sent, int& rows, int* layer = nullptr, bool* open = nullptr, double* bound = nullptr) {
         E& x = e[seq % 64];
         if (x.sent < 0 || x.seq != seq) return false;
         sent = x.sent;
         rows = x.rows;
         if (layer != nullptr) *layer = x.layer;
+        if (open != nullptr) *open = x.open;
+        if (bound != nullptr) *bound = x.bound;
         x.sent = -1;
+        x.open = false;
         return true;
+    }
+    /// the open ones whose bound is before now: decided late (their count); their replies may still come (take)
+    int expire(double now) {
+        int n = 0;
+        for (E& x : e)
+            if (x.open && x.bound < now) {
+                x.open = false;
+                ++n;
+            }
+        return n;
     }
 };
 
