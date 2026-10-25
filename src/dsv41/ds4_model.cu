@@ -1177,7 +1177,7 @@ struct Model::Impl {
     bool slot_held = false;           // slot_save took this state and nothing has changed it since
     std::vector<uint32_t> prof;       // [nl][n_exp] routed-expert hits
     Stats st;
-    // the head's wait (the token's one host wait on the GPU, decode and prompt): its wall time, the waiting thread's CPU
+    // the head's wait (a token's long host wait on the GPU, decode and prompt): its wall time, the waiting thread's CPU
     // time in it and the CPU it began on (Stats::head_*) - whether the wait spins (DS4_CUDA_SYNC) and on which CPU
     bool head_wait(cudaStream_t s, std::string& err) {
         const int c = os::cpu_now();
@@ -2495,7 +2495,8 @@ struct Model::Impl {
         u9::mask();       // (both print their state at load)
         attn_split();
         // DS4_CUDA_SYNC=spin|yield|block: how this process's host threads wait on its GPUs (cudaStreamSynchronize and the
-        // like - the head's wait, the token's one: decode's layers do not wait on the host). Unset: the driver's default,
+        // like: a decode token's two - the head's, then sample()'s short one; the layers do not wait on the host, their
+        // routing goes through mapped memory the service thread polls). Unset: the driver's default,
         // auto, which spins while the process's contexts are fewer than the CPUs - here the head's wait spins its whole
         // time (Stats::head_cpu_ms), a busy thread on a CPU no one pinned it to, likely a lane core's sibling (the
         // lane-bench's :spin=, slot-20261025T1948Z). block sleeps in the driver until the GPU's interrupt: the wait's CPU
