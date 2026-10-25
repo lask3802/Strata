@@ -120,7 +120,7 @@ struct Gate {
     }
 };
 
-/// The main's late requests (the last 64 by seq): a reply that comes after all gives the gate the round trip it had
+/// The main's late requests (seq mod 64: a later one 64 on takes the slot): a reply that comes after all gives the gate the round trip it had
 struct LateBook {
     struct E {
         uint32_t seq = 0;

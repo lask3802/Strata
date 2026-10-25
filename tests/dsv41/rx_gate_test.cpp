@@ -97,11 +97,11 @@ int main() {
         check(g.rtt[1] < 0.9 * (0.9 * four + 0.8) + 0.3 * (0.9 * four + 0.8) + 1e-9, "and the run starts again: clamped");
         rx::Gate h;   // (a sample within 3 x between ends the run)
         for (int i = 0; i < 10; ++i) h.rtt_seen(1, 0.8);
-        for (int i = 0; i < 3; ++i) h.rtt_seen(1, 8.0);
+        for (int i = 0; i < 4; ++i) h.rtt_seen(1, 8.0);
         h.rtt_seen(1, 0.8);
         const double r = h.rtt[1];
         h.rtt_seen(1, 8.0);
-        check(std::fabs(h.rtt[1] - 1.2 * r) < 1e-9, "3 slow, one fast, one slow: the slow one is clamped again");
+        check(std::fabs(h.rtt[1] - 1.2 * r) < 1e-9, "4 slow (clamped), one fast, one slow: the fast one ends the run, the slow one is clamped again");
     }
     {
         // a late request's reply that comes after all (lead's Q3): the book gives its send and rows once

@@ -6730,7 +6730,8 @@ struct Model::Impl {
             double ts;
             int rw;
             if (lt.second >= 0) rx_kts = true;
-            if (rx_late_book.take(lt.first, ts, rw) && lt.second >= ts && lt.second <= t1) rx_gate.rtt_seen(rw, lt.second - ts);
+            if (rx_late_book.take(lt.first, ts, rw) && lt.second >= ts && lt.second <= t1 && lt.second != ta)
+                rx_gate.rtt_seen(rw, lt.second - ts);   // (== ta: one read with this reply, the stamp is this one's)
         }
         if (ta >= 0) rx_kts = true;
         if (ta >= t0 && ta <= t1) rx_gate.rtt_seen(rows, ta - t0);   // (outside: the realtime clock stepped)
