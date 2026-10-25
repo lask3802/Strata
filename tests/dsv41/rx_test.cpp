@@ -17,6 +17,7 @@
 //               [--parts-k K [--parts-reqs N (60)] (H': the server has that pack; requests also of slice picks at k K,
 //                checked against the CPU lane's [K, 9) - the two sets of kReqSets apart, kReqWrong's [K - 1, 9); K below
 //                the server's lo: the request refused, exit 0)]  [--parts-hash HEX (another pack's: refused at the Geo, 3)]
+//               (no --parts-k against a server with parts: the Geo's k 9, pack_hash 0 - taken, the server warns; U4)
 //   (STRATA_STAGE_TOKEN: the same as the server's)
 // Exit 0 all good, 1 a failure, 3 the server refused the blobs with an Error (the engine drops it at load).  Two cases
 // of the server's load: a full room (the server with DS4_RX_TEST_VRAM_MIB=600 --expert-server-reserve-mib 0, this
@@ -170,6 +171,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (parts_k > 0) gm.pack_hash = parts_hash;
+    gm.k = parts_k > 0 ? parts_k : NB;   // (no --parts-k: a main that does not split - parts that do not fit, a warning)
     std::vector<int> sent(L.size(), n_exp);   // (each layer's expert ids 0 .. sent - 1: content id % n_exp)
     const char* tv = std::getenv("STRATA_STAGE_TOKEN");
     rx::Main m;

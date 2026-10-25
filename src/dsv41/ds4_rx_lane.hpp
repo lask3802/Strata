@@ -108,8 +108,11 @@ public:
     std::string note() const;
     /// a main process's Geo: "" or why these parts do not serve it - another pack (pack_hash), a served layer (K[0] != 0)
     /// they do not cover, gate and up of two types, a part of another type or layout than the layer's (SliceLane::init).
-    /// The lane set up for it ("" without parts: nothing to check)
-    std::string geo(const GeoMsg& g, const std::vector<GeoLayer>& layers);
+    /// The lane set up for it ("" without parts: nothing to check).  Only a main that splits (g.k 1 .. nb - 1) is
+    /// refused: one that does not (DS4_EP_K unset) gets "" and `warn` says why, and the session takes no slice picks
+    /// (slices() false: whole picks only, U4)
+    std::string geo(const GeoMsg& g, const std::vector<GeoLayer>& layers, std::string& warn);
+    bool slices() const { return on() && slices_; }   // (the last Geo set the lane up: slice picks taken)
     /// a request's slice picks (its rows' slice bits; c: kReqK, kReqWrong) of x (nr rows of n_embd floats, ldx apart)
     /// into ys (nr rows, ldy apart: each its slice picks' sum, in their order; 0 for a row with none).  False (err)
     bool run(int layer, int32_t c, const ReqRow* rows, int nr, const float* x, size_t ldx, float* ys, size_t ldy,
@@ -124,7 +127,8 @@ private:
     int lo_ = 0, threads_ = 0;
     std::vector<int> cpus_;
     double last_ms_ = 0.0;
-    bool wrong_said_ = false;
+    bool wrong_said_ = false, slices_ = false;
+    std::string geo_check(const GeoMsg& g, const std::vector<GeoLayer>& layers);
 };
 
 }  // namespace strata::ds4::rx

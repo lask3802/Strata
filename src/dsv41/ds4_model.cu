@@ -6869,6 +6869,10 @@ struct Model::Impl {
             gl[(size_t) li].blob = off;
         }
         gm.pack_hash = stage::pack_hash(o.pack);   // (a server's parts must be cut from this pack: refused at the Geo if not)
+        // the k rx_split tries (DS4_EP_K; else nb: no split, so a server's parts that do not fit are only its warning)
+        const char* kv = std::getenv("DS4_EP_K");
+        const int kw = kv != nullptr && *kv != '\0' ? std::atoi(kv) : rx_nb;
+        gm.k = kw >= 1 && kw < rx_nb ? kw : rx_nb;
         struct Cand {
             uint32_t n;
             int li, e;
@@ -7061,7 +7065,7 @@ struct Model::Impl {
     // the picks a request's server computes, as picks of the lane: the whole ones and the slice ones' [k, nb) share
     // (rx::server_range) - the gate's and the deadline's count
     size_t rx_npicks(size_t whole, size_t slice) const {
-        return whole + (slice * (size_t) (rx_nb - rx_k) + (size_t) rx_nb - 1) / (size_t) std::max(1, rx_nb);
+        return whole + rx::slice_share(slice, rx_k, rx_nb);
     }
     // request seq's picks the server holds ((expert, t * kPicks + i), in token order) and its slice picks (spk: tagged,
     // from block rx_k) as rows of r's tokens
@@ -7286,7 +7290,9 @@ struct Model::Impl {
         const double tf = rx::now_ms();
         // exactly the server's share (the late reply is dropped when it comes): its experts whole, the slice picks' [k, nb)
         lane_add(l, r, rp, T, rpk, sp.late_whole);
+        const int64_t ce = st.cpu_experts;   // (a slice pick is in cpu_experts once: serve_lane counted its [0, k))
         lane_add(l, r, rp, T, spk, sp.late_slice);
+        st.cpu_experts = ce;
         st.rx_fallback += (int64_t) rpk.size();
         st.rx_split_fallback += (int64_t) spk.size();
         st.rx_fallback_ms += rx::now_ms() - tf;
@@ -7611,8 +7617,9 @@ struct Model::Impl {
                     rpicks.clear();
                     want = false;
                 }
+                // (the lane's picks in the gate's local cost: in a layer that splits, each its (nb - k) / nb share)
                 if (want && !rx_gate.send(T, rx_nrows(rpicks, spl ? picks : std::vector<std::pair<int, int>>()), rpicks.size(),
-                                          picks.size())) {
+                                          spl ? rx::slice_share(picks.size(), rx_k, rx_nb) : picks.size())) {
                     rx_here_note(l, rpicks);
                     picks.insert(picks.end(), rpicks.begin(), rpicks.end());   // (the round trip would cost more)
                     ++st.rx_skip_t[T];
@@ -10828,7 +10835,9 @@ struct Model::Impl {
         }
         if (!ents.empty()) {
             const double tc = now_ms();
-            cpu_experts(l, h_x, ents, 0, nullptr, 0, g.ff);   // (whole: this path sends no request, so no pick is split)
+            int ff0, ffn;
+            rx::ff_range(rx::host_range(rx_k < rx_nb, rx_k, rx_nb), rx_nb, g.ff, ff0, ffn);   // (whole: no request)
+            cpu_experts(l, h_x, ents, 0, nullptr, ff0, ffn);
             std::fill(h_part, h_part + (size_t) T * D, 0.0f);
             for (int sl = 0; sl < nslots; ++sl) {
                 float* o = h_part + (size_t) cpu_rows[(size_t) sl].first * D;

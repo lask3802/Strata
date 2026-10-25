@@ -102,6 +102,8 @@ struct GeoMsg {
     int32_t n_embd = 0, n_ff = 0, n_layers = 0;
     float limit = 0.0f;   // the swiglu's clamp (0: none)
     uint64_t pack_hash = 0;   // the main's pack (ds4_stage.hpp pack_hash): a server's parts must be cut from it
+    int32_t k = 0;   // the main's DS4_EP_K: 1 .. nb - 1 it splits (parts that do not serve it: refused at the Geo); else
+                     // (DS4_EP_K unset, nb) whole picks only: a parts problem is the server's warning, and it serves as U4
 };
 struct GeoLayer {         // a layer's experts: the roles' ggml types (0: the layer is not served), each role's offset in
     int32_t K[3] = {0, 0, 0};   // a blob (gate | up | down, 256-aligned) and the blob's bytes
@@ -117,7 +119,7 @@ struct ReqRow {           // a request's row: the window's token t, n picks (exp
 #pragma pack(pop)
 static_assert(sizeof(Hdr) == 32, "the header's size");
 static_assert(sizeof(HelloMsg) == 128, "the hello's size");
-static_assert(sizeof(GeoMsg) == 24 && sizeof(ReqRow) == 52, "the geometry's and a row's sizes");
+static_assert(sizeof(GeoMsg) == 28 && sizeof(ReqRow) == 52, "the geometry's and a row's sizes");
 
 /// A server's check of a request row: 1..kMaxPicks picks, slice bits only on them, and slice picks only with a k (c's
 /// kReqK) and parts here (has_parts).  "" or why.

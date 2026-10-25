@@ -107,9 +107,17 @@ static int case_flow(int NB) {
     rx::ff_range({0, 1}, 1, 2304, w0, wn);
     rx::ff_range({0, 0}, NB, 2304, e0, en);
     ff = ff && w0 == 0 && wn == 2304 && en == 0;
-    std::printf("split_plan: %d cases (k 1..8 x the layer splits x out x the send x the reply), %d wrong; ff_range %s\n", cases,
-                bad, ff ? "ok" : "WRONG");
-    return bad + (ff ? 0 : 1);
+    // the host-routed path sends nothing: its CPU-lane picks whole at every k, split layer or not
+    bool host = true;
+    for (int k = 1; k <= NB; ++k)
+        for (int spl = 0; spl < 2; ++spl) {
+            int h0, hn;
+            rx::ff_range(rx::host_range(spl != 0, k, NB), NB, 2304, h0, hn);
+            host = host && h0 == 0 && hn == 2304;
+        }
+    std::printf("split_plan: %d cases (k 1..8 x the layer splits x out x the send x the reply), %d wrong; ff_range %s; "
+                "host_range %s\n", cases, bad, ff ? "ok" : "WRONG", host ? "ok" : "WRONG");
+    return bad + (ff ? 0 : 1) + (host ? 0 : 1);
 }
 
 int main() {

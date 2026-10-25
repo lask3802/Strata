@@ -7,6 +7,8 @@
 // A reply late or lost: the main adds what the server would have (fallback_range).  Pure functions, no state.
 #pragma once
 
+#include <cstddef>
+
 namespace strata::ds4::rx {
 
 enum class PickLane : int {
@@ -75,6 +77,14 @@ inline SplitPlan split_plan(bool spl, bool out, bool ok, int k, int nb) {
     }
     return s;
 }
+/// n slice picks as picks of the lane: their [k, nb) share, rounded up - what the server computes of them, the gate's
+/// local cost of them (ep-u6-plan.md 3a: a slice pick counts (nb - k) / nb of a pick) and the deadline's count
+inline size_t slice_share(size_t n, int k, int nb) {
+    return nb > 0 && k < nb ? (n * (size_t) (nb - k) + (size_t) nb - 1) / (size_t) nb : 0;
+}
+/// the host-routed path's range for its CPU-lane picks (the decode's layers routed on the host, prefill): it sends no
+/// request, so a split layer's picks too are whole on the main
+inline BlockRange host_range(bool spl, int k, int nb) { return split_plan(spl, false, false, k, nb).here; }
 /// blocks [b0, b1) as cpu_experts' n_ff values [ff0, ff0 + ffn) of n_ff (the last of nb blocks runs to n_ff)
 inline void ff_range(BlockRange br, int nb, int n_ff, int& ff0, int& ffn) {
     ff0 = 256 * br.b0 < n_ff ? 256 * br.b0 : n_ff;

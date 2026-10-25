@@ -262,7 +262,9 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
             l.trellis[r] = l.suh[r] = l.svh[r] = (size_t) G.off[r];
         }
     }
-    if (const std::string why = sl.geo(g, ss.layers); !why.empty()) return refuse_now(why);
+    std::string warn;
+    if (const std::string why = sl.geo(g, ss.layers, warn); !why.empty()) return refuse_now(why);
+    if (!warn.empty()) std::fprintf(stderr, "expert server: %s: %s\n", c.peer().c_str(), warn.c_str());
     std::fprintf(stderr, "expert server: main process %s: %d layers, n_embd %d, n_ff %d; %.2f GB of VRAM for blobs; %s\n",
                  c.peer().c_str(), g.n_layers, g.n_embd, g.n_ff, (double) me.room / 1e9, sl.note().c_str());
     // the blobs, once, into the arena: the room in one piece
@@ -420,7 +422,7 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         for (int j = 0; why.empty() && j < nr; ++j) {
             ReqRow& rw = rws[j];
             std::memcpy(&rw, p.data() + (size_t) j * per, sizeof rw);
-            if (!(why = row_refusal(rw, h.c, sl.on())).empty()) break;
+            if (!(why = row_refusal(rw, h.c, sl.slices())).empty()) break;
             any_slice = any_slice || rw.slice != 0;
             nw[j] = 0;   // (the plan: the row's whole picks first, in their order; a slice pick is the lane's)
             for (int i = 0; i < rw.n; ++i) {

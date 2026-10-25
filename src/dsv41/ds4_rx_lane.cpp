@@ -306,8 +306,21 @@ std::string SliceServer::note() const {
     return s;
 }
 
-std::string SliceServer::geo(const GeoMsg& g, const std::vector<GeoLayer>& layers) {
+std::string SliceServer::geo(const GeoMsg& g, const std::vector<GeoLayer>& layers, std::string& warn) {
+    warn.clear();
+    slices_ = false;
     if (!on()) return "";
+    const std::string why = geo_check(g, layers);
+    if (why.empty()) {
+        slices_ = true;
+        return "";
+    }
+    if (g.k >= 1 && g.k < parts_.blocks()) return why;   // (the main splits: it needs these parts)
+    warn = why + " - the main does not split (k " + std::to_string(g.k) + "): whole picks only";
+    return "";
+}
+
+std::string SliceServer::geo_check(const GeoMsg& g, const std::vector<GeoLayer>& layers) {
     if (g.pack_hash != parts_.pack_hash()) {
         char b[200];
         std::snprintf(b, sizeof b, "the parts at %s were cut from another pack (pack_hash %016llx, the main's %016llx)",
@@ -340,7 +353,7 @@ bool SliceServer::run(int layer, int32_t c, const ReqRow* rows, int nr, const fl
             if ((rows[j].slice >> i) & 1) pk.push_back({j, rows[j].e[i], rows[j].w[i]});
     }
     if (pk.empty()) return true;
-    if (!on()) {
+    if (!slices()) {
         err = "slice picks, and no parts here (--expert-server-parts)";
         return false;
     }

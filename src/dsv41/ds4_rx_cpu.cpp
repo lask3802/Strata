@@ -80,7 +80,9 @@ int cpu_session(Conn& c, void* arg) {
         const std::string why = blob_refusal((int) li, layers[li], bytes);
         if (!why.empty()) return refuse_now("the geometry: " + why);
     }
-    if (const std::string why = sl.geo(g, layers); !why.empty()) return refuse_now(why);
+    std::string warn;
+    if (const std::string why = sl.geo(g, layers, warn); !why.empty()) return refuse_now(why);
+    if (!warn.empty()) std::fprintf(stderr, "expert server (CPU): %s: %s\n", c.peer().c_str(), warn.c_str());
     std::fprintf(stderr, "expert server (CPU): main process %s: %d layers, n_embd %d, n_ff %d; %.2f GB of RAM for blobs; %s\n",
                  c.peer().c_str(), g.n_layers, g.n_embd, g.n_ff, (double) me.room / 1e9, sl.note().c_str());
     std::unordered_map<uint32_t, std::vector<uint8_t>> blobs;   // (layer << 16 | expert)
@@ -133,7 +135,7 @@ int cpu_session(Conn& c, void* arg) {
         for (int j = 0; why.empty() && j < nr; ++j) {
             ReqRow& rw = rws[(size_t) j];
             std::memcpy(&rw, p.data() + (size_t) j * per, sizeof rw);
-            why = row_refusal(rw, h.c, sl.on());
+            why = row_refusal(rw, h.c, sl.slices());
             const uint16_t* xb = (const uint16_t*) (p.data() + (size_t) j * per + sizeof(ReqRow));
             for (int i = 0; i < D; ++i) xs[(size_t) j * D + i] = bf2f(xb[i]);
         }

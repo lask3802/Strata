@@ -1990,7 +1990,11 @@ int main(int argc, char** argv) {
                          "head wait %.2f, Engram reads %.2f\n",
                  (s.layer_ms - s0.layer_ms) / nt, (s.gpu_wait_ms - s0.gpu_wait_ms) / nt, (s.cpu_ms - s0.cpu_ms) / nt,
                  (s.head_ms - s0.head_ms) / nt, (s.engram_ms - s0.engram_ms) / nt);
-    if (s.lane_bytes > s0.lane_bytes)   // (the lane's effective rate: H' reads [0, k) of each split pick's rows in place)
+    // the lane's effective rate (H' reads [0, k) of each split pick's rows in place): with --remote-experts, DS4_EP_K or
+    // DS4_LANE_BYTES (a slot's base arm) only, so the default path's stderr stays the int build's
+    const bool lane_line = !o.remote_experts.empty() || std::getenv("DS4_EP_K") != nullptr ||
+                           std::getenv("DS4_LANE_BYTES") != nullptr;
+    if (lane_line && s.lane_bytes > s0.lane_bytes)
         std::fprintf(stderr, "decode CPU lane reads: %.1f MB a token of its experts' bytes, %.1f GB/s over its %.2f ms\n",
                      (s.lane_bytes - s0.lane_bytes) / nt / 1e6,
                      (s.lane_bytes - s0.lane_bytes) / 1e6 / std::max(1e-3, s.cpu_ms - s0.cpu_ms), (s.cpu_ms - s0.cpu_ms) / nt);

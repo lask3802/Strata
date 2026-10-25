@@ -17,7 +17,8 @@
 //   - Linux: TCP_QUICKACK after each read;
 //   - H' (--expert-server-parts): a reply is its whole picks' sum plus its slice picks' [k, 9) from the parts, this end's
 //     [0, k) of them with it the all-whole sum, k from request to request 6 -> 7 -> 8 -> 9; the verify's two sets and
-//     its wrong slice; another pack, a layer the parts do not cover, a k below theirs: refused.
+//     its wrong slice; another pack, a layer the parts do not cover, a k below theirs: refused (a main that does not
+//     split: taken, its whole picks served).
 // What it does not reach: serve_lane's own use of these (the Wake flag, the naps, the pools off the link core, the
 // service thread's pin) - the engine's, checked in the GPU slot (ep-u4-slot.sh: ep against ep-nowake, the stats line).
 // No GPU, no model.
@@ -230,9 +231,9 @@ static double norm(const std::vector<float>& a) {
 }
 
 // a main process up to the blobs (`unserved` more layers in the geometry with no types: not the server's): false (and
-// why) when it did not get there; `sent`: the blobs that went out
+// why) when it did not get there; `sent`: the blobs that went out; k: the Geo's (the main's DS4_EP_K: 0 or 9 none)
 static bool connect(rx::Main& m, int port, const std::vector<Layer>& L, std::string& err, int unserved = 0,
-                    int* sent = nullptr, uint64_t pack_hash = 0) {
+                    int* sent = nullptr, uint64_t pack_hash = 0, int k = 0) {
     if (!m.accept("127.0.0.1:" + std::to_string(port), kToken, 30, err)) return false;
     rx::GeoMsg gm;
     gm.n_embd = E;
@@ -240,6 +241,7 @@ static bool connect(rx::Main& m, int port, const std::vector<Layer>& L, std::str
     gm.n_layers = (int) L.size() + unserved;
     gm.limit = kLim;
     gm.pack_hash = pack_hash;
+    gm.k = k;
     std::vector<rx::GeoLayer> gl;
     for (const Layer& l : L) gl.push_back(l.geo);
     gl.resize(gl.size() + (size_t) unserved);
@@ -304,7 +306,8 @@ static bool write_parts(const std::string& dir, const std::vector<Layer>& L, int
 // (its parts' [k, NB)) - its reply the sum of both, as this test computes them for x in bf16; with this end's [0, k) of
 // the slice picks (x unrounded) the layer's sum of all picks whole; k from request to request 6 -> 7 -> 8 -> 9 (9: no
 // slice picks); the verify's two sets and its wrong slice (kReqWrong); the refusals - another pack, a layer the parts do
-// not cover (both at the Geo), a k below the parts' (the request's Error)
+// not cover (both at the Geo of a main that splits; one that does not: taken, whole picks only), a k below the
+// parts' (the request's Error)
 static void case_parts(int port, const std::vector<Layer>& L) {
     const std::string root = (std::filesystem::temp_directory_path() / ("ds4_rx_loop_parts_" + std::to_string(rx::now_ms()).substr(0, 9))).string();
     const uint64_t H = 0x5eed00000000abcdull;
@@ -324,7 +327,7 @@ static void case_parts(int port, const std::vector<Layer>& L) {
         check(ch.start(port, root + "/a6"), "a CPU expert server with parts [6, 9) started");
         rx::Main m;
         std::string err;
-        const bool up = connect(m, port, L, err, 0, nullptr, H);
+        const bool up = connect(m, port, L, err, 0, nullptr, H, 6);
         check(up && m.lo() == 6 && m.lane_threads() >= 0, "taken, its hello's lo " + std::to_string(m.lo()) + " (6), " +
                                                               std::to_string(m.lane_threads()) + " lane workers (" + err + ")");
         std::mt19937_64 rng(11);
@@ -457,7 +460,7 @@ static void case_parts(int port, const std::vector<Layer>& L) {
         check(ch.start(port, root + "/a8"), "a CPU expert server with parts [8, 9) started");
         rx::Main m;
         std::string err;
-        const bool up = connect(m, port, L, err, 0, nullptr, H);
+        const bool up = connect(m, port, L, err, 0, nullptr, H, 7);
         check(up && m.lo() == 8, "taken, lo " + std::to_string(m.lo()) + " (8)");
         rx::ReqRow r;
         r.n = 1;
@@ -479,11 +482,47 @@ static void case_parts(int port, const std::vector<Layer>& L) {
                                                                     (c == 0 ? "[6, 9)" : "of layer 0 alone") + " started");
         rx::Main m;
         std::string err;
-        const bool up = connect(m, port, L, err, 0, nullptr, c == 0 ? H ^ 1 : H);
+        const bool up = connect(m, port, L, err, 0, nullptr, c == 0 ? H ^ 1 : H, 6);
         check(!up && err.rfind("expert server: ", 0) == 0 &&
                   err.find(c == 0 ? "another pack" : "layer 1: not in the parts") != std::string::npos,
               std::string(c == 0 ? "another pack's main" : "a geometry serving layer 1") + ": refused at the Geo (" + err + ")");
         check(stop(ch) == 0, "and it exited 0");
+    }
+    // the same parts problems with a main that does not split (DS4_EP_K unset: the Geo's k 9): taken, a warning on the
+    // server; its whole picks served as U4, a slice pick (which that main never sends) refused
+    for (int c = 0; c < 2; ++c) {
+        Child ch;
+        const std::string what = c == 0 ? "another pack's main" : "a geometry serving layer 1";
+        check(ch.start(port, root + (c == 0 ? "/a6" : "/l0")), "a CPU expert server with parts started (" + what + ", k 9)");
+        rx::Main m;
+        std::string err;
+        const bool up = connect(m, port, L, err, 0, nullptr, c == 0 ? H ^ 1 : H, NB);
+        check(up, what + " that does not split: taken (" + err + ")");
+        rx::ReqRow r;
+        r.n = 2;
+        r.e[0] = 1, r.e[1] = 2;
+        r.w[0] = 0.4f, r.w[1] = 0.3f;
+        std::vector<float> x((size_t) E);
+        for (int i = 0; i < E; ++i) x[(size_t) i] = rx::bf2f(rx::f2bf(0.01f * (float) ((i * 37) % 61) - 0.3f));
+        const float* xp[1] = {x.data()};
+        const uint16_t* y = nullptr;
+        int us = 0;
+        const bool got = up && m.send_req(1, 1, 1, &r, xp, err, 0) && m.wait_resp(1, 1, rx::now_ms() + 20000.0, &y, us, err) == 1;
+        double e0 = 0, n0 = 0;
+        if (got) {
+            std::vector<float> w;
+            slice_sum(L[1], r, 0x3, 0, NB, x.data(), w);
+            for (int i = 0; i < E; ++i) {
+                const double d = rx::bf2f(y[i]) - w[(size_t) i];
+                e0 += d * d, n0 += (double) w[(size_t) i] * w[(size_t) i];
+            }
+        }
+        check(got && std::sqrt(e0 / std::max(1e-30, n0)) < 1e-2, "  its whole picks served (|d| / |it| " +
+                                                                     std::to_string(std::sqrt(e0 / std::max(1e-30, n0))) + ")");
+        r.slice = 0x2;
+        const int g = got && m.send_req(2, 1, 1, &r, xp, err, 6) ? m.wait_resp(2, 1, rx::now_ms() + 10000.0, &y, us, err) : -2;
+        check(g == -1 && err.find("no parts here") != std::string::npos, "  a slice pick: refused (" + err + ")");
+        check(stop(ch) == 0, "  and it exited 0");
     }
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
