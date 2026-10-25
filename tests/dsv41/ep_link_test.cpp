@@ -210,10 +210,15 @@ int child(const std::string& mode, int port) {
         if (!b.dial(at, 5000, err)) return 13;
         return !bulk_worker(b, me, m.hello.session ^ 7, err) && has(err, "refused") ? 0 : 14;
     }
-    if (mode == "swap" || mode == "badmagic" || mode == "half") {   // (a worker that breaks the rules: the raw socket)
+    if (mode == "swap" || mode == "badmagic" || mode == "half" || mode == "close") {   // (a worker that breaks the rules: the raw socket)
         EpHdr h;
         std::vector<uint8_t> p;
         if (w.req.recv(h, p, now_ms() + 5000, err) != 1 || h.type != Req) return 15;
+        if (mode == "close") {   // an orderly close (FIN, not a reset) with a request out, and no bye
+            w.req.close();
+            sleep_ms(500);
+            return 0;
+        }
         const int T = h.T;
         std::vector<uint16_t> y = doubled((const uint16_t*) (p.data() + (size_t) T * kK * sizeof(EpPick)), T);
         uint16_t head[2] = {(uint16_t) ((1u << T) - 1), 0};
@@ -430,11 +435,26 @@ void case_order() {
     p.open("swap");
     std::string err;
     Reply r;
-    ReqData a(1, 1), b(2, 2);
+    ReqData a(1, 1), b(1, 2);   // (the same T: only the seq tells the two replies apart)
     p.m.send_req(1, 0, 1, 0, 0, a.picks.data(), a.x.data(), err);
-    p.m.send_req(2, 0, 2, 0, 0, b.picks.data(), b.x.data(), err);
+    p.m.send_req(2, 0, 1, 0, 0, b.picks.data(), b.x.data(), err);
     const int got = p.m.wait_resp(1, now_ms() + 3000, r, err);
-    check(got == -1 && has(err, "seq 2") && !p.m.up() && p.m.st.downs == 1, "a reply out of order: the link is down");
+    check(got == -1 && has(err, "seq 2") && has(err, "oldest") && !p.m.up() && p.m.st.downs == 1,
+          "a reply out of order: the link is down");
+    p.end();
+}
+
+void case_closed() {
+    Pair p;
+    p.open("close");
+    std::string err;
+    Reply r;
+    ReqData a(1, 1);
+    p.m.send_req(1, 0, 1, 0, 0, a.picks.data(), a.x.data(), err);
+    const double t0 = now_ms();
+    const int got = p.m.wait_resp(1, t0 + 3000, r, err);
+    check(got == -1 && has(err, "closed") && !p.m.up() && now_ms() - t0 < 2000,
+          "the worker closes its socket: the link is down at once, not at the deadline (" + err + ")");
     p.end();
 }
 
@@ -843,6 +863,7 @@ int main(int argc, char** argv) {
     case_refusals();
     case_accept_and_rules();
     case_order();
+    case_closed();
     case_timeouts();
     case_killed();
     case_badmagic();
