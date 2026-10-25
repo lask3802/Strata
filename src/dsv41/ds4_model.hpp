@@ -163,6 +163,13 @@ struct Stats {
     // those the lane computed whole after all (a reply late or lost)
     // those of W the balance kept here (DS4_EP_POOL_BAL: the reply would have come in after this lane's part)
     int64_t rx_pool_w = 0, rx_pool_picks = 0, rx_pool_fallback = 0, rx_pool_kept = 0;
+    // the W picks' n_ff blocks the server computed (DS4_EP_POOL_CUT: [cut, nb) of each), and the decode requests (T=1,
+    // sent) by the W blocks of [0, k) they moved there (0, 1-3, 4-6, 7-12, 13+): requests, and in ms in all the send to
+    // this lane's part done, to the reply's arrival in the kernel (the requests it is known for: rx_wb_na) and this
+    // lane's wait after its part
+    int64_t rx_pool_blocks = 0;
+    int64_t rx_wb_n[5] = {}, rx_wb_na[5] = {};
+    double rx_wb_part[5] = {}, rx_wb_arr[5] = {}, rx_wb_wait[5] = {};
     // DS4_RX_FILL=1 (EP U5b): fills queued, loaded by the server, refused; their bytes sent and the time in the paced
     // sends; the requests the server answered Stale (an expert mid-fill)
     int64_t rx_fills = 0, rx_fill_ok = 0, rx_fill_fail = 0, rx_fill_bytes = 0, rx_stale = 0;

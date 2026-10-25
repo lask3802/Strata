@@ -528,10 +528,15 @@ bool SliceServer::run(int layer, int32_t c, const ReqRow* rows, int nr, const fl
                          times == 2 ? "[k, nb) twice: the parts hold no block before k" : "from block k - 1");
         wrong_said_ = true;
     }
+    const int cut = (c & kReqCut) >> kReqCutShift;   // (W's first block here: the main computes [0, cut) of them)
+    if (!wk_.empty() && cut >= (c & kReqK)) {
+        err = "W picks cut at block " + std::to_string(cut) + ", not before k " + std::to_string(c & kReqK);
+        return false;
+    }
     const double t0 = lane_ms_now();
-    if (!wk_.empty()) {   // (one pass: the slice picks' [k, nb) from the parts, W's [0, k) from the pool)
+    if (!wk_.empty()) {   // (one pass: the slice picks' [k, nb) from the parts, W's [cut, k) from the pool)
         const LaneSet s[2] = {{k, parts_.blocks(), &parts_, pk.data(), (int) pk.size()},
-                              {0, c & kReqK, &pool_, wk_.data(), (int) wk_.size()}};
+                              {cut, c & kReqK, &pool_, wk_.data(), (int) wk_.size()}};
         if (!lane_.run_sets(layer, s, 2, nr, x, ldx, ys, ldy, false, err)) return false;
         pool_picks_ += (int64_t) wk_.size();
     } else {

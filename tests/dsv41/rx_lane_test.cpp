@@ -582,6 +582,21 @@ int main() {
                 m = std::max(m, std::fabs(ref));
             }
             CHECK(d / m < 1e-4);
+            {   // the W pick cut at block 2 (DS4_EP_POOL_CUT): [2, nb) here, the main [0, 2)
+                std::vector<float> yc((size_t) E, 7.0f);
+                CHECK(sv.run(l, 6 | 2 << rx::kReqCutShift, &rw, 1, x.data(), E, yc.data(), E, err));
+                const std::vector<float> r1c = ref_slice(l, ex[(size_t) l][1], fm[l], xa, 2 * 256, FF - 2 * 256);
+                double dc = 0, mc = 1e-30, dw = 0;   // (dw: against the whole W pick's sums - not those)
+                for (int c = 0; c < E && !r1c.empty() && !r3.empty(); ++c) {
+                    const double ref = 0.4 * r1c[(size_t) c] + 0.25 * r3[(size_t) c];
+                    dc = std::max(dc, std::fabs(yc[(size_t) c] - ref));
+                    mc = std::max(mc, std::fabs(ref));
+                    dw = std::max(dw, (double) std::fabs(yc[(size_t) c] - ys[(size_t) c]));
+                }
+                CHECK(dc / mc < 1e-4 && dw / mc > 1e-3);
+                CHECK(!sv.run(l, 6 | 6 << rx::kReqCutShift, &rw, 1, x.data(), E, yc.data(), E, err) &&
+                      err.find("not before k") != std::string::npos);
+            }
             if (l == 1) {
                 rw.slice = (uint16_t) (0x4u | 4u << rx::kPoolBit);   // (expert 2 of layer 1 tagged W: not in W)
                 CHECK(!sv.run(l, 6, &rw, 1, x.data(), E, ys.data(), E, err) && err.find("not in W") != std::string::npos);

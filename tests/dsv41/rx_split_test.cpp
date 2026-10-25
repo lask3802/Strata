@@ -80,6 +80,23 @@ static void case_checks() {
     check(rx::pool_keep(4, 8, wk, wt, rm, rs, 0.0, 0.0) <= 4 && rx::pool_keep(4, 8, wk, wt, -1, rs, 0.17, 0.1) == 0 &&
               rx::pool_keep(0, 8, wk, wt, rm, rs, 0.17, 0.1) == 0,
           "pool_keep: at most nc; no estimate yet or no candidates: none");
+    // ... by the block (DS4_EP_POOL_CUT): 3 picks a layer - no room for a whole W pick, room for some of its blocks
+    const rx::PoolCut c3 = rx::pool_cut(1, 3, 6, wk, wt, rm, rs, 0.17, 0.1);
+    check(c3.n == 1 && c3.cut > 0 && c3.cut < 6, "pool_cut: 3 picks a layer - one W pick, cut inside [0, k)");
+    // the rule: the blocks moved, n (k - cut), fit (the slack's M), n is the fewest picks for them, and a pick's
+    // blocks never go past k; with room for nc whole: every candidate whole (cut 0, pool_keep's nc)
+    bool crule = true;
+    for (int N = 1; N <= 16; ++N)
+        for (int nc = 1; nc <= N; ++nc) {
+            const rx::PoolCut c = rx::pool_cut(nc, N, 6, wk, wt, rm, rs, 0.17, 0.1);
+            const int mv = c.n * (6 - c.cut);
+            auto fits = [&](int b) { return 0.17 + rs * (N * wt + b * wk / 6) + 0.1 <= rm * (N * wk - b * wk / 6); };
+            crule = crule && c.n >= 0 && c.n <= nc && (c.n == 0 ? !fits(1) : c.cut >= 0 && c.cut < 6 && fits(mv)) &&
+                    (c.n <= 1 || (c.n - 1) * 6 < mv) && (rx::pool_keep(nc, N, wk, wt, rm, rs, 0.17, 0.1) < nc || c.cut == 0);
+        }
+    check(crule, "pool_cut: the blocks moved fit, the fewest picks for them, whole when all fit, N 1..16");
+    check(rx::pool_cut(2, 8, 6, wk, wt, -1, rs, 0.17, 0.1).n == 0 && rx::pool_cut(0, 8, 6, wk, wt, rm, rs, 0.17, 0.1).n == 0,
+          "pool_cut: no estimate yet or no candidates: none");
     check(rx::ewma(-1, 3.0, 0.05) == 3.0 && rx::ewma(2.0, 4.0, 0.5) == 3.0, "ewma: the first sample, then a step");
 }
 

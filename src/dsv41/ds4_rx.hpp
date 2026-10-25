@@ -55,13 +55,17 @@
 namespace strata::ds4::rx {
 
 constexpr uint32_t kMagic = 0x58524453u;   // "SDRX"
-constexpr uint32_t kProto = 4;             // (2: H' - the hello's lo, the Geo's pack_hash, the slice picks; 3: fills; 4: W)
+constexpr uint32_t kProto = 5;             // (2: H' - the hello's lo, the Geo's pack_hash, the slice picks; 3: fills; 4: W;
+                                           //  5: the W picks' cut, kReqCut)
 constexpr int kMaxRows = 16;               // a request's rows at most (kWin)
 constexpr int kMaxPicks = 8;               // picks a row at most (kPicks)
 // a Req's c: the slice picks' first n_ff block k (0: none), and flags
 constexpr int32_t kReqK = 0xff;
 constexpr int32_t kReqSets = 1 << 8;    // (DS4_EP_SPLIT_VERIFY) the reply's rows twice: the whole picks' sums, then the slice's
 constexpr int32_t kReqWrong = 1 << 9;   // (DS4_EP_SPLIT_VERIFY=2, the check's own check) the slice from k - 1 on purpose
+// (protocol 5) the W picks' first n_ff block on the server, 0 .. k - 1 (0: whole there; the main computes [0, cut))
+constexpr int kReqCutShift = 16;
+constexpr int32_t kReqCut = 0xff << kReqCutShift;
 
 enum Msg : uint32_t {
     Hello = 1,      // payload HelloMsg (each side sends one; the server first)

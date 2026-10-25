@@ -98,6 +98,30 @@ inline int pool_keep(int nc, int N, double wk, double wt, double rm, double rs, 
     const double n = num / den;
     return n >= nc ? nc : (int) n;
 }
+/// ... in blocks (DS4_EP_POOL_CUT, on with the balance): a whole W pick moves k blocks at once, more than a layer's slack
+/// mostly holds, so the server may take a W pick's [cut, k) alone and this lane its [0, cut).  A block (wk / k bytes)
+/// moved: this lane rm less a byte, the server rs more.  M: the blocks the slack (pool_keep's) takes, nc k at most;
+/// n = ceil(M / k) candidates go, all cut at the same block, k - floor(M / n) (0: whole there, as pool_keep's) - or
+/// n - 1 whole where they move as many blocks
+struct PoolCut {
+    int n = 0, cut = 0;   // (the candidates sent; their first block on the server)
+};
+inline PoolCut pool_cut(int nc, int N, int k, double wk, double wt, double rm, double rs, double fix, double margin) {
+    PoolCut pc;
+    if (nc <= 0 || k <= 0 || wk <= 0 || rm <= 0 || rs <= 0) return pc;
+    const double num = rm * N * wk - fix - rs * N * wt - margin, den = wk / k * (rs + rm);
+    if (num <= 0) return pc;
+    const double mf = num / den;
+    const int M = mf >= (double) nc * k ? nc * k : (int) mf;
+    if (M <= 0) return pc;
+    pc.n = (M + k - 1) / k;
+    pc.cut = k - M / pc.n;
+    if (pc.n > 1 && pc.n * (k - pc.cut) <= (pc.n - 1) * k) {   // (n - 1 whole move as many: fewer picks)
+        --pc.n;
+        pc.cut = 0;
+    }
+    return pc;
+}
 /// one EWMA step (a: the new sample's weight; v < 0: none yet - the sample)
 inline double ewma(double v, double x, double a) { return v < 0 ? x : v + a * (x - v); }
 /// blocks [b0, b1) as cpu_experts' n_ff values [ff0, ff0 + ffn) of n_ff (the last of nb blocks runs to n_ff)
