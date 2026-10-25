@@ -812,7 +812,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(strata-dsv41 src/dsv41/ds4_main.cpp src/dsv41/ds4_model.cu src/dsv41/ds4_kernels.cu src/dsv41/ds4_vision.cu
                    src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
                    src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp
-                   src/net/stage_link.cpp src/dsv41/ds4_rx.cpp src/dsv41/ds4_rx_server.cu)
+                   src/net/stage_link.cpp src/dsv41/ds4_rx.cpp src/dsv41/ds4_rx_server.cu src/dsv41/ds4_rx_cpu.cpp)
     if(WIN32)
       target_link_libraries(strata-dsv41 PRIVATE ws2_32)   # the remote stage's sockets (src/net/stage_link.cpp)
     endif()
@@ -912,6 +912,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(ds4_rx_link_test PRIVATE Threads::Threads)
       if(WIN32)
         target_link_libraries(ds4_rx_link_test PRIVATE ws2_32)
+      endif()
+      # the remote experts between two processes on 127.0.0.1 (ds4_rx.hpp): rx::Main against the CPU expert server
+      # (--expert-server-cpu's, ds4_rx_cpu.cpp) - the sums, a late reply, a server killed, --expert-server-once, the Wake
+      # and the spin budget, the link core's pin, the lane's nap rule, TCP_QUICKACK.  No GPU, no model
+      add_executable(ds4_rx_loop_test tests/dsv41/rx_loop_test.cpp src/dsv41/ds4_rx.cpp src/dsv41/ds4_rx_cpu.cpp
+                     src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_tq_cpu.cpp)
+      target_include_directories(ds4_rx_loop_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
+      target_link_libraries(ds4_rx_loop_test PRIVATE strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(ds4_rx_loop_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+      if(WIN32)
+        target_link_libraries(ds4_rx_loop_test PRIVATE ws2_32)
       endif()
       # expert parallelism's n_ff slices on the CPU lane (gg::iq_cpu_slice, ds4_ffslice.hpp): the slices of an expert read
       # in place sum to the whole one, in place == copied out, blob -> slices -> blob; no GPU (--pack: a pack's experts, read only)

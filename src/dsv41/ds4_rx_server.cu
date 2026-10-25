@@ -198,16 +198,18 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     };
     std::vector<uint16_t> yb((size_t) kMaxRows * D);
     int rc = 0;
-    int64_t served = 0, pings = 0;
+    int64_t served = 0, pings = 0, wakes = 0;
     double busy = 0, prep = 0, gpu = 0;
     const int errs0 = gg::launch_errors();
     for (;;) {
-        if (c.recv(h, p, -1, err) != 1) {
+        if (serve_next(c, h, p, pings, wakes, err) != 1) {
             const double n = (double) std::max<int64_t>(1, served);
             std::fprintf(stderr, "expert server: main process %s gone (%s); %lld requests served, %.1f us each (the "
                                  "rows' prep %.1f, the GPU from the copy in to the copy out %.1f, bf16 and send %.1f)\n",
                          c.peer().c_str(), err.c_str(), (long long) served, busy * 1000.0 / n, prep * 1000.0 / n,
                          gpu * 1000.0 / n, (busy - prep - gpu) * 1000.0 / n);
+            std::fprintf(stderr, "expert server: %lld Wakes taken, %llu waits in poll, %llu reads quick-ACKed\n",
+                         (long long) wakes, (unsigned long long) c.polls, (unsigned long long) c.quickacks);
             if (pings > 0) std::fprintf(stderr, "expert server: %lld pings answered\n", (long long) pings);
             static const char* const bucket_name[3] = {"T=1", "T=4", "T=other"};
             for (int bk = 0; diag && bk < 3; ++bk)
@@ -223,12 +225,6 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
                 }
             break;
         }
-        if (h.type == Ping) {
-            if (!c.send(Pong, h.seq, 0, 0, 0, p.data(), p.size(), err)) break;
-            ++pings;
-            continue;
-        }
-        if (h.type != Req) continue;
         const double tr = now_ms();
         const int li = h.a, nr = h.b;
         bucket = nr == 1 ? 0 : nr == 4 ? 1 : 2;
@@ -382,25 +378,17 @@ int serve(const std::string& host_port, const std::string& token, int64_t reserv
     RX_CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     if (!gg::prepare(s)) return 1;
     if (token.empty()) std::fprintf(stderr, "expert server: WARNING: no STRATA_STAGE_TOKEN\n");
-    std::fprintf(stderr, "expert server: GPU %d, dialing %s (again each second until a main process listens)\n", dev,
-                 host_port.c_str());
-    bool said = false;
-    for (;;) {
-        Conn c;
-        std::string err;
-        if (!c.dial(host_port, 2, err)) {
-            if (!said) std::fprintf(stderr, "expert server: %s; trying again each second\n", err.c_str());
-            said = true;
-            std::this_thread::sleep_for(std::chrono::seconds(1));   // (no main process listening: nothing to spin for)
-            continue;
-        }
-        said = false;
-        std::fprintf(stderr, "expert server: connected to %s\n", host_port.c_str());
-        const int rc = session(c, token, reserve_mib, dev, s);
-        c.close();
-        if (rc < 0) return 1;
-        if (once) return 0;
-    }
+    std::fprintf(stderr, "expert server: GPU %d\n", dev);
+    struct Arg {
+        const std::string& token;
+        int64_t reserve_mib;
+        int dev;
+        cudaStream_t s;
+    } a{token, reserve_mib, dev, s};
+    return serve_loop(host_port, once, "expert server", [](Conn& c, void* p) {
+        const Arg& x = *(const Arg*) p;
+        return session(c, x.token, x.reserve_mib, x.dev, x.s);
+    }, &a);
 }
 
 }  // namespace strata::ds4::rx

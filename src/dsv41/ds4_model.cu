@@ -1083,6 +1083,13 @@ struct Model::Impl {
     bool ep_of[kRing] = {};
     std::thread service;
     std::atomic<bool> quit{false};
+    // the link core (--remote-experts, ds4_rx.hpp): the service thread's CPU (DS4_EP_CPU; -1: none) and that core's
+    // logical CPUs, which the CPU lane's pools leave out; a window's start (forward), for serve_lane's Wake;
+    // DS4_EP_WAKE=0: no Wake and the lane's 2 ms naps as without the link (A/B)
+    int ep_cpu = -1;
+    std::vector<int> ep_sibs;
+    std::atomic<bool> rx_wake{false};
+    bool ep_wake = true;
     // remote experts (--remote-experts, ds4_rx.hpp): the link (the service thread's after the load), the experts the
     // server holds ([layer][n_exp]), the per-request times (ms) for the percentiles
     std::unique_ptr<rx::Main> rx_link;
@@ -2941,6 +2948,11 @@ struct Model::Impl {
         // the CPU lane: one pool of workers per NUMA node, each expert split in NH column parts (part X on node X); in
         // place, one part (the files' layout) and one pool over every node's cores (the pages lie where the cache put them)
         cores = node_cores();
+        if (!o.remote_experts.empty()) {   // (before the pools: they leave the link core out)
+            if ((ep_cpu = rx::link_cpu()) >= 0) ep_sibs = os::cpu_siblings(ep_cpu);
+            const char* wv = std::getenv("DS4_EP_WAKE");
+            ep_wake = wv == nullptr || std::atoi(wv) != 0;
+        }
         NH = file_experts ? 1 : (int) std::min<size_t>(2, cores.size());
         if (NH > 1 && ((g.ff / NH) % 128 != 0 || (g.dim / NH) % 128 != 0)) NH = 1;
         if (!pk.gguf) make_pools();   // (a GGUF's after its experts: copy_experts decides NH)
@@ -3062,7 +3074,7 @@ struct Model::Impl {
             ahead_fl.assign(L.size() * 1024, 0);
             ahead_rank.assign(L.size() * 1024, 0);
             ahead_for.assign(L.size(), 0);
-            const int core = !cores.empty() && !cores[0].empty() ? cores[0][0] : -1;
+            const int core = ep_cpu >= 0 ? ep_cpu : !cores.empty() && !cores[0].empty() ? cores[0][0] : -1;
             service = std::thread([this, core] {
                 if (core >= 0) pin_self(core);
                 serve_lane();
@@ -4978,7 +4990,8 @@ struct Model::Impl {
             std::vector<int> c = cs[(size_t) X];
             if (file_experts && NH == 1)
                 for (size_t Y = 1; Y < cs.size(); ++Y) c.insert(c.end(), cs[Y].begin(), cs[Y].end());
-            if (X == 0 && !c.empty()) c.erase(c.begin());   // the host thread's core (it helps node 0's pool)
+            if (ep_cpu >= 0) c = rx::off_link(c, ep_sibs);   // (the link core: the service thread helps node 0's pool from it)
+            else if (X == 0 && !c.empty()) c.erase(c.begin());   // the host thread's core (it helps node 0's pool)
             // cores of the first pool left free beside the host thread's, for the thread that launches the decode's kernels
             // (and waits on the device) and whatever else the PC runs: with a worker spinning on every other logical CPU
             // that thread waits for a core (Project Maya #359, a 20-core Windows 11 PC: decode 28.3 -> 55.5 tok/s).  Only
@@ -6788,7 +6801,7 @@ struct Model::Impl {
         return true;
     }
     // picks (expert, t * kPicks + i) of request r computed on the lane and added to rp's parts
-    void lane_add(const Layer& l, const Req& r, Resp& rp, int T, std::vector<std::pair<int, int>> pk2) {
+    void lane_add(const Layer& l, const Req& r, Resp& rp, int T, std::vector<std::pair<int, int>> pk2, bool ep) {
         std::sort(pk2.begin(), pk2.end());
         std::vector<Ent> ents;
         float wv[kWin * kPicks];
@@ -6808,7 +6821,7 @@ struct Model::Impl {
             }
             ents.push_back(en);
         }
-        cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim);
+        cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, nullptr, ep);   // (the window's kind, as serve_lane's)
         const int D = g.dim;
         for (int t = 0; t < T; ++t)
             for (int sl = 0; sl < nslots; ++sl) {
@@ -6912,7 +6925,7 @@ struct Model::Impl {
             rx_lost(e.empty() ? "the link failed" : e);
         }
         const double tf = rx::now_ms();
-        lane_add(l, r, rp, T, rpk);
+        lane_add(l, r, rp, T, rpk, ep_of[seq % kRing]);
         st.rx_fallback += (int64_t) rpk.size();
         st.rx_fallback_ms += rx::now_ms() - tf;
     }
@@ -7012,7 +7025,21 @@ struct Model::Impl {
             out += b;
         }
         out += "\n";
+        out += ep_line(s0, nt);
         return out;
+    }
+    // the link core and keep-awake (ds4_rx.hpp): where the link thread runs, the Wakes, the lane's naps
+    std::string ep_line(const Stats& s0, double nt) const {
+        std::string sibs;
+        for (int c : ep_sibs) sibs += " " + std::to_string(c);
+        char b[512];
+        std::snprintf(b, sizeof b,
+                      "remote experts' link: the service thread on CPU %d%s (the CPU lane's pools off CPUs%s); keep-awake "
+                      "%s: %lld Wakes sent (%.3f a token), %lld requests found the lane napping\n",
+                      ep_cpu, ep_cpu < 0 ? " (DS4_EP_CPU off: as without the link)" : "", sibs.empty() ? " -" : sibs.c_str(),
+                      ep_wake ? "on" : "off (DS4_EP_WAKE=0)", (long long) (st.rx_wakes - s0.rx_wakes),
+                      (double) (st.rx_wakes - s0.rx_wakes) / std::max(1.0, nt), (long long) (st.lane_nap_reqs - s0.lane_nap_reqs));
+        return b;
     }
 
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
@@ -7020,15 +7047,27 @@ struct Model::Impl {
     void serve_lane() {
         unsigned next = 1;
         auto last = std::chrono::steady_clock::now();
+        bool napped = false;
         std::vector<Ent> ents;
         while (!quit.load(std::memory_order_relaxed)) {
             Req& r = reqs[next % kRing];
             if (*(volatile unsigned*) &r.seq != next) {
                 cpu_relax();
-                if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(2))
+                // (--remote-experts) a window began: a Wake to the server if the link has gone quiet; no naps while
+                // the server still spins (rx::lane_naps)
+                if (ep_wake && rx_wake.load(std::memory_order_relaxed) && rx_wake.exchange(false) && rx_on) {
+                    std::string e;
+                    if (rx_link->wake(e)) ++st.rx_wakes;
+                }
+                if (rx::lane_naps(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last).count(),
+                                  rx_on && ep_wake)) {
+                    napped = true;
                     std::this_thread::sleep_for(std::chrono::microseconds(20));
+                }
                 continue;
             }
+            if (napped) ++st.lane_nap_reqs;   // (a request that found the lane napping)
+            napped = false;
             std::atomic_thread_fence(std::memory_order_acquire);
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
             const bool ep = ep_of[next % kRing];   // (written before the request's launch: ep_of)
@@ -9404,6 +9443,7 @@ struct Model::Impl {
                 err = "token " + std::to_string(tk[t]) + " out of range";
                 return false;
             }
+        if (rx_link) rx_wake.store(true, std::memory_order_relaxed);   // (serve_lane: a Wake if the link went quiet)
         if (stage_lost && pos == 0 && stage_reset && stage_reset(stage_err)) stage_lost = false;   // (the worker back)
         if (stage_lost) {   // (the worker's layers hold another state, or none: only a conversation from 0 goes on)
             err = stage_err + " - the conversation starts again from its first token";   // (the link's: "remote stage ...")

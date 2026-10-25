@@ -17,6 +17,11 @@
 // requests, then the link is tried again with a clean count; a lost link, or no reply at all from one such idle spell
 // to the next: the lane computes everything from then on.
 // Never a hang.
+// Keep-awake: each end's receive spins while bytes came in the last kSpinMs; a window's start sends a Wake when the
+// link has been quiet for kWakeQuietMs (the server's spin restarts before the window's first request), and serve_lane
+// does not nap while the link is up and its last request is under kSpinMs old.  Both ends' link threads run on the
+// link core (DS4_EP_CPU, 2), the main's CPU lane workers off it and its SMT sibling.  DS4_EP_WAKE=0: no Wake and the
+// lane's 2 ms naps (A/B).
 //
 // The wire: a 32-byte header (magic, type, seq, a, b, c, payload bytes), then the payload; TCP_NODELAY, rows bf16.
 #pragma once
@@ -44,8 +49,23 @@ enum Msg : uint32_t {
     Resp = 7,       // server -> main: seq, a = rows, c = the server's time (us); payload rows x bf16 y[n_embd]
     Error = 9,      // either way: payload the message
     Ping = 10,      // main -> server (tests: the link alone): seq; the server answers Pong with the same payload at once
-    Pong = 11,
+    Pong = 11,      // (a = the Wakes the server took, b = its waits in poll (the low 31 bits), c = the one CPU its
+                    // serve loop may run on, -1: not pinned)
+    Wake = 12,      // main -> server: no payload, no reply; a window starts (its bytes restart the server's spin)
 };
+
+constexpr double kSpinMs = 200.0;      // a receive spins while bytes came this recently, then waits in poll
+constexpr double kWakeQuietMs = 100.0; // a Wake goes out only when the main sent nothing for this long (half the spin)
+
+/// The link core (DS4_EP_CPU, 2 by default; -1 or "off": none): the logical CPU the thread that drives the link runs
+/// on, on either PC - the main's service thread, the server's serve loop.  -1 also where this PC has no such CPU
+int link_cpu();
+/// `cores` less the link CPU's core (`link`: its SMT siblings, os::cpu_siblings), in their order: the CPU lane's
+/// workers stay off the core the link thread spins on
+std::vector<int> off_link(const std::vector<int>& cores, const std::vector<int>& link);
+/// serve_lane, with no request in: may it nap (20 us sleeps) after idle_ms without one - after 2 ms, but while the
+/// link is up not before kSpinMs (the server spins as long: a window's first request is not held up by the lane)
+inline bool lane_naps(double idle_ms, bool link_up) { return idle_ms > (link_up ? kSpinMs : 2.0); }
 
 #pragma pack(push, 1)
 struct Hdr {
@@ -214,7 +234,11 @@ public:
     /// the last message recv gave: when the kernel took in the read that completed it (steady ms; SO_TIMESTAMPNS,
     /// Linux), -1 where the kernel says nothing (Windows)
     double arrival_ms() const { return arrival_; }
+    /// when a message last went out (steady ms; 0: none yet)
+    double last_out_ms() const { return last_out_; }
     uint64_t bytes_out = 0, bytes_in = 0;
+    uint64_t polls = 0;       // receives' waits in poll (quiet past kSpinMs)
+    uint64_t quickacks = 0;   // reads followed by TCP_QUICKACK (Linux: the peer's next send is not held for our ACK)
 
 private:
     bool send_raw_(const void* p, size_t n, std::string& err);
@@ -222,6 +246,7 @@ private:
     std::string peer_;
     std::vector<uint8_t> rb_;   // bytes read, not yet a whole message
     double last_in_ = 0;        // when bytes last came in (steady ms)
+    double last_out_ = 0;       // when a message last went out
     double in_at_ = -1, arrival_ = -1;   // the kernel's time of the last read; of the last message's
 };
 
@@ -251,8 +276,12 @@ public:
         v.swap(late_);
         return v;
     }
-    /// tests: a Ping of `bytes` payload and its Pong (1; 0 none by the deadline; -1 the link failed)
-    int ping(uint32_t seq, size_t bytes, double deadline, std::string& err);
+    /// tests: a Ping of `bytes` payload and its Pong (1; 0 none by the deadline; -1 the link failed); the Pong's a, b, c
+    /// in pong[0..2] (the server's Wakes taken, waits in poll, pinned CPU) when given
+    int ping(uint32_t seq, size_t bytes, double deadline, std::string& err, int32_t* pong = nullptr);
+    /// a window starts: a Wake when nothing went out for kWakeQuietMs (the server's spin may have run out); true if sent
+    bool wake(std::string& err);
+    uint64_t wakes = 0;   // Wakes sent
     void close() { c_.close(); }
     bool ok() const { return c_.ok(); }
     uint64_t bytes_out() const { return c_.bytes_out; }
@@ -276,5 +305,15 @@ private:
 /// serves it until it goes away, frees the blobs, dials again (once: return after one main process).  GPU `dev`, VRAM
 /// free less reserve_mib for blobs.  Returns nonzero on a CUDA error.
 int serve(const std::string& host_port, const std::string& token, int64_t reserve_mib, int dev, bool once);
+/// tests (--expert-server-cpu): the same server with the CPU lane's arithmetic (ds4_iq_cpu.cpp, the i-quant types) in
+/// place of a GPU, the blobs in RAM (room: DS4_RX_CPU_ROOM_MIB, 2048)
+int serve_cpu(const std::string& host_port, const std::string& token, bool once);
+
+/// Either server's parts.  serve_loop: dial `host_port` (again each second until a main process takes it), run
+/// `session` on the connection (0: the main went away; < 0: an error, returned as 1), again unless `once`; the calling
+/// thread on link_cpu() meanwhile (its mask restored at the return).  serve_next: the next request (1, in h / p),
+/// answering Pings and taking Wakes on the way (the counts in *wakes); -1: the link went (err)
+int serve_loop(const std::string& host_port, bool once, const char* what, int (*session)(Conn&, void*), void* arg);
+int serve_next(Conn& c, Hdr& h, std::vector<uint8_t>& p, int64_t& pings, int64_t& wakes, std::string& err);
 
 }  // namespace strata::ds4::rx

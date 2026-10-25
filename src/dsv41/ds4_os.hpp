@@ -463,16 +463,90 @@ inline void anon_free(void* p, size_t bytes) {
 #endif
 }
 
-/// The calling thread, or `t`, on logical CPU `cpu` (Windows: the first 64 CPUs, processor group 0).
+/// The calling thread, or `t`, on logical CPU `cpu` (Windows: the first 64 CPUs, processor group 0).  pin_self(-1):
+/// the calling thread's mask from before its first pin_self again (nothing if it was not pinned since).
 inline void pin_self(int cpu) {
 #if defined(_WIN32)
-    if (cpu >= 0 && cpu < 64) SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << cpu);
+    thread_local DWORD_PTR before = 0;
+    if (cpu >= 0 && cpu < 64) {
+        const DWORD_PTR was = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << cpu);
+        if (before == 0) before = was;
+    } else if (cpu < 0 && before != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), before);
+        before = 0;
+    }
 #else
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(cpu, &set);
-    sched_setaffinity(0, sizeof set, &set);
+    thread_local bool saved = false;
+    thread_local cpu_set_t before;
+    if (cpu >= 0) {
+        if (!saved) saved = sched_getaffinity(0, sizeof before, &before) == 0;
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
+        sched_setaffinity(0, sizeof set, &set);
+    } else if (saved) {
+        sched_setaffinity(0, sizeof before, &before);
+        saved = false;
+    }
 #endif
+}
+/// The one logical CPU the calling thread may run on (-1: more than one, or not known)
+inline int pinned_cpu() {
+    int one = -1;
+#if defined(_WIN32)
+    GROUP_AFFINITY ga{};
+    if (!GetThreadGroupAffinity(GetCurrentThread(), &ga) || ga.Group != 0) return -1;
+    for (int c = 0; c < 64; ++c)
+        if ((ga.Mask >> c) & 1) {
+            if (one >= 0) return -1;
+            one = c;
+        }
+#else
+    cpu_set_t s;
+    if (sched_getaffinity(0, sizeof s, &s) != 0 || CPU_COUNT(&s) != 1) return -1;
+    for (int c = 0; c < CPU_SETSIZE && one < 0; ++c)
+        if (CPU_ISSET(c, &s)) one = c;
+#endif
+    return one;
+}
+/// The logical CPUs of `cpu`'s physical core, `cpu` among them, ascending ({cpu} where the OS does not say)
+inline std::vector<int> cpu_siblings(int cpu) {
+    std::vector<int> v;
+#if defined(_WIN32)
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    std::vector<uint8_t> b(len);
+    if (cpu >= 0 && cpu < 64 && len > 0 &&
+        GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) b.data(), &len))
+        for (size_t o = 0; o < b.size() && v.empty();) {
+            auto* e = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) (b.data() + o);
+            const KAFFINITY m = e->Processor.GroupCount > 0 && e->Processor.GroupMask[0].Group == 0
+                                    ? e->Processor.GroupMask[0].Mask : 0;
+            if ((m >> cpu) & 1)
+                for (int c = 0; c < 64; ++c)
+                    if ((m >> c) & 1) v.push_back(c);
+            o += e->Size;
+        }
+#else
+    FILE* f = cpu >= 0 ? std::fopen(("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list").c_str(), "r")
+                       : nullptr;
+    char s[256] = {};
+    if (f != nullptr) {
+        if (std::fgets(s, sizeof s, f) == nullptr) s[0] = '\0';
+        std::fclose(f);
+    }
+    for (const char* p = s; *p >= '0' && *p <= '9';) {   // "3,19" or "3-4"
+        char* q = nullptr;
+        const int lo = (int) std::strtol(p, &q, 10);
+        int hi = lo;
+        if (*q == '-') hi = (int) std::strtol(q + 1, &q, 10);
+        for (int c = lo; c <= hi && c - lo < 1024; ++c) v.push_back(c);
+        p = *q == ',' ? q + 1 : q;
+    }
+#endif
+    if (std::find(v.begin(), v.end(), cpu) == v.end()) v.assign(1, cpu);
+    std::sort(v.begin(), v.end());
+    return v;
 }
 inline void pin_thread(std::thread& t, int cpu) {
 #if defined(_WIN32)

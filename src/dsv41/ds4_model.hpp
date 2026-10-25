@@ -140,6 +140,9 @@ struct Stats {
     // by the window's T (1..16): requests sent, late replies, and windows the send gate kept here (the server's round
     // trip at that T expected to cost more than the lane computing its picks)
     int64_t rx_req_t[17] = {}, rx_late_t[17] = {}, rx_skip_t[17] = {};
+    // the link's keep-awake (ds4_rx.hpp): Wakes sent at a window's start, and the CPU lane's requests that found
+    // serve_lane napping (its 20 us sleeps: after 2 ms idle, kSpinMs while the link is up)
+    int64_t rx_wakes = 0, lane_nap_reqs = 0;
 };
 
 class Model {

@@ -1,9 +1,12 @@
 // src/dsv41/ds4_rx.cpp - see ds4_rx.hpp: the sockets, the messages, the main process's end.
 #include "ds4_rx.hpp"
 
+#include "ds4_os.hpp"   // (os::pin_self: the link core)
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <thread>
@@ -289,6 +292,7 @@ bool Conn::send(uint32_t type, uint32_t seq, int32_t a, int32_t b, int32_t c, co
     h.b = b;
     h.c = c;
     h.bytes = n + n2;
+    last_out_ = now_ms();
     if (n + n2 <= 64 * 1024) {   // (a small message in one send: one segment on the wire)
         uint8_t one[sizeof(Hdr) + 64 * 1024];
         std::memcpy(one, &h, sizeof h);
@@ -345,6 +349,10 @@ int Conn::recv(Hdr& h, std::vector<uint8_t>& payload, double deadline, std::stri
             bytes_in += (uint64_t) k;
             last_in_ = now_ms();
             in_at_ = at;
+#if defined(TCP_QUICKACK)
+            int one = 1;   // (the kernel turns it off again by itself: after each read)
+            if (setsockopt((sock_t) fd_, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof one) == 0) ++quickacks;
+#endif
             continue;
         }
         if (k == 0 || !would_block(last_err())) {
@@ -354,8 +362,9 @@ int Conn::recv(Hdr& h, std::vector<uint8_t>& payload, double deadline, std::stri
         }
         const double now = now_ms();
         if (deadline >= 0 && now > deadline) return 0;
-        if (now - last_in_ > 200.0) {   // quiet: sleep in poll (a reply's wait in decode stays a spin)
+        if (now - last_in_ > kSpinMs) {   // quiet: sleep in poll (a reply's wait in decode stays a spin)
             const int ms = deadline < 0 ? 50 : (int) std::min(50.0, deadline - now) + 1;
+            ++polls;
             (void) wait_sock((sock_t) fd_, true, ms);
             continue;
         }
@@ -450,14 +459,90 @@ int Main::wait_resp(uint32_t seq, int nrows, double deadline, const uint16_t** y
     }
 }
 
-int Main::ping(uint32_t seq, size_t bytes, double deadline, std::string& err) {
+int Main::ping(uint32_t seq, size_t bytes, double deadline, std::string& err, int32_t* pong) {
     tx_.assign(bytes, 0);
     if (!c_.send(Ping, seq, 0, 0, 0, tx_.data(), bytes, err)) return -1;
     for (;;) {
         Hdr h;
         const int got = c_.recv(h, rx_, deadline, err);
         if (got <= 0) return got;
-        if (h.type == Pong && h.seq == seq) return rx_.size() == bytes ? 1 : -1;
+        if (h.type == Pong && h.seq == seq) {
+            if (pong != nullptr) {
+                pong[0] = h.a;
+                pong[1] = h.b;
+                pong[2] = h.c;
+            }
+            return rx_.size() == bytes ? 1 : -1;
+        }
+    }
+}
+
+bool Main::wake(std::string& err) {
+    if (!c_.ok() || now_ms() - c_.last_out_ms() < kWakeQuietMs) return false;
+    if (!c_.send(Wake, 0, 0, 0, 0, nullptr, 0, err)) return false;
+    ++wakes;
+    return true;
+}
+
+int link_cpu() {
+    const char* v = std::getenv("DS4_EP_CPU");
+    if (v != nullptr && (std::strcmp(v, "off") == 0 || std::strcmp(v, "none") == 0)) return -1;
+    const int cpu = v != nullptr && *v != '\0' ? std::atoi(v) : 2;
+    return cpu >= 0 && cpu < (int) std::thread::hardware_concurrency() ? cpu : -1;
+}
+
+std::vector<int> off_link(const std::vector<int>& cores, const std::vector<int>& link) {
+    std::vector<int> v;
+    for (int c : cores)
+        if (std::find(link.begin(), link.end(), c) == link.end()) v.push_back(c);
+    return v;
+}
+
+int serve_loop(const std::string& host_port, bool once, const char* what, int (*session)(Conn&, void*), void* arg) {
+    const int cpu = link_cpu();
+    if (cpu >= 0) os::pin_self(cpu);
+    std::fprintf(stderr, "%s: dialing %s (again each second until a main process listens); the link thread on CPU %d%s\n",
+                 what, host_port.c_str(), cpu, cpu < 0 ? " (not pinned: DS4_EP_CPU)" : "");
+    bool said = false;
+    int rc = 0;
+    for (;;) {
+        Conn c;
+        std::string err;
+        if (!c.dial(host_port, 2, err)) {
+            if (!said) std::fprintf(stderr, "%s: %s; trying again each second\n", what, err.c_str());
+            said = true;
+            std::this_thread::sleep_for(std::chrono::seconds(1));   // (no main process listening: nothing to spin for)
+            continue;
+        }
+        said = false;
+        std::fprintf(stderr, "%s: connected to %s\n", what, host_port.c_str());
+        const int s = session(c, arg);
+        c.close();
+        if (s < 0) {
+            rc = 1;
+            break;
+        }
+        if (once) break;
+    }
+    if (cpu >= 0) os::pin_self(-1);
+    return rc;
+}
+
+int serve_next(Conn& c, Hdr& h, std::vector<uint8_t>& p, int64_t& pings, int64_t& wakes, std::string& err) {
+    for (;;) {
+        if (c.recv(h, p, -1, err) != 1) return -1;
+        if (h.type == Ping) {
+            if (!c.send(Pong, h.seq, (int32_t) wakes, (int32_t) (c.polls & 0x7fffffffu), os::pinned_cpu(), p.data(),
+                        p.size(), err))
+                return -1;
+            ++pings;
+            continue;
+        }
+        if (h.type == Wake) {   // (its bytes restarted the receive's spin: nothing else to do)
+            ++wakes;
+            continue;
+        }
+        if (h.type == Req) return 1;
     }
 }
 
