@@ -25,6 +25,9 @@
 //   engine's CUDA host thread waiting, a polling link) on a lane core or its sibling
 //   :gap=N - after each timed call the caller idles N us polling (cpu_relax), the pool's workers in their 20 ms spin: the
 //   engine's time between the lane's calls (the GPU's part of each layer), its threads idling as the engine's do
+//   :stream=N[:scpu=A+B] - a thread on each of those CPUs (default 2 and 18) copying past the L3, N GB/s copied in all
+//   (max: unpaced), the whole timed part: the engine's other memory traffic (fills, disk, GPU copies) beside the lane
+//   :caller=N - the caller on CPU N (the engine's service thread on its link core 2: thr=16:skip=18:caller=2)
 //   :trace - the calls of --trace FILE instead of the pool's (file / file-nopf only): the engine's picks a layer, their
 //   number varying call to call and their reuse as a session has it, over the pack's every expert (the TLB, the page
 //   tables and the caches as cold as the engine's) - FILE is DS4_TRACE's (every pick of a decode token; --trace-hot N
@@ -767,6 +770,54 @@ struct Spin {
         for (auto& t : th) t.join();
     }
 };
+// (:stream=N, :scpu=A+B) memory traffic beside the lane over its timed tokens, as the engine's other threads and DMA make
+// it (the fills' sends, the disk's and the GPU's copies): a thread on each CPU listed copying 1 MiB pieces of a 64 MiB
+// buffer into another (past the L3: DRAM), N GB/s copied in all (N read and N written), paced as the fill thread paces
+// its sends (sleep_for to each piece's due time); max: unpaced. Its buffers are touched before the timed tokens (their
+// faults not in the lane's minflt); copied() / secs give the rate it got
+struct Stream {
+    static constexpr size_t kBuf = 64u << 20, kPiece = 1u << 20;
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> bytes{0};
+    std::vector<std::thread> th;
+    std::vector<std::vector<uint8_t>> src, dst;
+    std::chrono::steady_clock::time_point t0;
+    Stream(const std::vector<int>& cpus, double gbs) {   // (gbs <= 0: unpaced)
+        const size_t n = cpus.size();
+        src.resize(n);
+        dst.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            src[i].assign(kBuf, (uint8_t) (i + 1));
+            dst[i].assign(kBuf, 0);
+        }
+        t0 = std::chrono::steady_clock::now();
+        const double per = gbs > 0 ? gbs * 1e9 / (double) n : 0.0;   // (bytes / s, each thread)
+        for (size_t i = 0; i < n; ++i) {
+            th.emplace_back([this, i, per] {
+                auto due = std::chrono::steady_clock::now();
+                const auto step = std::chrono::nanoseconds(per > 0 ? (int64_t) (1e9 * (double) kPiece / per) : 0);
+                for (size_t off = 0; !stop.load(std::memory_order_relaxed); off = (off + kPiece) % kBuf) {
+                    std::memcpy(dst[i].data() + off, src[i].data() + off, kPiece);
+                    bytes.fetch_add(kPiece, std::memory_order_relaxed);
+                    if (per <= 0) continue;
+                    due += step;
+                    const auto now = std::chrono::steady_clock::now();
+                    if (due > now) std::this_thread::sleep_for(due - now);
+                    else if (now - due > std::chrono::milliseconds(5)) due = now;   // (behind: no burst to catch up)
+                }
+            });
+            os::pin_thread(th.back(), cpus[i]);
+        }
+    }
+    double gbs() const {   // (the rate it got so far, GB/s copied)
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return (double) bytes.load() / 1e9 / std::max(1e-9, s);
+    }
+    ~Stream() {
+        stop.store(true);
+        for (auto& t : th) t.join();
+    }
+};
 // (every variant, Linux) the CPUs' clock over the timed tokens: each one's cpufreq scaling_cur_freq (on x86 the kernel's
 // APERF / MPERF estimate since its last read) every 50 ms from a thread of its own, averaged over the lane's CPUs, the
 // :spin= ones and the rest - whether a busy neighbour off the lane's cores takes the package's clock down (its power
@@ -990,8 +1041,11 @@ struct Variant {
     bool split = false, empty = false, fix = false, dparts = false, trace = false, cold = false;
     int pf_age = 0;          // (:pf=N)
     int gap_us = 0;          // (:gap=N: the caller's idle after each timed call, us)
+    int stream = -1;         // (:stream=N: GB/s of copies beside the lane; 0: :stream=max, unpaced; -1: none)
+    int caller = -1;         // (:caller=N: the caller on CPU N, the others in their order after it)
     std::vector<int> skip;   // (:skip=2+18: those CPUs not used)
     std::vector<int> spin;   // (:spin=16+18: a spinning thread on each)
+    std::vector<int> scpu;   // (:scpu=2+18: the :stream= threads' CPUs; default 2 and 18)
 };
 static void plus_list(const std::string& s, std::vector<int>& v) {   // "2+18"
     std::istringstream ss(s);
@@ -1017,6 +1071,10 @@ static bool parse_variant(const std::string& s, const Variant& def, Variant& v) 
         else if (p == "cold") v.cold = true;
         else if (p.rfind("pf=", 0) == 0) v.pf_age = std::atoi(p.c_str() + 3);
         else if (p.rfind("gap=", 0) == 0) v.gap_us = std::atoi(p.c_str() + 4);
+        else if (p == "stream=max") v.stream = 0;
+        else if (p.rfind("stream=", 0) == 0) v.stream = std::max(1, std::atoi(p.c_str() + 7));
+        else if (p.rfind("scpu=", 0) == 0) plus_list(p.substr(5), v.scpu);
+        else if (p.rfind("caller=", 0) == 0) v.caller = std::atoi(p.c_str() + 7);
         else if (p.rfind("skip=", 0) == 0) plus_list(p.substr(5), v.skip);
         else if (p.rfind("spin=", 0) == 0) plus_list(p.substr(5), v.spin);
         else return false;
@@ -1024,7 +1082,9 @@ static bool parse_variant(const std::string& s, const Variant& def, Variant& v) 
     const char* modes[] = {"file", "file-nopf", "file-fresh", "file-populate", "anon4k", "anon2m", "hot"};
     bool known = false;
     for (const char* m : modes) known = known || v.mode == m;
-    return known && v.k >= 1 && v.k <= 9 && v.picks >= 1 && v.rb >= 1 && v.gap_us >= 0 && v.gap_us <= 100000;
+    if (v.stream >= 0 && v.scpu.empty()) v.scpu = {2, 18};
+    return known && v.k >= 1 && v.k <= 9 && v.picks >= 1 && v.rb >= 1 && v.gap_us >= 0 && v.gap_us <= 100000 &&
+           v.stream <= 100;
 }
 
 // (:dparts) expert e's down part in `p` - the first that holds a block, of the layer's type and row layout (one row's
@@ -1109,7 +1169,8 @@ int main(int argc, char** argv) {
             Variant v;
             if (!parse_variant(s, def, v)) {
                 std::printf("variant %s: a mode (file file-nopf file-fresh file-populate anon4k anon2m hot), then :k= :picks= "
-                            ":rb= :thr= :split :skip=A+B :empty :pool=fix :dparts :pf=N :spin=A+B :gap=N :trace :cold\n", s.c_str());
+                            ":rb= :thr= :split :skip=A+B :empty :pool=fix :dparts :pf=N :spin=A+B :gap=N :stream=N|max "
+                            ":scpu=A+B :caller=N :trace :cold\n", s.c_str());
                 return 2;
             }
             vs.push_back(v);
@@ -1357,6 +1418,10 @@ int main(int argc, char** argv) {
         for (int c : cores)
             if (std::find(v.skip.begin(), v.skip.end(), c) == v.skip.end()) cpus.push_back(c);
         if (cpus.empty()) cpus.push_back(cores[0]);
+        if (v.caller >= 0) {   // (:caller=N: the engine's service thread on its link core, the pool's caller)
+            cpus.erase(std::remove(cpus.begin(), cpus.end(), v.caller), cpus.end());
+            cpus.insert(cpus.begin(), v.caller);
+        }
         const int thr = std::max(1, std::min(v.thr > 0 ? v.thr : threads, (int) cpus.size()));
         const bool fresh = v.mode == "file-fresh" || v.mode == "file-populate";
         const bool anon = v.mode == "anon4k" || v.mode == "anon2m";
@@ -1505,6 +1570,8 @@ int main(int argc, char** argv) {
 #endif
         std::unique_ptr<Spin> spin;   // (after the counters opened: they count the lane's threads alone)
         if (!v.spin.empty()) spin = std::make_unique<Spin>(v.spin);
+        std::unique_ptr<Stream> stream;   // (its buffers touched here, before the faults' count)
+        if (v.stream >= 0) stream = std::make_unique<Stream>(v.scpu, (double) v.stream);
         Clock clk(256);
         const int64_t f0 = faults();
         gapping = true;
@@ -1514,6 +1581,8 @@ int main(int argc, char** argv) {
         gapping = false;
         const int64_t f1 = faults();
         clk.end();
+        const double stream_gbs = stream ? stream->gbs() : 0.0;
+        stream.reset();
         spin.reset();
 #if defined(__linux__)
         std::vector<std::vector<double>> pc;
@@ -1547,6 +1616,13 @@ int main(int argc, char** argv) {
             std::printf("  %s: gap %d us after each call: %.2f ms a token idle (%.0f us a call), %.2f ms a token in all\n",
                         v.name.c_str(), v.gap_us, gap_ms / n, 1000.0 * gap_ms / (double) std::max(1L, a.calls),
                         wall_ms / n);
+        if (v.stream >= 0) {   // (:stream=) the copies' rate it got, and on which CPUs
+            std::string sc;
+            for (int c : v.scpu) sc += (sc.empty() ? "" : "+") + std::to_string(c);
+            std::printf("  %s: stream on CPUs %s: %.2f GB/s copied (%s), %.2f GB/s of DRAM traffic\n", v.name.c_str(),
+                        sc.c_str(), stream_gbs, v.stream == 0 ? "unpaced" : ("asked " + std::to_string(v.stream)).c_str(),
+                        2.0 * stream_gbs);
+        }
         const std::vector<int> lcpus(cpus.begin(), cpus.begin() + thr);   // (the lane's threads' CPUs)
         if (!clk.ok)
             std::printf("  %s: clock: unavailable\n", v.name.c_str());
