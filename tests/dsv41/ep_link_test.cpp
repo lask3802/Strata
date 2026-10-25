@@ -884,6 +884,23 @@ void case_late_reply() {
           "a reply that came and is unread while its request is over a second old: not stale (" + err + ")");
     p.m.bye();
     p.end();
+    {   // the same for a request dropped at its deadline: the reply arrives after the 1 s mark and sits unread; the next send takes it first
+        Pair q;
+        q.open("late");
+        std::string e;
+        Reply r2;
+        ReqData c(1, 1), d(1, 2);
+        const double t0 = now_ms();
+        const int s3 = q.m.send_req(1, 0, 1, 0, 0, c.picks.data(), c.x.data(), e);
+        const int w3 = s3 == 1 ? q.m.wait_resp(1, now_ms() + 50.0, r2, e) : 9;   // (dropped at its deadline)
+        sleep_ms(t0 + 1300.0 - now_ms());   // (the reply came at 1.1 s: past the 1 s since the drop, unread)
+        const int s4 = q.m.send_req(2, 0, 1, 0, 0, d.picks.data(), d.x.data(), e);
+        const int w4 = s4 == 1 ? q.m.wait_resp(2, now_ms() + 2000, r2, e) : 9;
+        check(s3 == 1 && w3 == 0 && s4 == 1 && w4 == 1 && d.is_doubled(r2, 1) && q.m.up() && q.m.st.downs == 0,
+              "a dropped request's reply that came after the 1 s mark and is unread: taken first, the link stays up (" + e + ")");
+        q.m.bye();
+        q.end();
+    }
 }
 
 void case_killed() {
@@ -1669,6 +1686,31 @@ int probe(const std::string& host, int load_n, int pin, int busy_us, int rounds,
     return 0;
 }
 
+// a case that runs this long is hung, or its waits ran to their deadlines (a peer's close not noticed): the run says which case
+// and fails, instead of the whole run going on, or hanging (the cases take well under 20 s each)
+constexpr double kCaseMs = 30000.0;
+std::atomic<const char*> g_case{nullptr};
+std::atomic<double> g_case_t0{0.0};
+
+void run_case(const char* name, void (*fn)()) {
+    g_case_t0 = now_ms();
+    g_case = name;
+    fn();
+    g_case = nullptr;
+}
+
+void watchdog() {
+    for (;;) {
+        sleep_ms(200);
+        const char* c = g_case.load();
+        if (c != nullptr && now_ms() - g_case_t0.load() > kCaseMs) {
+            std::printf("%s: still running after %d s (hung, or waiting out its deadlines) FAIL\nFAILED\n", c, (int) (kCaseMs / 1000.0));
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1700,27 +1742,28 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: ds4_ep_link_test (the cases) | --serve ... | --probe ...\n");
         return 2;
     }
-    case_pure();
-    case_refusals();
-    case_sessions_and_listeners();
-    case_accept_and_rules();
-    case_order();
-    case_closed();
-    case_timeouts();
-    case_late_reply();
-    case_killed();
-    case_badmagic();
-    case_spin_wake();
-    case_read_buffer();
-    case_fill();
-    case_fill_layers();
-    case_fill_gate();
-    case_fill_stop();
-    case_reconnect();
-    case_fill_drop();
-    case_bulk_accept();
-    case_pin_restore();
-    case_rx_stamps();
+    std::thread(watchdog).detach();
+    run_case("case_pure", case_pure);
+    run_case("case_refusals", case_refusals);
+    run_case("case_sessions_and_listeners", case_sessions_and_listeners);
+    run_case("case_accept_and_rules", case_accept_and_rules);
+    run_case("case_order", case_order);
+    run_case("case_closed", case_closed);
+    run_case("case_timeouts", case_timeouts);
+    run_case("case_late_reply", case_late_reply);
+    run_case("case_killed", case_killed);
+    run_case("case_badmagic", case_badmagic);
+    run_case("case_spin_wake", case_spin_wake);
+    run_case("case_read_buffer", case_read_buffer);
+    run_case("case_fill", case_fill);
+    run_case("case_fill_layers", case_fill_layers);
+    run_case("case_fill_gate", case_fill_gate);
+    run_case("case_fill_stop", case_fill_stop);
+    run_case("case_reconnect", case_reconnect);
+    run_case("case_fill_drop", case_fill_drop);
+    run_case("case_bulk_accept", case_bulk_accept);
+    run_case("case_pin_restore", case_pin_restore);
+    run_case("case_rx_stamps", case_rx_stamps);
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails != 0;
 }
