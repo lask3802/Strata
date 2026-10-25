@@ -503,6 +503,23 @@ bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
     return true;
 }
 
+bool load_moe_kernels() {
+#if !defined(STRATA_USE_HIP)
+    for (int t : {kTQK6, kTQK7, kTQK5X, kTQK4X, kTQK5T, kTQK4T}) {   // (DS4_TQ_SWITCH's types, both stream loads)
+        cudaFuncAttributes fa{};
+        bool ok = false;
+#define LK_(K, C) ok = cudaFuncGetAttributes(&fa, gate_up_kernel<K, C, true>) == cudaSuccess && \
+                       cudaFuncGetAttributes(&fa, gate_up_kernel<K, C, false>) == cudaSuccess && \
+                       cudaFuncGetAttributes(&fa, down_kernel<K, C, true>) == cudaSuccess &&    \
+                       cudaFuncGetAttributes(&fa, down_kernel<K, C, false>) == cudaSuccess
+        DS4_TQ_SWITCH(t, LK_)
+#undef LK_
+        if (!ok) return false;
+    }
+#endif
+    return true;
+}
+
 bool set_gate_up(const SetArgs& a, cudaStream_t s) {
     const bool w = use_words();
     if (a.n_embd % 128 != 0 || a.n_ff % (kWaves * kTileRows) != 0) return bad("set_gate_up: geometry not covered");

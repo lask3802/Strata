@@ -48,14 +48,40 @@ std::string utc_now() {
     return b;
 }
 
+constexpr int kMaxDim = 8192;   // (a geometry's n_embd and n_ff at most: the request buffers are this size)
+
+// a main process's session: its geometry, its blobs, the request buffers (all freed with it)
 struct Session {
     GeoMsg geo;
     std::vector<GeoLayer> layers;
     std::vector<x3::ExpertLayout> lay;
-    std::unordered_map<uint32_t, void*> blobs;   // (layer << 16 | expert) -> its blob in VRAM
-    uint64_t used = 0;
+    std::unordered_map<uint32_t, void*> blobs;   // (layer << 16 | expert) -> its blob in the arena
+    // the blobs' VRAM: one cudaMalloc of the room, each blob at a 256 B boundary in it (a cudaMalloc a blob took about
+    // 1 MiB more each on the 3080: past the reserve, the request's own memory failed after the BlobsOk)
+    void* arena = nullptr;
+    uint64_t cap = 0, used = 0;   // (the arena's bytes; the end of its last blob)
+    void* hs = nullptr;           // the request buffers, pinned host and device (kMaxDim), taken before the room is read
+    void* ds = nullptr;
+    void* hm = nullptr;           // (DS4_RX_COPY=map: x, then y, mapped)
+    cudaEvent_t evt[3 + 2 * kMaxRows + 1] = {};   // (DS4_RX_EVENTS)
+    // (DS4_RX_TEST_VRAM_MIB=N, tests: this session's cudaMallocs as on a GPU with N MiB free, each rounded up to 2 MiB
+    // as this PC's driver rounds them, out of memory past it; the room is read from it.  WDDM's own cudaMalloc goes
+    // past the free into host memory, so on Windows only this can run out)
+    uint64_t budget = 0, spent = 0;
+    cudaError_t alloc(void** p, size_t n) {
+        const uint64_t r = (n + (2u << 20) - 1) / (2u << 20) * (2u << 20);
+        if (budget > 0 && spent + r > budget) return cudaErrorMemoryAllocation;
+        const cudaError_t e = cudaMalloc(p, n);
+        if (e == cudaSuccess) spent += r;
+        return e;
+    }
     ~Session() {
-        for (auto& b : blobs) cudaFree(b.second);
+        for (cudaEvent_t e : evt)
+            if (e != nullptr) cudaEventDestroy(e);
+        if (arena != nullptr) cudaFree(arena);
+        if (ds != nullptr) cudaFree(ds);
+        if (hs != nullptr) cudaFreeHost(hs);
+        if (hm != nullptr) cudaFreeHost(hm);
     }
 };
 
@@ -72,11 +98,99 @@ struct Bufs {
 
 enum class Copy { Base, Nr, One, Map };   // (DS4_RX_COPY: how a request's inputs reach the GPU)
 
+// a request of one pick a layer format (the roles' types) on a blob of it, through the requests' kernels and copies,
+// before the BlobsOk: what a first request would meet (a kernel that does not load or launch, no memory left past the
+// room) the main then sees at load.  "" or why it failed
+std::string warm_up(const Session& ss, const Bufs& b, cudaStream_t s) {
+    const int D = ss.geo.n_embd;
+    const int errs0 = gg::launch_errors();
+    std::vector<float> x((size_t) D, 1.0f / 64.0f), y((size_t) D);
+    std::vector<size_t> done;   // (layers whose format had its request)
+    for (size_t li = 0; li < ss.layers.size(); ++li) {
+        const GeoLayer& L = ss.layers[li];
+        bool seen = false;
+        for (size_t d : done) seen = seen || std::equal(L.K, L.K + 3, ss.layers[d].K);
+        if (seen) continue;
+        void* blob = nullptr;
+        for (const auto& kv : ss.blobs)
+            if ((kv.first >> 16) == (uint32_t) li) {
+                blob = kv.second;
+                break;
+            }
+        if (blob == nullptr) continue;
+        done.push_back(li);
+        const unsigned long long plan[8] = {(unsigned long long) blob};
+        const float w[8] = {1.0f};
+        cudaError_t e = cudaMemcpyAsync(b.d_plan, plan, sizeof plan, cudaMemcpyHostToDevice, s);
+        if (e == cudaSuccess) e = cudaMemcpyAsync(b.d_w, w, sizeof w, cudaMemcpyHostToDevice, s);
+        if (e == cudaSuccess) e = cudaMemcpyAsync(b.d_x, x.data(), (size_t) D * 4, cudaMemcpyHostToDevice, s);
+        if (e == cudaSuccess) {
+            x3::MoeArgs ma;
+            ma.plan_ptr = b.d_plan;
+            ma.plan_w = b.d_w;
+            ma.lay = ss.lay[li];
+            ma.k = 1;
+            ma.n_embd = D;
+            ma.n_ff = ss.geo.n_ff;
+            ma.limit = ss.geo.limit;
+            gg::moe_gate_up(ma, b.d_x, b.d_h, s);
+            gg::moe_down(ma, b.d_h, nullptr, b.d_y, s);
+            e = cudaMemcpyAsync(y.data(), b.d_y, (size_t) D * 4, cudaMemcpyDeviceToHost, s);
+        }
+        const cudaError_t es = cudaStreamSynchronize(s);
+        if (e == cudaSuccess) e = es;
+        if (e != cudaSuccess || gg::launch_errors() != errs0) {
+            cudaGetLastError();
+            return "the warm-up request of layer " + std::to_string(li) + " (" + gg::type_name(L.K[0]) + " / " +
+                   gg::type_name(L.K[1]) + " / " + gg::type_name(L.K[2]) + ") failed: " +
+                   (e != cudaSuccess ? cudaGetErrorString(e) : "a kernel did not launch (the server's log says which)");
+        }
+    }
+    return "";
+}
+
 // one main process: 0 when it went away, -1 on a CUDA error
 int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cudaStream_t s) {
     std::string err;
+    Session ss;
+    // the requests: the rows' plan, weights and x packed, one copy in (DS4_RX_COPY=one, the default: 0.02-0.05 ms less a
+    // request than base's two on the 3070).  Diagnostics (env, read at each session):
+    //   DS4_RX_NULL=1    a reply of zeros at once: no prep, no CUDA call (the link and both ends' sockets alone)
+    //   DS4_RX_COPY=base all kMaxRows rows' plan and weights, then x: two copies (the PoC's first path)
+    //               nr   the plan and weights of the request's rows only, packed, then x: two copies
+    //               map  the plan and weights packed (one copy); x read and y written by the kernels in mapped host
+    //                    memory (no x or y copy)
+    //   DS4_RX_EVENTS=1  cudaEvents between the GPU parts (plan in, x in, gate_up, down, y out), printed with the host
+    //                    parts' at the session's end
+    //   DS4_RX_TEST_VRAM_MIB=N  (tests) the session's VRAM as N MiB free (Session::budget)
+    const char* nv = std::getenv("DS4_RX_NULL");
+    const bool null_reply = nv != nullptr && *nv == '1';
+    const char* cv = std::getenv("DS4_RX_COPY");
+    const std::string cm = cv != nullptr && *cv != '\0' ? cv : "one";
+    const Copy cp = cm == "nr" ? Copy::Nr : cm == "base" ? Copy::Base : cm == "map" ? Copy::Map : Copy::One;
+    const char* ev = std::getenv("DS4_RX_EVENTS");
+    const bool evs = ev != nullptr && *ev == '1';
+    const bool diag = null_reply || evs || cp != Copy::One;
+    const char* bv = std::getenv("DS4_RX_TEST_VRAM_MIB");
+    if (bv != nullptr && *bv != '\0') {
+        ss.budget = (uint64_t) std::max(0LL, std::atoll(bv)) << 20;
+        std::fprintf(stderr, "expert server: test: %s MiB of VRAM (DS4_RX_TEST_VRAM_MIB)\n", bv);
+    }
+    // the request buffers (kMaxDim: before the geometry) and events, so that the room read next is the blobs' alone (the
+    // kernels are loaded: serve())
+    const size_t stage = (size_t) kMaxRows * 8 * 8 + (size_t) kMaxRows * 8 * 4 + (size_t) kMaxRows * kMaxDim * 4;
+    RX_CK(cudaHostAlloc(&ss.hs, stage + (size_t) kMaxRows * kMaxDim * 4, cudaHostAllocDefault));
+    RX_CK(ss.alloc(&ss.ds, stage + (size_t) kMaxRows * kMaxDim * 4 + (size_t) 8 * kMaxDim * 4));
+    float* dm = nullptr;
+    if (cp == Copy::Map) {
+        RX_CK(cudaHostAlloc(&ss.hm, (size_t) 2 * kMaxRows * kMaxDim * 4, cudaHostAllocMapped));
+        RX_CK(cudaHostGetDevicePointer((void**) &dm, ss.hm, 0));
+    }
+    if (evs)
+        for (cudaEvent_t& e : ss.evt) RX_CK(cudaEventCreate(&e));
     size_t fr = 0, tot = 0;
     RX_CK(cudaMemGetInfo(&fr, &tot));
+    if (ss.budget > 0) fr = std::min<size_t>(fr, ss.budget - ss.spent);
     HelloMsg me;
     std::memcpy(me.token, token.data(), std::min(token.size(), sizeof me.token - 1));
     me.room = fr > (uint64_t) reserve_mib << 20 ? fr - ((uint64_t) reserve_mib << 20) : 0;
@@ -99,14 +213,13 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         std::fprintf(stderr, "expert server: %s: %s\n", c.peer().c_str(), why);
         return 0;
     }
-    Session ss;
     if (c.recv(h, p, -1, err) != 1 || h.type != Geo || p.size() < sizeof(GeoMsg)) {
         std::fprintf(stderr, "expert server: no geometry (%s)\n", err.c_str());
         return 0;
     }
     std::memcpy(&ss.geo, p.data(), sizeof ss.geo);
     const GeoMsg& g = ss.geo;
-    if (g.n_embd <= 0 || g.n_embd > 8192 || g.n_ff <= 0 || g.n_ff > 8192 || g.n_layers <= 0 || g.n_layers > 256 ||
+    if (g.n_embd <= 0 || g.n_embd > kMaxDim || g.n_ff <= 0 || g.n_ff > kMaxDim || g.n_layers <= 0 || g.n_layers > 256 ||
         p.size() != sizeof(GeoMsg) + (size_t) g.n_layers * sizeof(GeoLayer)) {
         const char why[] = "a geometry this server does not take";
         (void) c.send(Error, 0, 0, 0, 0, why, sizeof why - 1, err);
@@ -125,7 +238,18 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     }
     std::fprintf(stderr, "expert server: main process %s: %d layers, n_embd %d, n_ff %d; %.2f GB of VRAM for blobs\n",
                  c.peer().c_str(), g.n_layers, g.n_embd, g.n_ff, (double) me.room / 1e9);
-    // the blobs, once
+    // the blobs, once, into the arena: the room in one piece
+    std::string refuse;   // (not empty: the BlobsOk is an Error with it, and the main drops this server at load)
+    const cudaError_t ea = me.room > 0 ? ss.alloc(&ss.arena, me.room) : cudaSuccess;
+    if (ea != cudaSuccess) {
+        cudaGetLastError();
+        char w[160];
+        std::snprintf(w, sizeof w, "the room's %.2f GB of VRAM in one piece failed (%s): a bigger --expert-server-reserve-mib",
+                      (double) me.room / 1e9, cudaGetErrorString(ea));
+        refuse = w;
+        ss.arena = nullptr;
+    }
+    ss.cap = ss.arena != nullptr ? me.room : 0;
     std::vector<uint8_t> ok;
     const double t0 = now_ms();
     for (;;) {
@@ -136,18 +260,15 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         if (h.type == BlobsEnd) break;
         if (h.type != Blob) continue;
         const int li = h.a, e = h.b;
-        bool good = li >= 0 && li < g.n_layers && e >= 0 && e < 65536 && ss.layers[(size_t) li].K[0] != 0 &&
-                    p.size() == ss.layers[(size_t) li].blob && ss.used + p.size() <= me.room &&
-                    ss.blobs.count((uint32_t) li << 16 | (uint32_t) e) == 0;
-        void* d = nullptr;
-        if (good && cudaMalloc(&d, p.size()) != cudaSuccess) {
-            cudaGetLastError();
-            good = false;
-        }
+        const uint64_t at = (ss.used + 255) / 256 * 256;
+        const bool good = li >= 0 && li < g.n_layers && e >= 0 && e < 65536 && ss.layers[(size_t) li].K[0] != 0 &&
+                          p.size() == ss.layers[(size_t) li].blob && at + p.size() <= ss.cap &&
+                          ss.blobs.count((uint32_t) li << 16 | (uint32_t) e) == 0;
         if (good) {
+            void* d = (uint8_t*) ss.arena + at;
             RX_CK(cudaMemcpy(d, p.data(), p.size(), cudaMemcpyHostToDevice));
             ss.blobs[(uint32_t) li << 16 | (uint32_t) e] = d;
-            ss.used += p.size();
+            ss.used = at + p.size();
         }
         ok.push_back(good ? 1 : 0);
     }
@@ -155,55 +276,34 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         std::fprintf(stderr, "expert server: %d blobs said, %zu came\n", h.a, ok.size());
         return 0;
     }
-    if (!c.send(BlobsOk, 0, (int32_t) ok.size(), 0, 0, ok.data(), ok.size(), err)) return 0;
-    std::fprintf(stderr, "expert server: %zu blobs (%.2f GB) in VRAM in %.1f s; serving\n", ss.blobs.size(),
-                 (double) ss.used / 1e9, (now_ms() - t0) / 1000.0);
-    // the requests: the rows' plan, weights and x packed, one copy in (DS4_RX_COPY=one, the default: 0.02-0.05 ms less a
-    // request than base's two on the 3070).  Diagnostics (env, read at each session):
-    //   DS4_RX_NULL=1    a reply of zeros at once: no prep, no CUDA call (the link and both ends' sockets alone)
-    //   DS4_RX_COPY=base all kMaxRows rows' plan and weights, then x: two copies (the PoC's first path)
-    //               nr   the plan and weights of the request's rows only, packed, then x: two copies
-    //               map  the plan and weights packed (one copy); x read and y written by the kernels in mapped host
-    //                    memory (no x or y copy)
-    //   DS4_RX_EVENTS=1  cudaEvents between the GPU parts (plan in, x in, gate_up, down, y out), printed with the host
-    //                    parts' at the session's end
     const int D = g.n_embd, FF = g.n_ff;
-    const char* nv = std::getenv("DS4_RX_NULL");
-    const bool null_reply = nv != nullptr && *nv == '1';
-    const char* cv = std::getenv("DS4_RX_COPY");
-    const std::string cm = cv != nullptr && *cv != '\0' ? cv : "one";
-    const Copy cp = cm == "nr" ? Copy::Nr : cm == "base" ? Copy::Base : cm == "map" ? Copy::Map : Copy::One;
-    const char* ev = std::getenv("DS4_RX_EVENTS");
-    const bool evs = ev != nullptr && *ev == '1';
-    const bool diag = null_reply || evs || cp != Copy::One;
     if (diag)
         std::fprintf(stderr, "expert server: diagnostics: %s, copies %s, events %s\n", null_reply ? "NULL replies" : "replies",
                      cm.c_str(), evs ? "on" : "off");
-    Bufs b;
+    Bufs b;   // (the request buffers laid out for this geometry)
     b.stage = (size_t) kMaxRows * 8 * 8 + (size_t) kMaxRows * 8 * 4 + (size_t) kMaxRows * D * 4;
-    void* hs = nullptr;
-    RX_CK(cudaHostAlloc(&hs, b.stage + (size_t) kMaxRows * D * 4, cudaHostAllocDefault));
+    void* const hs = ss.hs;
     b.h_plan = (unsigned long long*) hs;
     b.h_w = (float*) (b.h_plan + kMaxRows * 8);
     b.h_x = b.h_w + kMaxRows * 8;
     b.h_y = b.h_x + (size_t) kMaxRows * D;
-    void* ds = nullptr;
-    RX_CK(cudaMalloc(&ds, b.stage + (size_t) kMaxRows * D * 4 + (size_t) 8 * FF * 4));
+    void* const ds = ss.ds;
     b.d_plan = (unsigned long long*) ds;
     b.d_w = (float*) (b.d_plan + kMaxRows * 8);
     b.d_x = b.d_w + kMaxRows * 8;
     b.d_y = b.d_x + (size_t) kMaxRows * D;
     b.d_h = b.d_y + (size_t) kMaxRows * D;
-    void* hm = nullptr;   // (DS4_RX_COPY=map: x, then y, mapped)
-    float* dm = nullptr;
-    if (cp == Copy::Map) {
-        RX_CK(cudaHostAlloc(&hm, (size_t) 2 * kMaxRows * D * 4, cudaHostAllocMapped));
-        RX_CK(cudaHostGetDevicePointer((void**) &dm, hm, 0));
+    void* const hm = ss.hm;
+    if (refuse.empty()) refuse = warm_up(ss, b, s);
+    if (!refuse.empty()) {
+        (void) c.send(Error, 0, 0, 0, 0, refuse.data(), refuse.size(), err);
+        std::fprintf(stderr, "expert server: %s; the main process drops this server\n", refuse.c_str());
+        return 0;
     }
-    constexpr int kEv = 3 + 2 * kMaxRows + 1;
-    cudaEvent_t evt[kEv] = {};
-    if (evs)
-        for (cudaEvent_t& e : evt) RX_CK(cudaEventCreate(&e));
+    if (!c.send(BlobsOk, 0, (int32_t) ok.size(), 0, 0, ok.data(), ok.size(), err)) return 0;
+    std::fprintf(stderr, "expert server: %zu blobs (%.2f GB) in VRAM in %.1f s, their warm-up done; serving\n",
+                 ss.blobs.size(), (double) ss.used / 1e9, (now_ms() - t0) / 1000.0);
+    cudaEvent_t* const evt = ss.evt;
     enum { kPrep, kEnq, kSync, kPost, kAll, kPlanIn, kXIn, kGateUp, kDown, kYOut, kSpan, kParts };
     static const char* const part_name[kParts] = {"host: the rows' prep", "host: the copies' and kernels' enqueue",
                                                   "host: the sync's wait", "host: bf16 and send", "host: the whole request",
@@ -388,12 +488,7 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         last_end = now_ms();   // (after this one's timing and line: the gap is the main's and the network's)
     }
     cudaStreamSynchronize(s);
-    if (evs)
-        for (cudaEvent_t& e : evt) cudaEventDestroy(e);
-    if (hm != nullptr) cudaFreeHost(hm);
-    cudaFree(ds);
-    cudaFreeHost(hs);
-    return rc;
+    return rc;   // (the buffers, the events and the arena: ~Session)
 }
 
 }  // namespace
@@ -404,6 +499,17 @@ int serve(const std::string& host_port, const std::string& token, int64_t reserv
     cudaStream_t s = nullptr;
     RX_CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     if (!gg::prepare(s)) return 1;
+    // every kernel a request can launch, loaded before any session reads its room (DS4_RX_PRELOAD=0, tests: not, so
+    // that CUDA's lazy loading takes their memory at the first launch, which is then the warm-up's)
+    const char* lv = std::getenv("DS4_RX_PRELOAD");
+    if (!(lv != nullptr && *lv == '0')) {
+        size_t f0 = 0, f1 = 0, tot = 0;
+        cudaMemGetInfo(&f0, &tot);
+        if (!gg::load_moe_kernels()) return 1;
+        cudaMemGetInfo(&f1, &tot);
+        std::fprintf(stderr, "expert server: the requests' kernels loaded (%.1f MiB of VRAM)\n",
+                     f0 > f1 ? (double) (f0 - f1) / 1048576.0 : 0.0);
+    }
     if (token.empty()) std::fprintf(stderr, "expert server: WARNING: no STRATA_STAGE_TOKEN\n");
     std::fprintf(stderr, "expert server: GPU %d\n", dev);
     struct Arg {

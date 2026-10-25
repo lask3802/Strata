@@ -999,6 +999,26 @@ bool mx_geometry(const char* who, int k, int n_embd, int n_ff) {
 // ---------------------------------------------------------------- entry points
 bool prepare(cudaStream_t s) { return scratch(s) != nullptr; }
 
+bool load_moe_kernels() {
+#if !defined(STRATA_USE_HIP)
+    cudaFuncAttributes fa{};
+    if (cudaFuncGetAttributes(&fa, q8_quant_kernel) != cudaSuccess ||
+        cudaFuncGetAttributes(&fa, mx_gate_up_kernel<1, true>) != cudaSuccess ||
+        cudaFuncGetAttributes(&fa, mx_gate_up_kernel<1, false>) != cudaSuccess ||
+        cudaFuncGetAttributes(&fa, mx_down_kernel<1, true>) != cudaSuccess ||
+        cudaFuncGetAttributes(&fa, mx_down_kernel<1, false>) != cudaSuccess ||
+        cudaFuncGetAttributes(&fa, mx_combine_kernel) != cudaSuccess) {
+        check("load_moe_kernels");
+        return false;
+    }
+#endif
+    if (!iq::load_moe_kernels()) {
+        fail("load_moe_kernels: a low-bit type's kernel did not load");
+        return false;
+    }
+    return true;
+}
+
 int launch_errors() { return g_errors.load(std::memory_order_relaxed); }
 
 size_t type_row_bytes(int type, int64_t k) {
@@ -1274,7 +1294,10 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
         ia.xq = sc->xq;
         ia.xd = sc->xd;
         q8_quant(x, (size_t) a.n_embd, 1, a.n_embd, sc->xq, sc->xd, s);
-        iq::gate_up(ia, a.k, 1, s);
+        if (!iq::gate_up(ia, a.k, 1, s)) {   // (Q5_K / Q6_K: supported, but no token kernel; h was left as it was)
+            fail("moe_gate_up: the experts' type has no token kernel");
+            return;
+        }
         check("moe_gate_up");
         return;
     }
@@ -1311,7 +1334,10 @@ bool moe_down_experts(const x3::MoeArgs& a, const float* h, cudaStream_t s) {
         ia.part = sc->part;
         ia.hq = sc->hq;
         ia.hd = sc->hd;
-        iq::down(ia, a.k, 1, s);
+        if (!iq::down(ia, a.k, 1, s)) {
+            fail("moe_down: the experts' type has no token kernel");
+            return false;
+        }
     } else {
         launch_groups<DownK>(m, a.n_embd, a.k, 1, s);
     }

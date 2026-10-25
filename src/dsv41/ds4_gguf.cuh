@@ -55,6 +55,9 @@ bool type_on_device(int type);
 
 /// The per-stream scratch of the MXFP4 experts on the current device (once per stream, as x3::prepare).
 bool prepare(cudaStream_t s);
+/// Loads every kernel moe_gate_up / moe_down can launch (MXFP4 and each low-bit type, one entry a group: the expert
+/// server's), so that CUDA's lazy loading takes their memory now and not at the first request.  false: one failed (printed).
+bool load_moe_kernels();
 
 /// x3::mv's contract for GGUF matrices (F32 activations): each job's m->fmt kFmtBF16 (raw = BF16 [n][ld], ld values a
 /// row), kFmtMXFP4 (raw = MXFP4 [n][k / 32] blocks, ld bytes a row; 0: mx_row_bytes(k)) - an expert's matrix in VRAM -

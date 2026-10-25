@@ -46,7 +46,8 @@ enum Msg : uint32_t {
     Geo = 2,        // main -> server: payload GeoMsg, then n_layers x GeoLayer
     Blob = 3,       // main -> server: a = layer, b = expert; payload the blob (GeoLayer's layout)
     BlobsEnd = 4,   // main -> server: a = the blobs sent
-    BlobsOk = 5,    // server -> main: payload uint8 ok[blobs] (1: in its VRAM)
+    BlobsOk = 5,    // server -> main: payload uint8 ok[blobs] (1: in its VRAM); or an Error (it cannot serve them: the
+                    // room's VRAM in one piece or its warm-up requests failed) and the main drops the server
     Req = 6,        // main -> server: seq, a = layer, b = rows; payload rows x (ReqRow, then bf16 x[n_embd])
     Resp = 7,       // server -> main: seq, a = rows, c = the server's time (us); payload rows x bf16 y[n_embd]
     Error = 9,      // either way: payload the message
