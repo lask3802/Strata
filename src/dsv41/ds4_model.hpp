@@ -103,6 +103,9 @@ struct Stats {
     double eg_io_ms = 0.0;                            // the windows' Engram reads, issue to last done (mostly hidden)
     int64_t eg_cached = 0, eg_cache_cap = 0;          // the row cache's rows held, its capacity
     int64_t swaps = 0;                // experts the cache moved into VRAM
+    // the cache settles (cache_settle calls) since the load: with the expert server one a prompt (rx::PromptSettle; a
+    // chunked run settles each run, so a prompt read in two - pin=N - settles twice); verbose: a line each
+    int64_t prompt_settles = 0;
     int64_t skipped = 0;              // routed experts STRATA_DS4_DISK_SKIP_W left out (light, not in RAM)
     int64_t ram_experts = 0, ram_moves = 0;   // CPU-lane experts read from the RAM tier; experts moved into it
     double prof_ms[6] = {};          // DS4_PROF: the GPU's time in decode by stage (between layers, attention, routing +

@@ -939,6 +939,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # the remote experts' send gate and reply deadline (rx::Gate, ds4_rx.hpp): no GPU, no socket
       add_executable(ds4_rx_gate_test tests/dsv41/rx_gate_test.cpp)
       target_compile_features(ds4_rx_gate_test PRIVATE cxx_std_17)
+      # the remote experts' fills (ds4_rx_fill.hpp, EP U5): the remote tier's choice, the fill budget, the RAM tier's
+      # rule; no GPU, no socket
+      add_executable(ds4_rx_fill_test tests/dsv41/rx_fill_test.cpp)
+      target_compile_features(ds4_rx_fill_test PRIVATE cxx_std_17)
       # the link's arrival time in the kernel (rx::Conn, SO_TIMESTAMPNS on Linux) over loopback: no GPU
       add_executable(ds4_rx_link_test tests/dsv41/rx_link_test.cpp src/dsv41/ds4_rx.cpp)
       target_compile_features(ds4_rx_link_test PRIVATE cxx_std_17)

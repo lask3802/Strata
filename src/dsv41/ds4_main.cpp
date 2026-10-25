@@ -1507,6 +1507,7 @@ int profile_run(strata::ds4::Model& m, const std::string& ids_path, int window) 
         m.reset();
         for (size_t a = 0; a < ids.size();) {
             const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);
+            // (no logits: with --remote-experts its windows never settle the cache - offline, run without a server)
             if (!m.feed(ids.data() + a, T, 0, err)) {
                 std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
                 return 1;

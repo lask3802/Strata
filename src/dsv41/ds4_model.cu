@@ -22,6 +22,7 @@
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
+#include "ds4_rx_fill.hpp"
 #include "ds4_rx.hpp"
 #include "ds4_rx_split.hpp"
 #include "ds4_stage.hpp"
@@ -1147,6 +1148,7 @@ struct Model::Impl {
     // logical CPUs, which the CPU lane's pools leave out; a window's start (forward), for serve_lane's Wake;
     // DS4_EP_WAKE=0: no Wake and the lane's 2 ms naps as without the link (A/B)
     int ep_cpu = -1;
+    bool ep_freed = false;   // (no server held any expert: the link core went back to the CPU lane at the load)
     std::vector<int> ep_sibs;
     std::atomic<bool> rx_wake{false};
     bool ep_wake = true;
@@ -1207,6 +1209,8 @@ struct Model::Impl {
                             // l's FFN one) on purpose, which the comparison must show; decode stays exact
     float* v_err = nullptr;
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
+    bool win_prompt = false;   // (feed_windows: a prompt's windows - their cache ticks are the decode's, serve_T 0)
+    rx::PromptSettle psettle;  // (a window prompt's settle: once a prompt, ds4_rx_fill.hpp)
     // lookahead: while layer L runs, the device guesses the next layer's picks (its gate on L's FFN input, the same
     // choice) and publishes them with L's routing; the CPU lane asks for the guessed experts it will read from the files
     // at once (a thread of its own, os::prefetch), so the SSD reads them while L computes instead of on the next
@@ -3164,6 +3168,15 @@ struct Model::Impl {
         }
         if (!rx_slices_ok(err)) return false;
         rx_setup();   // (--remote-experts: the expert server's blobs, before the service thread takes the link)
+        if (!rx_on && ep_cpu >= 0) {   // (no server after all: the link core and its sibling back to the CPU lane - the
+                                       // pools are idle until the service thread starts, below)
+            std::fprintf(stderr, "ds4: remote experts: none held - the link core (CPU %d) goes back to the CPU lane\n", ep_cpu);
+            ep_cpu = -1;
+            ep_freed = true;
+            ep_sibs.clear();
+            pools.clear();
+            make_pools();
+        }
         if (!defer_setup(err)) return false;
         {
             void* m = nullptr;
@@ -5034,8 +5047,10 @@ struct Model::Impl {
         for (const Layer& l : L) {
             if (l.il >= g.nl) continue;
             const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+            const uint8_t* srv = rx_row(l, 0);   // (the expert server's, sent at rx_setup: the decode's lane does not read them)
             for (int e = 0; e < l.n_exp; ++e)
-                if (l.slot[(size_t) e] < 0 && p[e] > 0) cand.push_back({(double) p[e] / (double) l.blob, {l.il, e}});
+                if (l.slot[(size_t) e] < 0 && (srv == nullptr || srv[e] == 0) && p[e] > 0)
+                    cand.push_back({(double) p[e] / (double) l.blob, {l.il, e}});
         }
         std::stable_sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         std::vector<std::pair<int, int>> list;
@@ -5124,6 +5139,7 @@ struct Model::Impl {
     }
 
     void reset() {
+        psettle.next();   // (another prompt from here)
         pos = 0;
         toks.clear();
         ctoks.clear();
@@ -5239,6 +5255,7 @@ struct Model::Impl {
     }
 
     bool restore(int64_t limit) {
+        psettle.next();   // (another prompt from here)
         const int b = ckpt_ok() ? best_check(limit) : -1;   // (a remote stage keeps none, unless it was asked to)
         if (b < 0) return false;
         const Check& c = ck[b];
@@ -6486,6 +6503,11 @@ struct Model::Impl {
     // follows finds the hot experts in VRAM.  Rounds of the ordinary swap rule (the hottest CPU-lane pick of each layer
     // in, its coldest VRAM expert out) until nothing is worth moving or DS4_SETTLE_MS (6000) is spent
     void cache_settle() {
+        psettle.settled();
+        ++st.prompt_settles;
+        if (o.verbose && rx_on)   // (the CT's check: settles == prompts)
+            std::fprintf(stderr, "ds4: expert cache: settle %lld (one a prompt with the expert server)\n",
+                         (long long) st.prompt_settles);
         if (!o.expert_cache || cache_ths.empty()) return;
         static const double budget = env_f("DS4_SETTLE_MS", 6000.0f);
         if (budget <= 0.0) return;
@@ -6507,8 +6529,10 @@ struct Model::Impl {
             std::vector<std::pair<float, std::pair<int, int>>> hot;
             for (const Layer& l : L) {
                 if (l.mtp) continue;
+                const uint8_t* srv = rx_row(l, 0);   // (the expert server's: the decode's lane does not read them)
                 for (int e = 0; e < l.n_exp; ++e)
-                    if (l.slot[(size_t) e] < 0 && l.heat[(size_t) e] >= 4.0f) hot.push_back({l.heat[(size_t) e], {l.il, e}});
+                    if (l.slot[(size_t) e] < 0 && (srv == nullptr || srv[e] == 0) && l.heat[(size_t) e] >= 4.0f)
+                        hot.push_back({l.heat[(size_t) e], {l.il, e}});
             }
             std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             std::vector<std::pair<int, int>> list;
@@ -6657,11 +6681,9 @@ struct Model::Impl {
                 }
             }
             if (l.ram.empty() || ram_free.empty() || ram_inflight >= kMaxSwaps) continue;
-            int rb = -1;   // RAM: the hottest read from the file, in place of the layer's coldest held (or a free slot)
-            for (int e : hits)
-                if (e != vin && l.slot[(size_t) e] < 0 && l.ram[(size_t) e] < 0 &&
-                    (rb < 0 || l.heat[(size_t) e] > l.heat[(size_t) rb]))
-                    rb = e;
+            // RAM: the hottest read from the file, in place of the layer's coldest held (or a free slot) - not one the
+            // expert server holds (the lane does not compute it where the server serves: rx_row, as the VRAM tier)
+            const int rb = rx::ram_in(hits, l.slot.data(), l.ram.data(), l.heat.data(), rx_row(l, serve_T), vin);
             if (rb < 0) continue;
             int rc = -1;
             for (int e = 0; e < l.n_exp; ++e)
@@ -7032,9 +7054,9 @@ struct Model::Impl {
         rx_wait.reserve(1 << 20);
         rx_arr.reserve(1 << 20);
     }
-    // layer l's experts the expert server holds, for the hits of a window of T rows (0: the settle, or the tick after a
-    // chunked prompt - the decode's) ([n_exp]; null:
-    // none, the link given up - the lane's again -, or a window the server does not serve: DS4_SYNC, T past
+    // layer l's experts the expert server holds, for the hits of a window of T rows (0: the settle, the tick after a
+    // chunked prompt or a window prompt's ticks - the decode's) ([n_exp]; null:
+    // none, the link given up - the lane's again -, or a decode window the server does not serve: DS4_SYNC, T past
     // async_max_t - rx::lane_serves - whose CPU lane computed them itself)
     const uint8_t* rx_row(const Layer& l, int T) const {
         return rx_on && rx::lane_serves(T, par, sync_decode, async_max_t) && !l.mtp && l.n_exp == g.n_exp &&
@@ -7374,7 +7396,7 @@ struct Model::Impl {
               "remote experts per token: the lane's own part %.2f ms + its wait %.2f ms + the late ones %.2f ms; the "
               "link %.1f KB out, %.1f KB in; the upload %lld experts, %.2f GB in %.1f s, %lld of them in this "
               "GPU's VRAM too now (the cache's: none but zero-copy ones, after the link was given up, or after "
-              "windows the server does not serve: DS4_SYNC, T past DS4_ASYNC_T)\n",
+              "decode windows the server does not serve: DS4_SYNC, T past DS4_ASYNC_T)\n",
               local + served > 0 ? 100.0 * served / (local + served) : 0.0, served / nt, (local + served) / nt,
               (double) (st.rx_fallback - s0.rx_fallback) / nt, (long long) (st.rx_late - s0.rx_late),
               (long long) (st.rx_late_link - s0.rx_late_link), (long long) (st.rx_backoffs - s0.rx_backoffs),
@@ -7457,7 +7479,8 @@ struct Model::Impl {
         add_f(b,
               "remote experts' link: the service thread on CPU %d%s (the CPU lane's pools off CPUs%s); keep-awake "
               "%s: %lld Wakes sent (%.3f a token), %lld requests found the lane napping\n",
-              ep_cpu, ep_cpu < 0 ? " (DS4_EP_CPU off: as without the link)" : "", sibs.empty() ? " -" : sibs.c_str(),
+              ep_cpu, ep_cpu >= 0 ? "" : ep_freed ? " (none: no server held any expert, the core went back to the CPU lane)"
+                                                 : " (DS4_EP_CPU off: as without the link)", sibs.empty() ? " -" : sibs.c_str(),
               ep_wake ? "on" : "off (DS4_EP_WAKE=0)", (long long) (st.rx_wakes - s0.rx_wakes),
               (double) (st.rx_wakes - s0.rx_wakes) / std::max(1.0, nt), (long long) (st.lane_nap_reqs - s0.lane_nap_reqs));
         if (rx_k < rx_nb) {   // H' (DS4_EP_K)
@@ -9259,10 +9282,24 @@ struct Model::Impl {
     // n tokens through windows of 16, the last one's logits_rows rows of logits
     bool feed_windows(const int* tokens, int n, int logits_rows, std::string& err) {
         logits_all = false;
-        for (int a = 0; a < n; a += kWin) {
-            const int T = std::min(kWin, n - a);
-            if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, false, err)) return false;   // (a prompt's: whole)
+        {
+            struct Off {   // (win_prompt false again on every way out)
+                bool& f;
+                ~Off() { f = false; }
+            } off{win_prompt};
+            win_prompt = true;   // (its ticks as the chunked prompt's: for the decode that follows)
+            for (int a = 0; a < n; a += kWin) {
+                const int T = std::min(kWin, n - a);
+                if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, false, err)) return false;   // (a prompt's: whole)
+            }
         }
+        // with the expert server: the settle, as after a chunked prompt - the cache's swaps for the decode that follows -,
+        // once a prompt (rx::PromptSettle: the feed that asks for logits, unless the prompt's chunked part settled
+        // already).  Before U5a nothing settled after a window prompt, and its ticks (serve_T = T: past async_max_t
+        // the lane's) put the server's experts into this GPU's VRAM (slot 20261025T1243Z's ep2 arm: no settle line, 9
+        // server experts in VRAM); win_prompt keeps them the server's now, as the decode's (rx::lane_serves(0, ..):
+        // unless DS4_SYNC).  Without the server as before
+        if (psettle.after_feed(rx_on, logits_rows) && (!o.stage_worker || stage_last)) cache_settle();
         return true;
     }
     // the picked path took ms: the flow's predictions for the prompt's size class scaled by what it really takes (taken
@@ -10037,7 +10074,8 @@ struct Model::Impl {
         prof_collect();
         pos += T;
         st.tokens += T;
-        cache_tick(T);
+        cache_tick(T, win_prompt ? 0 : -1);   // (a window prompt's: the server's experts as the decode's, rx_row(.., 0))
+        if (ep) psettle.next();   // (a decode window: the next prompt settles again)
         if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err)) return false;
         return true;
     }
@@ -10977,9 +11015,12 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
                             ? p.forward_chunks(tokens, n, logits_rows, err)
                             : p.feed_windows(tokens, n, logits_rows, err);
         if (ok) p.path_done(now_ms() - t0);
+        if (logits_rows > 0) p.psettle.next();   // (a feed that asks for logits ends a prompt: the next is another's)
         return ok;
     }
-    return p.feed_windows(tokens, n, logits_rows, err);
+    const bool ok = p.feed_windows(tokens, n, logits_rows, err);
+    if (logits_rows > 0) p.psettle.next();
+    return ok;
 }
 bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
     Impl& p = *p_;
@@ -10993,17 +11034,20 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
                                               : p.feed_windows(tokens, n - 1, 0, err)) &&
                         (p.checkpoint(slot), p.feed_windows(tokens + n - 1, 1, logits_rows, err));
         if (ok) p.path_done(now_ms() - t0);
+        if (logits_rows > 0) p.psettle.next();   // (as feed's)
         return ok;
     }
     if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && (p.o.remote_stage || p.pick_path(n))) {   // (the last token rides along; its layers
         const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot);   // keep the state before it)
         if (ok) p.path_done(now_ms() - t0);
+        if (logits_rows > 0) p.psettle.next();
         return ok;
     }
     if (n > 1 && !p.feed_windows(tokens, n - 1, 0, err)) return false;
     p.checkpoint(slot);
     const bool ok = n < 1 || p.feed_windows(tokens + n - 1, 1, logits_rows, err);
     if (ok) p.path_done(now_ms() - t0);   // (windows, when pick_path chose them)
+    if (logits_rows > 0) p.psettle.next();
     return ok;
 }
 int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) p_->o.max_context) : kWin; }
@@ -11112,7 +11156,9 @@ bool Model::stage_run(const int32_t* tokens, int T, int64_t p0, std::string& err
     }
     p.stage_t = 0;
     p.spec_win = T > 1;   // (a window of 2 or more rows may be a draft's check: its layers keep their backups)
-    const bool ok = p.forward(tk.data(), T, 0, false, err);   // (the link carries no window kind: no slices here, ep_slices_ok)
+    // (the link carries no window kind: no slices here, ep_slices_ok; its cache ticks keep serve_T = T - a stage worker is
+    // not on the expert server's path)
+    const bool ok = p.forward(tk.data(), T, 0, false, err);
     p.spec_win = false;
     if (!ok) return false;
     if (T > 1) p.stage_t = T;
