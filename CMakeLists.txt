@@ -950,6 +950,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       if(WIN32)
         target_link_libraries(ds4_stage_test PRIVATE ws2_32)
       endif()
+      # the EP link (src/net/ep_link.{hpp,cpp}): the hellos and their refusals, the request rules, timeouts, a peer killed
+      # mid-frame, the spin budget and Wakes, fills and epochs - between two processes on 127.0.0.1; --serve / --probe:
+      # the token-shaped round trips between two PCs (its own libstdc++ inside, so it runs on the other PC's system too).
+      # No GPU, no model
+      add_executable(ds4_ep_link_test tests/dsv41/ep_link_test.cpp src/net/ep_link.cpp)
+      target_include_directories(ds4_ep_link_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/net)
+      target_compile_features(ds4_ep_link_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_ep_link_test PRIVATE Threads::Threads)
+      if(WIN32)
+        target_link_libraries(ds4_ep_link_test PRIVATE ws2_32)
+      elseif(NOT APPLE)
+        target_link_options(ds4_ep_link_test PRIVATE -static-libstdc++ -static-libgcc)
+      endif()
       # the EP parts pack's read side (ds4_epparts.hpp; tools/dsv41/ep_parts.py writes it): parts -> whole byte for byte,
       # the slice views, the refusals; with PACK PARTS arguments the same against a real pack.  No GPU, no model
       add_executable(ds4_epparts_test tests/dsv41/epparts_test.cpp src/net/stage_link.cpp)
