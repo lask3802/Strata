@@ -2092,8 +2092,9 @@ int main(int argc, char** argv) {
     }
     if (s.rx_split_n > s0.rx_split_n) {   // DS4_EP_SPLIT_VERIFY
         // the server's slice sums in bf16 against this lane's for the same x in bf16: the bf16 rounding of a sum (~4e-3);
-        // a layer above it is a wiring bug (a block twice or not at all) - and under =2 (the server's slice from k - 1,
-        // or twice) every layer checked must be above it
+        // a layer above it is the server's share wired wrong (its blocks, its picks, its parts) - and under =2 (the
+        // server's slice from k - 1, or twice) every layer checked must be above it.  This end's own [0, k) and the
+        // fallback's [k, nb) are not in it: the slot's quality checks (KL, bytecheck) are theirs
         const float bound = 1e-2f;
         int last = -1, worst = -1, above = 0, seen = 0;
         for (int i = 0; i < 64; ++i)
