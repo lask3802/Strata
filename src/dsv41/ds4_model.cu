@@ -6570,9 +6570,9 @@ struct Model::Impl {
             if (l.cpu_hits.empty()) continue;
             std::vector<int> hits;
             hits.swap(l.cpu_hits);
-            int best = -1, vin = -1;
-            for (int e : hits)
-                if (l.slot[(size_t) e] < 0 && (best < 0 || l.heat[(size_t) e] > l.heat[(size_t) best])) best = e;
+            // (the expert server's experts never in: there they cost the lane nothing, so the slot would be lost - the
+            // prompt's hits and the settle after it list them, the decode's serve_lane does not)
+            int best = rx::cache_in(hits, l.slot.data(), l.heat.data(), rx_row(l)), vin = -1;
             if (best >= 0 && l.spare_vram >= 0 && !l.swap_pending && sw_inflight < c_inflight) {   // VRAM: the hottest in
                 int cold = -1;
                 for (int e = 0; e < l.n_exp; ++e)
@@ -6899,6 +6899,19 @@ struct Model::Impl {
         rx_wait.reserve(1 << 20);
         rx_arr.reserve(1 << 20);
     }
+    // layer l's experts the expert server holds ([n_exp]; null: none, or the link given up - the lane's again)
+    const uint8_t* rx_row(const Layer& l) const {
+        return rx_on && !l.mtp && l.n_exp == g.n_exp && (size_t) (l.il + 1) * g.n_exp <= rx_has.size()
+                   ? rx_has.data() + (size_t) l.il * g.n_exp
+                   : nullptr;
+    }
+    int64_t rx_in_vram() const {   // (the server's experts in this GPU's VRAM too)
+        int64_t n = 0;
+        for (const Layer& l : L)
+            if (!l.mtp && l.n_exp == g.n_exp && (size_t) (l.il + 1) * g.n_exp <= rx_has.size())
+                for (int e = 0; e < l.n_exp; ++e) n += l.slot[(size_t) e] >= 0 && rx_has[(size_t) l.il * g.n_exp + e];
+        return n;
+    }
     // the link given up: the lane computes every pick from now on (said once)
     void rx_lost(const std::string& why) {
         if (!rx_on) return;
@@ -7158,7 +7171,8 @@ struct Model::Impl {
                       "remote experts per request: round trip %s ms (the server's own %.3f ms; send to the reply's arrival "
                       "in the kernel %s ms), the lane's wait after its part %s ms\n"
                       "remote experts per token: the lane's own part %.2f ms + its wait %.2f ms + the late ones %.2f ms; the "
-                      "link %.1f KB out, %.1f KB in; the upload %lld experts, %.2f GB in %.1f s\n",
+                      "link %.1f KB out, %.1f KB in; the upload %lld experts, %.2f GB in %.1f s, %lld of them in this "
+                      "GPU's VRAM too now (the cache's: none but after the link was given up)\n",
                       local + served > 0 ? 100.0 * served / (local + served) : 0.0, served / nt, (local + served) / nt,
                       (double) (st.rx_fallback - s0.rx_fallback) / nt, (long long) (st.rx_late - s0.rx_late),
                       (long long) (st.rx_late_link - s0.rx_late_link), (long long) (st.rx_backoffs - s0.rx_backoffs),
@@ -7168,7 +7182,8 @@ struct Model::Impl {
                       (st.cpu_ms - s0.cpu_ms) / nt, (st.rx_wait_ms - s0.rx_wait_ms) / nt,
                       (st.rx_fallback_ms - s0.rx_fallback_ms) / nt,
                       (double) (st.rx_bytes_out - s0.rx_bytes_out) / 1e3 / nt, (double) (st.rx_bytes_in - s0.rx_bytes_in) / 1e3 / nt,
-                      (long long) st.rx_held, (double) st.rx_upload_bytes / 1e9, st.rx_upload_ms / 1000.0);
+                      (long long) st.rx_held, (double) st.rx_upload_bytes / 1e9, st.rx_upload_ms / 1000.0,
+                      (long long) rx_in_vram());
         std::string out = b;
         std::snprintf(b, sizeof b,
                       "remote experts' late replies that came after all: %lld (%lld read with a later reply, %lld with no "

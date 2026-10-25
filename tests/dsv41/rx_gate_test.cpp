@@ -293,6 +293,21 @@ int main() {
         check(rx::slice_refusal(true, 1024, 1280, 2304) != nullptr, "a slice [1024, 2304): refused");
         check(rx::slice_refusal(false, 0, 1024, 2304) == nullptr, "no --remote-experts: the slice is not ours to refuse");
     }
+    {
+        // the expert cache does not take the expert server's experts into VRAM (lead 2026-10-25: the settle after the
+        // prompt moved 67, and the server's share of the lane's picks fell from 20.2% to 16.3%)
+        const std::vector<int> hits = {3, 5, 7, 5};
+        int slot[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+        const float heat[8] = {0, 0, 0, 9.0f, 0, 6.0f, 0, 4.0f};
+        const uint8_t none[8] = {0, 0, 0, 0, 0, 0, 0, 0}, held3[8] = {0, 0, 0, 1, 0, 0, 0, 0},
+                      all[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+        check(rx::cache_in(hits, slot, heat, nullptr) == 3, "no expert server: the hottest hit (3)");
+        check(rx::cache_in(hits, slot, heat, none) == 3, "the server holds none of them: the hottest hit (3)");
+        check(rx::cache_in(hits, slot, heat, held3) == 5, "the server holds 3: the next hottest (5)");
+        check(rx::cache_in(hits, slot, heat, all) == -1, "the server holds all of them: none");
+        slot[5] = 0;
+        check(rx::cache_in(hits, slot, heat, held3) == 7, "5 in VRAM already, 3 on the server: 7");
+    }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;
 }
