@@ -148,6 +148,10 @@ struct Stats {
     // trip at that T expected to cost more than the lane computing its picks)
     int64_t rx_req_t[17] = {}, rx_late_t[17] = {}, rx_skip_t[17] = {};
     int64_t ep_late = 0;   // DS4_EP_DEFER: the layers whose mailbox part the next layer (or the head) added
+    // DS4_EP_DEFER_VERIFY: the checks made (a layer's deferred streams against the exact ones), and by the layer whose
+    // part it was the largest relative difference since the load (the last layer's: before the head)
+    int64_t ep_verify_n = 0;
+    float ep_verify[64] = {};
 };
 
 class Model {
