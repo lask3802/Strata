@@ -87,6 +87,7 @@ bool SliceLane::init_(const ep::Parts& parts, const std::vector<Types>& types, i
                 lo_ = std::max(lo_, run_lo(parts, (int) l, e, kind, nb_));
             }
         f.cap = gg::tq_cpu_type(ty.tg) || gg::tq_cpu_type(ty.td) ? 8 : kLaneMaxRows;   // (the trellis rows: 8 tokens a call, tq_cpu.hpp kTqMaxTokens - the main's ent_cap)
+        f.ty = ty;
         f.on = true;
         any = true;
     }
@@ -97,6 +98,17 @@ bool SliceLane::init_(const ep::Parts& parts, const std::vector<Types>& types, i
     yd_.assign((size_t) kLaneMaxRows * kLaneMaxPicks * (size_t) n_embd, 0.0f);
     ents_.reserve((size_t) kLaneMaxRows * kLaneMaxPicks);
     pool_ = std::make_unique<Pool>(std::max(0, threads), cpus, spin_us);
+    return true;
+}
+
+bool SliceLane::views(const ep::Parts& from, int layer, int e, int k0, int k1, ep::View* v) const {
+    const Fmt& f = fmt_[(size_t) layer];
+    const size_t ub = f.fm.d_row / (size_t) nb_;   // (a down row's bytes a block)
+    for (int kind = 0; kind < 3; ++kind)
+        if (!from.view(layer, e, kind, k0, v[kind]) || v[kind].b < k1 || v[kind].type != (kind < 2 ? f.ty.tg : f.ty.td) ||
+            (kind < 2 ? v[kind].row_bytes != f.fm.gu_row
+                      : v[kind].rows != (uint32_t) dim_ || v[kind].stride != ub * (size_t) (v[kind].b - v[kind].a)))
+            return false;
     return true;
 }
 
@@ -111,20 +123,33 @@ bool SliceLane::run(int layer, int k, const SlicePick* picks, int np, int nr, co
               std::to_string(lo_) + ", " + std::to_string(nb_) + ")";
         return false;
     }
+    return run_range(layer, k, nb_, *parts_, picks, np, nr, x, ldx, y, ldy, help, err);
+}
+
+bool SliceLane::run_range(int layer, int k0, int k1, const ep::Parts& from, const SlicePick* picks, int np, int nr,
+                          const float* x, size_t ldx, float* y, size_t ldy, bool help, std::string& err) {
+    if (layer < 0 || layer >= (int) fmt_.size() || !fmt_[(size_t) layer].on) {
+        err = "layer " + std::to_string(layer) + " is not served here";
+        return false;
+    }
+    if (k0 < 0 || k0 >= k1 || k1 > nb_) {
+        err = "n_ff blocks [" + std::to_string(k0) + ", " + std::to_string(k1) + ") outside [0, " + std::to_string(nb_) + ")";
+        return false;
+    }
     if (nr < 1 || nr > kLaneMaxRows || np < 0 || np > nr * kLaneMaxPicks) {
         err = "a request of " + std::to_string(nr) + " rows and " + std::to_string(np) + " slice picks";
         return false;
     }
     if (np == 0) return true;
     for (int i = 0; i < np; ++i)
-        if (picks[i].t < 0 || picks[i].t >= nr || picks[i].e < 0 || picks[i].e >= parts_->experts()) {
+        if (picks[i].t < 0 || picks[i].t >= nr || picks[i].e < 0 || picks[i].e >= from.experts()) {
             err = "a slice pick of row " + std::to_string(picks[i].t) + ", expert " + std::to_string(picks[i].e);
             return false;
         }
     const double t0 = lane_ms_now();
     const gg::IqCpu& fm = fmt_[(size_t) layer].fm;
     const int cap = fmt_[(size_t) layer].cap;
-    const int E = dim_, ff0 = 256 * k, ffn = ff_ - ff0;
+    const int E = dim_, ff0 = 256 * k0, ffn = (k1 >= nb_ ? ff_ : 256 * k1) - ff0;
     gg::IqCpu fs;
     size_t d_off = 0;
     if (!gg::iq_cpu_slice(fm, ff0, ffn, fs, d_off, err)) return false;
@@ -152,12 +177,12 @@ bool SliceLane::run(int layer, int k, const SlicePick* picks, int np, int nr, co
         Ent en;
         en.e = picks[ord[a]].e;
         en.slot0 = (int) a;
-        for (int kind = 0; kind < 3; ++kind)   // (a part to nb: two that overlap, the first one found may end before it)
-            if (!parts_->view(layer, en.e, kind, k, en.v[kind]) || en.v[kind].b != nb_ || (kind == 2 && en.v[2].row_bytes != fs.d_row)) {
-                err = "layer " + std::to_string(layer) + " expert " + std::to_string(en.e) + ": no part holds blocks [" + std::to_string(k) +
-                      ", " + std::to_string(nb_) + ")";
-                return false;
-            }
+        // (a part to k1: two that overlap, the first one found may end before it)
+        if (!views(from, layer, en.e, k0, k1, en.v) || fm.d_row / (size_t) nb_ * (size_t) (k1 - k0) != fs.d_row) {
+            err = "layer " + std::to_string(layer) + " expert " + std::to_string(en.e) + ": no part holds blocks [" + std::to_string(k0) +
+                  ", " + std::to_string(k1) + ") of the layer's type and layout";
+            return false;
+        }
         while (a < ord.size() && picks[ord[a]].e == en.e && en.n < cap) {
             slot_of[(size_t) ord[a]] = (int) a;
             en.tok[en.n++] = picks[ord[a]].t;
@@ -219,8 +244,7 @@ bool SliceLane::run(int layer, int k, const SlicePick* picks, int np, int nr, co
         }
     };
     go(SC);
-    for (const Ent& en : ents)
-        bytes_ += 2 * (uint64_t) en.v[0].rows * en.v[0].row_bytes + (uint64_t) en.v[2].rows * en.v[2].row_bytes;
+    bytes_ += (uint64_t) ents.size() * (2 * (uint64_t) ffn * fm.gu_row + (uint64_t) E * fs.d_row);
     busy_ms_ += lane_ms_now() - t0;
     ++runs_;
     (void) d_off;
@@ -279,7 +303,68 @@ bool SliceServer::open(const std::string& dir, int link, std::string& err) {
         std::fprintf(stderr, "expert server: the parts' %.2f GB read once in %.1f s (DS4_RX_PARTS_WARM; %llu)\n",
                      (double) n / 1e9, (lane_ms_now() - t0) / 1000.0, (unsigned long long) (sum & 1));
     }
+    if (const char* pv = std::getenv("DS4_RX_POOL"); pv != nullptr && *pv != '\0') {   // (the hybrid's pool, U5c)
+        pool_dir_ = pv;
+        if (!pool_.open(pool_dir_, err)) {
+            err = "the pool at " + pool_dir_ + ": " + err;
+            parts_.close();
+            return false;
+        }
+        if (pool_.pack_hash() != parts_.pack_hash() || pool_.dim() != parts_.dim() || pool_.n_ff() != parts_.n_ff() ||
+            pool_.unit() != parts_.unit() || pool_.layers() != parts_.layers() || pool_.experts() != parts_.experts()) {
+            err = "the pool at " + pool_dir_ + " is not of the parts' pack and geometry";
+            pool_.close();
+            parts_.close();
+            return false;
+        }
+        if (const char* gv = std::getenv("DS4_RX_POOL_GB"); gv != nullptr && *gv != '\0') pool_gb_ = std::max(0.0, std::atof(gv));
+    }
     return true;
+}
+
+std::vector<uint32_t> SliceServer::pool_choose(const std::vector<uint32_t>& held) {
+    for (const auto& r : locked_) os::unlock_range(r.first, r.second);
+    locked_.clear();
+    w_.clear();
+    pool_note_.clear();
+    if (!pool_on() || !slices() || k_ < 1 || k_ >= parts_.blocks()) return w_;
+    const double t0 = lane_ms_now();
+    const uint64_t budget = (uint64_t) (pool_gb_ * 1e9);
+    uint64_t bytes = 0;
+    std::vector<std::pair<const void*, size_t>> rs;
+    for (const ep::Parts::Heat& h : pool_.heat()) {   // (hottest first)
+        const uint32_t id = (uint32_t) h.layer << 16 | (uint32_t) h.expert;
+        if (std::binary_search(held.begin(), held.end(), id) || !lane_.takes(pool_, h.layer, h.expert, 0, k_)) continue;
+        ep::View v[3];
+        uint64_t b = 0;
+        for (int kind = 0; kind < 3; ++kind) {   // (the stored parts from block 0, whole: [0, k) of them is read)
+            pool_.view(h.layer, h.expert, kind, 0, v[kind]);
+            b += (uint64_t) v[kind].rows * v[kind].stride;
+        }
+        if (bytes + b > budget) break;
+        bytes += b;
+        for (int kind = 0; kind < 3; ++kind) rs.push_back({v[kind].data, (size_t) v[kind].rows * v[kind].stride});
+        w_.push_back(id);
+    }
+    os::prefetch(rs);   // (the kernel's read-ahead over all of W, then each range locked)
+    size_t lk = 0;
+    uint64_t sum = 0;
+    for (const auto& r : rs) {
+        if (os::lock_range(r.first, r.second)) {
+            locked_.push_back(r);
+            ++lk;
+            continue;
+        }
+        for (size_t at = 0; at < r.second; at += 4096) sum += ((const uint8_t*) r.first)[at];   // (each page read once)
+    }
+    std::sort(w_.begin(), w_.end());
+    char b[300];
+    std::snprintf(b, sizeof b, "W: %zu of the pool's experts (%s) [0, %d) in RAM, %.2f GB of DS4_RX_POOL_GB %.1f, %s in "
+                  "%.1f s (%llu)", w_.size(), pool_dir_.c_str(), k_, (double) bytes / 1e9, pool_gb_,
+                  lk == rs.size() ? "locked" : lk == 0 ? "read once (not locked: RLIMIT_MEMLOCK?)" : "partly locked",
+                  (lane_ms_now() - t0) / 1000.0, (unsigned long long) (sum & 1));
+    pool_note_ = b;
+    return w_;
 }
 
 std::string SliceServer::note() const {
@@ -303,12 +388,20 @@ std::string SliceServer::note() const {
         for (int c : cpus_) s += " " + std::to_string(c);
         s += ")";
     }
+    if (pool_on()) {
+        uint64_t pn = 0;
+        for (const ep::Parts::File& f : pool_.files()) pn += f.bytes;
+        std::snprintf(b, sizeof b, "; the pool %s: %zu experts, %.2f GB (DS4_RX_POOL_GB %.1f of them kept as W)",
+                      pool_dir_.c_str(), pool_.heat().size(), (double) pn / 1e9, pool_gb_);
+        s += b;
+    }
     return s;
 }
 
 std::string SliceServer::geo(const GeoMsg& g, const std::vector<GeoLayer>& layers, std::string& warn) {
     warn.clear();
     slices_ = false;
+    k_ = g.k;
     if (!on()) return "";
     const std::string why = geo_check(g, layers);
     if (why.empty()) {
@@ -346,13 +439,28 @@ bool SliceServer::run(int layer, int32_t c, const ReqRow* rows, int nr, const fl
                       std::string& err) {
     last_ms_ = 0.0;
     const int dim = parts_.dim();
-    std::vector<SlicePick> pk;
+    std::vector<SlicePick>& pk = pk_;
+    pk.clear();
+    wk_.clear();
     for (int j = 0; j < nr; ++j) {
         for (int c2 = 0; c2 < dim; ++c2) ys[(size_t) j * ldy + (size_t) c2] = 0.0f;
-        for (int i = 0; i < rows[j].n && i < kMaxPicks; ++i)
+        for (int i = 0; i < rows[j].n && i < kMaxPicks; ++i) {
             if ((rows[j].slice >> i) & 1) pk.push_back({j, rows[j].e[i], rows[j].w[i]});
+            if ((rows[j].slice >> (kPoolBit + i)) & 1) wk_.push_back({j, rows[j].e[i], rows[j].w[i]});
+        }
     }
     if (pk.empty()) return true;
+    if (!wk_.empty()) {   // (W picks: whole here - [0, k) from the pool below, [k, nb) with the slice picks)
+        if (!pools()) {
+            err = "pool picks, and no W here (DS4_RX_POOL)";
+            return false;
+        }
+        for (const SlicePick& q : wk_)
+            if (!std::binary_search(w_.begin(), w_.end(), (uint32_t) layer << 16 | (uint32_t) (uint16_t) q.e)) {
+                err = "layer " + std::to_string(layer) + " expert " + std::to_string(q.e) + ": a pool pick not in W";
+                return false;
+            }
+    }
     if (!slices()) {
         err = "slice picks, and no parts here (--expert-server-parts)";
         return false;
@@ -369,6 +477,11 @@ bool SliceServer::run(int layer, int32_t c, const ReqRow* rows, int nr, const fl
     const double t0 = lane_ms_now();
     for (int r = 0; r < times; ++r)
         if (!lane_.run(layer, k, pk.data(), (int) pk.size(), nr, x, ldx, ys, ldy, false, err)) return false;
+    if (!wk_.empty()) {
+        if (!lane_.run_range(layer, 0, c & kReqK, pool_, wk_.data(), (int) wk_.size(), nr, x, ldx, ys, ldy, false, err))
+            return false;
+        pool_picks_ += (int64_t) wk_.size();
+    }
     last_ms_ = lane_ms_now() - t0;
     return true;
 }

@@ -78,6 +78,15 @@ static void fill(std::mt19937_64& rng, int type, int rows, int k, uint8_t* p) {
     }
 }
 
+static void set_env(const char* k, const char* v) {
+#if defined(_WIN32)
+    _putenv_s(k, v == nullptr ? "" : v);
+#else
+    if (v == nullptr) unsetenv(k);
+    else setenv(k, v, 1);
+#endif
+}
+
 struct Expert {   // gate, up, down as the pack holds them
     std::vector<uint8_t> m[3];
 };
@@ -385,6 +394,58 @@ int main() {
         for (int c = 0; c < E; ++c) d = std::max(d, std::fabs((double) y[(size_t) c] - ys[(size_t) c]) / ymax);
         CHECK(d < 1e-6);
     }
+    // ---- the hybrid (U5c): a pool [0, 6) beside the [6, 9) parts.  run_range's [0, 6) from it is the slice in place,
+    // and with run's [6, 9) the expert whole; a layer the pool does not cover refused, y untouched; takes() says so
+    {
+        write_parts((root / "p6").string(), ex, {{0, 6}}, {0, 1, 2});
+        write_parts((root / "p6l0").string(), ex, {{0, 6}}, {0});
+        ep::Parts tail, pool, pool0;
+        std::string err;
+        CHECK(tail.open((root / "a6").string(), err));
+        CHECK(pool.open((root / "p6").string(), err));
+        CHECK(pool0.open((root / "p6l0").string(), err));
+        rx::SliceLane lane;
+        CHECK(lane.init(tail, types, E, FF, kLim, 2, {}, 50, err));
+        double dw = 0, dm = 0;
+        for (int l = 0; l < NL; ++l)
+            for (int nr : {1, 4, 16}) {
+                const Req q = make_req(rng, nr);
+                std::vector<float> y((size_t) nr * E, 0.0f), y0((size_t) nr * E, 0.0f);
+                CHECK(lane.run(l, 6, q.picks.data(), (int) q.picks.size(), nr, q.x.data(), E, y.data(), E, true, err));
+                CHECK(lane.run_range(l, 0, 6, pool, q.picks.data(), (int) q.picks.size(), nr, q.x.data(), E, y0.data(), E, true, err));
+                std::vector<double> yw((size_t) nr * E, 0.0), ym((size_t) nr * E, 0.0), ymax((size_t) nr, 1e-30);
+                for (const rx::SlicePick& pk : q.picks) {
+                    std::vector<uint8_t> xa(fm[l].act_bytes);
+                    gg::iq_cpu_quant(fm[l].gu_act, q.x.data() + (size_t) pk.t * E, E, xa.data());
+                    const Expert& x = ex[(size_t) l][(size_t) pk.e];
+                    const std::vector<float> rw = ref_slice(l, x, fm[l], xa, 0, FF), rm = ref_slice(l, x, fm[l], xa, 0, 6 * 256);
+                    for (int c = 0; c < E && !rw.empty() && !rm.empty(); ++c) {
+                        yw[(size_t) pk.t * E + c] += (double) pk.w * rw[(size_t) c];
+                        ym[(size_t) pk.t * E + c] += (double) pk.w * rm[(size_t) c];
+                    }
+                }
+                for (int t = 0; t < nr; ++t)
+                    for (int c = 0; c < E; ++c) ymax[(size_t) t] = std::max(ymax[(size_t) t], std::fabs(yw[(size_t) t * E + c]));
+                for (int t = 0; t < nr; ++t)
+                    for (int c = 0; c < E; ++c) {
+                        const size_t i = (size_t) t * E + c;
+                        dw = std::max(dw, std::fabs((double) y[i] + (double) y0[i] - yw[i]) / ymax[(size_t) t]);
+                        dm = std::max(dm, std::fabs((double) y0[i] - ym[i]) / ymax[(size_t) t]);
+                    }
+            }
+        CHECK(dw < 1e-4 && dm < 1e-6);
+        std::printf("  the pool's [0, 6) through run_range: against the slice in place %.2e, with [6, 9) against whole %.2e\n", dm, dw);
+        CHECK(lane.takes(pool, 0, 3, 0, 6) && !lane.takes(pool, 0, 3, 0, 7) && !lane.takes(pool, NL, 3, 0, 6));
+        CHECK(lane.takes(pool0, 0, 3, 0, 6) && !lane.takes(pool0, 1, 3, 0, 6));
+        const Req q = make_req(rng, 1);
+        std::vector<float> y((size_t) E, 7.0f);
+        CHECK(!lane.run_range(1, 0, 6, pool0, q.picks.data(), (int) q.picks.size(), 1, q.x.data(), E, y.data(), E, true, err));
+        CHECK(!lane.run_range(0, 0, 7, pool, q.picks.data(), (int) q.picks.size(), 1, q.x.data(), E, y.data(), E, true, err));
+        CHECK(!lane.run_range(0, 6, 6, pool, q.picks.data(), (int) q.picks.size(), 1, q.x.data(), E, y.data(), E, true, err));
+        bool same = true;
+        for (float v : y) same = same && v == 7.0f;
+        CHECK(same);
+    }
     // ---- init refusals: a layer the parts do not cover, a down type not the layer's, another geometry
     {
         write_parts((root / "l0").string(), ex, 6, {0});
@@ -445,6 +506,64 @@ int main() {
             CHECK(!why.empty() == c.refused && warn.empty() == c.refused && !sv.slices());
             std::printf("  geo, n_ff %d, k %d: %s\n", c.n_ff, c.k, c.refused ? ("refused: " + why).c_str() : ("taken, warned: " + warn).c_str());
         }
+    }
+    // ---- SliceServer with a pool (DS4_RX_POOL, U5c): W is the pool's experts the GPU does not hold (in RAM), a row's pool
+    // pick comes back whole beside a slice pick's [6, 9); a pool pick not in W refused; a Geo whose k the pool does not
+    // reach (7: [0, 7)) has no W
+    {
+        set_env("DS4_RX_POOL", (root / "p6").string().c_str());
+        set_env("DS4_RX_POOL_GB", "1");
+        rx::SliceServer sv;
+        std::string err, warn;
+        CHECK(sv.open((root / "a6").string(), -1, err) && sv.pool_on());
+        set_env("DS4_RX_POOL", nullptr);
+        set_env("DS4_RX_POOL_GB", nullptr);
+        rx::GeoMsg g;
+        g.n_embd = E;
+        g.n_ff = FF;
+        g.n_layers = NL;
+        g.limit = kLim;
+        g.pack_hash = 0xaa;
+        g.k = 6;
+        std::vector<rx::GeoLayer> gl((size_t) NL);
+        for (int l = 0; l < NL; ++l) {
+            gl[(size_t) l].K[0] = gl[(size_t) l].K[1] = kTy[l][0];
+            gl[(size_t) l].K[2] = kTy[l][1];
+        }
+        CHECK(sv.geo(g, gl, warn).empty() && sv.slices());
+        const uint32_t held = 1u << 16 | 2u;   // (layer 1 expert 2 in the GPU's VRAM)
+        const std::vector<uint32_t> w = sv.pool_choose({held});
+        CHECK(w.size() == (size_t) (NL * NE - 1) && !std::binary_search(w.begin(), w.end(), held) && sv.pools());
+        std::printf("  %s\n", sv.pool_note().c_str());
+        for (int l = 0; l < NL; ++l) {
+            rx::ReqRow rw;
+            rw.n = 3;
+            const int es[3] = {1, 3, 2};
+            const float ws[3] = {0.4f, 0.25f, 0.6f};
+            for (int i = 0; i < 3; ++i) rw.e[i] = (int16_t) es[i], rw.w[i] = ws[i];
+            rw.slice = (uint16_t) (0x3u | 1u << rx::kPoolBit);   // (pick 0 W, pick 1 slice, pick 2 the GPU's)
+            CHECK(rx::row_refusal(rw, 6, sv.slices(), sv.pools()).empty());
+            std::vector<float> x((size_t) E), ys((size_t) E, 7.0f);
+            for (auto& v : x) v = ((float) (rng() % 20001) - 10000.0f) * 1e-4f;
+            CHECK(sv.run(l, 6, &rw, 1, x.data(), E, ys.data(), E, err));
+            std::vector<uint8_t> xa(fm[l].act_bytes);
+            gg::iq_cpu_quant(fm[l].gu_act, x.data(), E, xa.data());
+            const std::vector<float> r1 = ref_slice(l, ex[(size_t) l][1], fm[l], xa, 0, FF);
+            const std::vector<float> r3 = ref_slice(l, ex[(size_t) l][3], fm[l], xa, 6 * 256, FF - 6 * 256);
+            double d = 0, m = 1e-30;
+            for (int c = 0; c < E && !r1.empty() && !r3.empty(); ++c) {
+                const double ref = 0.4 * r1[(size_t) c] + 0.25 * r3[(size_t) c];
+                d = std::max(d, std::fabs(ys[(size_t) c] - ref));
+                m = std::max(m, std::fabs(ref));
+            }
+            CHECK(d / m < 1e-4);
+            if (l == 1) {
+                rw.slice = (uint16_t) (0x4u | 4u << rx::kPoolBit);   // (expert 2 of layer 1 tagged W: not in W)
+                CHECK(!sv.run(l, 6, &rw, 1, x.data(), E, ys.data(), E, err) && err.find("not in W") != std::string::npos);
+            }
+        }
+        g.k = 7;
+        CHECK(sv.geo(g, gl, warn).empty() && sv.slices() && sv.pool_choose({}).empty() && !sv.pools());
     }
     std::error_code ec;
     fs::remove_all(root, ec);

@@ -34,6 +34,8 @@ expert is its parts in both (ds4_epparts.hpp assembles it back, byte for byte). 
   ep_parts.py PACK OUT --dry-run            sizes per k and the pool, nothing written
   ep_parts.py PACK OUT                      write the sets and the index
   ep_parts.py PACK OUT --verify             re-read the index and the pack: every part, every whole expert, byte-exact
+  ep_parts.py PACK OUT --pool-only --pool-gb 16   the pool's [0, 6) alone, a second index beside a worker's [6, 9)
+                                            cut before (the expert server's DS4_RX_POOL=OUT, EP U5c)
 """
 import argparse
 import glob
@@ -310,11 +312,16 @@ def choose_pool(pack, order, a, b, n_experts=None, gb=None):
     return chosen
 
 
-def check_complementary(tail, pool, nb):
+def check_complementary(tail, pool, nb, pool_only=False):
     """The two sets of one parts pack tile [0, nb): the pool [0, k) and the worker's [k, nb).  Anything else leaves an
     expert that can never be whole (or a double part), so the writer refuses it.  With no worker set the pool alone
-    has to be [0, nb)."""
+    has to be [0, nb) - unless pool_only (--pool-only): the pool is a second index beside a worker's parts cut on their
+    own (the hybrid, EP U5c: the expert server's DS4_RX_POOL), and it must start at 0."""
     if pool is None:
+        return
+    if pool_only:
+        if pool[0] != 0:
+            raise ValueError("--pool-only: the pool %d:%d must start at 0 (the [0, k) beside a worker's k:%d)" % (pool + (nb,)))
         return
     if tail is None:
         if pool != (0, nb):
@@ -680,6 +687,9 @@ def main(argv=None):
     ap.add_argument("--pool", default="0:6", help="the pool's set A:B, the hottest experts only (default 0:6)")
     ap.add_argument("--pool-experts", type=int, help="the pool's expert count")
     ap.add_argument("--pool-gb", type=float, default=44.5, help="the pool's size in GB (default 44.5; --pool-experts wins)")
+    ap.add_argument("--pool-only", action="store_true",
+                    help="write the pool's set alone (no worker set, --tail ignored): an index beside a worker's parts "
+                         "cut before, the expert server's DS4_RX_POOL (the hybrid, EP U5c)")
     ap.add_argument("--layers", default="all", help="layers to write, e.g. 3 or 0-9,12 (default all)")
     ap.add_argument("--profile", help="expert profile (default PACK/expert-profile.bin; 'none': index order)")
     ap.add_argument("--rank", choices=("per-byte", "count"), default="per-byte", help="heat order key (default per-byte)")
@@ -698,9 +708,9 @@ def main(argv=None):
 def run(ap, args, pack):
     try:
         layers = parse_layers(args.layers, pack.nl)
-        tail = None if args.tail == "none" else parse_range(args.tail, pack.nb)
+        tail = None if args.tail == "none" or args.pool_only else parse_range(args.tail, pack.nb)
         pool = parse_range(args.pool, pack.nb)
-        check_complementary(tail, pool, pack.nb)
+        check_complementary(tail, pool, pack.nb, args.pool_only)
     except (argparse.ArgumentTypeError, ValueError) as ex:
         ap.error(str(ex))
     profile_path = args.profile if args.profile else os.path.join(args.pack, "expert-profile.bin")

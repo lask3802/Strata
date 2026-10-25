@@ -32,6 +32,11 @@ static void case_checks() {
     check(!rx::row_refusal(rw, 0, true).empty(), "row_refusal: slice picks without a k: refused");
     check(!rx::row_refusal(rw, rx::kReqSets, true).empty(), "row_refusal: slice picks, a flag but no k: refused");
     check(!rx::row_refusal(rw, 8, false).empty(), "row_refusal: slice picks and no parts here: refused");
+    rw.slice = (uint16_t) (0x5 | 0x4 << rx::kPoolBit);   // (pick 2 W: whole on the server, U5c)
+    check(rx::row_refusal(rw, 8, true, true).empty(), "row_refusal: a pool bit on a slice pick, a W here: taken");
+    check(!rx::row_refusal(rw, 8, true).empty(), "row_refusal: a pool bit and no W here: refused");
+    rw.slice = (uint16_t) (0x5 | 0x2 << rx::kPoolBit);
+    check(!rx::row_refusal(rw, 8, true, true).empty(), "row_refusal: a pool bit on a whole pick: refused");
     rw.slice = 0x8;
     check(!rx::row_refusal(rw, 8, true).empty(), "row_refusal: a slice bit past the row's picks: refused");
     rw.slice = 0;

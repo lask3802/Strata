@@ -527,6 +527,21 @@ class Geometry(Base):
         with self.assertRaises(SystemExit):
             ep.main([self.pack_dir, "--dry-run", "--tail", "none", "--pool", "2:6"])
 
+    def test_a_pool_only_index_starts_at_0_and_needs_no_worker_set(self):
+        ep.check_complementary(None, (0, 6), 9, pool_only=True)   # (beside a worker's [6, 9) cut before: the hybrid's)
+        with self.assertRaises(ValueError):
+            ep.check_complementary(None, (2, 6), 9, pool_only=True)
+        old, sys.stdout = sys.stdout, io.StringIO()
+        try:
+            self.assertEqual(ep.main([self.pack_dir, self.out, "--pool-only", "--layers", "1", "--pool-experts", "3"]), 0)
+            self.assertEqual(ep.main([self.pack_dir, self.out, "--verify", "--layers", "1"]), 0)
+        finally:
+            sys.stdout = old
+        ix = ep.PartsIndex(self.out)
+        self.addCleanup(ix.close)
+        self.assertEqual([f[0] for f in ix.files], ["ep-parts-0-6.bin"])   # (--tail's default 6:9 not written)
+        self.assertEqual(len(ix.heat), 3)
+
 
 class Cli(Base):
     def test_dry_run_and_write_and_verify(self):

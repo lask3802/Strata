@@ -445,6 +445,8 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         }
         ok.push_back(good ? 1 : 0);
     }
+    std::vector<uint32_t> not_w(p.size() / 4);   // (the BlobsEnd's: the main's GPU experts, none of W)
+    if (!not_w.empty()) std::memcpy(not_w.data(), p.data(), not_w.size() * 4);
     if (h.a != (int32_t) ok.size()) {
         std::fprintf(stderr, "expert server: %d blobs said, %zu came\n", h.a, ok.size());
         return 0;
@@ -485,7 +487,17 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     fl.tab = std::vector<std::atomic<void*>>((size_t) g.n_layers * kTabExp);
     for (const auto& kv : ss.blobs)   // (an id past the table's: looked up in ss.blobs, never filled)
         if ((kv.first & 0xFFFFu) < (uint32_t) kTabExp) fl.tab[(size_t) (kv.first >> 16) * kTabExp + (kv.first & 0xFFFFu)].store(kv.second);
-    if (!c.send(BlobsOk, 0, (int32_t) ok.size(), 0, 0, ok.data(), ok.size(), err)) return 0;
+    {   // (the hybrid, U5c: W - the pool's hottest not in either GPU's VRAM - named after ok[])
+        std::vector<uint32_t> held = not_w;
+        for (const auto& kv : ss.blobs) held.push_back(kv.first);
+        std::sort(held.begin(), held.end());
+        const std::vector<uint32_t> w = sl.pool_choose(held);
+        if (!sl.pool_note().empty()) std::fprintf(stderr, "expert server: %s\n", sl.pool_note().c_str());
+        const size_t n = ok.size();
+        ok.resize(n + w.size() * 4);
+        if (!w.empty()) std::memcpy(ok.data() + n, w.data(), w.size() * 4);
+        if (!c.send(BlobsOk, 0, (int32_t) n, 0, 0, ok.data(), ok.size(), err)) return 0;
+    }
     std::fprintf(stderr, "expert server: %zu blobs (%.2f GB) in VRAM in %.1f s, their warm-up done; serving\n",
                  ss.blobs.size(), (double) ss.used / 1e9, (now_ms() - t0) / 1000.0);
     cudaEvent_t* const evt = ss.evt;
@@ -533,6 +545,9 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
                                      "%.1f GB/s in the lane)\n", (long long) sliced, lane * 1000.0 / (double) sliced,
                              (double) sl.lane().bytes() / 1e9,
                              sl.lane().busy_ms() > 0 ? (double) sl.lane().bytes() / 1e6 / sl.lane().busy_ms() : 0.0);
+            if (sl.pools())
+                std::fprintf(stderr, "expert server: %lld W picks computed whole here (the pool's [0, k) and the parts' "
+                                     "[k, nb))\n", (long long) sl.pool_picks());
             static const char* const bucket_name[3] = {"T=1", "T=4", "T=other"};
             for (int bk = 0; diag && bk < 3; ++bk)
                 for (int k = 0; k < kParts; ++k) {
@@ -602,7 +617,7 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         for (int j = 0; why.empty() && !stale && j < nr; ++j) {
             ReqRow& rw = rws[j];
             std::memcpy(&rw, p.data() + (size_t) j * per, sizeof rw);
-            if (!(why = row_refusal(rw, h.c, sl.slices())).empty()) break;
+            if (!(why = row_refusal(rw, h.c, sl.slices(), sl.pools())).empty()) break;
             any_slice = any_slice || rw.slice != 0;
             nw[j] = 0;   // (the plan: the row's whole picks first, in their order; a slice pick is the lane's)
             for (int i = 0; i < rw.n; ++i) {

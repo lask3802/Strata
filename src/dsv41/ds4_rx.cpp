@@ -416,17 +416,19 @@ bool Main::send_blob(int layer, int e, const void* blob, size_t bytes, std::stri
     return c_.send(Blob, 0, layer, e, 0, blob, bytes, err);
 }
 
-bool Main::end_blobs(int n, std::vector<uint8_t>& ok, double timeout_ms, std::string& err) {
-    if (!c_.send(BlobsEnd, 0, n, 0, 0, nullptr, 0, err)) return false;
+bool Main::end_blobs(int n, std::vector<uint8_t>& ok, double timeout_ms, std::string& err, const std::vector<uint32_t>& gpu) {
+    if (!c_.send(BlobsEnd, 0, n, 0, 0, gpu.data(), gpu.size() * 4, err)) return false;
     Hdr h;
     const int got = c_.recv(h, rx_, now_ms() + timeout_ms, err);
-    if (got != 1 || h.type != BlobsOk || rx_.size() != (size_t) n) {
+    if (got != 1 || h.type != BlobsOk || rx_.size() < (size_t) n || (rx_.size() - (size_t) n) % 4 != 0) {
         if (got == 1 && h.type == Error) err = "expert server: " + std::string(rx_.begin(), rx_.end());
         else if (err.empty()) err = "no answer to the blobs";
         c_.close();
         return false;
     }
-    ok = rx_;
+    ok.assign(rx_.begin(), rx_.begin() + n);
+    pool_.resize((rx_.size() - (size_t) n) / 4);
+    if (!pool_.empty()) std::memcpy(pool_.data(), rx_.data() + n, pool_.size() * 4);
     return true;
 }
 

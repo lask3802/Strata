@@ -106,11 +106,23 @@ int cpu_session(Conn& c, void* arg) {
         }
         ok.push_back(good ? 1 : 0);
     }
+    std::vector<uint32_t> not_w(p.size() / 4);   // (the BlobsEnd's: the main's GPU experts, none of W)
+    if (!not_w.empty()) std::memcpy(not_w.data(), p.data(), not_w.size() * 4);
     if (h.a != (int32_t) ok.size()) {
         std::fprintf(stderr, "expert server (CPU): %d blobs said, %zu came\n", h.a, ok.size());
         return 0;
     }
-    if (!c.send(BlobsOk, 0, (int32_t) ok.size(), 0, 0, ok.data(), ok.size(), err)) return 0;
+    {   // (the hybrid, U5c: W - the pool's hottest not held here nor on the main's GPU - named after ok[])
+        std::vector<uint32_t> held = not_w;
+        for (const auto& kv : blobs) held.push_back(kv.first);
+        std::sort(held.begin(), held.end());
+        const std::vector<uint32_t> w = sl.pool_choose(held);
+        if (!sl.pool_note().empty()) std::fprintf(stderr, "expert server (CPU): %s\n", sl.pool_note().c_str());
+        const size_t n = ok.size();
+        ok.resize(n + w.size() * 4);
+        if (!w.empty()) std::memcpy(ok.data() + n, w.data(), w.size() * 4);
+        if (!c.send(BlobsOk, 0, (int32_t) n, 0, 0, ok.data(), ok.size(), err)) return 0;
+    }
     std::fprintf(stderr, "expert server (CPU): %zu blobs (%.2f GB) in RAM; serving\n", blobs.size(), (double) used / 1e9);
     const int D = g.n_embd, FF = g.n_ff;
     std::vector<float> xs((size_t) kMaxRows * D), hh((size_t) FF), yo((size_t) D), y((size_t) D), ys((size_t) kMaxRows * D);
@@ -135,7 +147,7 @@ int cpu_session(Conn& c, void* arg) {
         for (int j = 0; why.empty() && j < nr; ++j) {
             ReqRow& rw = rws[(size_t) j];
             std::memcpy(&rw, p.data() + (size_t) j * per, sizeof rw);
-            why = row_refusal(rw, h.c, sl.slices());
+            why = row_refusal(rw, h.c, sl.slices(), sl.pools());
             const uint16_t* xb = (const uint16_t*) (p.data() + (size_t) j * per + sizeof(ReqRow));
             for (int i = 0; i < D; ++i) xs[(size_t) j * D + i] = bf2f(xb[i]);
         }

@@ -38,6 +38,12 @@
 // it (ep::Conn), and Fills come on it - an expert's bytes into the slot of one the server holds, FillOk back.  A request
 // that names an expert whose slot is being filled (a late one: the main stops naming `out` before the Fill leaves) gets
 // Stale, not an Error: the main computes its picks on the lane, as for a late reply.
+//
+// The hybrid (protocol 4, EP U5c, DS4_RX_POOL=DIR on the server): a second parts index of the hottest experts' [0, k)
+// (ep_parts.py --pool-only), of which the server keeps W in RAM (DS4_RX_POOL_GB, the hottest it does not hold in VRAM)
+// and names them after its BlobsOk's ok[] (uint32 layer << 16 | expert each).  A slice pick of W the main tags pool too
+// (ReqRow::slice's high byte): the server's CPU lane computes it whole ([0, k) from the pool, [k, nb) from the parts)
+// and the main's lane skips it; a late reply: the main computes it whole.
 #pragma once
 
 #include <cstddef>
@@ -49,7 +55,7 @@
 namespace strata::ds4::rx {
 
 constexpr uint32_t kMagic = 0x58524453u;   // "SDRX"
-constexpr uint32_t kProto = 3;             // (2: H' - the hello's lo, the Geo's pack_hash, the slice picks; 3: fills)
+constexpr uint32_t kProto = 4;             // (2: H' - the hello's lo, the Geo's pack_hash, the slice picks; 3: fills; 4: W)
 constexpr int kMaxRows = 16;               // a request's rows at most (kWin)
 constexpr int kMaxPicks = 8;               // picks a row at most (kPicks)
 // a Req's c: the slice picks' first n_ff block k (0: none), and flags
@@ -61,8 +67,10 @@ enum Msg : uint32_t {
     Hello = 1,      // payload HelloMsg (each side sends one; the server first)
     Geo = 2,        // main -> server: payload GeoMsg, then n_layers x GeoLayer
     Blob = 3,       // main -> server: a = layer, b = expert; payload the blob (GeoLayer's layout)
-    BlobsEnd = 4,   // main -> server: a = the blobs sent
-    BlobsOk = 5,    // server -> main: payload uint8 ok[blobs] (1: in its VRAM); or an Error (its warm-up requests
+    BlobsEnd = 4,   // main -> server: a = the blobs sent; payload uint32 (protocol 4): the experts the main's own GPU
+                    // computes (layer << 16 | expert), never a CPU-lane pick: not for W
+    BlobsOk = 5,    // server -> main: payload uint8 ok[blobs] (1: in its VRAM), then uint32 W (protocol 4: the pool's
+                    // experts in its RAM, layer << 16 | expert; none without a pool); or an Error (its warm-up requests
                     // failed) and the main drops the server.  A refusal known at the Geo (the geometry, the room's VRAM
                     // in one piece) is an Error right after it: the main reads it before each blob and stops
     Req = 6,        // main -> server: seq, a = layer, b = rows, c = k | flags (kReqK); payload rows x (ReqRow, then bf16
@@ -120,7 +128,8 @@ struct GeoLayer {         // a layer's experts: the roles' ggml types (0: the la
 };
 struct ReqRow {           // a request's row: the window's token t, n picks (expert ids, route weights)
     uint8_t t = 0, n = 0;
-    uint16_t slice = 0;   // bit i: pick i is a slice pick (its n_ff blocks [k, nb) from the parts), else a blob's whole
+    uint16_t slice = 0;   // bit i: pick i is a slice pick (its n_ff blocks [k, nb) from the parts), else a blob's whole;
+                          // bit kPoolBit + i (a slice pick's): its [0, k) from the pool too (W: the pick whole there)
     int16_t e[kMaxPicks] = {};
     float w[kMaxPicks] = {};
 };
@@ -129,13 +138,19 @@ static_assert(sizeof(Hdr) == 32, "the header's size");
 static_assert(sizeof(HelloMsg) == 128, "the hello's size");
 static_assert(sizeof(GeoMsg) == 28 && sizeof(ReqRow) == 52, "the geometry's and a row's sizes");
 
-/// A server's check of a request row: 1..kMaxPicks picks, slice bits only on them, and slice picks only with a k (c's
-/// kReqK) and parts here (has_parts).  "" or why.
-inline std::string row_refusal(const ReqRow& rw, int32_t c, bool has_parts) {
+constexpr int kPoolBit = 8;   // (ReqRow::slice: the pool bits' first; kMaxPicks of each)
+static_assert(kPoolBit >= kMaxPicks && kPoolBit + kMaxPicks <= 16, "a row's slice and pool bits in its uint16");
+
+/// A server's check of a request row: 1..kMaxPicks picks, slice bits only on them, slice picks only with a k (c's
+/// kReqK) and parts here (has_parts), pool bits only on slice picks and with a W here (has_pool).  "" or why.
+inline std::string row_refusal(const ReqRow& rw, int32_t c, bool has_parts, bool has_pool = false) {
     if (rw.n < 1 || rw.n > kMaxPicks) return "a request row with " + std::to_string(rw.n) + " picks";
-    if ((rw.slice >> rw.n) != 0) return "a request row's slice bits past its " + std::to_string(rw.n) + " picks";
-    if (rw.slice != 0 && (c & kReqK) == 0) return "slice picks without a k";
-    if (rw.slice != 0 && !has_parts) return "slice picks, and no parts here (--expert-server-parts)";
+    const unsigned sl = rw.slice & ((1u << kPoolBit) - 1), po = (unsigned) rw.slice >> kPoolBit;
+    if ((sl >> rw.n) != 0) return "a request row's slice bits past its " + std::to_string(rw.n) + " picks";
+    if ((po & ~sl) != 0) return "a request row's pool bits on picks that are not slice picks";
+    if (sl != 0 && (c & kReqK) == 0) return "slice picks without a k";
+    if (sl != 0 && !has_parts) return "slice picks, and no parts here (--expert-server-parts)";
+    if (po != 0 && !has_pool) return "pool picks, and no W here (DS4_RX_POOL)";
     return "";
 }
 
@@ -427,8 +442,12 @@ public:
     /// false (err) also when the server refused at the Geo: its Error, looked for before each blob ("expert server:
     /// " and the reason), or the link it closed then - the blobs stop there, not after all of them
     bool send_blob(int layer, int e, const void* blob, size_t bytes, std::string& err);
-    /// the end of the blobs: the server's ok[] (one a blob sent, in order)
-    bool end_blobs(int n, std::vector<uint8_t>& ok, double timeout_ms, std::string& err);
+    /// the end of the blobs (`gpu`: the experts this end's GPU computes, layer << 16 | expert - none of W): the server's
+    /// ok[] (one a blob sent, in order); its W after them in pool()
+    bool end_blobs(int n, std::vector<uint8_t>& ok, double timeout_ms, std::string& err,
+                   const std::vector<uint32_t>& gpu = {});
+    /// the server's W (layer << 16 | expert: the pool's experts it computes whole on its CPU lane; empty: none)
+    const std::vector<uint32_t>& pool() const { return pool_; }
     /// rows[j] and its x (n_embd floats, sent as bf16); c: the slice picks' k and flags (kReqK)
     bool send_req(uint32_t seq, int layer, int nrows, const ReqRow* rows, const float* const* x, std::string& err,
                   int32_t c = 0);
@@ -474,6 +493,7 @@ private:
     int n_embd_ = 0;
     std::vector<uint8_t> tx_, rx_;
     std::vector<std::pair<uint32_t, double>> late_;   // (take_late)
+    std::vector<uint32_t> pool_;
     std::vector<uint16_t> xb_;
     bool stale_ = false;
 };

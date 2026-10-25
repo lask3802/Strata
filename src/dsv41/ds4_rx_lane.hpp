@@ -56,6 +56,16 @@ public:
     /// False (err), y untouched: a layer not served, k outside [lo, nb), a pick out of range, a row's expert twice.
     bool run(int layer, int k, const SlicePick* picks, int np, int nr, const float* x, size_t ldx, float* y, size_t ldy,
              bool help, std::string& err);
+    /// the same over the n_ff blocks [k0, k1) (0 <= k0 < k1 <= nb) of `from`'s parts: each pick's three matrices in a part
+    /// that holds k0 and runs to k1 or past it, of the layer's types and layout (the hybrid, U5c: a W pick's [0, k) from
+    /// the pool, beside run's [k, nb) - the two sum to it whole).  False (err), y untouched, as run's; also a part missing
+    bool run_range(int layer, int k0, int k1, const ep::Parts& from, const SlicePick* picks, int np, int nr, const float* x,
+                   size_t ldx, float* y, size_t ldy, bool help, std::string& err);
+    /// whether run_range would take expert e of the layer over [k0, k1) from `from` (the layer served, its parts there)
+    bool takes(const ep::Parts& from, int layer, int e, int k0, int k1) const {
+        ep::View v[3];
+        return layer >= 0 && layer < (int) fmt_.size() && fmt_[(size_t) layer].on && views(from, layer, e, k0, k1, v);
+    }
 
     // (read on the thread that runs: not atomic)
     uint64_t bytes() const { return bytes_; }   // weight bytes the runs read
@@ -65,9 +75,13 @@ public:
 private:
     bool init_(const ep::Parts& parts, const std::vector<Types>& types, int n_embd, int n_ff, float limit, int threads,
                const std::vector<int>& cpus, int spin_us, std::string& err);
+    // a served layer's expert e: its three matrices' views from k0 in parts that run to k1 or past it, of the layer's
+    // types and layout
+    bool views(const ep::Parts& from, int layer, int e, int k0, int k1, ep::View* v) const;
     struct Fmt {
         bool on = false;
         int cap = kLaneMaxRows;   // rows an entry (a call of the rows) at most
+        Types ty;
         gguf::IqCpu fm;
     };
     struct Ent {
@@ -121,6 +135,18 @@ public:
     const SliceLane& lane() const { return lane_; }
     const ep::Parts& parts() const { return parts_; }   // (a fill's [k, nb) beside the main's [0, k): ds4_rx_server.cu)
 
+    // The hybrid (U5c, ds4_rx.hpp protocol 4): DS4_RX_POOL=DIR at open() - a second parts index of the same pack with
+    // the [0, k) of the hottest experts (ep_parts.py --pool-only); DS4_RX_POOL_GB=G (6) of them kept in RAM as W.
+    bool pool_on() const { return pool_.is_open(); }
+    /// a session's W, after its blobs: the pool's experts in heat order with a part [0, k) of every matrix (the last
+    /// Geo's k), a layer the lane serves, not `held` (layer << 16 | expert, sorted: the GPU's), up to the budget;
+    /// locked in RAM (mlock; where it may not, every page read once).  The ids (layer << 16 | expert; empty: no pool,
+    /// a Geo that does not split)
+    std::vector<uint32_t> pool_choose(const std::vector<uint32_t>& held);
+    bool pools() const { return slices() && !w_.empty(); }   // (the session has a W: pool picks taken)
+    std::string pool_note() const { return pool_note_; }   // (the last pool_choose in a line)
+    int64_t pool_picks() const { return pool_picks_; }   // (W picks computed whole here)
+
 private:
     ep::Parts parts_;
     SliceLane lane_;
@@ -130,6 +156,14 @@ private:
     double last_ms_ = 0.0;
     bool wrong_said_ = false, slices_ = false;
     std::string geo_check(const GeoMsg& g, const std::vector<GeoLayer>& layers);
+    ep::Parts pool_;
+    std::string pool_dir_, pool_note_;
+    double pool_gb_ = 6.0;
+    int k_ = 0;
+    std::vector<uint32_t> w_;   // (sorted)
+    std::vector<std::pair<const void*, size_t>> locked_;   // (W's ranges locked: unlocked at the next pool_choose)
+    int64_t pool_picks_ = 0;
+    std::vector<SlicePick> pk_, wk_;
 };
 
 }  // namespace strata::ds4::rx

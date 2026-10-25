@@ -405,6 +405,27 @@ inline void prefetch_cold(const std::vector<std::pair<const void*, size_t>>& ran
 #endif
 }
 
+/// [p, p + n) of a file's mapping kept in RAM (Linux mlock: every page read in and pinned until unmapped); false where
+/// it was not (RLIMIT_MEMLOCK, Windows: the caller touches the pages instead, and the page cache may drop them)
+inline bool lock_range(const void* p, size_t n) {
+#if defined(_WIN32)
+    (void) p, (void) n;
+    return false;
+#else
+    const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
+    return mlock((const void*) b, n + (a - b)) == 0;
+#endif
+}
+/// lock_range's range let go (the page cache may drop it again)
+inline void unlock_range(const void* p, size_t n) {
+#if defined(_WIN32)
+    (void) p, (void) n;
+#else
+    const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
+    munlock((const void*) b, n + (a - b));
+#endif
+}
+
 /// Whether [p, p + n) of a file's mapping is in RAM now: every page (Linux, one mincore), sampled pages of the working
 /// set (Windows; a page on the standby list counts as not in RAM)
 inline bool in_ram(const void* p, size_t n) {

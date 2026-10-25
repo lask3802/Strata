@@ -40,9 +40,12 @@ inline uint64_t index_stamp(const std::string& text) {   // (the index's lines b
     return h;
 }
 
-/// dir/ep-parts.txt and dir/ep-parts-A-NB.bin: blocks [a, nb) of `layers`, pack_hash `hash`.  False: not written
-inline bool write_parts(const std::string& dir, const PartsSrc& s, int a, const std::vector<int>& layers, uint64_t hash) {
+/// dir/ep-parts.txt and dir/ep-parts-A-B.bin: blocks [a, b) of `layers` (b < 0: nb), pack_hash `hash`.  False: not
+/// written
+inline bool write_parts(const std::string& dir, const PartsSrc& s, int a, const std::vector<int>& layers, uint64_t hash,
+                        int b = -1) {
     const int nb = s.n_ff / 256;
+    if (b < 0) b = nb;
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     char hx[40];
@@ -62,27 +65,27 @@ inline bool write_parts(const std::string& dir, const PartsSrc& s, int a, const 
                 const size_t whole = s.row_bytes(l, kind);
                 size_t rb = 0, rows = 0;
                 std::vector<uint8_t> p;
-                if (kind < 2) {   // (gate, up: the rows of blocks [a, nb))
+                if (kind < 2) {   // (gate, up: the rows of blocks [a, b))
                     rb = whole;
-                    rows = (size_t) (nb - a) * 256;
-                    p.assign(m + (size_t) a * 256 * rb, m + (size_t) s.n_ff * rb);
-                } else {          // (down: each row's values of blocks [a, nb))
+                    rows = (size_t) (b - a) * 256;
+                    p.assign(m + (size_t) a * 256 * rb, m + (size_t) b * 256 * rb);
+                } else {          // (down: each row's values of blocks [a, b))
                     const size_t ub = whole / (size_t) nb;
-                    rb = ub * (size_t) (nb - a);
+                    rb = ub * (size_t) (b - a);
                     rows = (size_t) s.dim;
                     for (size_t r = 0; r < rows; ++r) p.insert(p.end(), m + r * whole + (size_t) a * ub, m + r * whole + (size_t) a * ub + rb);
                 }
                 file.resize((file.size() + 4095) / 4096 * 4096, 0);
                 static const char* kn[3] = {"gate", "up", "down"};
                 parts += "part " + std::to_string(l) + " " + std::to_string(e) + " " + kn[kind] + " " + std::to_string(s.type(l, kind)) +
-                         " 0 " + std::to_string(a) + " " + std::to_string(nb) + " " + std::to_string(rows) + " " + std::to_string(rb) +
+                         " 0 " + std::to_string(a) + " " + std::to_string(b) + " " + std::to_string(rows) + " " + std::to_string(rb) +
                          " " + std::to_string(file.size()) + " " + std::to_string(p.size()) + "\n";
                 file.insert(file.end(), p.begin(), p.end());
             }
         }
     file.resize((file.size() + 4095) / 4096 * 4096, 0);
-    const std::string name = "ep-parts-" + std::to_string(a) + "-" + std::to_string(nb) + ".bin";
-    idx += "file 0 " + name + " " + std::to_string(a) + " " + std::to_string(nb) + " " + std::to_string(file.size()) + "\n" + heat + parts;
+    const std::string name = "ep-parts-" + std::to_string(a) + "-" + std::to_string(b) + ".bin";
+    idx += "file 0 " + name + " " + std::to_string(a) + " " + std::to_string(b) + " " + std::to_string(file.size()) + "\n" + heat + parts;
     const uint64_t stamp = index_stamp(idx);
     char sx[40];
     std::snprintf(sx, sizeof sx, "%016llx", (unsigned long long) stamp);
@@ -90,7 +93,7 @@ inline bool write_parts(const std::string& dir, const PartsSrc& s, int a, const 
     idx = idx.substr(0, at) + "stamp " + sx + idx.substr(idx.find('\n', at));
     std::memcpy(file.data(), "EPPARTS1", 8);
     for (int i = 0; i < 8; ++i) file[8 + (size_t) i] = (uint8_t) (stamp >> (8 * i));
-    const uint32_t hdr[3] = {0u, (uint32_t) a, (uint32_t) nb};
+    const uint32_t hdr[3] = {0u, (uint32_t) a, (uint32_t) b};
     for (int j = 0; j < 3; ++j)
         for (int i = 0; i < 4; ++i) file[16 + (size_t) j * 4 + (size_t) i] = (uint8_t) (hdr[j] >> (8 * i));
     std::ofstream(dir + "/" + name, std::ios::binary | std::ios::trunc).write((const char*) file.data(), (std::streamsize) file.size());

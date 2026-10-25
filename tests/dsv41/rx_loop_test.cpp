@@ -19,6 +19,8 @@
 //     [0, k) of them with it the all-whole sum, k from request to request 6 -> 7 -> 8 -> 9; the verify's two sets and
 //     its wrong slice; another pack, a layer the parts do not cover, a k below theirs: refused (a main that does not
 //     split: taken, its whole picks served).
+//   - the hybrid (U5c, DS4_RX_POOL): the server's W after its BlobsOk (the pool's experts not held), a row's W picks
+//     whole in the reply, a pool pick not in W refused, no W for a main that does not split.
 // What it does not reach: serve_lane's own use of these (the Wake flag, the naps, the pools off the link core, the
 // service thread's pin) - the engine's, checked in the GPU slot (ep-u4-slot.sh: ep against ep-nowake, the stats line).
 // No GPU, no model.
@@ -231,9 +233,11 @@ static double norm(const std::vector<float>& a) {
 }
 
 // a main process up to the blobs (`unserved` more layers in the geometry with no types: not the server's): false (and
-// why) when it did not get there; `sent`: the blobs that went out; k: the Geo's (the main's DS4_EP_K: 0 or 9 none)
+// why) when it did not get there; `sent`: the blobs that went out; k: the Geo's (the main's DS4_EP_K: 0 or 9 none);
+// below >= 0: only the blobs of experts below it a layer; gpu: the BlobsEnd's (this end's GPU experts, not for W)
 static bool connect(rx::Main& m, int port, const std::vector<Layer>& L, std::string& err, int unserved = 0,
-                    int* sent = nullptr, uint64_t pack_hash = 0, int k = 0) {
+                    int* sent = nullptr, uint64_t pack_hash = 0, int k = 0, int below = -1,
+                    const std::vector<uint32_t>& gpu = {}) {
     if (!m.accept("127.0.0.1:" + std::to_string(port), kToken, 30, err)) return false;
     rx::GeoMsg gm;
     gm.n_embd = E;
@@ -248,12 +252,12 @@ static bool connect(rx::Main& m, int port, const std::vector<Layer>& L, std::str
     if (!m.send_geo(gm, gl, err)) return false;
     int nb = 0;
     for (size_t li = 0; li < L.size(); ++li)
-        for (size_t e = 0; e < L[li].blobs.size(); ++e, ++nb) {
+        for (size_t e = 0; e < L[li].blobs.size() && (below < 0 || (int) e < below); ++e, ++nb) {
             if (!m.send_blob((int) li, (int) e, L[li].blobs[e].data(), L[li].blobs[e].size(), err)) return false;
             if (sent != nullptr) *sent = nb + 1;
         }
     std::vector<uint8_t> ok;
-    if (!m.end_blobs(nb, ok, 60000.0, err)) return false;
+    if (!m.end_blobs(nb, ok, 60000.0, err, gpu)) return false;
     for (uint8_t v : ok)
         if (v != 1) {
             err = "a blob not held";
@@ -524,6 +528,141 @@ static void case_parts(int port, const std::vector<Layer>& L) {
         check(g == -1 && err.find("no parts here") != std::string::npos, "  a slice pick: refused (" + err + ")");
         check(stop(ch) == 0, "  and it exited 0");
     }
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+// the hybrid (U5c, protocol 4): the CPU server with parts [6, 9) and a pool [0, 6) (DS4_RX_POOL) of both layers, the
+// blobs of experts 0-2 only - its W (after the BlobsOk's ok[]) experts 3 and 4 of each layer, not the held ones; a row's
+// W picks (tagged slice and pool) come back whole beside the whole picks and a plain slice pick's [6, 9); a pool pick of
+// an expert not in W: the request's Error.  Then a main that does not split (k 9): no W
+static void case_pool(int port, const std::vector<Layer>& L) {
+    const std::string root = (std::filesystem::temp_directory_path() / ("ds4_rx_loop_pool_" + std::to_string(rx::now_ms()).substr(0, 9))).string();
+    const uint64_t H = 0x5eed00000000abcdull;
+    ep_test::PartsSrc s;
+    s.dim = E;
+    s.n_ff = FF;
+    s.layers = (int) L.size();
+    s.experts = (int) L[0].blobs.size();
+    s.mat = [&](int l, int e, int kind) { return L[(size_t) l].blobs[(size_t) e].data() + L[(size_t) l].geo.off[kind]; };
+    s.row_bytes = [&](int l, int kind) { return kind < 2 ? L[(size_t) l].fm.gu_row : L[(size_t) l].fm.d_row; };
+    s.type = [&](int l, int kind) { return L[(size_t) l].geo.K[kind]; };
+    check(write_parts(root + "/a6", L, 6, {0, 1}, H) && ep_test::write_parts(root + "/p6", s, 0, {0, 1}, H, 6),
+          "parts [6, 9) and a pool [0, 6) of both layers written: " + root);
+    auto stop = [](Child& ch) {
+        const int rc = ch.wait(10000);
+        if (rc < 0) {
+            ch.kill();
+            ch.wait(5000);
+        }
+        return rc;
+    };
+    set_env("DS4_RX_POOL", (root + "/p6").c_str());
+    {
+        Child ch;
+        check(ch.start(port, root + "/a6"), "a CPU expert server with parts [6, 9) and a pool [0, 6) started");
+        rx::Main m;
+        std::string err;
+        const bool up = connect(m, port, L, err, 0, nullptr, H, 6, 3);
+        std::vector<uint32_t> w = m.pool();
+        std::sort(w.begin(), w.end());
+        const std::vector<uint32_t> want_w = {3u, 4u, 1u << 16 | 3u, 1u << 16 | 4u};
+        check(up && w == want_w, "taken; its W after the ok[]: " + std::to_string(w.size()) + " experts (3 and 4 of both "
+                                 "layers: 4) (" + err + ")");
+        std::mt19937_64 rng(13);
+        std::uniform_real_distribution<float> ux(-1.0f, 1.0f), uw(0.05f, 0.4f);
+        double worst = 0;
+        bool all_in = up;
+        uint32_t seq = 2000;
+        for (int it = 0; up && it < 8 && all_in; ++it) {
+            const int li = it % 2, T = it % 2 == 0 ? 4 : 1;
+            std::vector<rx::ReqRow> req((size_t) T);
+            std::vector<std::vector<float>> x((size_t) T, std::vector<float>((size_t) E)), xb = x;
+            std::vector<const float*> xp((size_t) T);
+            for (int t = 0; t < T; ++t) {
+                int ord[5] = {0, 1, 2, 3, 4};
+                std::shuffle(ord, ord + 5, rng);
+                rx::ReqRow& r = req[(size_t) t];
+                r.t = (uint8_t) t;
+                r.n = 5;
+                for (int i = 0; i < 5; ++i) {   // (0-2 whole, the server's blobs; 3 W; 4 W on even requests, else slice)
+                    r.e[i] = (int16_t) ord[i];
+                    r.w[i] = uw(rng);
+                    if (ord[i] >= 3) r.slice |= (uint16_t) (1u << i);
+                    if (ord[i] == 3 || (ord[i] == 4 && it % 2 == 0)) r.slice |= (uint16_t) (1u << (rx::kPoolBit + i));
+                }
+                for (int c = 0; c < E; ++c) {
+                    x[(size_t) t][(size_t) c] = ux(rng);
+                    xb[(size_t) t][(size_t) c] = rx::bf2f(rx::f2bf(x[(size_t) t][(size_t) c]));
+                }
+                xp[(size_t) t] = x[(size_t) t].data();
+            }
+            if (!m.send_req(++seq, li, T, req.data(), xp.data(), err, 6)) {
+                check(false, "a request sent (" + err + ")");
+                break;
+            }
+            const uint16_t* y = nullptr;
+            int srv_us = 0;
+            const int got = m.wait_resp(seq, T, rx::now_ms() + 20000.0, &y, srv_us, err);
+            all_in = all_in && got == 1;
+            if (got != 1) break;
+            const Layer& l = L[(size_t) li];
+            for (int t = 0; t < T; ++t) {   // (the server's: x in bf16 - whole the blobs' and W's, [6, 9) the others')
+                const rx::ReqRow& r = req[(size_t) t];
+                const unsigned sl = r.slice & 0xffu, po = (unsigned) r.slice >> rx::kPoolBit;
+                std::vector<float> w0, w1, w2;
+                slice_sum(l, r, ~sl | po, 0, NB, xb[(size_t) t].data(), w0);
+                slice_sum(l, r, sl & ~po, 6, NB, xb[(size_t) t].data(), w1);
+                std::vector<float> d((size_t) E), want((size_t) E);
+                for (int c = 0; c < E; ++c) {
+                    want[(size_t) c] = w0[(size_t) c] + w1[(size_t) c];
+                    d[(size_t) c] = rx::bf2f(y[(size_t) t * E + c]) - want[(size_t) c];
+                }
+                worst = std::max(worst, norm(d) / std::max(1e-30, norm(want)));
+            }
+        }
+        char b[200];
+        std::snprintf(b, sizeof b, "8 requests answered; each reply the whole picks' and W's sums whole plus the other "
+                      "slice pick's [6, 9) (|d| / |it| %.2e < 1e-2)", worst);
+        check(all_in && worst < 1e-2, b);
+        rx::ReqRow r;   // (a pool pick of expert 1, a blob's: not in W)
+        r.n = 1;
+        r.e[0] = 1;
+        r.w[0] = 0.5f;
+        r.slice = (uint16_t) (1u | 1u << rx::kPoolBit);
+        std::vector<float> x((size_t) E, 0.1f);
+        const float* xp[1] = {x.data()};
+        const uint16_t* y = nullptr;
+        int us = 0;
+        const int g = up && m.send_req(++seq, 0, 1, &r, xp, err, 6) ? m.wait_resp(seq, 1, rx::now_ms() + 10000.0, &y, us, err) : -2;
+        check(g == -1 && err.find("not in W") != std::string::npos, "  a pool pick not in W: refused (" + err + ")");
+        m.close();
+        check(stop(ch) == 0, "  and it exited 0");
+    }
+    {
+        Child ch;
+        check(ch.start(port, root + "/a6"), "the same server");
+        rx::Main m;
+        std::string err;
+        const bool up = connect(m, port, L, err, 0, nullptr, H, NB, 3);
+        check(up && m.pool().empty(), "a main that does not split (k 9): no W (" + err + ")");
+        m.close();
+        check(stop(ch) == 0, "  and it exited 0");
+    }
+    {
+        Child ch;
+        check(ch.start(port, root + "/a6"), "the same server");
+        rx::Main m;
+        std::string err;
+        const bool up = connect(m, port, L, err, 0, nullptr, H, 6, 3, {3u});
+        std::vector<uint32_t> w = m.pool();
+        std::sort(w.begin(), w.end());
+        check(up && w == std::vector<uint32_t>({4u, 1u << 16 | 3u, 1u << 16 | 4u}),
+              "layer 0's expert 3 on this end's GPU (the BlobsEnd's): not in W, " + std::to_string(w.size()) + " experts (3) (" + err + ")");
+        m.close();
+        check(stop(ch) == 0, "  and it exited 0");
+    }
+    set_env("DS4_RX_POOL", nullptr);
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
 }
@@ -997,6 +1136,8 @@ int main(int argc, char** argv) {
     }
     // ---- H': the server with parts (--expert-server-parts)
     case_parts(port + 1, L);
+    // ---- the hybrid (U5c): the server's pool (DS4_RX_POOL) and its W
+    case_pool(port + 1, L);
     if (fails == 0) std::printf("ALL OK\n");
     else std::printf("%d FAILED\n", fails);
     return fails == 0 ? 0 : 1;
