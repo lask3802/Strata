@@ -14,6 +14,7 @@
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_model.hpp"
 #include "ds4_engram_io.hpp"
+#include "ds4_epparts.hpp"
 
 #include "ds4_gguf.cuh"
 #include "ds4_iq.cuh"
@@ -1087,6 +1088,38 @@ struct Model::Impl {
     // DS4_LANE_PROF=1: the lane's phases timed (Stats::lp_*, the decode's "decode lane phases" line) - clocks read,
     // nothing computed otherwise
     const bool lane_prof = std::getenv("DS4_LANE_PROF") != nullptr && std::atoi(std::getenv("DS4_LANE_PROF")) != 0;
+    // DS4_IQ_PF: the i-quant CPU lane's hint on its experts' ranges each call (madvise WILLNEED; on pages the cache holds
+    // it only costs the walk - 1.7 ms a token of 160 slices on CT 580, lane-bench file vs file-nopf): unset as before
+    // (every range; DS4_IQ_PF_COLD=1 prefetch_cold), 0 none, 1 every range, N > 1 the experts the layer's last N calls did
+    // not take only (pf_seen: the layer's call count at an expert's last call, pf_calls: the layer's calls)
+    const int iq_pf = std::getenv("DS4_IQ_PF") != nullptr ? std::max(0, std::atoi(std::getenv("DS4_IQ_PF"))) : -1;
+    std::vector<uint32_t> pf_seen, pf_calls;
+    size_t pf_ne = 0;
+    // DS4_IQ_DOWN_PARTS=dir: the CPU lane's down over a slice [ff0, ff0 + ffn) read from a parts pack of the down
+    // matrices alone (ep_parts.py --down-only A:B: each expert's dim rows cut to the blocks [A, B), back to back) instead
+    // of the pack's rows in place - there a row's [0, k) is strided (594 bytes a row, 396 of them read at k 6 on IQ2_XXS)
+    // and the prefetchers bring the rest of the row too: the down's DRAM time at k 6 is the whole row's (lane-bench file
+    // 11.10 ms at k 6 vs 11.40 at k 9).  A slice the parts end at (ff0 + ffn = 256 B, A <= ff0 / 256) of an expert read
+    // from the files (not a RAM-tier copy, no store) takes them; any other the pack's.  init_down_parts checks the parts:
+    // the pack's (pack_hash), every expert of a covered i-quant layer one part of the layer's down type and row layout.
+    ::strata::ds4::ep::Parts dparts;
+    struct DownParts {
+        int a = 0, b = 0;
+        size_t ub = 0, rb = 0;                // a row's bytes a block, and the part's row (b - a) ub
+        std::vector<const uint8_t*> at;       // expert -> its part's row 0, block a (empty: the layer has none)
+    };
+    std::vector<DownParts> dpl;               // by layer index
+    // DS4_LANE_TRACE=file: the i-quant CPU lane's calls as cpu_experts_iq gets them, for lane-bench --trace (its picks,
+    // their n_ff slice and tokens): "LANETRC1", then a record a call - u8 layer, u8 ff0 / 256, u8 (ff0 + ffn) / 256,
+    // u8 entries, then each entry's int16 expert and u8 tokens (flushed every 4096 calls and at the end)
+    std::FILE* lane_tr = open_lane_trace();
+    uint32_t lane_tr_n = 0;
+    static std::FILE* open_lane_trace() {
+        const char* p = std::getenv("DS4_LANE_TRACE");
+        std::FILE* f = p != nullptr && *p != '\0' ? std::fopen(p, "wb") : nullptr;
+        if (f != nullptr) std::fwrite("LANETRC1", 1, 8, f);
+        return f;
+    }
     std::vector<std::vector<int>> cores;        // each node's physical cores
     int NH = 1;                                 // the CPU lane's parts of an expert (the NUMA nodes)
     // the CPU lane's experts read in place from the model's files (one part, the files' layout; the page cache keeps
@@ -1492,6 +1525,8 @@ struct Model::Impl {
             }
         quit.store(true);
         if (service.joinable()) service.join();
+        if (lane_tr != nullptr) std::fclose(lane_tr);   // (the lane's calls are over: its service thread is)
+        lane_tr = nullptr;
         {
             std::lock_guard<std::mutex> lk(pf_mu);
         }
@@ -2033,6 +2068,63 @@ struct Model::Impl {
     // expert parallelism's n_ff slices: every layer with one must be a trunk layer with its experts on the i-quant CPU lane
     // alone (no VRAM tier, no GPU-visible store slots), in a process that is no remote stage's worker and skips no expert
     // by its RAM (STRATA_DS4_DISK_SKIP_W) - false (err) otherwise.  At load, and again by whatever sets a slice later
+    // DS4_IQ_DOWN_PARTS (dparts above): the parts opened and checked against this pack and its layers; false (err): set
+    // but not usable - a layer the parts cover with an expert missing or of another type or layout, no layer at all
+    bool init_down_parts(std::string& err) {
+        const char* dir = std::getenv("DS4_IQ_DOWN_PARTS");
+        if (dir == nullptr || *dir == '\0') return true;
+        namespace epp = ::strata::ds4::ep;
+        auto refuse = [&](const std::string& why) {
+            err = std::string("DS4_IQ_DOWN_PARTS=") + dir + ": " + why;
+            dparts.close();
+            dpl.clear();
+            return false;
+        };
+        std::string perr;
+        if (!dparts.open(dir, perr)) return refuse(perr);
+        if (dparts.pack_hash() != stage::pack_hash(o.pack)) return refuse("cut from another pack than " + o.pack + " (pack_hash)");
+        if (dparts.dim() != g.dim || dparts.n_ff() != g.ff || dparts.unit() != 256)
+            return refuse("the parts' geometry (dim " + std::to_string(dparts.dim()) + ", n_ff " + std::to_string(dparts.n_ff()) +
+                          ") is not the model's");
+        const int nb = dparts.blocks();
+        dpl.assign(L.size(), DownParts{});
+        int on = 0, a0 = 0, b0 = 0;
+        for (size_t li = 0; li < L.size(); ++li) {
+            const Layer& l = L[li];
+            if (l.mtp || (size_t) l.il != li || l.il >= dparts.layers() || !dparts.covers(l.il) || l.lay.fmt != gg::kFmtMXFP4 ||
+                gg::mx_experts(l.lay))
+                continue;   // (dpl and down_parts index by il: L's own order)
+            const std::string ln = "layer " + std::to_string(l.il);
+            const int td = gg::expert_type(l.lay, 2);
+            const size_t ub = gg::type_row_bytes(td, g.ff) / (size_t) nb;
+            epp::View v;
+            int k = 0;
+            while (k < nb && !dparts.view(l.il, 0, epp::kDown, k, v)) ++k;
+            if (k == nb) return refuse(ln + ": covered, but no down part of expert 0");
+            DownParts& d = dpl[li];
+            d.a = v.a, d.b = v.b, d.ub = ub, d.rb = (size_t) (v.b - v.a) * ub;
+            d.at.assign((size_t) l.n_exp, nullptr);
+            for (int e = 0; e < l.n_exp; ++e) {
+                if (!dparts.view(l.il, e, epp::kDown, d.a, v) || v.a != d.a || v.b != d.b || v.type != td || v.rows != (uint32_t) g.dim ||
+                    v.stride != d.rb)
+                    return refuse(ln + " expert " + std::to_string(e) + ": no down part [" + std::to_string(d.a) + ", " +
+                                  std::to_string(d.b) + ") of the layer's type " + std::to_string(td) + " and row layout");
+                d.at[(size_t) e] = v.data;
+            }
+            ++on;
+            a0 = d.a, b0 = d.b;
+        }
+        if (on == 0) return refuse("it covers none of the i-quant layers of the CPU lane");
+        std::fprintf(stderr, "ds4: DS4_IQ_DOWN_PARTS: %d layers' down slices [%d, %d) (and [k, %d) of them) from %s, rows contiguous\n",
+                     on, a0, b0, b0, dir);
+        return true;
+    }
+    // the layer's down parts when they serve the slice [ff0, ff0 + ffn) (it ends where they end), else null
+    const DownParts* down_parts(const Layer& l, int ff0, int ffn) const {
+        if (dpl.empty() || l.il < 0 || (size_t) l.il >= dpl.size() || L[(size_t) l.il].il != l.il) return nullptr;
+        const DownParts& d = dpl[(size_t) l.il];
+        return !d.at.empty() && ff0 % 256 == 0 && ff0 / 256 >= d.a && ff0 + ffn == 256 * d.b ? &d : nullptr;
+    }
     bool ep_slices_ok(std::string& err) const {
         if (!rx_slices_ok(err)) return false;
         for (const Layer& l : L)
@@ -3249,6 +3341,7 @@ struct Model::Impl {
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
         if (!ep_slices_ok(err)) return false;
+        if (!init_down_parts(err)) return false;
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         // U9 hc's side stream and events, made last: the plan, the read-ahead, the placement and the load's report all
         // read the free VRAM before them, as the old path's do
@@ -6130,6 +6223,35 @@ struct Model::Impl {
             };
         run_nodes(ne * DB, f);
     }
+    // (DS4_IQ_PF > 1) the layer's call count, this call's; and whether expert e was not taken in the layer's last iq_pf
+    // calls (never, or longer ago), marked taken now - a layer past the counts' size: always
+    uint32_t pf_tick(const Layer& l) {
+        if (pf_calls.empty()) {
+            for (const Layer& x : L) pf_ne = std::max(pf_ne, (size_t) std::max(0, x.n_exp));
+            pf_calls.assign(L.size(), 0);
+            pf_seen.assign(L.size() * pf_ne, 0);
+        }
+        return l.il >= 0 && (size_t) l.il < pf_calls.size() ? ++pf_calls[(size_t) l.il] : 0;
+    }
+    bool pf_stale(const Layer& l, int e, uint32_t tick) {
+        if (tick == 0 || e < 0 || (size_t) e >= pf_ne) return true;
+        uint32_t& s = pf_seen[(size_t) l.il * pf_ne + (size_t) e];
+        const bool stale = s == 0 || tick - s > (uint32_t) iq_pf;
+        s = tick;
+        return stale;
+    }
+    // (DS4_LANE_TRACE) the call's record
+    void lane_trace(const Layer& l, const std::vector<Ent>& ents, int ff0, int ffn) {
+        const uint8_t hd[4] = {(uint8_t) l.il, (uint8_t) (ff0 / 256), (uint8_t) ((ff0 + ffn) / 256), (uint8_t) std::min<size_t>(255, ents.size())};
+        std::fwrite(hd, 1, 4, lane_tr);
+        for (size_t i = 0; i < (size_t) hd[3]; ++i) {
+            const int16_t e = (int16_t) ents[i].e;
+            const uint8_t n = (uint8_t) std::min(255, ents[i].n);
+            std::fwrite(&e, 2, 1, lane_tr);
+            std::fwrite(&n, 1, 1, lane_tr);
+        }
+        if (++lane_tr_n % 4096 == 0) std::fflush(lane_tr);
+    }
     // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
     // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same.
     // Over the n_ff slice [ff0, ff0 + ffn) (cpu_experts' caller's: the whole n_ff, or a split pick's share - H',
@@ -6158,18 +6280,35 @@ struct Model::Impl {
             return;
         }
         const float lim = g.lim;
+        if (lane_tr != nullptr) lane_trace(l, ents, ff0, ffn);
+        const gg::IqCpu& fd = sliced ? fs : fm;
+        // (DS4_IQ_DOWN_PARTS) the entries' down rows from the parts, contiguous - an expert read from the files only (a
+        // RAM-tier copy or the store keeps the pack's layout): dpart(e) its slice's row 0, fp the rows' stride
+        const DownParts* dp = store ? nullptr : down_parts(l, ff0, ffn);
+        gg::IqCpu fp = fd;
+        if (dp != nullptr) fp.d_stride = dp->rb;
+        auto dpart = [&](int e) -> const uint8_t* {
+            return dp != nullptr && (l.ram.empty() || l.ram[(size_t) e] < 0) ? dp->at[(size_t) e] + (size_t) (ff0 / 256 - dp->a) * dp->ub
+                                                                             : nullptr;
+        };
         const double tp0 = lane_prof ? now_ms() : 0.0;   // (DS4_LANE_PROF: the prefetch and the x quant from here)
-        {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
+        if (iq_pf != 0) {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
             // range, ~0.13 ms an IQ2_XXS expert, on the lane's critical path before the first entry computes.
             // off by default (the mmap path, owner PC: not faster in every pair); DS4_IQ_PF_COLD=1 turns it on)
+            const uint32_t tick = iq_pf > 1 ? pf_tick(l) : 0;
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
-                if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
-                    for (int r = 0; r < 3; ++r)   // (a slice's gate / up rows; the down's rows hold every slice)
+                if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0) && (iq_pf <= 1 || pf_stale(l, en.e, tick)))
+                    for (int r = 0; r < 3; ++r) {   // (a slice's gate / up rows; the down's rows hold every slice)
+                        if (r == 2 && dpart(en.e) != nullptr) {   // (the parts' rows of the slice)
+                            want.push_back({dpart(en.e), (size_t) (E - 1) * dp->rb + fd.d_row});
+                            continue;
+                        }
                         want.push_back({mx_mat(l, en.e, r) + (r < 2 ? (size_t) ff0 * mx_row_b(l, r) : 0),
                                         r < 2 ? (size_t) ffn * mx_row_b(l, r) : mx_part_bytes(l, r)});
+                    }
             static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
-            if (pf_all) os::prefetch(want);
+            if (pf_all || iq_pf > 0) os::prefetch(want);
             else os::prefetch_cold(want);
         }
         // the activations in c_xh's bytes, E 4 apart: token t's (t < kWin) at row t - quantized once, whatever number of
@@ -6216,7 +6355,6 @@ struct Model::Impl {
                 gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF + ff0, ffn,
                                  aq + (size_t) (kWin + en.slot0 + i) * E * 4);
         };
-        const gg::IqCpu& fd = sliced ? fs : fm;
         auto dn_job = [&](int X, int q, int b) {
             const Ent& en = ents[(size_t) (ord != nullptr ? ord[q] : q)];
             const int r0 = X * Eh + b * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
@@ -6226,7 +6364,10 @@ struct Model::Impl {
                 hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
                 yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
             }
-            gg::iq_cpu_down(fd, mx_part_ptr(l, en.e, 2, X) + d_off, hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+            if (const uint8_t* p = dpart(en.e))   // (the parts' rows: part X's from row X Eh)
+                gg::iq_cpu_down(fp, p + (size_t) (X * Eh) * dp->rb, hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+            else
+                gg::iq_cpu_down(fd, mx_part_ptr(l, en.e, 2, X) + d_off, hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
         };
         std::function<void(int)> f[4];
         for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { gu_job(X, j / GB, j % GB); };
