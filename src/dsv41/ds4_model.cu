@@ -1120,20 +1120,20 @@ struct Model::Impl {
     // other value fails the load
     const char* iq_warm_env = std::getenv("DS4_IQ_WARM");
     const bool iq_warm_split = iq_warm_env != nullptr && std::strcmp(iq_warm_env, "split") == 0;
-    // DS4_IQ_WARM_TOUCH (with split): unset or 1, warm_split reads a byte of every 4 KiB page it read in, through the
-    // lane's mapping, so each one's page table entry has its accessed bit when the kernel next looks for pages to evict
-    // (MADV_POPULATE_READ maps them without it on x86, as far as known: then a page populated but not yet read by the
-    // lane is as evictable as one no process maps). lane-bench-report.md section 17: the first warm arm after another
-    // config lost 9-18 GB of the pages it had just populated within the populate, while 25-35 GB of the other config's
-    // unmapped pages stayed. 0: no touch (as before); any other value fails the load
+    // DS4_IQ_WARM_TOUCH (with split): 1, warm_split reads a byte of every 4 KiB page it read in, through the lane's
+    // mapping, so each one's page table entry has its accessed bit when the kernel next looks for pages to evict (the
+    // guess of lane-bench-report.md section 17, that MADV_POPULATE_READ maps them without it on x86). Section 18: the
+    // populated pages were promoted to the youngest generation within the populate, with no aging - they had the bit;
+    // the wt-run A/B (slot-20261025T2329Z): touched or not, the same speed (28.2-28.8 tok/s cold, 30.7-31.3 hot). Unset,
+    // empty or 0: no touch; any other value fails the load
     const char* iq_warm_touch_env = std::getenv("DS4_IQ_WARM_TOUCH");
-    const bool iq_warm_touch = iq_warm_touch_env == nullptr || *iq_warm_touch_env == '\0' || std::strcmp(iq_warm_touch_env, "1") == 0;
-    // DS4_IQ_WARM_ORDER (with split): unset or cold, warm_split reads its experts (still the most-routed up to
-    // warm_bytes) the least-routed first, so what the read-ahead pushes out of a full page cache itself is its coldest
-    // pages, not its hottest (section 17: the most-routed first lost the hottest 9-18 GB); hot: the most-routed first,
-    // as before; any other value fails the load
+    const bool iq_warm_touch = iq_warm_touch_env != nullptr && std::strcmp(iq_warm_touch_env, "1") == 0;
+    // DS4_IQ_WARM_ORDER (with split): cold, warm_split reads its experts (still the most-routed up to warm_bytes) the
+    // least-routed first, so what the read-ahead pushes out of a full page cache itself is its coldest pages, not its
+    // hottest (section 17's guess). The wt-run A/B: either order the same speed. Unset, empty or hot: the most-routed
+    // first; any other value fails the load
     const char* iq_warm_order_env = std::getenv("DS4_IQ_WARM_ORDER");
-    const bool iq_warm_cold_first = iq_warm_order_env == nullptr || *iq_warm_order_env == '\0' || std::strcmp(iq_warm_order_env, "cold") == 0;
+    const bool iq_warm_cold_first = iq_warm_order_env != nullptr && std::strcmp(iq_warm_order_env, "cold") == 0;
     // DS4_LANE_TRACE=file: the i-quant CPU lane's calls as cpu_experts_iq gets them, for lane-bench --trace (its picks,
     // their n_ff slice and tokens): "LANETRC1", then a record a call - u8 layer, u8 ff0 / 256, u8 (ff0 + ffn) / 256,
     // u8 entries, then each entry's int16 expert and u8 tokens (flushed every 4096 calls and at the end)
@@ -2184,7 +2184,7 @@ struct Model::Impl {
     }
     // DS4_IQ_WARM=split (iq_warm_split above), at the end of the load (the server's upload, rx_split's slices and the
     // parts known): what the CPU lane reads of each of its experts' picks read in and mapped, the most-routed up to
-    // warm_bytes (read the least-routed first: DS4_IQ_WARM_ORDER), then each of its pages read once through that mapping (DS4_IQ_WARM_TOUCH).  Neither read ahead nor dropped from the page cache (no POSIX_FADV_DONTNEED): a CPU-lane expert's
+    // warm_bytes (in what order: DS4_IQ_WARM_ORDER), then with DS4_IQ_WARM_TOUCH=1 each of its pages read once through that mapping.  Neither read ahead nor dropped from the page cache (no POSIX_FADV_DONTNEED): a CPU-lane expert's
     // rows past its layer's slice (its gate / up [k, 9); with the parts the pack's down), and the expert server's experts
     // (rx_has).  The lane reads those only when it computes a pick's [k, 9), or a pick whole, after all - a late or lost
     // reply, a pick the send gate keeps here, the link given up - and then they come in by page faults through the same
@@ -2299,7 +2299,7 @@ struct Model::Impl {
         if (!no_pop.load() && by_read.load() > 0)
             how += ", " + std::to_string(by_read.load()) + " ranges by pread after it failed on them (not mapped)";
         if (failed.load() > 0) how += "; " + std::to_string(failed.load()) + " reads failed (those ranges left to the lane's faults)";
-        how += iq_warm_cold_first ? "; the least-routed first (DS4_IQ_WARM_ORDER)" : "; the most-routed first (DS4_IQ_WARM_ORDER=hot)";
+        how += iq_warm_cold_first ? "; the least-routed first (DS4_IQ_WARM_ORDER=cold)" : "; the most-routed first (DS4_IQ_WARM_ORDER)";
         std::fprintf(stderr, "ds4: DS4_IQ_WARM=split: %zu of the CPU lane's experts read ahead in %.1f s (%.1f GB: the gate / up "
                              "of their slices %.1f GB, downs %.1f GB from the parts and %.1f GB the pack's whole ones) - %s; "
                              "left out: %zu past warm_bytes (%.1f GB), the expert server's %zu, and each one's rows past its "
@@ -2307,7 +2307,7 @@ struct Model::Impl {
                      nw, (now_ms() - t0) / 1000.0, b / 1e9, gu / 1e9, dpb / 1e9, dwb / 1e9, how.c_str(), ws.size() - nw,
                      warm_bytes / 1e9, n_rx);
         if (!iq_warm_touch) {
-            std::fprintf(stderr, "ds4: DS4_IQ_WARM_TOUCH=0: the pages read ahead not touched\n");
+            std::fprintf(stderr, "ds4: DS4_IQ_WARM_TOUCH unset or 0: the pages read ahead not touched\n");
             return;
         }
         // (DS4_IQ_WARM_TOUCH) a byte of every 4 KiB page of the ranges read through the lane's mapping, by 12 threads
@@ -3443,11 +3443,11 @@ struct Model::Impl {
             err = std::string("DS4_IQ_WARM=") + iq_warm_env + ": split or unset";
             return false;
         }
-        if (!iq_warm_touch && std::strcmp(iq_warm_touch_env, "0") != 0) {
+        if (!iq_warm_touch && iq_warm_touch_env != nullptr && *iq_warm_touch_env != '\0' && std::strcmp(iq_warm_touch_env, "0") != 0) {
             err = std::string("DS4_IQ_WARM_TOUCH=") + iq_warm_touch_env + ": 0, 1 or unset";
             return false;
         }
-        if (!iq_warm_cold_first && std::strcmp(iq_warm_order_env, "hot") != 0) {
+        if (!iq_warm_cold_first && iq_warm_order_env != nullptr && *iq_warm_order_env != '\0' && std::strcmp(iq_warm_order_env, "hot") != 0) {
             err = std::string("DS4_IQ_WARM_ORDER=") + iq_warm_order_env + ": cold, hot or unset";
             return false;
         }
