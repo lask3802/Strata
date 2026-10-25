@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -568,6 +569,26 @@ inline int pinned_cpu() {
         if (CPU_ISSET(c, &s)) one = c;
 #endif
     return one;
+}
+/// The logical CPU the calling thread runs on now (-1: not known)
+inline int cpu_now() {
+#if defined(_WIN32)
+    PROCESSOR_NUMBER pn{};
+    GetCurrentProcessorNumberEx(&pn);
+    return pn.Group == 0 ? (int) pn.Number : -1;
+#else
+    return sched_getcpu();
+#endif
+}
+/// The calling thread's CPU time, ms (Linux: CLOCK_THREAD_CPUTIME_ID; Windows: its cycles at the base clock are not
+/// time - -1)
+inline double thread_cpu_ms() {
+#if defined(_WIN32)
+    return -1.0;
+#else
+    timespec t{};
+    return clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t) == 0 ? (double) t.tv_sec * 1e3 + (double) t.tv_nsec / 1e6 : -1.0;
+#endif
 }
 /// A kernel CPU list ("3,19", "3-4", "0-1,8-9") as its CPUs, in its order; it ends at anything else
 inline std::vector<int> cpu_list(const char* s) {

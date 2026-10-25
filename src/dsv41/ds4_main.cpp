@@ -1999,6 +1999,28 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "decode CPU lane reads: %.1f MB a token of its experts' bytes, %.1f GB/s over its %.2f ms\n",
                      (s.lane_bytes - s0.lane_bytes) / nt / 1e6,
                      (s.lane_bytes - s0.lane_bytes) / 1e6 / std::max(1e-3, s.cpu_ms - s0.cpu_ms), (s.cpu_ms - s0.cpu_ms) / nt);
+    // the head's wait (DS4_CUDA_SYNC): its thread's CPU time over its wall time (about 100%: it spins) and the CPUs it
+    // waited on, the most first - with the lane's line, or DS4_CUDA_SYNC set
+    const char* sync_env = std::getenv("DS4_CUDA_SYNC");
+    if ((lane_line || sync_env != nullptr) && s.head_waits > s0.head_waits) {
+        std::vector<std::pair<int64_t, int>> on;
+        for (int c = 0; c < 129; ++c)
+            if (s.head_on[c] > s0.head_on[c]) on.push_back({s.head_on[c] - s0.head_on[c], c});
+        std::sort(on.begin(), on.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+        std::string cpus;
+        for (size_t i = 0; i < on.size() && i < 6; ++i)
+            cpus += (i ? ", " : "") + (on[i].second < 128 ? "CPU " + std::to_string(on[i].second) : std::string("not known")) +
+                    " " + std::to_string(on[i].first);
+        if (on.size() > 6) cpus += ", " + std::to_string(on.size() - 6) + " more";
+        const double wall = s.head_ms - s0.head_ms, cpu = s.head_cpu_ms - s0.head_cpu_ms;
+        const std::string share = strata::ds4::os::thread_cpu_ms() < 0
+                                      ? std::string("not known")
+                                      : std::to_string((int) std::lround(100.0 * cpu / std::max(1e-9, wall))) + "% of it";
+        std::fprintf(stderr, "decode head wait (DS4_CUDA_SYNC=%s): %.2f ms a token, its thread's CPU time %s; %lld waits on %s\n",
+                     sync_env != nullptr ? sync_env : "unset, the driver's auto", wall / nt, share.c_str(),
+                     (long long) (s.head_waits - s0.head_waits), cpus.c_str());
+    }
     if (s.lp_calls > s0.lp_calls) {   // (DS4_LANE_PROF=1 only) the lane's phases, ms a token; use: busy / (threads x wall)
         auto pt = [&](double a, double b) { return (a - b) / nt; };
         auto use = [&](double busy, double busy0, double wall, double wall0) {

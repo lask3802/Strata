@@ -1177,6 +1177,19 @@ struct Model::Impl {
     bool slot_held = false;           // slot_save took this state and nothing has changed it since
     std::vector<uint32_t> prof;       // [nl][n_exp] routed-expert hits
     Stats st;
+    // the head's wait (the token's one host wait on the GPU, decode and prompt): its wall time, the waiting thread's CPU
+    // time in it and the CPU it began on (Stats::head_*) - whether the wait spins (DS4_CUDA_SYNC) and on which CPU
+    bool head_wait(cudaStream_t s, std::string& err) {
+        const int c = os::cpu_now();
+        ++st.head_on[c >= 0 && c < 128 ? c : 128];
+        ++st.head_waits;
+        const double th = now_ms(), tc = os::thread_cpu_ms();
+        CK(cudaStreamSynchronize(s));
+        st.head_ms += now_ms() - th;
+        const double tc1 = os::thread_cpu_ms();
+        if (tc >= 0 && tc1 >= 0) st.head_cpu_ms += tc1 - tc;
+        return true;
+    }
     int cur_topk_n[kWin] = {}, cur_cand_n[kWin] = {};   // what the latest indexer / candidate source left, per query
                                                         // (plan_window's: the windows' plans are made in order)
     int n_logits = 0;                 // the last forward's logit rows
@@ -2481,10 +2494,55 @@ struct Model::Impl {
         devs.resize(ids.size());
         u9::mask();       // (both print their state at load)
         attn_split();
+        // DS4_CUDA_SYNC=spin|yield|block: how this process's host threads wait on its GPUs (cudaStreamSynchronize and the
+        // like - the head's wait, the token's one: decode's layers do not wait on the host). Unset: the driver's default,
+        // auto, which spins while the process's contexts are fewer than the CPUs - here the head's wait spins its whole
+        // time (Stats::head_cpu_ms), a busy thread on a CPU no one pinned it to, likely a lane core's sibling (the
+        // lane-bench's :spin=, slot-20261025T1948Z). block sleeps in the driver until the GPU's interrupt: the wait's CPU
+        // free, its return later by the wake-up (measured on an RTX 3070, Windows: +43 us a wait, the thread's cycles
+        // 0.1 M against spin's 6 M over 2 ms). yield spins too, giving the CPU to a ready thread between its polls. The
+        // flags are the primary context's (cudaInitDevice, CUDA 12+), read back after; not on HIP. The fill thread
+        // (ds4_rx_fill_link.cpp) has no switch: it does not spin (Conn spin_ms 0 - a poll() wait -, sleep_for between
+        // its pieces)
+        unsigned sched = 0;
+        const char* sync_env = std::getenv("DS4_CUDA_SYNC");
+        if (sync_env != nullptr) {
+            const std::string v = sync_env;
+            sched = v == "spin" ? cudaDeviceScheduleSpin : v == "yield" ? cudaDeviceScheduleYield
+                                                         : v == "block" ? cudaDeviceScheduleBlockingSync : 0u;
+            if (sched == 0) {
+                err = "DS4_CUDA_SYNC=" + v + ": spin, yield, block or unset";
+                return false;
+            }
+#if defined(STRATA_USE_HIP)
+            err = "DS4_CUDA_SYNC: CUDA only";
+            return false;
+#endif
+        }
         for (size_t i = 0; i < ids.size(); ++i) {
             Dev& d = devs[i];
             d.id = ids[i];
+#if !defined(STRATA_USE_HIP)
+            // (cudaInitDeviceFlagsAreValid: without it the call ignores sched and returns success - measured on CUDA 13)
+            if (sched != 0) CK(cudaInitDevice(d.id, sched, cudaInitDeviceFlagsAreValid));
+#endif
             CK(cudaSetDevice(d.id));
+#if !defined(STRATA_USE_HIP)
+            if (sched != 0) {
+                unsigned f = 0;
+                CK(cudaGetDeviceFlags(&f));
+                if ((f & cudaDeviceScheduleMask) != sched) {
+                    err = "DS4_CUDA_SYNC=" + std::string(sync_env) + ": CUDA" + std::to_string(d.id) + "'s flags are " +
+                          std::to_string(f) + ": the schedule was not applied";
+                    return false;
+                }
+                std::fprintf(stderr, "ds4: DS4_CUDA_SYNC=%s: CUDA%d's host waits %s (device flags 0x%x)\n", sync_env, d.id,
+                             sched == cudaDeviceScheduleSpin    ? "spin"
+                             : sched == cudaDeviceScheduleYield ? "spin, yielding the CPU between polls"
+                                                                : "block until the GPU's interrupt",
+                             f);
+            }
+#endif
             CK(cudaStreamCreateWithFlags(&d.st, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming));
             if (!x3::prepare(d.st) || (pk.gguf && !gg::prepare(d.st))) {
@@ -10155,9 +10213,7 @@ struct Model::Impl {
         eg_stats();
         Dev& d = devs[(size_t) head_dev];
         cudaSetDevice(d.id);
-        const double th = now_ms();
-        CK(cudaStreamSynchronize(d.st));
-        st.head_ms += now_ms() - th;
+        if (!head_wait(d.st, err)) return false;
         if (prof_chunk) {   // DS4_PROF: the run's GPU time by stage, every device's summed
             for (Dev& dv : devs) {
                 cudaSetDevice(dv.id);
@@ -10555,9 +10611,7 @@ struct Model::Impl {
         eg_stats();
         Dev& d = devs[(size_t) head_dev];
         cudaSetDevice(d.id);
-        const double th = now_ms();
-        CK(cudaStreamSynchronize(d.st));
-        st.head_ms += now_ms() - th;
+        if (!head_wait(d.st, err)) return false;
         if (ep_verify) {   // (the window's checks are in: its stream is done)
             CK(cudaMemcpy(st.ep_verify, v_err, sizeof(float) * (size_t) std::min(g.nl, 64), cudaMemcpyDeviceToHost));
             st.ep_verify_wrong = v_wrong;

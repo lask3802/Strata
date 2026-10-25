@@ -109,6 +109,11 @@ struct Stats {
     double lp_gu_ms = 0.0, lp_gu_tail_ms = 0.0, lp_gu_busy_ms = 0.0, lp_hq_ms = 0.0;
     double lp_dn_ms = 0.0, lp_dn_tail_ms = 0.0, lp_dn_busy_ms = 0.0;
     double layer_ms = 0.0, head_ms = 0.0, engram_ms = 0.0;   // the layers' host time in all; the head's wait; Engram reads
+    // the head's waits (its cudaStreamSynchronize, decode and prompt): the waiting thread's CPU time in them (Linux; a
+    // spinning wait's is its wall time, a blocking one's near 0) and the CPU each began on, by CPU (the last: past 127
+    // or not known)
+    double head_cpu_ms = 0.0;
+    int64_t head_waits = 0, head_on[129] = {};
     int64_t eg_rows = 0, eg_hits = 0, eg_reads = 0;   // Engram rows asked for, served without a read, read from the files
     double eg_io_ms = 0.0;                            // the windows' Engram reads, issue to last done (mostly hidden)
     int64_t eg_cached = 0, eg_cache_cap = 0;          // the row cache's rows held, its capacity
