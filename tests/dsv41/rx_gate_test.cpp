@@ -119,6 +119,25 @@ int main() {
         const double so[5] = {1030.0, 1045.0, 1060.0, 1015.0, 1000.0};
         for (double x : so) o.rtt_seen(1, 8.0, true, x);
         check(std::fabs(o.rtt[1] - (0.9 * four + 0.8)) < 1e-9, "sends out of order over 60 ms: the 5th as it is");
+        rx::Gate g2 = g;
+        g2.rtt_seen(1, 0.8, true, 310.0);   // (ends g's run of one)
+        const double base2 = g2.rtt[1];
+        for (int i = 0; i < 5; ++i) g2.rtt_seen(1, 27.0, true, 400.0 + 2.5 * i);
+        check(std::fabs(g2.rtt[1] - base2 * 1.2 * 1.2 * 1.2 * 1.2 * 1.2) < 1e-9,
+              "a second run in the same gate: its own span (bunched: all 5 clamped)");
+        rx::Gate n;   // (no send times: the count alone)
+        for (int i = 0; i < 10; ++i) n.rtt_seen(1, 0.8);
+        for (int i = 0; i < 5; ++i) n.rtt_seen(1, 8.0);
+        check(std::fabs(n.rtt[1] - (0.9 * four + 0.8)) < 1e-9, "no send times: the 5th as it is (the count alone)");
+        rx::Gate m;   // (the run's first sample has no send time, the 4 others are bunched)
+        for (int i = 0; i < 10; ++i) m.rtt_seen(1, 0.8, true, 10.0 * i);
+        m.rtt_seen(1, 8.0);
+        for (int i = 0; i < 4; ++i) m.rtt_seen(1, 8.0, true, 1000.0 + 2.5 * i);
+        check(std::fabs(m.rtt[1] - five) < 1e-9, "the first without a send time, then 4 within 10 ms: all clamped");
+        rx::Gate e;   // (the edge: exactly 50 ms)
+        for (int i = 0; i < 10; ++i) e.rtt_seen(1, 0.8, true, 10.0 * i);
+        for (int i = 0; i < 5; ++i) e.rtt_seen(1, 8.0, true, 1000.0 + 12.5 * i);
+        check(std::fabs(e.rtt[1] - (0.9 * four + 0.8)) < 1e-9, "5 slow over exactly 50 ms: the 5th as it is");
     }
     {
         // a late request's reply that comes after all (lead's Q3): the book gives its send and rows once

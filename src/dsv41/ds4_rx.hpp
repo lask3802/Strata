@@ -94,9 +94,9 @@ struct Gate {
     // there when the lane finished its own part says only that the round trip was at most that long - the time is the
     // lane's, not the link's -: it may lower the estimate, never raise it.  After 4 samples a sample counts as 3 x the
     // estimate at most (one spike moves it by 20%; the late count is the reply's own time), but not after 4 in a row
-    // were and their sends span kSlowerMs or more: then the link did get slower, and the sample counts as it is
-    // (before 8 of 64 late idle the link).  A stall bunches its replies within a few ms: those stay clamped.  sent < 0
-    // (no send time): the count alone
+    // were and their sends span kSlowerMs or more: then the link did get slower, and the sample counts as it is (with
+    // sends sparser than that, 8 of 64 late may idle the link first; the run spans it after).  A stall bunches its
+    // replies within a few ms: those stay clamped.  sent < 0 (no send time): the count alone
     void rtt_seen(int rows, double ms, bool waited = true, double sent = -1.0) {
         if (!waited && rtt[rows] > 0.0 && ms >= rtt[rows]) return;
         if (seen[rows] >= 4 && ms > 3.0 * rtt[rows]) {
