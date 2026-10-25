@@ -3,7 +3,9 @@
 // experts, expert parallelism) and so take token paths of their own route the same experts as the baseline.  The file:
 // ids as the decode prints them (1,2,3, - commas, spaces or new lines between); fewer than N: refused.  Each own pick
 // that differed is counted, the first one's position kept.  Plain decode only (no drafts: their verification picks
-// the tokens).
+// the tokens).  An EOS (1) in the file ends the decode there as the run that wrote it ended (DS4_NO_EOS: on through it);
+// a run that ended before N wrote fewer: give the same N only when it did not (or DS4_NO_EOS both times).  Other modes
+// (--serve, --score, --spec-eval, --profile-run) say they leave it out.
 #pragma once
 
 #include <cstdlib>

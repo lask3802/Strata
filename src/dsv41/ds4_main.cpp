@@ -1800,6 +1800,10 @@ int main(int argc, char** argv) {
             m.set_stage_chunks(std::move(sc));
         }
     }
+    if (const char* ff = std::getenv("DS4_FORCE_TOKENS");
+        ff != nullptr && *ff != 0 && (serve_mode || !prof_ids.empty() || !spec_ids.empty() || !score_ids.empty()))
+        std::fprintf(stderr, "maya-ds4: DS4_FORCE_TOKENS is the CLI decode's (--ids ... --n N): not this mode's, left "
+                             "out\n");
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
     const int window_given = window;
     if (window == 0) window = 16;   // (the scoring / profiling runs; the plain run below takes the model's feed unit)
