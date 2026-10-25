@@ -82,18 +82,16 @@ int main() {
         q.rtt_seen(1, 100.0, true, 1000.0);
         check(near(q.rtt[1], 0.9 * 0.7 + 0.1 * 2.1), "a seed after 4 clamped: the run starts again, clamped");
     }
-    {   // H' (ep-u6-plan.md 3a): a slice pick counts its [k, nb) share of a pick in the gate's local cost
+    {   // H': the gate counts the lane's picks whole, split or not (sent, its [0, k) of them hides the round trip);
+        // slice_share (a slice pick's [k, nb) share) is the deadline's
         rx::Gate g;
         g.rtt_seen(1, 0.66);
         g.pick_seen(1, 0.26);
         check(rx::slice_share(4, 8, 9) == 1 && rx::slice_share(4, 3, 9) == 3 && rx::slice_share(9, 6, 9) == 3 &&
                   rx::slice_share(0, 6, 9) == 0 && rx::slice_share(4, 9, 9) == 0,
               "slice_share: 4 slice picks at k 8 are 1 pick's worth (rounded up), at k 3 3; 9 at k 6 3; none, or k nb: 0");
-        check(!g.send(1, 1, 0, rx::slice_share(4, 8, 9)), "T=1, 4 slice picks at k 8, no whole: 0.66 > 0.26 ms, kept here");
-        check(g.send(1, 1, 0, 4), "  (the same 4 counted whole: 0.66 <= 1.04 ms, out)");
-        check(g.send(1, 1, 0, rx::slice_share(4, 3, 9)), "T=1, 4 slice picks at k 3: 0.66 <= 0.78 ms, out");
-        check(!g.send(1, 1, 1, rx::slice_share(4, 8, 9)), "T=1, 1 whole remote pick and 4 slice picks at k 8: 0.66 > 0.52 "
-                                                           "ms, kept here");
+        check(g.send(1, 1, 0, 4), "T=1, 4 slice picks at k 8, no whole: 0.66 <= 1.04 ms, out");
+        check(g.send(1, 1, 1, 4), "T=1, 1 whole remote pick and 4 slice picks at k 8: 0.66 <= 1.30 ms, out");
     }
     {
         rx::Gate g;
