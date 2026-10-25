@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <string>
 #include <thread>
 #include <unordered_map>
 
@@ -29,6 +31,22 @@ namespace {
             return -1;                                                                                 \
         }                                                                                              \
     } while (0)
+
+// the wall clock as HH:MM:SS.mmm UTC (a slow request's line, to match with the main's late replies)
+std::string utc_now() {
+    const auto t = std::chrono::system_clock::now();
+    const std::time_t s = std::chrono::system_clock::to_time_t(t);
+    const int ms = (int) (std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count() % 1000);
+    std::tm u{};
+#if defined(_WIN32)
+    gmtime_s(&u, &s);
+#else
+    gmtime_r(&s, &u);
+#endif
+    char b[32];
+    std::snprintf(b, sizeof b, "%02d:%02d:%02d.%03d", u.tm_hour, u.tm_min, u.tm_sec, ms);
+    return b;
+}
 
 struct Session {
     GeoMsg geo;
@@ -198,7 +216,8 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
     };
     std::vector<uint16_t> yb((size_t) kMaxRows * D);
     int rc = 0;
-    int64_t served = 0, pings = 0;
+    int64_t served = 0, pings = 0, slow = 0;   // (slow: requests over 2 ms here)
+    double last_end = -1;
     double busy = 0, prep = 0, gpu = 0;
     const int errs0 = gg::launch_errors();
     for (;;) {
@@ -209,6 +228,7 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
                          c.peer().c_str(), err.c_str(), (long long) served, busy * 1000.0 / n, prep * 1000.0 / n,
                          gpu * 1000.0 / n, (busy - prep - gpu) * 1000.0 / n);
             if (pings > 0) std::fprintf(stderr, "expert server: %lld pings answered\n", (long long) pings);
+            std::fprintf(stderr, "expert server: %lld requests over 2 ms here\n", (long long) slow);
             static const char* const bucket_name[3] = {"T=1", "T=4", "T=other"};
             for (int bk = 0; diag && bk < 3; ++bk)
                 for (int k = 0; k < kParts; ++k) {
@@ -337,6 +357,14 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
         }
         busy += dt;
         ++served;
+        if (const double tq = now_ms(); tq - tr > 2.0) {   // a slow one, its parts (a late reply: here or the network)
+            if (++slow <= 100)
+                std::fprintf(stderr, "expert server: slow request %s UTC seq %u layer %d rows %d: %.2f ms (the rows' prep "
+                                     "%.2f, the GPU %.2f, bf16 %.2f, the send %.2f; %.1f ms after the last one's end)%s\n",
+                             utc_now().c_str(), h.seq, li, nr, tq - tr, tg - tr, ts - tg, tr + dt - ts, tq - tr - dt,
+                             last_end > 0 ? tr - last_end : -1.0, slow == 100 ? " (the last one said; the count at the end)" : "");
+        }
+        last_end = now_ms();
         if (diag) {
             const double tz = now_ms();
             keep(kPrep, tg - tr);

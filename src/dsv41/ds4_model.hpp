@@ -137,6 +137,9 @@ struct Stats {
     // those with their own (rx_late_arr)
     int64_t rx_backoffs = 0, rx_idle = 0, rx_late_came = 0, rx_late_shared = 0, rx_late_timed = 0;
     int64_t rx_late_l[64] = {};   // late replies by layer (the first 64)
+    // the server's picks the lane computed after all (kept here by the send gate or an idle spell, late replies, a lost
+    // link), and their experts that were not all in the page cache then (Linux: mincore; read from the disk)
+    int64_t rx_here = 0, rx_here_cold = 0;
     // by the window's T (1..16): requests sent, late replies, and windows the send gate kept here (the server's round
     // trip at that T expected to cost more than the lane computing its picks)
     int64_t rx_req_t[17] = {}, rx_late_t[17] = {}, rx_skip_t[17] = {};

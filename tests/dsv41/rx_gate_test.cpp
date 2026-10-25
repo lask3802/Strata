@@ -1,8 +1,8 @@
 // Strata. The remote experts' send gate and reply deadline (rx::Gate, src/dsv41/ds4_rx.hpp): the main process sends a
 // window's remote picks only when the expert server's round trip is expected to end no later than the CPU lane
-// computing them with its own, and waits for a reply until the later of DS4_RX_TIMEOUT_MS after the lane's part and
-// 1.5 x the round trip expected at the request's rows.  No GPU, no socket.  The numbers are the 3070's over 1 GbE
-// (rx-poc-report.md): T=1 0.66 ms (1 pick), T=4 2.17 ms; the lane 0.26 ms a pick.
+// computing them with its own, and waits for a reply until the later of the lane's time for the remote picks after
+// its part and 1.5 x the round trip expected at the request's rows.  No GPU, no socket.  The numbers are the 3070's
+// over 1 GbE (rx-poc-report.md): T=1 0.66 ms (1 pick), T=4 2.17 ms; the lane 0.26 ms a pick.
 #include "../../src/dsv41/ds4_rx.hpp"
 
 #include <cmath>
@@ -26,6 +26,41 @@ int main() {
         check(near(g.rtt[1], 0.66), "the first round trip is the estimate");
         g.rtt_seen(1, 1.66);
         check(near(g.rtt[1], 0.76), "then an EWMA of 0.1");
+    }
+    {
+        // (lead 2026-10-25) the wait after the lane's part: as long as the lane would take for the remote picks
+        rx::Gate g;
+        check(near(g.wait_ms(1, 2, 2.0, false), 2.0), "the lane's time a pick not known yet: the fixed 2 ms");
+        g.pick_seen(1, 0.26);
+        check(near(g.wait_ms(1, 1, 2.0, false), 0.26), "1 remote pick at 0.26 ms a pick: wait 0.26 ms");
+        check(near(g.wait_ms(1, 3, 2.0, false), 0.78), "3 remote picks: 0.78 ms");
+        check(near(g.wait_ms(1, 3, 2.0, true), 2.0), "DS4_RX_TIMEOUT_MS set: the fixed wait");
+        rx::Gate f;
+        f.pick_seen(1, 0.03);
+        check(near(f.wait_ms(1, 1, 2.0, false), rx::Gate::kMinWaitMs), "a fast lane: 0.1 ms at least");
+        g.rtt_seen(1, 0.7);
+        check(near(g.deadline(10.0, 11.0, g.wait_ms(1, 1, 2.0, false), 1), 11.26), "the lane's part + 0.26 ms is the later");
+        g.rtt_seen(1, 3.0);   // (0.93 ms: 1.5 x is 1.395 after the send)
+        check(near(g.deadline(10.0, 11.0, g.wait_ms(1, 1, 2.0, false), 1), 10.0 + 1.5 * 0.93), "1.5 x the round trip is");
+    }
+    {
+        // (lead 2026-10-25) the gate's start: the load's pings seed it, and the clamp holds from the first sample (a
+        // cold server's first reply took 178 ms in a slot, and the gate kept 936 windows here until probes brought it
+        // down)
+        rx::Gate cold;
+        cold.rtt_seen(1, 178.0);
+        check(near(cold.rtt[1], 178.0), "no seed: a cold first reply is the estimate");
+        rx::Gate s;
+        s.seed(1, 0.7);
+        check(near(s.rtt[1], 0.7), "seeded: the pings' median is the estimate");
+        s.rtt_seen(1, 178.0, true, 0.0);
+        check(near(s.rtt[1], 0.9 * 0.7 + 0.1 * 2.1), "seeded: the cold first reply counts as 3 x the seed");
+        s.pick_seen(1, 0.26);
+        check(s.send(1, 1, 1, 3), "and the next window goes out (0.84 ms against 4 picks x 0.26)");
+        rx::Gate z;
+        z.seed(1, 0.0);
+        z.rtt_seen(1, 5.0);
+        check(near(z.rtt[1], 5.0), "a seed of 0 (no pings): nothing seeded");
     }
     {
         rx::Gate g;

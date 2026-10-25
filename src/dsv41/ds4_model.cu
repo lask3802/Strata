@@ -1069,7 +1069,9 @@ struct Model::Impl {
     std::unique_ptr<rx::Main> rx_link;
     std::vector<uint8_t> rx_has;
     bool rx_on = false;
-    double rx_timeout_ms = 2.0;   // (counted from when the lane's own picks are done)
+    double rx_timeout_ms = 2.0;   // (counted from when the lane's own picks are done: until the lane's time a pick is
+    bool rx_wait_fixed = false;   //  known, or always with DS4_RX_TIMEOUT_MS; rx::Gate::wait_ms)
+    double rx_seed_ms = -1.0;     // (the load's pings: the round trip at 1 row the gate starts from; -1 none)
     rx::Backoff rx_back;   // the last 64 replies' lateness (8 late: the link idle for DS4_RX_BACKOFF requests)
     rx::Gate rx_gate;   // the send gate and the deadline's floor (ds4_rx.hpp)
     rx::LateBook rx_late_book;   // the late requests, for their replies' round trips if they come
@@ -1079,6 +1081,8 @@ struct Model::Impl {
     mutable std::mutex rx_mu;
     std::vector<float> rx_rtt, rx_wait, rx_arr;
     std::vector<std::pair<float, int>> rx_late_arr;   // the late replies that came: send to arrival in the kernel, layer
+    std::vector<std::pair<float, float>> rx_first;    // the gate's first 8 samples at 1 row: the sample, the estimate after
+    int rx_first_n = 0;                                // (the service thread's count of them)
     bool sync_decode = std::getenv("DS4_SYNC") != nullptr;
     // a window of one through moe_gate_up / moe_down (DS4_MOE_TOKEN=0: win_experts, whose down rows run
     // before the wait for the CPU lane - the same bits, no faster)
@@ -6516,7 +6520,10 @@ struct Model::Impl {
     // room (none came, or the link failed: the lane computes all of them, as without the option)
     void rx_setup() {
         if (o.remote_experts.empty()) return;
-        if (const char* v = std::getenv("DS4_RX_TIMEOUT_MS"); v != nullptr && *v != '\0') rx_timeout_ms = std::max(0.05, std::atof(v));
+        if (const char* v = std::getenv("DS4_RX_TIMEOUT_MS"); v != nullptr && *v != '\0') {
+            rx_timeout_ms = std::max(0.05, std::atof(v));
+            rx_wait_fixed = true;
+        }
         if (const char* v = std::getenv("DS4_RX_BACKOFF"); v != nullptr && *v != '\0') rx_back.hold = std::max(1, std::atoi(v));
         const char* wv = std::getenv("DS4_RX_WAIT_S");
         const int wait_s = wv != nullptr && *wv != '\0' ? std::max(1, std::atoi(wv)) : 120;
@@ -6626,10 +6633,42 @@ struct Model::Impl {
         st.rx_held = held;
         st.rx_upload_bytes = (int64_t) held_b;
         st.rx_upload_ms = now_ms() - t0;
-        std::fprintf(stderr, "ds4: remote experts: %lld experts (%.2f GB) in the server's VRAM, uploaded in %.1f s (%.0f MB/s); "
-                             "a reply later than %.2f ms after the lane's own picks: its picks computed here\n",
-                     (long long) held, (double) held_b / 1e9, st.rx_upload_ms / 1000.0,
-                     st.rx_upload_ms > 0 ? (double) held_b / 1e3 / st.rx_upload_ms : 0.0, rx_timeout_ms);
+        if (rx_wait_fixed)
+            std::fprintf(stderr, "ds4: remote experts: %lld experts (%.2f GB) in the server's VRAM, uploaded in %.1f s (%.0f "
+                                 "MB/s); a reply later than %.2f ms after the lane's own picks (DS4_RX_TIMEOUT_MS): its "
+                                 "picks computed here\n",
+                         (long long) held, (double) held_b / 1e9, st.rx_upload_ms / 1000.0,
+                         st.rx_upload_ms > 0 ? (double) held_b / 1e3 / st.rx_upload_ms : 0.0, rx_timeout_ms);
+        else
+            std::fprintf(stderr, "ds4: remote experts: %lld experts (%.2f GB) in the server's VRAM, uploaded in %.1f s (%.0f "
+                                 "MB/s); a reply not in once the lane's own picks are done and as long again as the lane "
+                                 "would take for its picks (%.1f ms at least; %.2f ms until the lane's time a pick is "
+                                 "known): its picks computed here\n",
+                         (long long) held, (double) held_b / 1e9, st.rx_upload_ms / 1000.0,
+                         st.rx_upload_ms > 0 ? (double) held_b / 1e3 / st.rx_upload_ms : 0.0, rx::Gate::kMinWaitMs,
+                         rx_timeout_ms);
+        {   // the gate's start: 16 pings of a 1-row request's size, their median round trip (send to the kernel's
+            // arrival on Linux) - not the first requests' (a cold server's first reply took 178 ms in a slot)
+            const size_t pb = sizeof(rx::ReqRow) + (size_t) g.dim * 2;
+            std::vector<double> pr;
+            for (uint32_t i = 0; i < 16; ++i) {
+                const double s = now_ms();
+                if (link->ping(0xFFFF0000u + i, pb, s + 1000.0, e) != 1) break;
+                const double r = now_ms(), a = link->arrival_ms();
+                pr.push_back(a >= s && a <= r ? a - s : r - s);
+            }
+            if (pr.size() == 16) {
+                std::sort(pr.begin(), pr.end());
+                rx_seed_ms = 0.5 * (pr[7] + pr[8]);
+                rx_gate.seed(1, rx_seed_ms);
+                std::fprintf(stderr, "ds4: remote experts: 16 pings of a 1-row request's size (%zu B): round trip median "
+                                     "%.3f ms (%.3f - %.3f): the gate's estimate at 1 row starts there\n",
+                             pb, rx_seed_ms, pr.front(), pr.back());
+            } else {
+                std::fprintf(stderr, "ds4: remote experts: the load's pings got %zu of 16 answers (%s): the gate learns "
+                                     "from the first requests\n", pr.size(), e.c_str());
+            }
+        }
         st.rx_bytes_out = (int64_t) link->bytes_out();   // (the per-token bytes count from here)
         st.rx_bytes_in = (int64_t) link->bytes_in();
         rx_link = std::move(link);
@@ -6715,13 +6754,42 @@ struct Model::Impl {
             }
         st.cpu_experts += nslots;
     }
+    // a round trip sample into the gate (the first 8 at 1 row kept for the stats: how it started)
+    void rx_seen(int rows, double ms, bool waited, double sent) {
+        rx_gate.rtt_seen(rows, ms, waited, sent);
+        if (rows != 1 || rx_first_n >= 8) return;
+        ++rx_first_n;
+        std::lock_guard<std::mutex> lk(rx_mu);
+        rx_first.push_back({(float) (waited ? ms : -ms), (float) rx_gate.rtt[1]});   // (< 0: an upper bound)
+    }
+    // the server's picks (expert, slot) of layer l computed here after all: counted, with the experts not all in the
+    // page cache now (Linux; their pages read from the disk by the lane next)
+    void rx_here_note(const Layer& l, const std::vector<std::pair<int, int>>& rpk) {
+        st.rx_here += (int64_t) rpk.size();
+#if defined(__linux__)
+        int last = -1;
+        std::vector<std::pair<int, int>> s(rpk);
+        std::sort(s.begin(), s.end());
+        for (const auto& q : s) {
+            if (q.first == last) continue;
+            last = q.first;
+            bool res = true;
+            for (int r = 0; r < 3 && res; ++r) res = os::resident(mx_mat(l, q.first, r), mx_part_bytes(l, r));
+            st.rx_here_cold += res ? 0 : 1;
+        }
+#else
+        (void) l;
+#endif
+    }
     // the reply to request seq (sent at t0) into rp's parts; late or no link: those picks computed here.  The deadline:
-    // DS4_RX_TIMEOUT_MS after the lane's own picks, but not before 1.5 x the round trip expected at these rows
+    // after the lane's own picks, as long as the lane would take for these (rx::Gate::wait_ms), but not before 1.5 x the
+    // round trip expected at these rows
     void rx_finish(const Layer& l, const Req& r, Resp& rp, int T, unsigned seq, double t0,
                    const std::vector<std::pair<int, int>>& rpk) {
         const double tw = rx::now_ms();
         const int rows = (int) rx_rows.size();
-        const double deadline = rx_gate.deadline(t0, tw, rx_timeout_ms, rows);
+        const double wait = rx_gate.wait_ms(T, rpk.size(), rx_timeout_ms, rx_wait_fixed);
+        const double deadline = rx_gate.deadline(t0, tw, wait, rows);
         const uint16_t* y = nullptr;
         int srv_us = 0;
         std::string e;
@@ -6744,15 +6812,15 @@ struct Model::Impl {
                 ++st.rx_late_shared;
                 continue;
             }
-            rx_gate.rtt_seen(rw, la - ts, true, ts);
+            rx_seen(rw, la - ts, true, ts);
             std::lock_guard<std::mutex> lk(rx_mu);
             ++st.rx_late_timed;
             if (rx_late_arr.size() < (size_t(1) << 20)) rx_late_arr.push_back({(float) (la - ts), ly});
         }
         if (ta >= 0) rx_kts = true;
-        if (ta >= t0 && ta <= t1) rx_gate.rtt_seen(rows, ta - t0, true, t0);   // (outside: the realtime clock stepped)
+        if (ta >= t0 && ta <= t1) rx_seen(rows, ta - t0, true, t0);   // (outside: the realtime clock stepped)
         else if (got == 1 || (got == 0 && !rx_kts))   // (late, with the kernel's times: its reply, if it comes, says)
-            rx_gate.rtt_seen(rows, t1 - t0, t1 - tw > 0.05, t0);   // (read within 50 us of the lane's part: there already)
+            rx_seen(rows, t1 - t0, t1 - tw > 0.05, t0);   // (read within 50 us of the lane's part: there already)
         if (got == 0) rx_late_book.add(seq, t0, rows, l.il);
         st.rx_wait_ms += t1 - tw;
         st.rx_bytes_out = (int64_t) rx_link->bytes_out();
@@ -6791,7 +6859,7 @@ struct Model::Impl {
             if (++st.rx_late == 1)
                 std::fprintf(stderr, "ds4: remote experts: a reply past its deadline (%.2f ms after the lane's part, %.2f ms "
                                      "after its send; layer %d): its %zu picks computed here (said once; the count is in "
-                                     "the stats)\n", rx_timeout_ms, deadline - t0, l.il, rpk.size());
+                                     "the stats)\n", deadline - tw, deadline - t0, l.il, rpk.size());
             const int bk = rx_back.seen(true);
             if (bk == rx::Backoff::Silent)
                 rx_lost("8 of the last 64 replies past their deadline again, and no reply at all since the link was "
@@ -6803,6 +6871,7 @@ struct Model::Impl {
         } else {
             rx_lost(e.empty() ? "the link failed" : e);
         }
+        rx_here_note(l, rpk);
         const double tf = rx::now_ms();
         lane_add(l, r, rp, T, rpk);
         st.rx_fallback += (int64_t) rpk.size();
@@ -6894,6 +6963,36 @@ struct Model::Impl {
             if (bl.empty()) out += " -";
         }
         out += "\n";
+        {
+            std::vector<std::pair<float, float>> fs;
+            {
+                std::lock_guard<std::mutex> lk(rx_mu);
+                fs = rx_first;
+            }
+            if (rx_seed_ms >= 0)
+                std::snprintf(b, sizeof b, "remote experts' gate at 1 row: from the load's pings %.3f ms; ", rx_seed_ms);
+            else
+                std::snprintf(b, sizeof b, "remote experts' gate at 1 row: no pings' start; ");
+            out += b;
+            out += "the first samples (ms, the estimate after; - : an upper bound):";
+            for (const auto& f : fs) {
+                std::snprintf(b, sizeof b, " %s%.3f/%.3f", f.first < 0 ? "-" : "", std::fabs(f.first), f.second);
+                out += b;
+            }
+            const long long hn = st.rx_here - s0.rx_here, hc = st.rx_here_cold - s0.rx_here_cold;
+            const double eb = st.rx_held > 0 ? (double) st.rx_upload_bytes / (double) st.rx_held : 0.0;
+#if defined(__linux__)
+            std::snprintf(b, sizeof b, "; the server's picks the lane computed (kept here, late, idle) %lld (%.2f a token), "
+                                       "their experts not all in the page cache then %lld (%.1f MB a token at %.1f MB an "
+                                       "expert)\n",
+                          hn, (double) hn / nt, hc, (double) hc * eb / 1e6 / nt, eb / 1e6);
+#else
+            (void) hc, (void) eb;
+            std::snprintf(b, sizeof b, "; the server's picks the lane computed (kept here, late, idle) %lld (%.2f a "
+                                       "token)\n", hn, (double) hn / nt);
+#endif
+            out += b;
+        }
         out += "remote experts by T (requests / late / kept here by the send gate):";
         for (int t = 1; t <= kWin; ++t) {
             const long long q = st.rx_req_t[t] - s0.rx_req_t[t], la = st.rx_late_t[t] - s0.rx_late_t[t],
@@ -7025,11 +7124,13 @@ struct Model::Impl {
                 if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
                 double rx_t0 = 0.0;
                 if (!rpicks.empty() && rx_back.idle()) {   // (8 late of 64 a while ago: the link idle for now)
+                    rx_here_note(l, rpicks);
                     picks.insert(picks.end(), rpicks.begin(), rpicks.end());
                     ++st.rx_idle;
                     rpicks.clear();
                 }
                 if (!rpicks.empty() && !rx_gate.send(T, rx_nrows(rpicks), rpicks.size(), picks.size())) {
+                    rx_here_note(l, rpicks);
                     picks.insert(picks.end(), rpicks.begin(), rpicks.end());   // (the round trip would cost more)
                     ++st.rx_skip_t[T];
                     rpicks.clear();
@@ -7037,6 +7138,7 @@ struct Model::Impl {
                 if (!rpicks.empty()) {
                     rx_t0 = rx::now_ms();
                     if (!rx_send(next, li, T, r, rpicks)) {   // (no link: the lane computes them as it did before)
+                        rx_here_note(l, rpicks);
                         picks.insert(picks.end(), rpicks.begin(), rpicks.end());
                         st.rx_fallback += (int64_t) rpicks.size();
                         rpicks.clear();
