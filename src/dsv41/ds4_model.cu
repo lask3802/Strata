@@ -1114,12 +1114,34 @@ struct Model::Impl {
     // instead: of each CPU-lane expert only what the lane reads of a pick - its layer's slice [ep_ff0, ep_ff0 + ep_ffn)
     // of the gate / up rows, the down from the parts where they serve that slice (DS4_IQ_DOWN_PARTS), else the pack's
     // down whole - read in through the lane's own mapping (os::populate: the page cache and the page tables; pread where
-    // the kernel has no MADV_POPULATE_READ), the most-routed first, up to warm_bytes.  At k 6 with the parts that is 2/3
+    // the kernel has no MADV_POPULATE_READ), the most-routed up to warm_bytes (DS4_IQ_WARM_ORDER: in what order).  At k 6 with the parts that is 2/3
     // of an expert's bytes: lane-bench-report.md section 13 - the whole read-ahead's 97 GB held 12559 of CT 580's 15229
     // CPU-lane experts, and the parts, outside it, were pushed out by the arms before.  Unset or empty: as before; any
     // other value fails the load
     const char* iq_warm_env = std::getenv("DS4_IQ_WARM");
     const bool iq_warm_split = iq_warm_env != nullptr && std::strcmp(iq_warm_env, "split") == 0;
+    // DS4_IQ_WARM_TOUCH (with split): 1, warm_split reads a byte of every 4 KiB page it read in, through the lane's
+    // mapping, so each one's page table entry has its accessed bit when the kernel next looks for pages to evict (the
+    // guess of lane-bench-report.md section 17, that MADV_POPULATE_READ maps them without it on x86). Section 18: the
+    // populated pages were promoted to the youngest generation within the populate, with no aging - they had the bit;
+    // the wt-run A/B (slot-20261025T2329Z): touched or not, the same speed (28.2-28.8 tok/s cold, 30.7-31.3 hot). Unset,
+    // empty or 0: no touch; any other value fails the load
+    const char* iq_warm_touch_env = std::getenv("DS4_IQ_WARM_TOUCH");
+    const bool iq_warm_touch = iq_warm_touch_env != nullptr && std::strcmp(iq_warm_touch_env, "1") == 0;
+    // DS4_IQ_WARM_ORDER (with split): cold, warm_split reads its experts (still the most-routed up to warm_bytes) the
+    // least-routed first, so what the read-ahead pushes out of a full page cache itself is its coldest pages, not its
+    // hottest (section 17's guess). The wt-run A/B: either order the same speed. Unset, empty or hot: the most-routed
+    // first; any other value fails the load
+    const char* iq_warm_order_env = std::getenv("DS4_IQ_WARM_ORDER");
+    const bool iq_warm_cold_first = iq_warm_order_env != nullptr && std::strcmp(iq_warm_order_env, "cold") == 0;
+    // DS4_IQ_WARM_SRV (with split): 1, warm_split reads the expert server's experts too (their slices as the CPU
+    // lane's: the gate / up rows, the down from the parts) - the fills hand ~500 of them back to the lane in a decode
+    // (ds4_rx_fill.hpp: the evicted one is the lane's from then on), and a config before that left their pages out of
+    // the page cache made the first arm's down read them in by faults in its decode (wt-run, slot-20261025T2329Z: dn
+    // 10.3-10.6 ms a token against 7.5-7.6, the decode's disk reads 1.2-2.5 MB a token more). Unset, empty or 0: left
+    // out, as before; any other value fails the load
+    const char* iq_warm_srv_env = std::getenv("DS4_IQ_WARM_SRV");
+    const bool iq_warm_srv = iq_warm_srv_env != nullptr && std::strcmp(iq_warm_srv_env, "1") == 0;
     // DS4_LANE_TRACE=file: the i-quant CPU lane's calls as cpu_experts_iq gets them, for lane-bench --trace (its picks,
     // their n_ff slice and tokens): "LANETRC1", then a record a call - u8 layer, u8 ff0 / 256, u8 (ff0 + ffn) / 256,
     // u8 entries, then each entry's int16 expert and u8 tokens (flushed every 4096 calls and at the end)
@@ -2178,10 +2200,10 @@ struct Model::Impl {
         return !d.at.empty() && ff0 % 256 == 0 && ff0 / 256 >= d.a && ff0 + ffn == 256 * d.b ? &d : nullptr;
     }
     // DS4_IQ_WARM=split (iq_warm_split above), at the end of the load (the server's upload, rx_split's slices and the
-    // parts known): what the CPU lane reads of each of its experts' picks read in and mapped, the most-routed first up
-    // to warm_bytes.  Neither read ahead nor dropped from the page cache (no POSIX_FADV_DONTNEED): a CPU-lane expert's
+    // parts known): what the CPU lane reads of each of its experts' picks read in and mapped, the most-routed up to
+    // warm_bytes (in what order: DS4_IQ_WARM_ORDER), then with DS4_IQ_WARM_TOUCH=1 each of its pages read once through that mapping.  Neither read ahead nor dropped from the page cache (no POSIX_FADV_DONTNEED): a CPU-lane expert's
     // rows past its layer's slice (its gate / up [k, 9); with the parts the pack's down), and the expert server's experts
-    // (rx_has).  The lane reads those only when it computes a pick's [k, 9), or a pick whole, after all - a late or lost
+    // (rx_has; DS4_IQ_WARM_SRV=1: read as the lane's own, since a fill hands them back to it).  The lane reads those only when it computes a pick's [k, 9), or a pick whole, after all - a late or lost
     // reply, a pick the send gate keeps here, the link given up - and then they come in by page faults through the same
     // mapping: from the page cache where something left them, else from the disk (such an expert's first fallback pick
     // waits for its reads: ~2.9 MB of the pack's down, 1.9 MB of gate / up [6, 9) at k 6 on this pack).  No range of a
@@ -2222,7 +2244,7 @@ struct Model::Impl {
                 if (l.slot[(size_t) e] >= 0 || (!l.ram.empty() && l.ram[(size_t) e] >= 0)) continue;   // (VRAM, a RAM copy)
                 if (!rx_has.empty() && rx_has[(size_t) l.il * g.n_exp + e]) {
                     ++n_rx;
-                    continue;
+                    if (!iq_warm_srv) continue;   // (DS4_IQ_WARM_SRV: read as the lane's own)
                 }
                 ws.push_back({sum > 0 ? p[e] / sum : 0.0, l.il, e});
             }
@@ -2265,6 +2287,7 @@ struct Model::Impl {
             gu += (double) (rg[at].n + rg[at + 1].n);
             (rg[at + 2].file < 0 ? dpb : dwb) += (double) rg[at + 2].n;
         }
+        if (iq_warm_cold_first) std::reverse(rg.begin(), rg.end());   // (DS4_IQ_WARM_ORDER: the budget's coldest first)
         const double t0 = now_ms();
         std::atomic<size_t> ri{0};
         std::atomic<int> no_pop{0};
@@ -2293,12 +2316,38 @@ struct Model::Impl {
         if (!no_pop.load() && by_read.load() > 0)
             how += ", " + std::to_string(by_read.load()) + " ranges by pread after it failed on them (not mapped)";
         if (failed.load() > 0) how += "; " + std::to_string(failed.load()) + " reads failed (those ranges left to the lane's faults)";
+        how += iq_warm_cold_first ? "; the least-routed first (DS4_IQ_WARM_ORDER=cold)" : "; the most-routed first (DS4_IQ_WARM_ORDER)";
+        if (iq_warm_srv) how += "; the expert server's " + std::to_string(n_rx) + " among them (DS4_IQ_WARM_SRV=1)";
         std::fprintf(stderr, "ds4: DS4_IQ_WARM=split: %zu of the CPU lane's experts read ahead in %.1f s (%.1f GB: the gate / up "
                              "of their slices %.1f GB, downs %.1f GB from the parts and %.1f GB the pack's whole ones) - %s; "
                              "left out: %zu past warm_bytes (%.1f GB), the expert server's %zu, and each one's rows past its "
                              "slice (read only by the lane's fallback: neither read ahead nor dropped)\n",
                      nw, (now_ms() - t0) / 1000.0, b / 1e9, gu / 1e9, dpb / 1e9, dwb / 1e9, how.c_str(), ws.size() - nw,
-                     warm_bytes / 1e9, n_rx);
+                     warm_bytes / 1e9, iq_warm_srv ? (size_t) 0 : n_rx);
+        if (!iq_warm_touch) {
+            std::fprintf(stderr, "ds4: DS4_IQ_WARM_TOUCH unset or 0: the pages read ahead not touched\n");
+            return;
+        }
+        // (DS4_IQ_WARM_TOUCH) a byte of every 4 KiB page of the ranges read through the lane's mapping, by 12 threads
+        // in the read's order: each page's entry gets its accessed bit (a range read by pread instead comes in here by
+        // a fault, mapped like the others)
+        const double t1 = now_ms();
+        std::atomic<size_t> ti{0};
+        std::atomic<uint64_t> pages{0};
+        std::vector<std::thread> tt;
+        for (int t = 0; t < 12 && !rg.empty(); ++t)
+            tt.emplace_back([&] {
+                uint64_t np = 0;
+                for (size_t i; (i = ti.fetch_add(1)) < rg.size();) {
+                    const uintptr_t a = (uintptr_t) rg[i].p, e = a + rg[i].n;
+                    for (uintptr_t q = a & ~(uintptr_t) 4095; q < e; q += 4096, ++np)
+                        (void) *(const volatile uint8_t*) (q < a ? a : q);
+                }
+                pages.fetch_add(np);
+            });
+        for (auto& t : tt) t.join();
+        std::fprintf(stderr, "ds4: DS4_IQ_WARM_TOUCH: %llu pages of the read-ahead touched through the lane's mapping in %.1f s\n",
+                     (unsigned long long) pages.load(), (now_ms() - t1) / 1000.0);
     }
     bool ep_slices_ok(std::string& err) const {
         if (!rx_slices_ok(err)) return false;
@@ -3410,6 +3459,18 @@ struct Model::Impl {
         // the experts: VRAM slots in what each device has left, the rest on the host
         if (iq_warm_env != nullptr && *iq_warm_env != '\0' && !iq_warm_split) {
             err = std::string("DS4_IQ_WARM=") + iq_warm_env + ": split or unset";
+            return false;
+        }
+        if (!iq_warm_touch && iq_warm_touch_env != nullptr && *iq_warm_touch_env != '\0' && std::strcmp(iq_warm_touch_env, "0") != 0) {
+            err = std::string("DS4_IQ_WARM_TOUCH=") + iq_warm_touch_env + ": 0, 1 or unset";
+            return false;
+        }
+        if (!iq_warm_cold_first && iq_warm_order_env != nullptr && *iq_warm_order_env != '\0' && std::strcmp(iq_warm_order_env, "hot") != 0) {
+            err = std::string("DS4_IQ_WARM_ORDER=") + iq_warm_order_env + ": cold, hot or unset";
+            return false;
+        }
+        if (!iq_warm_srv && iq_warm_srv_env != nullptr && *iq_warm_srv_env != '\0' && std::strcmp(iq_warm_srv_env, "0") != 0) {
+            err = std::string("DS4_IQ_WARM_SRV=") + iq_warm_srv_env + ": 0, 1 or unset";
             return false;
         }
         if (!place_experts(err)) return false;
