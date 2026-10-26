@@ -1140,10 +1140,11 @@ struct Model::Impl {
     // lane's: the gate / up rows, the down from the parts) - the fills hand ~500 of them back to the lane in a decode
     // (ds4_rx_fill.hpp: the evicted one is the lane's from then on), and a config before that left their pages out of
     // the page cache made the first arm's down read them in by faults in its decode (wt-run, slot-20261025T2329Z: dn
-    // 10.3-10.6 ms a token against 7.5-7.6, the decode's disk reads 1.2-2.5 MB a token more). Unset, empty or 0: left
-    // out, as before; any other value fails the load
+    // 10.3-10.6 ms a token against 7.5-7.6, the decode's disk reads 1.2-2.5 MB a token more). On by default (srv-run,
+    // the first arm after a drop: 30.0 tok/s, dn 8.3 ms a token, against 25.5-28.3 and 10.8-12.4 without): unset, empty
+    // or 1 reads them; 0 leaves them out, as before; any other value fails the load
     const char* iq_warm_srv_env = std::getenv("DS4_IQ_WARM_SRV");
-    const bool iq_warm_srv = iq_warm_srv_env != nullptr && std::strcmp(iq_warm_srv_env, "1") == 0;
+    const bool iq_warm_srv = iq_warm_srv_env == nullptr || *iq_warm_srv_env == '\0' || std::strcmp(iq_warm_srv_env, "1") == 0;
     // DS4_LANE_TRACE=file: the i-quant CPU lane's calls as cpu_experts_iq gets them, for lane-bench --trace (its picks,
     // their n_ff slice and tokens): "LANETRC1", then a record a call - u8 layer, u8 ff0 / 256, u8 (ff0 + ffn) / 256,
     // u8 entries, then each entry's int16 expert and u8 tokens (flushed every 4096 calls and at the end)
@@ -3532,12 +3533,14 @@ struct Model::Impl {
                     cudaSetDevice(devs[di].id);
                     cp->flow = true;
                     cp->dev = (int) di;
-                    // DS4_IO_SPLIT=1: a read whose resident lead is not all of it - a gate / up the lane's warm read
+                    // DS4_IO_SPLIT: a read whose resident lead is not all of it - a gate / up the lane's warm read
                     // the first blocks of - takes that lead from the page cache, the rest from the disk unbuffered
-                    // (not the whole from the disk); DS4_IO_SPLIT_CHECK=1 reads each such one again and compares
+                    // (not the whole from the disk); on by default (pf-run, a 4K prompt: 23.3-25.2 -> 20.4-22.0 s with
+                    // the down parts, 21.1-21.2 -> 20.7-20.8 without), unset or empty: on, 0: every read whole as
+                    // before; DS4_IO_SPLIT_CHECK=1 reads each such one again and compares
                     const char* sp = std::getenv("DS4_IO_SPLIT");
                     const char* spk = std::getenv("DS4_IO_SPLIT_CHECK");
-                    cp->io = std::make_unique<IoQueue>(n_readers, sp != nullptr && std::atoi(sp) != 0,
+                    cp->io = std::make_unique<IoQueue>(n_readers, sp == nullptr || *sp == '\0' || std::atoi(sp) != 0,
                                                        spk != nullptr && std::atoi(spk) != 0);
                     cp->stage_item.assign((size_t) cp->S, -1);
                     cp->stage_ev.resize((size_t) cp->S);
