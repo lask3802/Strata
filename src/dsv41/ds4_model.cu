@@ -1134,6 +1134,14 @@ struct Model::Impl {
     // first; any other value fails the load
     const char* iq_warm_order_env = std::getenv("DS4_IQ_WARM_ORDER");
     const bool iq_warm_cold_first = iq_warm_order_env != nullptr && std::strcmp(iq_warm_order_env, "cold") == 0;
+    // DS4_IQ_WARM_SRV (with split): 1, warm_split reads the expert server's experts too (their slices as the CPU
+    // lane's: the gate / up rows, the down from the parts) - the fills hand ~500 of them back to the lane in a decode
+    // (ds4_rx_fill.hpp: the evicted one is the lane's from then on), and a config before that left their pages out of
+    // the page cache made the first arm's down read them in by faults in its decode (wt-run, slot-20261025T2329Z: dn
+    // 10.3-10.6 ms a token against 7.5-7.6, the decode's disk reads 1.2-2.5 MB a token more). Unset, empty or 0: left
+    // out, as before; any other value fails the load
+    const char* iq_warm_srv_env = std::getenv("DS4_IQ_WARM_SRV");
+    const bool iq_warm_srv = iq_warm_srv_env != nullptr && std::strcmp(iq_warm_srv_env, "1") == 0;
     // DS4_LANE_TRACE=file: the i-quant CPU lane's calls as cpu_experts_iq gets them, for lane-bench --trace (its picks,
     // their n_ff slice and tokens): "LANETRC1", then a record a call - u8 layer, u8 ff0 / 256, u8 (ff0 + ffn) / 256,
     // u8 entries, then each entry's int16 expert and u8 tokens (flushed every 4096 calls and at the end)
@@ -2186,7 +2194,7 @@ struct Model::Impl {
     // parts known): what the CPU lane reads of each of its experts' picks read in and mapped, the most-routed up to
     // warm_bytes (in what order: DS4_IQ_WARM_ORDER), then with DS4_IQ_WARM_TOUCH=1 each of its pages read once through that mapping.  Neither read ahead nor dropped from the page cache (no POSIX_FADV_DONTNEED): a CPU-lane expert's
     // rows past its layer's slice (its gate / up [k, 9); with the parts the pack's down), and the expert server's experts
-    // (rx_has).  The lane reads those only when it computes a pick's [k, 9), or a pick whole, after all - a late or lost
+    // (rx_has; DS4_IQ_WARM_SRV=1: read as the lane's own, since a fill hands them back to it).  The lane reads those only when it computes a pick's [k, 9), or a pick whole, after all - a late or lost
     // reply, a pick the send gate keeps here, the link given up - and then they come in by page faults through the same
     // mapping: from the page cache where something left them, else from the disk (such an expert's first fallback pick
     // waits for its reads: ~2.9 MB of the pack's down, 1.9 MB of gate / up [6, 9) at k 6 on this pack).  No range of a
@@ -2227,7 +2235,7 @@ struct Model::Impl {
                 if (l.slot[(size_t) e] >= 0 || (!l.ram.empty() && l.ram[(size_t) e] >= 0)) continue;   // (VRAM, a RAM copy)
                 if (!rx_has.empty() && rx_has[(size_t) l.il * g.n_exp + e]) {
                     ++n_rx;
-                    continue;
+                    if (!iq_warm_srv) continue;   // (DS4_IQ_WARM_SRV: read as the lane's own)
                 }
                 ws.push_back({sum > 0 ? p[e] / sum : 0.0, l.il, e});
             }
@@ -2300,12 +2308,13 @@ struct Model::Impl {
             how += ", " + std::to_string(by_read.load()) + " ranges by pread after it failed on them (not mapped)";
         if (failed.load() > 0) how += "; " + std::to_string(failed.load()) + " reads failed (those ranges left to the lane's faults)";
         how += iq_warm_cold_first ? "; the least-routed first (DS4_IQ_WARM_ORDER=cold)" : "; the most-routed first (DS4_IQ_WARM_ORDER)";
+        if (iq_warm_srv) how += "; the expert server's " + std::to_string(n_rx) + " among them (DS4_IQ_WARM_SRV=1)";
         std::fprintf(stderr, "ds4: DS4_IQ_WARM=split: %zu of the CPU lane's experts read ahead in %.1f s (%.1f GB: the gate / up "
                              "of their slices %.1f GB, downs %.1f GB from the parts and %.1f GB the pack's whole ones) - %s; "
                              "left out: %zu past warm_bytes (%.1f GB), the expert server's %zu, and each one's rows past its "
                              "slice (read only by the lane's fallback: neither read ahead nor dropped)\n",
                      nw, (now_ms() - t0) / 1000.0, b / 1e9, gu / 1e9, dpb / 1e9, dwb / 1e9, how.c_str(), ws.size() - nw,
-                     warm_bytes / 1e9, n_rx);
+                     warm_bytes / 1e9, iq_warm_srv ? (size_t) 0 : n_rx);
         if (!iq_warm_touch) {
             std::fprintf(stderr, "ds4: DS4_IQ_WARM_TOUCH unset or 0: the pages read ahead not touched\n");
             return;
@@ -3449,6 +3458,10 @@ struct Model::Impl {
         }
         if (!iq_warm_cold_first && iq_warm_order_env != nullptr && *iq_warm_order_env != '\0' && std::strcmp(iq_warm_order_env, "hot") != 0) {
             err = std::string("DS4_IQ_WARM_ORDER=") + iq_warm_order_env + ": cold, hot or unset";
+            return false;
+        }
+        if (!iq_warm_srv && iq_warm_srv_env != nullptr && *iq_warm_srv_env != '\0' && std::strcmp(iq_warm_srv_env, "0") != 0) {
+            err = std::string("DS4_IQ_WARM_SRV=") + iq_warm_srv_env + ": 0, 1 or unset";
             return false;
         }
         if (!place_experts(err)) return false;
