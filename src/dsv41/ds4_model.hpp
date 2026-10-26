@@ -191,6 +191,7 @@ struct Stats {
     double rx_np_ms[10] = {}, rx_np_wb[10] = {};
     // DS4_EP_POOL_CUT_CHECK=1: the requests whose cut W picks' pass was checked against two calls, and those not the same
     int64_t rx_cut_chk = 0, rx_cut_bad = 0;
+    int64_t rx_cut_sets = 0, rx_cut_dp = 0;   // (the cut's W sets computed here; of them, [0, cut)'s down from DS4_IQ_DOWN_PARTS)
     // DS4_RX_FILL=1 (EP U5b): fills queued, loaded by the server, refused; their bytes sent and the time in the paced
     // sends; the requests the server answered Stale (an expert mid-fill)
     int64_t rx_fills = 0, rx_fill_ok = 0, rx_fill_fail = 0, rx_fill_bytes = 0, rx_stale = 0;
