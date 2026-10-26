@@ -664,6 +664,7 @@ struct Chunk {
     double wait_ms = 0;                      // the compute waiting for a read
     uint64_t it_file = 0, it_ram = 0, it_spec = 0, it_spec_unused = 0;
     uint64_t io_d0 = 0, io_b0 = 0;           // io's unbuffered / buffered bytes when the run started
+    IoQueue::Split io_s0;                    // io's split jobs then (DS4_IO_SPLIT)
     // layer-major (a run of several chunks, every layer on this device): the layers one after another, each through
     // all the chunks; a chunk's state between its layers (h | pre | topk | cand, chunk k at k chunk_hand_bytes()) in
     // host memory, and the layer cache - RAM slots where the experts a layer's chunk reads from the files are kept for
@@ -3469,7 +3470,13 @@ struct Model::Impl {
                     cudaSetDevice(devs[di].id);
                     cp->flow = true;
                     cp->dev = (int) di;
-                    cp->io = std::make_unique<IoQueue>(n_readers);
+                    // DS4_IO_SPLIT=1: a read whose resident lead is not all of it - a gate / up the lane's warm read
+                    // the first blocks of - takes that lead from the page cache, the rest from the disk unbuffered
+                    // (not the whole from the disk); DS4_IO_SPLIT_CHECK=1 reads each such one again and compares
+                    const char* sp = std::getenv("DS4_IO_SPLIT");
+                    const char* spk = std::getenv("DS4_IO_SPLIT_CHECK");
+                    cp->io = std::make_unique<IoQueue>(n_readers, sp != nullptr && std::atoi(sp) != 0,
+                                                       spk != nullptr && std::atoi(spk) != 0);
                     cp->stage_item.assign((size_t) cp->S, -1);
                     cp->stage_ev.resize((size_t) cp->S);
                     cp->ring_fill.resize((size_t) cp->ring_n);
@@ -9789,6 +9796,7 @@ struct Model::Impl {
             c.lc_first = c.lc_chk = 0;
             c.io_d0 = c.io->direct_bytes();
             c.io_b0 = c.io->buffered_bytes();
+            c.io_s0 = c.io->split_stats();
             if (!c.fl_layers.empty()) {
                 flow_spec(c, 0, c.fl_layers[0], run.T[0]);
                 if (!flow_pump(c, err)) return false;
@@ -10652,7 +10660,18 @@ struct Model::Impl {
                 const double db = (double) (c.io->direct_bytes() - c.io_d0) / 1e9;
                 const double bb = (double) (c.io->buffered_bytes() - c.io_b0) / 1e9;
                 const double fb = db + bb, rb = (double) c.it_ram * (double) L[0].blob / 1e9;   // (a member: its parts)
-                char lcs[160] = "";
+                char lcs[160] = "", sps[256] = "";
+                if (c.io->split()) {
+                    const IoQueue::Split s = c.io->split_stats();
+                    int w = std::snprintf(sps, sizeof sps, "; DS4_IO_SPLIT: %llu reads split, %.1f GB of them from the "
+                                          "page cache, %.1f GB from the disk unbuffered",
+                                          (unsigned long long) (s.jobs - c.io_s0.jobs), (double) (s.lead - c.io_s0.lead) / 1e9,
+                                          (double) (s.direct - c.io_s0.direct) / 1e9);
+                    if (s.checked > c.io_s0.checked && w > 0 && (size_t) w < sizeof sps)
+                        std::snprintf(sps + w, sizeof sps - (size_t) w, " (DS4_IO_SPLIT_CHECK: %llu read again, %llu "
+                                      "not the same bytes)", (unsigned long long) (s.checked - c.io_s0.checked),
+                                      (unsigned long long) (s.bad - c.io_s0.bad));
+                }
                 if (c.lm)
                     std::snprintf(lcs, sizeof lcs, ", %llu again from the layer cache (layer-major, %d chunks, %.1f GB "
                                   "of RAM)", (unsigned long long) c.it_lc, (int) run.T.size(), (double) c.lc_bytes / 1e9);
@@ -10660,11 +10679,11 @@ struct Model::Impl {
                              "ds4 prompt stream, CUDA%d: %d tokens in %.0f ms; %llu experts streamed: %llu from the files "
                              "(%.1f GB, %.2f GB/s: %.1f GB from the disk unbuffered, %.1f GB through the page cache), %llu "
                              "from RAM (%.1f GB)%s; %llu likely ones queued early, %llu of them unpicked; the compute waited "
-                             "%.0f ms for reads\n",
+                             "%.0f ms for reads%s\n",
                              devs[di].id, n, ms, (unsigned long long) (c.it_file + c.it_ram + c.it_lc),
                              (unsigned long long) c.it_file, fb, fb / std::max(1e-3, ms / 1000.0), db, bb,
                              (unsigned long long) c.it_ram, rb, lcs, (unsigned long long) c.it_spec,
-                             (unsigned long long) c.it_spec_unused, c.wait_ms);
+                             (unsigned long long) c.it_spec_unused, c.wait_ms, sps);
             }
         }
         if (pm.on && run.T.size() == 1) {   // (the picks' spread for pick_path: the CPU-lane experts this run picked)
