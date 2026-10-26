@@ -1522,6 +1522,13 @@ struct Model::Impl {
         int tg, td, nrows, nexp, maxrows, dev, ff;
     };
     std::vector<EkMark> ek_marks;
+    // DS4_PROF (a run of chunks): gemm()'s pieces - its FP16 reconstruction of W (e0 - e1) apart from cuBLAS's GEMM
+    // (e1 - e2), by the matrix (k x n); nc the piece's columns, first: a call's first piece
+    struct GmMark {
+        cudaEvent_t e0, e1, e2;
+        int k, n, nc, rows, dev, first;
+    };
+    std::vector<GmMark> gm_marks;
     std::map<int, std::vector<cudaEvent_t>> ek_pool;   // by device
     cudaEvent_t ek_ev() {
         int cur = 0;
@@ -3790,14 +3797,35 @@ struct Model::Impl {
               std::string& err) {
         if (rows <= 0) return true;
         const int cols = std::max(128, (int) std::min<size_t>((size_t) m.n, c.w16_elems / (size_t) m.k) / 128 * 128);
+        const bool gp = prof_chunk;
         for (int c0 = 0; c0 < m.n; c0 += cols) {
             const int nc = std::min(cols, m.n - c0);
+            GmMark gm{};
+            if (gp) {
+                std::lock_guard<std::mutex> lk(prof_mu);
+                gm.e0 = ek_ev();
+                gm.e1 = ek_ev();
+                gm.e2 = ek_ev();
+                gm.k = m.k;
+                gm.n = m.n;
+                gm.nc = nc;
+                gm.rows = rows;
+                gm.first = c0 == 0;
+                cudaGetDevice(&gm.dev);
+                cudaEventRecord(gm.e0, d.st);
+            }
             if (m.fmt != 0) gg::rows(nc == m.n ? m : gg::view(m, c0, nc), c.w16, false, d.st);   // (a GGUF's)
             else x3::reconstruct_rows(nc == m.n ? m : x3::view(m, c0, nc), c.w16, false, d.st);
+            if (gp) cudaEventRecord(gm.e1, d.st);
             const float one = 1.0f;
             const cublasStatus_t st = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, m.k, &one, c.w16, CUDA_R_16F,
                                                    m.k, x16, CUDA_R_16F, ldx, &beta, y + c0, CUDA_R_32F, ldy,
                                                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (gp) {
+                cudaEventRecord(gm.e2, d.st);
+                std::lock_guard<std::mutex> lk(prof_mu);
+                gm_marks.push_back(gm);
+            }
             if (st != CUBLAS_STATUS_SUCCESS) {
                 err = "cublasGemmEx: status " + std::to_string((int) st);
                 return false;
@@ -11040,6 +11068,39 @@ struct Model::Impl {
                                  kv.second.experts > 0 ? (double) kv.second.rows / (double) kv.second.experts : 0.0,
                                  kv.second.ms > 0 ? kv.second.flops / kv.second.ms / 1e9 : 0.0);
                 std::fprintf(stderr, "ds4 prof  expert kernels total %.1f ms\n", tot);
+                // gemm(): W's FP16 reconstruction and cuBLAS's GEMM apart, by the matrix (no "%" at the end: not stages)
+                struct GAgg {
+                    double dq = 0, mm = 0, flops = 0;
+                    long calls = 0, pieces = 0;
+                };
+                std::map<std::pair<int, int>, GAgg> ga;   // (k, n)
+                {
+                    std::lock_guard<std::mutex> lk(prof_mu);
+                    for (const GmMark& m : gm_marks) {
+                        float a = 0, b = 0;
+                        cudaSetDevice(m.dev);
+                        cudaEventElapsedTime(&a, m.e0, m.e1);
+                        cudaEventElapsedTime(&b, m.e1, m.e2);
+                        GAgg& x = ga[{m.k, m.n}];
+                        x.dq += a;
+                        x.mm += b;
+                        x.flops += 2.0 * m.rows * (double) m.k * (double) m.nc;
+                        x.calls += m.first, x.pieces++;
+                        ek_pool[m.dev].push_back(m.e0);
+                        ek_pool[m.dev].push_back(m.e1);
+                        ek_pool[m.dev].push_back(m.e2);
+                    }
+                    gm_marks.clear();
+                }
+                double gdq = 0, gmm = 0;
+                for (auto& kv : ga) {
+                    gdq += kv.second.dq, gmm += kv.second.mm;
+                    std::fprintf(stderr,
+                                 "ds4 prof  gemm k %5d n %6d: calls %6ld  pieces %6ld  dequant %9.1f ms  gemm %9.1f ms (~%5.1f TFLOPS)\n",
+                                 kv.first.first, kv.first.second, kv.second.calls, kv.second.pieces, kv.second.dq, kv.second.mm,
+                                 kv.second.mm > 0 ? kv.second.flops / kv.second.mm / 1e9 : 0.0);
+                }
+                std::fprintf(stderr, "ds4 prof  gemm total: dequant %.1f ms, gemm %.1f ms\n", gdq, gmm);
             }
             for (double& v : cprof_ms) v = 0;
             prof_chunk = false;
