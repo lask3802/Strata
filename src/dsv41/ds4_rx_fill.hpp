@@ -13,15 +13,18 @@
 //     server-held expert that stays in this GPU's VRAM (a duplicate) leaves first, whatever its heat;
 //   - FillBook: the fills a token (R), pending (Q), the bulk pace (bytes a second) and the pause while the link idles;
 //   - ram_in: the RAM tier's next expert, never one the server holds (the RAM tier would save the lane nothing there);
-//   - PromptSettle: one cache settle a prompt that ends on windows.
+//   - PromptSettle: one cache settle a prompt that ends on windows;
+//   - StageGate: the expert server's copies of a fill into its staging blob, in pieces, each between requests.
 // The server's list (the main's rx_has row of a layer) has three states here: 0 not held, kHeld, kFilling.  cache_in
 // (ds4_rx.hpp) and ram_in treat any non-zero as the server's, so neither cache takes an expert on its way there.
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace strata::ds4::rx {
@@ -191,6 +194,46 @@ struct PromptSettle {
     bool after_feed(bool rx_on, int logits_rows) const { return rx_on && logits_rows > 0 && !done; }
     void settled() { done = true; }
     void next() { done = false; }
+};
+
+/// (DS4_RX_FILL_GATE_SRV=1, the expert server's fill_one) a fill's copies into its staging blob - the main's [0, k)
+/// from the payload, the parts' [k, nb) - in pieces of at most `piece` bytes, each begun once no request is in flight
+/// (idle()).  A request's slice picks read the parts on the server's CPU lane at most of its DRAM's bandwidth
+/// (fg-run, pve-5900x: 27.7 GB/s alone, 26.1 beside the gated main's fills, 23.9 beside ungated ones), and the copies
+/// beside them took that bandwidth.  `left` carries a piece's bytes over a fill's copies (a down row's [k, nb) is a
+/// few hundred bytes), so the wait is once a piece, not once a copy; a piece under way when a request comes is not
+/// stopped.  stop(): the wait gives up (the copy still goes); relax(): a spin-wait's pause.  piece 0: one memcpy a copy
+struct StageGate {
+    size_t piece = 0;
+    size_t left = 0;                 // (the bytes the piece under way may still copy)
+    int64_t pieces = 0, waits = 0;   // (pieces begun; those that found a request in flight)
+    double wait_ms = 0.0;
+    explicit StageGate(size_t p) : piece(p) {}
+    template <class Idle, class Stop, class Relax>
+    void copy(uint8_t* d, const uint8_t* s, size_t n, Idle&& idle, Stop&& stop, Relax&& relax) {
+        if (piece == 0) {
+            std::memcpy(d, s, n);
+            return;
+        }
+        while (n > 0) {
+            if (left == 0) {
+                ++pieces;
+                if (!idle()) {
+                    ++waits;
+                    const auto t0 = std::chrono::steady_clock::now();
+                    while (!idle() && !stop()) relax();
+                    wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                }
+                left = piece;
+            }
+            const size_t c = std::min(n, left);
+            std::memcpy(d, s, c);
+            d += c;
+            s += c;
+            n -= c;
+            left -= c;
+        }
+    }
 };
 
 }  // namespace strata::ds4::rx

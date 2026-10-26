@@ -1,11 +1,14 @@
 // Strata. The remote experts' fills (src/dsv41/ds4_rx_fill.hpp, EP U5): which CPU-lane expert goes to the expert
 // server in place of which held one, the budget a fill leaves under (R a token, Q pending, the bulk pace, the idle
 // pause), the server's list's states, and the RAM tier's rule that it never takes a server's expert.  No GPU, no
-// socket.  Heat as the engine's (profile-scaled counts), the rule's margin 1.25 and bonus 1 (DS4_CACHE_MARGIN / _BONUS).
+// socket.  StageGate: the expert server's staging copies between requests (DS4_RX_FILL_GATE_SRV).  Heat as the
+// engine's (profile-scaled counts), the rule's margin 1.25 and bonus 1 (DS4_CACHE_MARGIN / _BONUS).
 #include "../../src/dsv41/ds4_rx.hpp"
 #include "../../src/dsv41/ds4_rx_fill.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
@@ -304,6 +307,58 @@ int main() {
         ls = layers();
         f = rx::remote_choose(ls, p, M, B);
         check(f.size() == 1 && f[0].layer == 12, "the pace: one fill's bytes in the bucket, one fill");
+    }
+    {   // StageGate (DS4_RX_FILL_GATE_SRV): the server's staging copies in pieces, each begun with no request in flight
+        std::vector<uint8_t> src(10000), dst(10000, 0);
+        for (size_t i = 0; i < src.size(); ++i) src[i] = (uint8_t) (i * 131 + 7);
+        const size_t sizes[] = {1, 300, 999, 1000, 1001, 5007, 1692};   // (10000 in all)
+        int idles = 0, busy = 0, relaxes = 0;
+        bool stop = false;
+        auto idle = [&] {
+            ++idles;
+            return busy == 0;
+        };
+        auto stopped = [&] { return stop; };
+        auto relax = [&] {   // (a request ends after 3 pauses)
+            ++relaxes;
+            if (busy > 0 && ++busy > 3) busy = 0;
+        };
+        rx::StageGate g(1000);
+        size_t at = 0;
+        for (size_t n : sizes) {
+            g.copy(dst.data() + at, src.data() + at, n, idle, stopped, relax);
+            at += n;
+        }
+        check(dst == src, "StageGate: the copies' bytes as one memcpy's, over pieces that span copies");
+        check(g.pieces == 10 && idles == 10 && g.waits == 0,
+              "10000 bytes in 1000-byte pieces: 10 pieces, one look each");
+        rx::StageGate h(1000);
+        std::fill(dst.begin(), dst.end(), (uint8_t) 0);
+        idles = relaxes = 0;
+        busy = 1;   // (a request in flight at the first piece)
+        h.copy(dst.data(), src.data(), 2500, idle, stopped, relax);
+        check(std::equal(dst.begin(), dst.begin() + 2500, src.begin()) && dst[2500] == 0,
+              "a gated copy of 2500: its bytes, no more");
+        check(h.pieces == 3 && h.waits == 1 && relaxes == 3 && busy == 0,
+              "a request in flight: the first piece waits for it (3 pauses), the next two do not");
+        rx::StageGate s(1000);
+        busy = 1;
+        stop = true;
+        relaxes = 0;
+        auto never = [&] {
+            ++idles;
+            return false;
+        };
+        s.copy(dst.data(), src.data(), 1500, never, stopped, relax);
+        check(s.pieces == 2 && s.waits == 2 && relaxes == 0, "stop: no piece waits on a request that never ends");
+        rx::StageGate o(0);
+        idles = 0;
+        busy = 1;
+        stop = false;
+        std::fill(dst.begin(), dst.end(), (uint8_t) 0);
+        o.copy(dst.data(), src.data(), 4000, never, stopped, relax);
+        check(std::equal(dst.begin(), dst.begin() + 4000, src.begin()) && idles == 0 && o.pieces == 0,
+              "piece 0 (off): one memcpy, no look at the requests");
     }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;

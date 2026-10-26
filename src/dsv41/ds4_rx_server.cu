@@ -7,6 +7,7 @@
 
 #include "ds4_gguf.cuh"
 #include "ds4_os.hpp"   // (os::pin_thread: the fill thread)
+#include "ds4_rx_fill.hpp"   // (StageGate: DS4_RX_FILL_GATE_SRV)
 #include "ds4_rx_fill_link.hpp"
 #include "ds4_rx_lane.hpp"
 
@@ -175,6 +176,10 @@ struct Fills {
     int64_t loaded = 0, refused = 0;   // (the fill thread's: read after end())
     double load_ms = 0.0;
     uint64_t bytes = 0;
+    size_t gate_piece = 0;                      // (DS4_RX_FILL_GATE_SRV=1: the staging copies' piece; 0 off)
+    int64_t gate_pieces = 0, gate_waits = 0;    // (the fill thread's: its StageGates' sums)
+    double gate_ms = 0.0;
+    bool idle() const { return req_done.load() == req_started.load(); }   // (no request in flight)
     void* at(int li, int e) const {
         return e >= 0 && e < kTabExp ? tab[(size_t) li * kTabExp + (size_t) e].load(std::memory_order_acquire) : nullptr;
     }
@@ -205,28 +210,42 @@ uint16_t fill_one(const Session& ss, Fills& f, const SliceServer& sl, const net:
     void* slot = to.exchange(nullptr);
     if (slot == nullptr) return 2;
     const uint64_t s0 = f.req_started.load();
+    // (DS4_RX_FILL_GATE_SRV=1: the staging copies in pieces, each between requests - StageGate; off: memcpy each)
+    StageGate sg(f.gate_piece);
+    struct Sum {   // (sg's counts into f's at any return)
+        Fills& f;
+        const StageGate& g;
+        ~Sum() {
+            f.gate_pieces += g.pieces;
+            f.gate_waits += g.waits;
+            f.gate_ms += g.wait_ms;
+        }
+    } sum{f, sg};
+    auto cp = [&](uint8_t* d, const uint8_t* s, size_t n) {
+        sg.copy(d, s, n, [&f] { return f.idle(); }, [&f] { return f.stop.load(); }, [] { relax(); });
+    };
     // the main's [0, k) (or the whole blob) and the parts' [k, nb) into the staging blob (while the requests drain)
     if (!fg.split(k)) {
-        std::memcpy(stg, p.data(), (size_t) fg.blob);
+        cp(stg, p.data(), (size_t) fg.blob);
     } else {
         const ep::Parts& pa = sl.parts();
         const uint64_t ub = rb[2] / (uint64_t) fg.nb;   // (a down row's bytes a block)
         for (int r = 0; r < 3; ++r) {
             const uint8_t* sp = p.data() + fg.ship_off(r, k);
             uint8_t* d = stg + fg.off[r];
-            if (r < 2) std::memcpy(d, sp, (size_t) ((uint64_t) k * 256 * rb[r]));
+            if (r < 2) cp(d, sp, (size_t) ((uint64_t) k * 256 * rb[r]));
             else
-                for (int i = 0; i < g.n_embd; ++i) std::memcpy(d + (size_t) i * rb[2], sp + (size_t) i * k * ub, (size_t) (k * ub));
+                for (int i = 0; i < g.n_embd; ++i) cp(d + (size_t) i * rb[2], sp + (size_t) i * k * ub, (size_t) (k * ub));
             for (int kk = k; kk < fg.nb;) {
                 ep::View v;
                 if (!pa.view(li, in, r, kk, v) || v.type != G.K[r] || v.b <= kk) return 3;
                 if (r < 2) {
                     if (v.row_bytes != rb[r]) return 3;
-                    std::memcpy(d + (uint64_t) kk * 256 * rb[r], v.data, (size_t) v.rows * v.row_bytes);
+                    cp(d + (uint64_t) kk * 256 * rb[r], v.data, (size_t) v.rows * v.row_bytes);
                 } else {
                     if (v.rows != (uint32_t) g.n_embd || v.row_bytes != (uint64_t) (v.b - kk) * ub) return 3;
                     for (int i = 0; i < g.n_embd; ++i)
-                        std::memcpy(d + (size_t) i * rb[2] + kk * ub, v.data + (size_t) i * v.stride, v.row_bytes);
+                        cp(d + (size_t) i * rb[2] + kk * ub, v.data + (size_t) i * v.stride, v.row_bytes);
                 }
                 kk = v.b;
             }
@@ -535,10 +554,15 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
             std::fprintf(stderr, "expert server: %lld requests over 2 ms here\n", (long long) slow);
             if (fl.th.joinable()) {
                 fl.end();
+                char gl[160] = "";   // (DS4_RX_FILL_GATE_SRV=1: the staging pieces, those that waited, their wait)
+                if (fl.gate_piece > 0)
+                    std::snprintf(gl, sizeof gl, "; DS4_RX_FILL_GATE_SRV=1: %lld staging pieces, %lld of them waited "
+                                                 "for a request, %.1f ms in all", (long long) fl.gate_pieces,
+                                  (long long) fl.gate_waits, fl.gate_ms);
                 std::fprintf(stderr, "expert server: fills: %lld loaded (%.2f GB), %lld refused, %.1f ms loading each; "
-                                     "%lld requests Stale\n", (long long) fl.loaded, (double) fl.bytes / 1e9,
+                                     "%lld requests Stale%s\n", (long long) fl.loaded, (double) fl.bytes / 1e9,
                              (long long) fl.refused, fl.load_ms / (double) std::max<int64_t>(1, fl.loaded + fl.refused),
-                             (long long) fl.stale);
+                             (long long) fl.stale, gl);
             }
             if (sliced > 0)
                 std::fprintf(stderr, "expert server: %lld requests with slice picks, the CPU lane %.1f us each (%.2f GB read, "
@@ -577,11 +601,23 @@ int session(Conn& c, const std::string& token, int64_t reserve_mib, int dev, cud
                 const int fc = fill_cpu();
                 const char* chv = std::getenv("DS4_RX_FILL_CHUNK");   // (KB a copy; 0: the blob in one)
                 const size_t chunk = (size_t) std::max(0, chv != nullptr && *chv != '\0' ? std::atoi(chv) : 256) << 10;
+                // DS4_RX_FILL_GATE_SRV=1: the staging copies in pieces of the chunk (256 KB with DS4_RX_FILL_CHUNK=0),
+                // each between requests (unset, empty or 0: not)
+                const char* gv = std::getenv("DS4_RX_FILL_GATE_SRV");
+                if (gv != nullptr && *gv != '\0' && std::strcmp(gv, "0") != 0 && std::strcmp(gv, "1") != 0)
+                    std::fprintf(stderr, "expert server: DS4_RX_FILL_GATE_SRV=%s: 0, 1 or unset - not gated\n", gv);
+                const bool sg = gv != nullptr && std::strcmp(gv, "1") == 0;
+                fl.gate_piece = sg ? (chunk > 0 ? chunk : (size_t) 256 << 10) : 0;
                 fl.th = std::thread([&ss, &fl, &sl, dev, chunk] { fill_loop(ss, fl, sl, dev, chunk); });
                 if (fc >= 0) os::pin_thread(fl.th, fc);
-                std::fprintf(stderr, "expert server: fills: on (port %d; the fill thread on CPU %d; its copies %s)\n", h.a,
-                             fc, chunk > 0 ? (std::to_string(chunk >> 10) + " KB at a time, between requests").c_str()
-                                           : "a blob at a time (DS4_RX_FILL_CHUNK=0)");
+                const std::string gs = fl.gate_piece > 0 ? "; DS4_RX_FILL_GATE_SRV=1: the staging copies too, " +
+                                                               std::to_string(fl.gate_piece >> 10) + " KB pieces"
+                                                         : "";
+                std::fprintf(stderr, "expert server: fills: on (port %d; the fill thread on CPU %d; its copies %s%s)\n",
+                             h.a, fc,
+                             chunk > 0 ? (std::to_string(chunk >> 10) + " KB at a time, between requests").c_str()
+                                       : "a blob at a time (DS4_RX_FILL_CHUNK=0)",
+                             gs.c_str());
             }
             continue;
         }

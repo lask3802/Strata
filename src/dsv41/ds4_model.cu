@@ -1255,6 +1255,9 @@ struct Model::Impl {
     // lane call's gate / up and down batches run (cpu_experts_iq's LaneBusy), is the FillLink's gate
     std::atomic<int> lane_busy{0};
     bool fill_gate = false;
+    // DS4_RX_FILL_GATE_REPLY=1 (with the gate): the gate shut, too, from a request's send to its reply (rx_finish's
+    // end) - the server computes it then, and fg-run's gated fills went out in the lane's wait for it
+    bool fill_gate_reply = false;
     std::unique_ptr<rx::FillBook> rx_book;
     std::vector<rx::FillGeo> rx_fgeo;
     std::vector<int> rx_vout;
@@ -7704,6 +7707,12 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: DS4_RX_FILL_GATE=%s: 0, 1 or unset - not gated\n", gv);
         const bool gate = gv != nullptr && std::strcmp(gv, "1") == 0;
         if (gate) fl->gate = &lane_busy;
+        // DS4_RX_FILL_GATE_REPLY=1: the gate shut from each request's send to its reply as well (needs the gate)
+        const char* rv = std::getenv("DS4_RX_FILL_GATE_REPLY");
+        if (rv != nullptr && *rv != '\0' && std::strcmp(rv, "0") != 0 && std::strcmp(rv, "1") != 0)
+            std::fprintf(stderr, "ds4: DS4_RX_FILL_GATE_REPLY=%s: 0, 1 or unset - off\n", rv);
+        const bool reply = rv != nullptr && std::strcmp(rv, "1") == 0;
+        if (reply && !gate) std::fprintf(stderr, "ds4: DS4_RX_FILL_GATE_REPLY=1 needs DS4_RX_FILL_GATE=1: off\n");
         std::string e;
         const int cpu = rx::fill_cpu();
         if (!fl->open(*rx_link, o.remote_experts, port, token, pace, cpu, 3000, e)) {
@@ -7724,7 +7733,11 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: DS4_RX_FILL_GATE=1: the fill thread's copies and sends wait while the CPU lane's "
                                  "gate / up and down batches run (%llu KB pieces, a wait cut off at %.1f ms)\n",
                          (unsigned long long) (rx::FillLink::kGatePiece >> 10), rx::FillLink::kGateMaxMs);
+        if (gate && reply)
+            std::fprintf(stderr, "ds4: DS4_RX_FILL_GATE_REPLY=1: the fills' gate shut from each request's send to its "
+                                 "reply too\n");
         fill_gate = gate;
+        fill_gate_reply = gate && reply;
         st.rx_fill_gate = gate;
         rx_fill = std::move(fl);
     }
@@ -8583,6 +8596,17 @@ struct Model::Impl {
                         sp = rx::split_plan(spl, want, false, rx_k, rx_nb);
                     }
                 }
+                // DS4_RX_FILL_GATE_REPLY=1: the fills' gate shut from the send to the reply (rx_finish's end, this
+                // block's), the lane's batches inside it
+                struct ReplyBusy {
+                    std::atomic<int>* b;
+                    explicit ReplyBusy(std::atomic<int>* p) : b(p) {
+                        if (b != nullptr) rx::lane_busy_in(*b);
+                    }
+                    ~ReplyBusy() {
+                        if (b != nullptr) rx::lane_busy_out(*b);
+                    }
+                } rbusy(fill_gate_reply && sp.sent ? &lane_busy : nullptr);
                 // the lane's n_ff range for its picks: [0, k) of the slice picks just sent, else whole
                 const rx::BlockRange mr = sp.here;
                 std::sort(picks.begin(), picks.end());
