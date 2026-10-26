@@ -645,6 +645,7 @@ struct Chunk {
         std::atomic<int>* pf = nullptr;                // (DS4_LAYER_CACHE_LAYERS=2) its slot's read-ahead: 0 once read
         std::atomic<bool>* pf_bad = nullptr;
         bool lc2 = false;                              // (the same) its layer-cache slot laid out as a staging slot
+        bool hit = false;                              // (layer-major) ram is its layer-cache slot, not a RAM-tier blob
         std::atomic<int> left{0};                      // parts still being read
         std::atomic<bool> bad{false};
     };
@@ -713,6 +714,12 @@ struct Layer {
     // pick's lane, ds4_rx_split.hpp - these fields are what ep_slices_ok checks) - ep_ffn -1: the whole n_ff (resolved at
     // load, ep_resolve); a slice on a layer whose experts another path computes is refused there (ep_slices_ok)
     int ep_ff0 = 0, ep_ffn = -1;
+    // DS4_PF_SPLIT=a (a timing arm, init_pf_split): the prompt's streamed experts' n_ff [0, pf_ff) alone - the gate / up
+    // rows' first pf_ff, the down's blocks from the down parts - laid out as pf_lay, pf_len[r] bytes of each matrix; the
+    // rest of each streamed pick is left out.  pf_ff 0: whole, as before
+    int pf_ff = 0;
+    x3::ExpertLayout pf_lay;
+    size_t pf_len[3] = {0, 0, 0};
     // this member's heads [ah0, ah0 + ahn) and wo_a groups [og0, og0 + ogn) - all of them alone; in a group of more
     // members than the heads split among evenly (head_members: 9, 7 or 6 over 64 heads), the first ones none: their
     // attention adds nothing to the sum
@@ -2209,6 +2216,78 @@ struct Model::Impl {
                      on, a0, b0, b0, dir);
         return true;
     }
+    // DS4_PF_SPLIT=a (a timing arm, the prefill split's Stage A): the layer-major prompt's streamed experts read and
+    // computed for n_ff [0, 256 b) alone - the gate / up rows' first, the down from DS4_IQ_DOWN_PARTS's [0, b) (read
+    // buffered from the parts' files: the lane's warm pages) - and the rest of every streamed pick left out, as the expert
+    // server would compute it: the prompt's outputs are WRONG; what it measures is the reads' and the compute's time of
+    // the 2080 Ti's share.  The VRAM experts stay whole; the decode is not touched.  Each layer the down parts cover from
+    // block 0, alone on its device (no group), GGUF i-quant experts; not with the RAM tier's copy mode or pinned RAM
+    // slots.  Unset or empty: as before; any other value fails the load
+    bool init_pf_split(std::string& err) {
+        const char* v = std::getenv("DS4_PF_SPLIT");
+        if (v == nullptr || *v == '\0') return true;
+        if (std::strcmp(v, "a") != 0) {
+            err = std::string("DS4_PF_SPLIT=") + v + ": a, or unset";
+            return false;
+        }
+        if (!dparts.is_open() || dpl.empty()) {
+            err = "DS4_PF_SPLIT=a: no down parts (DS4_IQ_DOWN_PARTS) to read the downs' [0, b) from";
+            return false;
+        }
+        if (copy_mode || ram_pinned) {
+            err = "DS4_PF_SPLIT=a: not with the RAM tier's copy mode or pinned RAM slots";
+            return false;
+        }
+        int on = 0, ff = 0;
+        double whole = 0, part = 0;
+        for (Layer& l : L) {
+            if (l.mtp || l.nm != 1 || (size_t) l.il >= dpl.size()) continue;
+            const DownParts& d = dpl[(size_t) l.il];
+            if (d.at.empty() || d.a != 0 || 256 * d.b >= g.ff) continue;
+            const std::string ln = "DS4_PF_SPLIT=a: layer " + std::to_string(l.il);
+            l.pf_ff = 256 * d.b;
+            size_t off = 0;
+            for (int r = 0; r < 3; ++r) {
+                const int ty = gg::expert_type(l.lay, r);
+                l.pf_lay.K[r] = l.lay.K[r];
+                l.pf_lay.trellis[r] = l.pf_lay.suh[r] = l.pf_lay.svh[r] = off;
+                l.pf_len[r] = r < 2 ? (size_t) l.pf_ff * gg::type_row_bytes(ty, g.dim)
+                                    : (size_t) g.dim * gg::type_row_bytes(ty, l.pf_ff);
+                off += align256(l.pf_len[r]);
+            }
+            l.pf_lay.cb = l.lay.cb;
+            l.pf_lay.fmt = l.lay.fmt;
+            if (l.pf_len[2] != (size_t) g.dim * d.rb || l.pf_len[0] == 0 || l.pf_len[1] == 0 || off > l.blob) {
+                err = ln + ": its slice's layout does not fit (the down parts' rows " + std::to_string(d.rb) + " B)";
+                return false;
+            }
+            for (int e = 0; e < l.n_exp; ++e) {
+                os::fd_t fd = os::kBadFd;
+                uint64_t o = 0;
+                if (!pf_down(l, e, fd, o) || fd == os::kBadFd) {
+                    err = ln + " expert " + std::to_string(e) + ": its down part is in no file of the down parts";
+                    return false;
+                }
+                for (const auto& f : dparts.files())
+                    if (f.fd == fd && o + l.pf_len[2] > f.bytes) {
+                        err = ln + " expert " + std::to_string(e) + ": its down part runs past its file";
+                        return false;
+                    }
+            }
+            ++on;
+            ff = l.pf_ff;
+            whole += (double) (mx_part_bytes(l, 0) + mx_part_bytes(l, 1) + mx_part_bytes(l, 2));
+            part += (double) (l.pf_len[0] + l.pf_len[1] + l.pf_len[2]);
+        }
+        if (on == 0) {
+            err = "DS4_PF_SPLIT=a: the down parts cover no layer from block 0 alone on its device";
+            return false;
+        }
+        std::fprintf(stderr, "ds4: DS4_PF_SPLIT=a: %d layers' streamed experts n_ff [0, %d) alone (%.1f%% of their bytes: the "
+                             "gate / up rows' first, the downs from the down parts) - a timing arm, the prompt's outputs are "
+                             "wrong\n", on, ff, whole > 0 ? 100.0 * part / whole : 0.0);
+        return true;
+    }
     // expert e's down rows from n_ff value ff0 (a block's start in [a, b)) in its parts: row 0's, the rows d.rb apart
     static const uint8_t* dpart_at(const DownParts& d, int e, int ff0) {
         return d.at[(size_t) e] + (size_t) (ff0 / 256 - d.a) * d.ub;
@@ -3658,6 +3737,7 @@ struct Model::Impl {
         preload_store();
         if (!ep_slices_ok(err)) return false;
         if (!init_down_parts(err)) return false;
+        if (!init_pf_split(err)) return false;
         warm_split();
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         // U9 hc's side stream and events, made last: the plan, the read-ahead, the placement and the load's report all
@@ -4053,6 +4133,30 @@ struct Model::Impl {
         return r < 2 && l.nm > 1 ? (size_t) (g.ff / l.nm) * gg::type_row_bytes(gg::expert_type(l.lay, r), g.dim)
                                  : mx_part_bytes(l, r);
     }
+    // what an item of l reads and DMAs of matrix r (DS4_PF_SPLIT: its slice's)
+    size_t fl_len(const Layer& l, int r) const { return l.pf_ff > 0 ? l.pf_len[r] : mx_read_len(l, r); }
+    // (DS4_PF_SPLIT) expert e's down [0, pf_ff): the file of the down parts that holds it and its offset there (false: none)
+    bool pf_down(const Layer& l, int e, os::fd_t& fd, uint64_t& off) const {
+        const uint8_t* p = dpl[(size_t) l.il].at[(size_t) e];
+        for (const auto& f : dparts.files())
+            if (p >= f.map && p < f.map + f.bytes) {
+                fd = f.fd;
+                off = (uint64_t) (p - f.map);
+                return true;
+            }
+        return false;
+    }
+    // (DS4_PF_SPLIT) job j reads expert e's down part from its file, buffered (the lane's warm pages), not the pack's down
+    void pf_down_job(const Layer& l, int e, IoQueue::Job& j) const {
+        os::fd_t fd = os::kBadFd;
+        uint64_t off = 0;
+        pf_down(l, e, fd, off);   // (init_pf_split found every one)
+        j.fd = fd;
+        j.dfd = os::kBadFd;
+        j.off = off;
+        j.len = l.pf_len[2];
+        j.map = dpl[(size_t) l.il].at[(size_t) e];
+    }
     // the device's member index in L0's group (0 alone)
     int flow_mi(const Chunk& c, const Layer& L0) const {
         for (int m = 0; m < L0.nm; ++m)
@@ -4170,11 +4274,12 @@ struct Model::Impl {
                 jb.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[r]];
                 jb.dfd = pk.dfds.empty() ? os::kBadFd : pk.dfds[(size_t) l.mx_file[r]];
                 jb.off = l.mx_off[r] + (uint64_t) e * l.mx_stride[r] + mx_read_off(l, 0, r);
-                jb.len = mx_read_len(l, r);
+                jb.len = fl_len(l, r);
                 jb.dst = sb;
                 jb.left = &c.pf_left[s];
                 jb.bad = &c.pf_bad[s];
                 jb.map = pk.at(l.mx_file[r], jb.off);
+                if (l.pf_ff > 0 && r == 2) pf_down_job(l, e, jb);   // (DS4_PF_SPLIT)
                 jobs.push_back(jb);
                 sb += flow_region(r);
             }
@@ -4242,9 +4347,12 @@ struct Model::Impl {
         }
         it.stage = (int) (c.n_file++ % (uint64_t) c.S);
         uint8_t* sb = c.stage + (size_t) it.stage * c.stage_stride;
+        it.hit = hit;
         for (int r = 0; r < 3; ++r) {
-            const uint64_t off = l.mx_off[r] + (uint64_t) e * l.mx_stride[r] + mx_read_off(l, mi, r);
-            it.src[r] = sb + (in_ram || hit ? 0 : off % os::kDirectAlign);
+            uint64_t off = l.mx_off[r] + (uint64_t) e * l.mx_stride[r] + mx_read_off(l, mi, r);
+            os::fd_t pfd = os::kBadFd;
+            const bool pdown = l.pf_ff > 0 && r == 2 && pf_down(l, e, pfd, off);   // (DS4_PF_SPLIT: read, RAM tier or not)
+            it.src[r] = sb + ((in_ram && !pdown) || hit ? 0 : off % os::kDirectAlign);
             sb += flow_region(r);
         }
         it.left.store(in_ram && copy_mode && store_blob == nullptr ? 3 * NH : 3, std::memory_order_relaxed);
@@ -4418,20 +4526,26 @@ struct Model::Impl {
                     j.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[r]];
                     j.dfd = pk.dfds.empty() ? os::kBadFd : pk.dfds[(size_t) l.mx_file[r]];
                     j.off = l.mx_off[r] + (uint64_t) it.e * l.mx_stride[r] + mx_read_off(l, it.mi, r);
-                    j.len = mx_read_len(l, r);
+                    j.len = fl_len(l, r);
                     j.dst = sb;
                     j.left = &it.left;
                     j.bad = &it.bad;
+                    j.map = pk.at(l.mx_file[r], j.off);
+                    // (DS4_PF_SPLIT: the down from its part's file - a RAM-tier expert's too; a layer-cache hit copies
+                    // it from the slot, where that read put it)
+                    const bool pdown = l.pf_ff > 0 && r == 2;
+                    if (pdown) pf_down_job(l, it.e, j);
                     if (it.lc2) {   // (a layer-cache slot laid out as a staging slot: the part where a read put it)
                         const size_t at = (size_t) (sb - (c.stage + (size_t) it.stage * c.stage_stride)) +
                                           (size_t) (j.off % os::kDirectAlign);
                         j.mem = it.ram != nullptr ? it.ram + at : nullptr;
                         j.keep = it.keep != nullptr ? it.keep + at : nullptr;
                     } else {
-                        j.mem = it.ram != nullptr ? it.ram + l.lay.trellis[r] + mx_read_off(l, it.mi, r) : nullptr;
-                        j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
+                        const x3::ExpertLayout& kl = l.pf_ff > 0 ? l.pf_lay : l.lay;   // (a layer-cache slot's)
+                        j.mem = it.ram == nullptr || (pdown && !it.hit) ? nullptr
+                                : it.ram + (it.hit ? kl : l.lay).trellis[r] + mx_read_off(l, it.mi, r);
+                        j.keep = it.keep != nullptr ? it.keep + kl.trellis[r] : nullptr;
                     }
-                    j.map = pk.at(l.mx_file[r], j.off);
                     sb += flow_region(r);
                 }
                 c.io->push(jobs, nj);
@@ -4458,19 +4572,20 @@ struct Model::Impl {
             if (c.n_dma >= R) CK(cudaStreamWaitEvent(c.cs, c.ring_free[r], 0));
             const Layer& l = L[(size_t) it.il];
             uint8_t* dst = c.ring + r * c.ring_stride;
-            const x3::ExpertLayout& lay = l.nm > 1 ? l.hlay : l.lay;
+            const x3::ExpertLayout& lay = l.pf_ff > 0 ? l.pf_lay : l.nm > 1 ? l.hlay : l.lay;
             for (int p = 0; p < 2; ++p)
-                CK(cudaMemcpyAsync(dst + lay.trellis[p], it.src[p], mx_read_len(l, p), cudaMemcpyHostToDevice, c.cs));
+                CK(cudaMemcpyAsync(dst + lay.trellis[p], it.src[p], fl_len(l, p), cudaMemcpyHostToDevice, c.cs));
             if (l.nm > 1) {   // (the down's part: in each of its rows the member's blocks)
                 const int t2 = gg::expert_type(l.lay, 2);
                 const size_t dr = gg::type_row_bytes(t2, g.ff), dh = gg::type_row_bytes(t2, g.ff / l.nm);
                 CK(cudaMemcpy2DAsync(dst + lay.trellis[2], dh, it.src[2] + (size_t) it.mi * dh, dr, dh, (size_t) g.dim,
                                      cudaMemcpyHostToDevice, c.cs));
             } else
-                CK(cudaMemcpyAsync(dst + lay.trellis[2], it.src[2], mx_part_bytes(l, 2), cudaMemcpyHostToDevice, c.cs));
+                CK(cudaMemcpyAsync(dst + lay.trellis[2], it.src[2], l.pf_ff > 0 ? l.pf_len[2] : mx_part_bytes(l, 2),
+                                   cudaMemcpyHostToDevice, c.cs));
             CK(cudaEventRecord(c.ring_fill[r], c.cs));
             if (it.stage >= 0) CK(cudaEventRecord(c.stage_ev[(size_t) it.stage], c.cs));
-            c.stream_bytes += (double) unit(l);
+            c.stream_bytes += l.pf_ff > 0 ? (double) (l.pf_len[0] + l.pf_len[1] + l.pf_len[2]) : (double) unit(l);
             ++c.n_dma;
         }
         return true;
@@ -4518,7 +4633,8 @@ struct Model::Impl {
             if (bc[n] > bc[0]) {
                 CK(cudaStreamWaitEvent(s, c.ring_fill[(i1 - 1) % R], 0));
                 CK(cudaMemcpyAsync(bcd, bc, (size_t) (n + 1) * 4, cudaMemcpyHostToDevice, s));
-                if (!run_set(d, c, L0, c.ring + (i0 % R) * c.ring_stride, 0, c.ring_stride, bcd, bc, 0, n, T, err))
+                if (!run_set(d, c, L0, c.ring + (i0 % R) * c.ring_stride, 0, c.ring_stride, bcd, bc, 0, n, T, err,
+                             L0.pf_ff > 0 ? &L0.pf_lay : nullptr, L0.pf_ff))
                     return false;
             }
             for (size_t i = i0; i < i1; ++i) CK(cudaEventRecord(c.ring_free[i % R], s));
@@ -4538,10 +4654,12 @@ struct Model::Impl {
     }
 
     // the experts [i0, i1) of a sorted set (blobs at wbase + i * stride; bounds b on the host, d_bounds on the device)
-    // over the chunk's rows, in pieces of at most C rows, each added into acc in pick order
+    // over the chunk's rows, in pieces of at most C rows, each added into acc in pick order (lay_o / ff_o: the blobs'
+    // layout and n_ff, DS4_PF_SPLIT's slices; null / 0: the layer's)
     bool run_set(Dev& d, Chunk& c, const Layer& l, const uint8_t* wbase, int wb0, size_t stride, const int* d_bounds,
-                 const int* b, int i0, int i1, int T, std::string& err) {
-        const int D = g.dim, FF = l.ffn;
+                 const int* b, int i0, int i1, int T, std::string& err, const x3::ExpertLayout* lay_o = nullptr,
+                 int ff_o = 0) {
+        const int D = g.dim, FF = ff_o > 0 ? ff_o : l.ffn;
         while (i0 < i1) {
             int j = i0 + 1;
             while (j < i1 && b[j + 1] - b[i0] <= c.C) ++j;
@@ -4552,7 +4670,7 @@ struct Model::Impl {
                 x3::SetArgs sa;
                 sa.wbase = wbase + (size_t) (i0 - wb0) * stride;   // (wbase: set member wb0's blob)
                 sa.stride = stride;
-                sa.lay = l.nm > 1 ? l.hlay : l.lay;
+                sa.lay = lay_o != nullptr ? *lay_o : l.nm > 1 ? l.hlay : l.lay;
                 sa.n_exp = j - i0;
                 sa.bounds = d_bounds + i0;
                 sa.row0 = a;
