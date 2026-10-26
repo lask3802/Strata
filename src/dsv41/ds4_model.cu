@@ -677,6 +677,11 @@ struct Chunk {
     size_t lm_state_bytes = 0;
     uint8_t* lc = nullptr;                   // lc_bytes of slots, a layer's experts' blobs side by side
     size_t lc_bytes = 0;
+    // DS4_LC_ONCE=1: the layer cache and the chunks' states allocated at the first layer-major run and kept for the
+    // runs after (lc / lm_state point into them while a run is on), freed with the model
+    uint8_t *lc_kept = nullptr, *st_kept = nullptr;
+    size_t lc_cap = 0, st_cap = 0;
+    bool st_kept_pinned = false;
     int lc_il = -1, lc_used = 0, lc_n = 0;   // the layer the cache holds, its slots taken, its slots in all
     size_t lc_first = 0, lc_chk = 0;         // the layer's first item; the items before lc_chk all read
     std::vector<int> lc_of;                  // expert -> its slot (-1: none)
@@ -1615,6 +1620,14 @@ struct Model::Impl {
         for (std::thread& t : cache_ths)
             if (t.joinable()) t.join();
         if (ram_th.joinable()) ram_th.join();
+        for (auto& cp : chunks) {   // (DS4_LC_ONCE's kept layer cache and chunks' states)
+            if (cp == nullptr) continue;
+            if (cp->lc_kept != nullptr) os::anon_free(cp->lc_kept, cp->lc_cap);
+            if (cp->st_kept != nullptr) {
+                if (cp->st_kept_pinned) cudaFreeHost(cp->st_kept);
+                else os::anon_free(cp->st_kept, cp->st_cap);
+            }
+        }
         for (size_t i = 0; i < ram_chunks.size(); ++i) os::anon_free(ram_chunks[i], ram_chunk_bytes[i]);
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
@@ -10535,8 +10548,14 @@ struct Model::Impl {
         const size_t hb = chunk_hand_bytes(), state_b = run.T.size() * hb;
         const double moved = 2.0 * (double) rows * ((double) hb / (double) chunk) * (double) (hi - lo);   // (its layers)
         if (need == 0 || (double) (run.T.size() - 1) * file_b <= moved) return false;
+        // DS4_LC_ONCE=1: the layer cache allocated at the first such run and kept (Chunk::lc_kept) - a run after it
+        // takes what it holds (no RAM check: the RAM is the process's already), at most lc_cap; the chunks' states
+        // kept too, allocated again only when a run needs more
+        static const bool once = std::getenv("DS4_LC_ONCE") != nullptr && std::atoi(std::getenv("DS4_LC_ONCE")) != 0;
+        const bool reuse = once && c.lc_kept != nullptr;
         size_t lc_bytes = need;
-        if (const char* mb = std::getenv("DS4_LAYER_CACHE_MB")) lc_bytes = std::min(need, (size_t) std::atoll(mb) << 20);
+        if (reuse) lc_bytes = std::min(need, c.lc_cap);
+        else if (const char* mb = std::getenv("DS4_LAYER_CACHE_MB")) lc_bytes = std::min(need, (size_t) std::atoll(mb) << 20);
         else {
             const uint64_t avail = ram_avail();
             if (avail != ~uint64_t{0})
@@ -10551,7 +10570,8 @@ struct Model::Impl {
         bool two = false;
         if (want2) {
             uint64_t cap = ~uint64_t{0};
-            if (const char* mb = std::getenv("DS4_LAYER_CACHE_MB")) cap = (uint64_t) std::atoll(mb) << 20;
+            if (reuse) cap = c.lc_cap;
+            else if (const char* mb = std::getenv("DS4_LAYER_CACHE_MB")) cap = (uint64_t) std::atoll(mb) << 20;
             else {
                 const uint64_t avail = ram_avail();
                 if (avail != ~uint64_t{0}) cap = avail > kRamMargin + state_b ? avail - kRamMargin - state_b : 0;
@@ -10567,23 +10587,47 @@ struct Model::Impl {
                 else
                     std::fprintf(stderr, "ds4: DS4_LAYER_CACHE_LAYERS=2: two layers need %.1f GB of RAM, %.1f GB "
                                  "allowed (%s): the layer cache stays one layer\n", (double) need2 / 1e9, (double) cap / 1e9,
-                                 std::getenv("DS4_LAYER_CACHE_MB") ? "DS4_LAYER_CACHE_MB" : "free RAM less 8 GB and the "
-                                 "chunks' states");
+                                 reuse ? "DS4_LC_ONCE's layer cache" : std::getenv("DS4_LAYER_CACHE_MB") ? "DS4_LAYER_CACHE_MB"
+                                 : "free RAM less 8 GB and the chunks' states");
             }
             if (two) lc_bytes = need2;
         }
         void* st_p = nullptr;
-        c.lm_pinned = cudaHostAlloc(&st_p, state_b, cudaHostAllocPortable) == cudaSuccess;
-        if (!c.lm_pinned) {
-            cudaGetLastError();
-            st_p = os::anon_alloc(state_b, -1, 1);
-            if (st_p == nullptr) return false;
+        if (once && c.st_kept != nullptr && c.st_cap >= state_b) {
+            st_p = c.st_kept;
+            c.lm_pinned = c.st_kept_pinned;
+        } else {
+            if (once && c.st_kept != nullptr) {   // (a run with more chunks: the kept states again, larger)
+                if (c.st_kept_pinned) cudaFreeHost(c.st_kept);
+                else os::anon_free(c.st_kept, c.st_cap);
+                c.st_kept = nullptr;
+                c.st_cap = 0;
+            }
+            c.lm_pinned = cudaHostAlloc(&st_p, state_b, cudaHostAllocPortable) == cudaSuccess;
+            if (!c.lm_pinned) {
+                cudaGetLastError();
+                st_p = os::anon_alloc(state_b, -1, 1);
+                if (st_p == nullptr) return false;
+            }
+            if (once) {
+                c.st_kept = (uint8_t*) st_p;
+                c.st_cap = state_b;
+                c.st_kept_pinned = c.lm_pinned;
+            }
         }
-        c.lc = (uint8_t*) os::anon_alloc(lc_bytes, -1, 1);
+        c.lc = reuse ? c.lc_kept : (uint8_t*) os::anon_alloc(lc_bytes, -1, 1);
         if (c.lc == nullptr) {
+            if (once) return false;   // (the states kept for the next run)
             if (c.lm_pinned) cudaFreeHost(st_p);
             else os::anon_free(st_p, state_b);
             return false;
+        }
+        if (once && !reuse) {
+            c.lc_kept = c.lc;
+            c.lc_cap = lc_bytes;
+            std::fprintf(stderr, "ds4: DS4_LC_ONCE=1: the layer cache (%.1f GB) and the chunks' states (%.1f GB, %s) "
+                         "allocated once, kept for the prompts after\n", (double) lc_bytes / 1e9, (double) c.st_cap / 1e9,
+                         c.st_kept_pinned ? "pinned" : "pageable");
         }
         c.lm_state = (uint8_t*) st_p;
         c.lm_state_bytes = state_b;
@@ -10626,9 +10670,11 @@ struct Model::Impl {
                 lc2_drain(c, 1);
                 c.lc2 = false;
             }
-            if (c.lm_pinned) cudaFreeHost(c.lm_state);
-            else os::anon_free(c.lm_state, c.lm_state_bytes);
-            os::anon_free(c.lc, c.lc_bytes);
+            if (c.lm_state != c.st_kept) {   // (DS4_LC_ONCE: the kept ones stay, Chunk::lc_kept)
+                if (c.lm_pinned) cudaFreeHost(c.lm_state);
+                else os::anon_free(c.lm_state, c.lm_state_bytes);
+            }
+            if (c.lc != c.lc_kept) os::anon_free(c.lc, c.lc_bytes);
             c.lm_state = c.lc = nullptr;
             c.lm_state_bytes = c.lc_bytes = 0;
             c.lm = c.lm_pinned = false;

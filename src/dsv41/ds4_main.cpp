@@ -1899,6 +1899,31 @@ int main(int argc, char** argv) {
     std::FILE* df = dump.empty() ? nullptr : std::fopen(dump.c_str(), "wb");
     std::vector<float> lg;
     if (window_given == 0) window = df != nullptr ? 16 : std::max(16, std::min(m.feed_unit(), 1 << 30));
+    // DS4_PROMPT_TIMES=K (2..9; a bench's): the prompt read K - 1 times first, the state reset after each (primes: a
+    // process's later prompts, DS4_LC_ONCE's kept memory), then the prompt as always - its "prompt:" line and the
+    // decode after it are the last's; each one's UTC span on a line (the cgroup's counters over it)
+    const char* ptv = std::getenv("DS4_PROMPT_TIMES");
+    const int times = ptv != nullptr && df == nullptr && images.empty() ? std::max(1, std::min(9, std::atoi(ptv))) : 1;
+    const auto utc_s = [] {
+        return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    };
+    for (int rep = 1; rep < times; ++rep) {
+        const double u0 = utc_s(), tp = now_ms();
+        for (size_t a = 0; a < ids.size();) {
+            const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);
+            if (!m.feed(ids.data() + a, T, a + (size_t) T == ids.size() ? 1 : 0, err)) {
+                std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+                return 1;
+            }
+            a += (size_t) T;
+        }
+        const double tq = now_ms();
+        std::fprintf(stderr, "prompt (prime %d of %d): %zu tokens in %.0f ms (%.2f tok/s, windows of %d); UTC %.3f to "
+                     "%.3f\n", rep, times, ids.size(), tq - tp, 1000.0 * (double) ids.size() / (tq - tp), window, u0,
+                     utc_s());
+        m.reset();
+    }
+    const double u0 = utc_s();
     const double t0 = now_ms();
     for (size_t a = 0; a < ids.size();) {
         const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);
@@ -1914,6 +1939,8 @@ int main(int argc, char** argv) {
     const double t1 = now_ms();
     std::fprintf(stderr, "prompt: %zu tokens in %.0f ms (%.2f tok/s, windows of %d)\n", ids.size(), t1 - t0,
                  1000.0 * (double) ids.size() / (t1 - t0), window);
+    if (times > 1)
+        std::fprintf(stderr, "prompt %d of %d (DS4_PROMPT_TIMES): UTC %.3f to %.3f\n", times, times, u0, utc_s());
     const strata::ds4::Stats s0 = m.stats();
     if (s0.eg_rows > 0)
         std::fprintf(stderr, "prompt's Engram rows: %lld, %.1f%% without a read (repeats and the row cache), %lld read\n",
