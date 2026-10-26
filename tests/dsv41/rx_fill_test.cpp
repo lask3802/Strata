@@ -305,6 +305,32 @@ int main() {
         f = rx::remote_choose(ls, p, M, B);
         check(f.size() == 1 && f[0].layer == 12, "the pace: one fill's bytes in the bucket, one fill");
     }
+    {
+        // DS4_RX_HELD_HEAT: a loaded set's experts (6, 7, 3: the profile's coldest) take the lane's top heats
+        const int n = 9;
+        std::vector<int> slot(n, -1);
+        slot[8] = 0;   // (in VRAM: not the lane's, not in `order`)
+        std::vector<float> heat = {10.0f, 8.0f, 6.0f, 4.0f, 2.0f, 1.0f, 0.5f, 0.0f, 30.0f};
+        std::vector<uint8_t> has = {0, 0, 0, rx::kHeld, 0, 0, rx::kHeld, rx::kHeld, 0};
+        rx::Fill f = pick({0}, slot.data(), heat.data(), has.data(), n, -1);
+        check(f.in == 0 && f.out == 7, "the profile's heat: a hit on 0 (10) fills over the coldest held (7, 0)");
+        const std::vector<int> order = {6, 7, 3, 0, 1, 2, 4, 5};
+        const int m = rx::held_heat(heat.data(), order);
+        check(m == 8, "all eight lane experts took another heat");
+        check(heat[6] == 10.0f && heat[7] == 8.0f && heat[3] == 6.0f,
+              "the held, in the set's order (6, 7, 3), took the lane's top three heats (10, 8, 6)");
+        check(heat[0] == 4.0f && heat[1] == 2.0f && heat[2] == 1.0f && heat[4] == 0.5f && heat[5] == 0.0f,
+              "the others, in their order, the rest (4, 2, 1, 0.5, 0)");
+        check(heat[8] == 30.0f, "the VRAM expert's heat untouched");
+        double sum = 0;
+        for (int e : order) sum += heat[(size_t) e];
+        check(near(sum, 31.5), "the same heats: the lane's sum kept (31.5)");
+        f = pick({0}, slot.data(), heat.data(), has.data(), n, -1);
+        check(f.in < 0, "then a hit on 0 (4) is not past the coldest held (3: 6 x 1.25 + 1): no fill");
+        std::vector<float> prof = {10.0f, 8.0f, 6.0f, 4.0f};
+        check(rx::held_heat(prof.data(), {0, 1, 2, 3}) == 0 && prof[0] == 10.0f && prof[3] == 4.0f,
+              "the profile's own set in its order: nothing moves");
+    }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;
 }

@@ -7534,6 +7534,39 @@ struct Model::Impl {
         st.rx_held = held;
         st.rx_upload_bytes = (int64_t) held_b;
         st.rx_upload_ms = now_ms() - t0;
+        // DS4_RX_HELD_HEAT=1 (lead 2026-10-26, after gs-run): the heat starts from the profile, so a loaded set's
+        // experts the profile ranks low start the coldest held - the fills' first outs.  Each layer's CPU-lane heats
+        // given out in the set's order instead (rx::held_heat: the held first, each part in cand's order)
+        if (const char* hv = std::getenv("DS4_RX_HELD_HEAT"); hv != nullptr && *hv == '1') {
+            if (hn > 0 && held > 0) {
+                std::vector<std::vector<int>> ord((size_t) NL);
+                for (int pass = 0; pass < 2; ++pass)
+                    for (const Cand& c : cand)
+                        if ((rx_has[(size_t) c.li * g.n_exp + c.e] != 0) == (pass == 0)) ord[(size_t) c.li].push_back(c.e);
+                double h0 = 0, h1 = 0, lane = 0;
+                int moved = 0, nly = 0;
+                for (int li = 0; li < NL; ++li) {
+                    Layer& l = L[(size_t) li];
+                    const std::vector<int>& o_ = ord[(size_t) li];
+                    if (o_.empty() || (int) l.heat.size() < l.n_exp) continue;
+                    for (int e : o_) {
+                        lane += l.heat[(size_t) e];
+                        if (rx_has[(size_t) li * g.n_exp + e] != 0) h0 += l.heat[(size_t) e];
+                    }
+                    const int m = rx::held_heat(l.heat.data(), o_);
+                    for (int e : o_)
+                        if (rx_has[(size_t) li * g.n_exp + e] != 0) h1 += l.heat[(size_t) e];
+                    moved += m;
+                    nly += m > 0;
+                }
+                std::fprintf(stderr, "ds4: DS4_RX_HELD_HEAT=1: the CPU lane's heat in the server's set's order: %d experts in %d "
+                                     "layers took another; the %lld held have %.1f%% of the lane's heat (%.1f%% before)\n",
+                             moved, nly, (long long) held, lane > 0 ? 100.0 * h1 / lane : 0.0, lane > 0 ? 100.0 * h0 / lane : 0.0);
+            } else {
+                std::fprintf(stderr, "ds4: DS4_RX_HELD_HEAT=1 not used (no held set loaded: DS4_RX_HELD_LOAD) - the profile's "
+                                     "heat\n");
+            }
+        }
         rx_split(*link, gl);
 #if defined(__linux__)
         std::fprintf(stderr, "ds4: remote experts: the upload read %.2f of its %.2f GB from the disk (not in the page "

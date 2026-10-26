@@ -13,7 +13,8 @@
 //     server-held expert that stays in this GPU's VRAM (a duplicate) leaves first, whatever its heat;
 //   - FillBook: the fills a token (R), pending (Q), the bulk pace (bytes a second) and the pause while the link idles;
 //   - ram_in: the RAM tier's next expert, never one the server holds (the RAM tier would save the lane nothing there);
-//   - PromptSettle: one cache settle a prompt that ends on windows.
+//   - PromptSettle: one cache settle a prompt that ends on windows;
+//   - held_heat: DS4_RX_HELD_HEAT's starting heat, a loaded held set's experts where the profile's top was.
 // The server's list (the main's rx_has row of a layer) has three states here: 0 not held, kHeld, kFilling.  cache_in
 // (ds4_rx.hpp) and ram_in treat any non-zero as the server's, so neither cache takes an expert on its way there.
 #pragma once
@@ -178,6 +179,25 @@ inline bool fill_landed(uint8_t* has, int in, bool ok) {
     if (has[in] != kFilling) return false;
     has[in] = ok ? kHeld : 0;
     return true;
+}
+
+/// DS4_RX_HELD_HEAT=1, a held set loaded (DS4_RX_HELD_LOAD): a layer's starting heat in the server's set's order.  The
+/// heat starts from the profile (its counts, ~512 hits a layer), so a loaded set's experts the profile ranks low start
+/// the coldest held - the fills' first `out`s (remote_pick), before the text's own hits count for them.  `order`: the
+/// layer's CPU-lane experts, the held ones first; their heats, sorted down, given out in that order - the same heats,
+/// the set where the profile's top was (the profile's own set, in its order: nothing moves).  The experts that took
+/// another heat
+inline int held_heat(float* heat, const std::vector<int>& order) {
+    std::vector<float> h;
+    h.reserve(order.size());
+    for (int e : order) h.push_back(heat[e]);
+    std::stable_sort(h.begin(), h.end(), [](float a, float b) { return a > b; });
+    int moved = 0;
+    for (size_t i = 0; i < order.size(); ++i) {
+        moved += heat[order[i]] != h[i];
+        heat[order[i]] = h[i];
+    }
+    return moved;
 }
 
 /// The cache settle after a prompt that ends on windows (feed_windows), with the expert server on: once a prompt.
