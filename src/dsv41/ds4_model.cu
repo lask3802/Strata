@@ -9936,11 +9936,18 @@ struct Model::Impl {
     // set allocated for the run (the experts' placement as it was), else as 2; 2: one set, piece by piece.  States in
     // pageable memory, a remote stage's runs: off.  Its line printed when it differs from the last one
     void ls_begin(Chunk& c) {
-        static const int want =
-            std::getenv("DS4_LM_STATE_OVERLAP") != nullptr ? std::atoi(std::getenv("DS4_LM_STATE_OVERLAP")) : 0;
+        static const char* env = std::getenv("DS4_LM_STATE_OVERLAP");
+        static const int want = env != nullptr ? std::atoi(env) : 0;
         static std::string said;
         c.ls_mode = 0;
-        if (want != 1 && want != 2) return;
+        if (want != 1 && want != 2) {   // (set to anything else: said, once - a mistyped arm is not silently off)
+            static bool told = false;
+            if (env != nullptr && !told)
+                std::fprintf(stderr, "ds4: DS4_LM_STATE_OVERLAP=%s: off - 1 (ping-pong where VRAM allows) or 2 (one "
+                                     "set) turns it on\n", env);
+            told = true;
+            return;
+        }
         Dev& d = devs[0];
         cudaSetDevice(d.id);
         char b[320];
@@ -9990,12 +9997,21 @@ struct Model::Impl {
     bool ls_streams(Chunk& c) {
         cudaEvent_t* ev[] = {&c.ls_comp[0], &c.ls_comp[1], &c.ls_save[0], &c.ls_save[1], &c.ls_load[0], &c.ls_load[1],
                              &c.ls_saved};
+        c.ls_out = c.ls_in = nullptr;
+        for (cudaEvent_t* e : ev) *e = nullptr;
+        for (cudaEvent_t& e : c.ls_pc) e = nullptr;
         bool ok = cudaStreamCreateWithFlags(&c.ls_out, cudaStreamNonBlocking) == cudaSuccess &&
                   cudaStreamCreateWithFlags(&c.ls_in, cudaStreamNonBlocking) == cudaSuccess;
         for (cudaEvent_t* e : ev) ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming) == cudaSuccess;
         for (cudaEvent_t& e : c.ls_pc) ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
-        if (!ok) {
+        if (!ok) {   // (what was made undone: the next run tries again)
             cudaGetLastError();
+            for (cudaEvent_t* e : ev)
+                if (*e != nullptr) cudaEventDestroy(*e), *e = nullptr;
+            for (cudaEvent_t& e : c.ls_pc)
+                if (e != nullptr) cudaEventDestroy(e), e = nullptr;
+            if (c.ls_in != nullptr) cudaStreamDestroy(c.ls_in);
+            if (c.ls_out != nullptr) cudaStreamDestroy(c.ls_out);
             c.ls_out = c.ls_in = nullptr;
         }
         return ok;
