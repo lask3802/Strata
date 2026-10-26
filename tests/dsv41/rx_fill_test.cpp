@@ -1,6 +1,7 @@
 // Strata. The remote experts' fills (src/dsv41/ds4_rx_fill.hpp, EP U5): which CPU-lane expert goes to the expert
 // server in place of which held one, the budget a fill leaves under (R a token, Q pending, the bulk pace, the idle
-// pause), the server's list's states, and the RAM tier's rule that it never takes a server's expert.  No GPU, no
+// pause), the server's list's states, a prompt's tick (remote_choose_all: many a layer, DS4_RX_FILL_PF), and the
+// RAM tier's rule that it never takes a server's expert.  No GPU, no
 // socket.  Heat as the engine's (profile-scaled counts), the rule's margin 1.25 and bonus 1 (DS4_CACHE_MARGIN / _BONUS).
 #include "../../src/dsv41/ds4_rx.hpp"
 #include "../../src/dsv41/ds4_rx_fill.hpp"
@@ -304,6 +305,72 @@ int main() {
         ls = layers();
         f = rx::remote_choose(ls, p, M, B);
         check(f.size() == 1 && f[0].layer == 12, "the pace: one fill's bytes in the bucket, one fill");
+    }
+    {
+        // a prompt's tick (DS4_RX_FILL_PF): each layer as many fills as the book lets leave, the hottest hits for the
+        // coldest held ones while the rule holds; the book's R and Q the prompt's (set_limits), then the decode's again
+        const int n = 8;
+        std::vector<int> s0(n, -1), s1(n, -1);
+        s0[6] = 0;   // (6: in this GPU's VRAM - never a fill's in)
+        std::vector<float> h0 = {1.0f, 2.0f, 30.0f, 20.0f, 10.0f, 2.5f, 40.0f, 0.0f};
+        std::vector<float> h1 = {0.0f, 0.0f, 50.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        std::vector<uint8_t> a0 = {rx::kHeld, rx::kHeld, 0, 0, 0, 0, 0, rx::kHeld};
+        std::vector<uint8_t> a1 = {rx::kHeld, 0, 0, 0, 0, 0, 0, 0};
+        std::vector<int> k0 = {2, 3, 4, 5, 6}, k1 = {2};
+        auto layers = [&]() {
+            std::vector<rx::TierLayer> v(2);
+            std::vector<int>* k[2] = {&k0, &k1};
+            std::vector<int>* s[2] = {&s0, &s1};
+            std::vector<float>* h[2] = {&h0, &h1};
+            std::vector<uint8_t>* a[2] = {&a0, &a1};
+            for (int i = 0; i < 2; ++i) {
+                v[(size_t) i].layer = 20 + i;
+                v[(size_t) i].hits = k[i];
+                v[(size_t) i].slot = s[i]->data();
+                v[(size_t) i].heat = h[i]->data();
+                v[(size_t) i].has = a[i]->data();
+                v[(size_t) i].n_exp = n;
+                v[(size_t) i].bytes = 8.6e6;
+            }
+            return v;
+        };
+        rx::FillBook b(6, 2, 0.0, 0.0, 8.6e6);
+        b.set_limits(64, 64);
+        b.tick(0.0, false);
+        auto ls = layers();
+        std::vector<rx::Fill> f = rx::remote_choose_all(ls, b, M, B);
+        // layer 20 (5 hits) first: 2 for 7 (heat 0), 3 for 0 (1), 4 for 1 (2); then 5 (2.5) is not past 2 x 1.25 + 1
+        // = 3.5 - and no held one is left anyway; 6 is in VRAM. Layer 21: 2 for 0
+        check(f.size() == 4, "a prompt's tick, R = Q = 64: four fills (three in layer 20, one in layer 21)");
+        check(f.size() == 4 && f[0].layer == 20 && f[0].in == 2 && f[0].out == 7 && f[1].in == 3 && f[1].out == 0 &&
+                  f[2].in == 4 && f[2].out == 1,
+              "layer 20: the hottest hits (2, 3, 4) for the coldest held ones (7, 0, 1), in that order");
+        check(f.size() == 4 && f[3].layer == 21 && f[3].in == 2 && f[3].out == 0, "then layer 21's: 2 for 0");
+        check(a0[2] == rx::kFilling && a0[3] == rx::kFilling && a0[4] == rx::kFilling && a0[0] == 0 && a0[1] == 0 &&
+                  a0[7] == 0 && a0[5] == 0 && a0[6] == 0,
+              "the ins filling, the outs off the list, 5 and the VRAM one (6) untouched");
+        check(b.pending() == 4, "four pending");
+        a0 = {rx::kHeld, rx::kHeld, 0, 0, 0, 0, 0, rx::kHeld};
+        a1 = {rx::kHeld, 0, 0, 0, 0, 0, 0, 0};
+        rx::FillBook q(64, 2, 0.0, 0.0, 8.6e6);
+        q.tick(0.0, false);
+        ls = layers();
+        f = rx::remote_choose_all(ls, q, M, B);
+        check(f.size() == 2 && f[0].layer == 20 && f[1].layer == 20 && a1[0] == rx::kHeld,
+              "Q = 2: two fills, both layer 20's; layer 21 waits");
+        a0 = {rx::kHeld, rx::kHeld, 0, 0, 0, 0, 0, rx::kHeld};
+        a1 = {rx::kHeld, 0, 0, 0, 0, 0, 0, 0};
+        rx::FillBook d(6, 2, 0.0, 0.0, 8.6e6);
+        d.set_limits(64, 64);
+        d.set_limits(6, 2);   // (the decode's again)
+        d.tick(0.0, false);
+        ls = layers();
+        f = rx::remote_choose(ls, d, M, B);
+        check(f.size() == 2 && f[0].layer == 20 && f[0].in == 2 && f[1].layer == 21,
+              "set_limits back to the decode's (R 6, Q 2): remote_choose's one a layer");
+        d.tick(1.0, false);
+        ls = layers();
+        check(rx::remote_choose_all(ls, d, M, B).empty(), "the two pending count against the decode's Q again");
     }
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails ? 1 : 0;

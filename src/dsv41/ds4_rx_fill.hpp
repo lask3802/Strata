@@ -12,6 +12,7 @@
 //     `in` only an expert the main computes on its CPU lane (not in VRAM, the RAM tier or the zero-copy store), and a
 //     server-held expert that stays in this GPU's VRAM (a duplicate) leaves first, whatever its heat;
 //   - FillBook: the fills a token (R), pending (Q), the bulk pace (bytes a second) and the pause while the link idles;
+//   - remote_choose_all: a prompt's tick (DS4_RX_FILL_PF): remote_choose without its one fill a layer;
 //   - ram_in: the RAM tier's next expert, never one the server holds (the RAM tier would save the lane nothing there);
 //   - PromptSettle: one cache settle a prompt that ends on windows.
 // The server's list (the main's rx_has row of a layer) has three states here: 0 not held, kHeld, kFilling.  cache_in
@@ -128,6 +129,11 @@ public:
         ++pending_;
         if (pace_ > 0.0) bucket_ -= bytes;
     }
+    /// R and Q from now on (DS4_RX_FILL_PF: a prompt's, then the decode's again) - the fills pending stay counted
+    void set_limits(int r, int q) {
+        r_ = r;
+        q_ = q;
+    }
     /// a pending fill ended: landed (FillOk), refused, or dropped with the link
     void done() {
         if (pending_ > 0) --pending_;
@@ -168,6 +174,34 @@ inline std::vector<Fill> remote_choose(std::vector<TierLayer>& ls, FillBook& boo
         t.has[f.in] = kFilling;
         book.take(t.bytes);
         out.push_back(f);
+    }
+    return out;
+}
+
+/// A prompt's tick (DS4_RX_FILL_PF: its routing in, layer by layer, while no request goes to the server): as
+/// remote_choose - the layers with the most hits first, `out` off the list and `in` kFilling at once - but each layer
+/// as many fills as the book lets leave, remote_pick again after each one (the next hottest hit, the next coldest held)
+inline std::vector<Fill> remote_choose_all(std::vector<TierLayer>& ls, FillBook& book, float margin, float bonus) {
+    std::vector<Fill> out;
+    std::vector<size_t> order(ls.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        const size_t na = ls[a].hits ? ls[a].hits->size() : 0, nb = ls[b].hits ? ls[b].hits->size() : 0;
+        return na > nb;
+    });
+    for (size_t i : order) {
+        TierLayer& t = ls[i];
+        if (t.hits == nullptr || t.hits->empty() || t.has == nullptr) continue;
+        while (!book.spent() && book.can(t.bytes)) {
+            Fill f = remote_pick(t, margin, bonus);
+            if (f.in < 0) break;
+            f.layer = t.layer;
+            t.has[f.out] = 0;
+            t.has[f.in] = kFilling;
+            book.take(t.bytes);
+            out.push_back(f);
+        }
+        if (book.spent()) break;
     }
     return out;
 }

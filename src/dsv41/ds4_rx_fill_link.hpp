@@ -80,6 +80,8 @@ public:
     std::string why();   // (after up() went false)
     void close();        // the fill thread ended, the socket closed (queued fills dropped: their slots stay out)
     int port() const { return port_; }
+    /// the sends' pace from the next piece on (bytes a second; <= 0: unpaced) - DS4_RX_FILL_PF's prompt, then the decode's
+    void set_pace(double bps) { pace_.store(bps, std::memory_order_relaxed); }
 
     std::atomic<uint64_t> sent{0}, bytes{0}, oks{0}, fails{0};
     std::atomic<uint64_t> send_us{0};   // the fill thread's time in send (the pace's)
@@ -105,7 +107,8 @@ private:
     bool file_ok_ = true;       // (the fill thread's: sendfile not refused yet)
     std::atomic<bool> stop_{false}, up_{false};
     int cpu_ = -1, port_ = 0;
-    double pace_ = 0.0, due_ = 0.0;   // (the fill thread's: bytes a second; when the next piece may go, steady ms)
+    std::atomic<double> pace_{0.0};   // bytes a second (set_pace: from the decode thread)
+    double due_ = 0.0;                // (the fill thread's: when the next piece may go, steady ms)
 };
 
 /// The server's end: dial the main's fills port (its host is the rx link's peer), the hello.  false (err)

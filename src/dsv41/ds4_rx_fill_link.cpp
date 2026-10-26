@@ -108,7 +108,7 @@ bool FillLink::open(Main& m, const std::string& rx_at, int port, const std::stri
         return refuse(fh.proto != kProto ? "protocol differs" : fh.session != session ? "another session" : "wrong token");
     if (!c_.send(net::ep::EpHdr{0, net::ep::HelloOk}, nullptr, 0, err)) return false;
     c_.max_frame = 4096;   // (FillOks, Errors)
-    pace_ = pace_bps;
+    pace_.store(pace_bps, std::memory_order_relaxed);
     due_ = 0.0;
     c_.cancel = &stop_;
     cpu_ = cpu;
@@ -220,10 +220,11 @@ void FillLink::loop_() {
             for (int s = 0; ok && s < nseg; ++s)
                 for (uint64_t at = 0; ok && at < seg[s].n; at += kPiece) {
                     const size_t m = (size_t) std::min<uint64_t>(kPiece, seg[s].n - at);
-                    if (pace_ > 0.0) {
+                    const double pace = pace_.load(std::memory_order_relaxed);
+                    if (pace > 0.0) {
                         const double now = net::ep::now_ms();
                         if (due_ > now) std::this_thread::sleep_for(std::chrono::microseconds((int64_t) ((due_ - now) * 1000.0)));
-                        due_ = std::max(due_, now) + 1000.0 * (double) m / pace_;
+                        due_ = std::max(due_, now) + 1000.0 * (double) m / pace;
                     }
                     if (stop_.load(std::memory_order_acquire)) {
                         ok = false;

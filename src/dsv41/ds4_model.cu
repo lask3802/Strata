@@ -1257,6 +1257,20 @@ struct Model::Impl {
     std::vector<rx::TierLayer> rx_tier;
     double rx_fill_max = 0.0;
     uint32_t rx_fill_seq = 0;
+    // DS4_RX_FILL_PF=1: fills while a prompt is read too (rx_pf_begin / rx_pf_end) - the prompt's budget DS4_RX_FILL_PF_Q
+    // a tick and pending, its pace DS4_RX_FILL_PF_PACE; the decode's (R, Q, the link's pace) kept for its end.
+    // rx_pf_layers: a chunked prompt's fills from its device's thread, each layer's once its routing is in (one device:
+    // nothing else touches the server's list while the prompt runs); the profile and the server's list at its start
+    bool rx_pf = false, rx_pf_on = false, rx_pf_layers = false, rx_pf_noted = false;
+    int rx_fill_r = 6, rx_fill_q = 2, rx_pf_q = 128;
+    double rx_fill_pace = 0.0, rx_pf_pace = 0.0, rx_pf_bytes = 0.0;
+    int64_t rx_pf_fills0 = 0, rx_pf_ok0 = 0;
+    std::vector<uint32_t> rx_pf_prof0;
+    std::vector<uint8_t> rx_pf_has0;
+    struct PfEnd {   // (a prompt's way out: rx_pf_end once, the decode's budget and pace again)
+        Impl* p;
+        ~PfEnd() { p->rx_pf_end(0); }
+    };
     mutable std::mutex rx_mu;
     std::vector<float> rx_rtt, rx_wait, rx_arr;
     std::vector<std::pair<float, int>> rx_late_arr;   // the late replies that came: send to arrival in the kernel, layer
@@ -7691,12 +7705,23 @@ struct Model::Impl {
             return;
         }
         rx_book = std::make_unique<rx::FillBook>(R, Q, 0.0, 0.0, rx_fill_max);
+        rx_fill_r = R, rx_fill_q = Q, rx_fill_pace = pace;
+        const char* pfv = std::getenv("DS4_RX_FILL_PF");
+        rx_pf = pfv != nullptr && std::string(pfv) == "1";
+        rx_pf_q = std::max(1, (int) env_f("DS4_RX_FILL_PF_Q", 128.0f));
+        rx_pf_pace = std::max(0.0, (double) env_f("DS4_RX_FILL_PF_PACE", 0.0f) * 1e9);
         rx_vout.assign(L.size(), -1);
         rx_thits.assign(L.size(), {});
         std::fprintf(stderr, "ds4: remote experts: fills on (port %d, %.2f GB/s, %d a token, %d pending, %s; the fill "
                              "thread on CPU %d)\n", fl->port(), pace / 1e9, R, Q,
                      rx_k < rx_nb ? ("the main's [0, " + std::to_string(rx_k) + ") of a split layer").c_str()
                                   : "whole blobs", cpu);
+        if (rx_pf) {
+            char pc[32] = "unpaced";
+            if (rx_pf_pace > 0.0) std::snprintf(pc, sizeof pc, "%.2f GB/s", rx_pf_pace / 1e9);
+            std::fprintf(stderr, "ds4: DS4_RX_FILL_PF=1: fills while a prompt is read too (%d a tick and pending, %s); "
+                                 "the decode's budget and pace at its end\n", rx_pf_q, pc);
+        }
         if (fl->zc > 0)
             std::fprintf(stderr, "ds4: DS4_RX_FILL_ZC=%d: a split fill's gate and up %s, its downs gathered\n", fl->zc,
                          fl->zc == 2 ? "through sendfile from the pack's file" : "sent straight from the pack's mapping");
@@ -7760,7 +7785,9 @@ struct Model::Impl {
     // (cache_tick_swaps, after the layers) this tick's fills: chosen (out off the server's list, in kFilling), queued
     void rx_fill_out() {
         rx_book->tick(now_ms(), rx_back.left > 0);
-        for (const rx::Fill& f : rx::remote_choose(rx_tier, *rx_book, c_margin, c_bonus)) {
+        const std::vector<rx::Fill> fills = rx_pf_on ? rx::remote_choose_all(rx_tier, *rx_book, c_margin, c_bonus)
+                                                     : rx::remote_choose(rx_tier, *rx_book, c_margin, c_bonus);
+        for (const rx::Fill& f : fills) {
             const Layer& l = L[(size_t) f.layer];
             rx::FillLink::Job j;
             j.seq = ++rx_fill_seq;
@@ -7778,8 +7805,71 @@ struct Model::Impl {
             }
             rx_fill->queue(j);
             ++st.rx_fills;
+            if (rx_pf_on) rx_pf_bytes += (double) j.geo.ship_bytes(j.k);
         }
         rx_tier.clear();
+    }
+    // DS4_RX_FILL_PF: a prompt's start - its budget and pace (no request goes to the server while a prompt is read on
+    // the flow; a window prompt's windows past async_max_t neither), the profile and the server's list as they are now
+    void rx_pf_begin(bool layers) {
+        if (!rx_pf || !rx_fill || !rx_book || rx_pf_on) return;
+        rx_pf_on = true;
+        rx_pf_layers = layers;
+        rx_pf_prof0 = prof;
+        rx_pf_has0 = rx_has;
+        rx_pf_fills0 = st.rx_fills;
+        rx_pf_ok0 = st.rx_fill_ok;
+        rx_pf_bytes = 0.0;
+        rx_book->set_limits(rx_pf_q, rx_pf_q);
+        rx_fill->set_pace(rx_pf_pace);
+    }
+    // (a chunked prompt's device thread, rx_pf_layers) layer l's routing in: the fills landed so far, then the layer's
+    // own - its CPU-lane experts this chunk picked, the hottest first, each for the coldest the server holds
+    void rx_pf_layer(const Layer& l, const std::vector<int>& hits) {
+        rx_fill_in();
+        if (!rx_fill) return;   // (the link went)
+        rx_tier_add(l, hits, -1);
+        rx_fill_out();
+    }
+    // the prompt's end (n its tokens; 0: a way out, no line): the decode's budget and pace again, and what the fills
+    // did - the prompt's CPU-lane picks (the profile's counts since rx_pf_begin, the experts not in this GPU's VRAM now)
+    // on the server's set before it and now, and that set against the prompt's most picked CPU-lane experts
+    void rx_pf_end(int n) {
+        if (!rx_pf_on) return;
+        rx_pf_on = rx_pf_layers = false;
+        if (rx_book) rx_book->set_limits(rx_fill_r, rx_fill_q);
+        if (rx_fill) rx_fill->set_pace(rx_fill_pace);
+        if (n <= 0) return;
+        const size_t ne = (size_t) g.n_exp, nr = std::min(rx_has.size(), rx_pf_has0.size()) / std::max<size_t>(1, ne);
+        double lane = 0.0, was = 0.0, now_on = 0.0;
+        size_t held = 0, filling = 0;
+        std::vector<std::pair<uint32_t, size_t>> top;   // (the prompt's picks, index) of its CPU-lane experts
+        for (size_t li = 0; li < nr && li < L.size(); ++li) {
+            const Layer& l = L[li];
+            if (l.mtp || l.n_exp != g.n_exp) continue;
+            for (size_t e = 0; e < ne; ++e) {
+                const size_t i = li * ne + e;
+                held += rx_has[i] == rx::kHeld;
+                filling += rx_has[i] == rx::kFilling;
+                if (l.slot[e] >= 0 || i >= prof.size() || i >= rx_pf_prof0.size()) continue;
+                const uint32_t c = prof[i] - rx_pf_prof0[i];
+                lane += c;
+                if (rx_pf_has0[i] != 0) was += c;
+                if (rx_has[i] != 0) now_on += c;
+                if (c > 0) top.push_back({c, i});
+            }
+        }
+        const size_t k = std::min(top.size(), held + filling);
+        std::partial_sort(top.begin(), top.begin() + (std::ptrdiff_t) k, top.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        size_t in_top = 0;
+        for (size_t j = 0; j < k; ++j) in_top += rx_has[top[j].second] != 0;
+        std::fprintf(stderr, "ds4: DS4_RX_FILL_PF: a prompt of %d tokens: %lld fills queued while it was read (%.2f GB), "
+                             "%lld landed by its end; the server's set %zu held + %zu on their way, %zu of them among the "
+                             "prompt's %zu most picked CPU-lane experts; the prompt's CPU-lane picks on that set %.1f%% "
+                             "(on the set before the prompt %.1f%%)\n",
+                     n, (long long) (st.rx_fills - rx_pf_fills0), rx_pf_bytes / 1e9, (long long) (st.rx_fill_ok - rx_pf_ok0),
+                     held, filling, in_top, k, lane > 0 ? 100.0 * now_on / lane : 0.0, lane > 0 ? 100.0 * was / lane : 0.0);
     }
     // layer l's experts the expert server holds, for the hits of a window of T rows (0: the settle, the tick after a
     // chunked prompt or a window prompt's ticks - the decode's) ([n_exp]; null:
@@ -9429,16 +9519,21 @@ struct Model::Impl {
         }
         if (mi == 0) {   // the profile (the CPU lane's experts: by the plan's order)
             uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
+            std::vector<int> pf_hits;   // (DS4_RX_FILL_PF, one device: this chunk's CPU-lane experts, for the layer's fills)
             for (int e = 0; e < l.n_exp; ++e) {
                 const int v = L0.vs_pin[e];
                 const int cnt = b[(size_t) v + 1] - b[(size_t) v];
                 pr[e] += (uint32_t) cnt;
                 if (cnt > 0) {   // (the expert cache learns from a chunked prompt as from windows: heat, and the CPU lane's hits)
                     l.heat[(size_t) e] += (float) cnt;
-                    if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
+                    if (l.slot[(size_t) e] < 0) {
+                        l.cpu_hits.push_back(e);
+                        if (rx_pf_layers) pf_hits.push_back(e);
+                    }
                 }
             }
             st.experts += (int64_t) T * l.k_exp;
+            if (rx_pf_layers && !pf_hits.empty()) rx_pf_layer(l, pf_hits);
         }
         if (c.flow) {
             if (!flow_layer(d, c, L0, mi, wp.k, T, b, err)) return false;
@@ -10223,10 +10318,13 @@ struct Model::Impl {
                 ~Off() { f = false; }
             } off{win_prompt};
             win_prompt = true;   // (its ticks as the chunked prompt's: for the decode that follows)
+            rx_pf_begin(false);   // (DS4_RX_FILL_PF: its windows' ticks with the prompt's budget)
+            PfEnd pf_end{this};
             for (int a = 0; a < n; a += kWin) {
                 const int T = std::min(kWin, n - a);
                 if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, false, err)) return false;   // (a prompt's: whole)
             }
+            rx_pf_end(n);
         }
         // with the expert server: the settle, as after a chunked prompt - the cache's swaps for the decode that follows -,
         // once a prompt (rx::PromptSettle: the feed that asks for logits, unless the prompt's chunked part settled
@@ -10525,6 +10623,16 @@ struct Model::Impl {
             halt_seen = -1;
         }
         bool halting = false;
+        // (DS4_RX_FILL_PF) the fills while the prompt is read: one device - layer by layer from its thread (rx_pf_layer);
+        // several, or a remote stage - at the prompt's end alone (the tick below), said once
+        const bool pf_one = devs.size() == 1 && !o.stage_worker && !linked();
+        if (rx_pf && rx_fill && !pf_one && !rx_pf_noted) {
+            std::fprintf(stderr, "ds4: DS4_RX_FILL_PF: a chunked prompt on %zu devices%s: its fills at its end, as without\n",
+                         devs.size(), linked() || o.stage_worker ? " or a remote stage" : "");
+            rx_pf_noted = true;
+        }
+        if (pf_one) rx_pf_begin(true);
+        PfEnd pf_end{this};
         for (size_t di = 0; di < devs.size(); ++di)
             workers[di]->submit([this, di, &run, &errs] {
                 std::string e;
@@ -10696,6 +10804,7 @@ struct Model::Impl {
         st.tokens += n;
         cache_tick(n, 0);   // (the server's experts as at the settle: the chunks streamed them to the GPU as any - the
                             // decode that follows is what the server serves)
+        rx_pf_end(n);   // (DS4_RX_FILL_PF: the tick above with the prompt's budget, then the decode's)
         if (lm_end_.on) {   // (the layer cache's RAM back before the store and the swaps want it)
             lm_end();
             lm_end_.on = false;
