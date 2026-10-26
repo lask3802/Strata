@@ -679,6 +679,18 @@ struct Chunk {
     std::vector<int> lc_of;                  // expert -> its slot (-1: none)
     std::vector<int64_t> lc_writer;          // slot -> the item reading its expert into it
     uint64_t it_lc = 0;                      // items taken from the layer cache
+    // DS4_LM_STATE_OVERLAP (layer-major, ls_begin): the states' moves on two copy streams of their own, ls_out (to host
+    // memory) and ls_in (back), off d.st - ls_mode 1: ping-pong, two state sets (ls_h[0] .. the chunk's own buffers,
+    // [1] a second set in VRAM for the run), a unit's state loaded into the other set while the unit before computes;
+    // 2: one set, a state's save and the next one's load piece by piece, both directions at once; 0: off (both on d.st)
+    static constexpr int kLsPieces = 8;      // (h in this many row slices; then pre, topk, cand)
+    int ls_mode = 0;
+    float *ls_h[2] = {nullptr, nullptr}, *ls_pre[2] = {nullptr, nullptr};
+    int *ls_tk[2] = {nullptr, nullptr}, *ls_cd[2] = {nullptr, nullptr};
+    size_t ls_bytes[4] = {};                 // a set's h, pre, topk, cand bytes
+    cudaStream_t ls_out = nullptr, ls_in = nullptr;
+    // a set's last unit done on d.st, its last save out, its last load in; the last save out; mode 2's pieces out
+    cudaEvent_t ls_comp[2] = {}, ls_save[2] = {}, ls_load[2] = {}, ls_saved = nullptr, ls_pc[kLsPieces + 3] = {};
 };
 
 struct Layer {
@@ -9742,6 +9754,262 @@ struct Model::Impl {
         return false;
     }
 
+    // ---- DS4_LM_STATE_OVERLAP: layer-major's state moves (h | pre | topk | cand) off the compute stream
+    // a run's unit (layer, chunk) in run_dev_layers' order: its state loaded before it (every layer after the device's
+    // first), saved after it (not a kv_only one's, not the last layer's), with its topk / cand (tc) only when a unit
+    // since the chunk's last save could have written them (an index layer's, not kv_only: layer_chunk's indexer) or it
+    // was never saved; a state saved and then loaded by the very next unit (the same chunk: the layers after a long
+    // prompt's yoco layer) stays on the device, neither move made (stay) - the same bits; set: the state set it runs on
+    struct LsUnit {
+        int k = 0, T = 0, set = 0;
+        bool load = false, save = false, tc = false, stay = false;
+    };
+    void ls_plan(const Chunk& c, const Run& run, std::vector<LsUnit>& lsu) const {
+        const int nk = (int) run.T.size();
+        std::vector<char> ix;   // (a unit's: an index layer's, not kv_only)
+        for (size_t li = 0; li < c.fl_layers.size(); ++li) {
+            const int il = c.fl_layers[li];
+            for (int k = 0; k < nk; ++k) {
+                if (!run.runs(k, il)) continue;
+                LsUnit x;
+                x.k = k;
+                x.T = run.T[(size_t) k];
+                x.load = li > 0;
+                x.save = !run.kv_only(k, il) && li + 1 < c.fl_layers.size();
+                x.stay = x.load && !lsu.empty() && lsu.back().save && lsu.back().k == k;
+                if (x.stay) x.load = lsu.back().save = false;
+                lsu.push_back(x);
+                ix.push_back(L[(size_t) il].ix_src && !run.kv_only(k, il));
+            }
+        }
+        std::vector<char> saved((size_t) nk, 0), dirty((size_t) nk, 0);
+        int set = 1;
+        for (size_t u = 0; u < lsu.size(); ++u) {
+            LsUnit& x = lsu[u];
+            if (ix[u]) dirty[(size_t) x.k] = 1;
+            if (x.save) {
+                x.tc = dirty[(size_t) x.k] || !saved[(size_t) x.k];
+                saved[(size_t) x.k] = 1;
+                dirty[(size_t) x.k] = 0;
+            }
+            if (!x.stay) set ^= 1;   // (ping-pong: each unit on the other set, a stay on its own)
+            x.set = c.ls_mode == 1 ? set : 0;
+        }
+        if (c.ls_mode == 1 && !lsu.empty() && lsu.back().set == 1)   // (the run ends on the chunk's own buffers)
+            for (LsUnit& x : lsu) x.set ^= 1;
+    }
+    static void ls_set(Chunk& c, int set) {
+        c.h = c.ls_h[set];
+        c.pre = c.ls_pre[set];
+        c.topk = c.ls_tk[set];
+        c.cand = c.ls_cd[set];
+    }
+    // chunk_xfer of state set `set`
+    Xfer ls_xfer(Chunk& c, int set, int k, int T, bool put) const {
+        float *const h = c.h, *const pre = c.pre;
+        int *const tk = c.topk, *const cd = c.cand;
+        ls_set(c, set);
+        const Xfer x = chunk_xfer(c.lm_state + (size_t) k * chunk_hand_bytes(), c, T, put);
+        c.h = h;
+        c.pre = pre;
+        c.topk = tk;
+        c.cand = cd;
+        return x;
+    }
+    // piece i of a move (x: chunk_xfer's, T rows): i < kLsPieces h's row slice i (the device's rows, C / kLsPieces a
+    // slice: a save's piece i and the next load's touch the same bytes), then pre, topk, cand; false: an empty one
+    bool ls_piece(const Chunk& c, const Xfer& x, int T, int i, const void*& src, void*& dst, size_t& n) const {
+        if (i >= Chunk::kLsPieces) {
+            const int r = i - Chunk::kLsPieces + 1;
+            src = x.src[r];
+            dst = x.dst[r];
+            n = x.bytes[r];
+            return n > 0;
+        }
+        const size_t rb = (size_t) g.hc * g.dim * 4, per = ((size_t) c.C + Chunk::kLsPieces - 1) / Chunk::kLsPieces;
+        const size_t r0 = (size_t) i * per, r1 = std::min((size_t) T, r0 + per);
+        if (r0 >= r1) return false;
+        src = (const uint8_t*) x.src[0] + r0 * rb;
+        dst = (uint8_t*) x.dst[0] + r0 * rb;
+        n = (r1 - r0) * rb;
+        return true;
+    }
+    // unit x's save (put: its topk / cand only with tc) or load on stream st, piece by piece: each piece after its
+    // save's event where after[i], each piece's event recorded where rec
+    bool ls_move(Chunk& c, const LsUnit& x, bool put, cudaStream_t st, const bool* after, bool* rec, std::string& err) {
+        const Xfer xf = ls_xfer(c, x.set, x.k, x.T, put);
+        for (int i = 0; i < Chunk::kLsPieces + 3; ++i) {
+            if (put && !x.tc && i > Chunk::kLsPieces) continue;   // (topk, cand: unchanged since its last save)
+            const void* src = nullptr;
+            void* dst = nullptr;
+            size_t n = 0;
+            if (!ls_piece(c, xf, x.T, i, src, dst, n)) continue;
+            if (after != nullptr && after[i]) CK(cudaStreamWaitEvent(st, c.ls_pc[i], 0));
+            CK(cudaMemcpyAsync(dst, src, n, put ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, st));
+            if (rec != nullptr) {
+                CK(cudaEventRecord(c.ls_pc[i], st));
+                rec[i] = true;
+            }
+        }
+        return true;
+    }
+    // unit u (on chunk k) about to start on s: the unit before it done there (ls_comp of its set) and its save issued
+    // on ls_out; this unit's state in - mode 2: loaded on ls_in now, a piece as soon as the save has it out (s waits
+    // for all of it); mode 1: loaded into its set while the unit before computed (s waits for it), and the next unit's
+    // load issued now, into the other set once the unit that used it last is done and saved
+    bool ls_enter(Chunk& c, cudaStream_t s, const std::vector<LsUnit>& lsu, size_t u, int k, std::string& err) {
+        if (u >= lsu.size() || lsu[u].k != k) {
+            err = "DS4_LM_STATE_OVERLAP: the run's units out of step with its plan";
+            return false;
+        }
+        const LsUnit& x = lsu[u];
+        bool rec[Chunk::kLsPieces + 3] = {};
+        if (u > 0) {
+            const LsUnit& p = lsu[u - 1];
+            CK(cudaEventRecord(c.ls_comp[p.set], s));
+            if (c.ls_mode == 2 && x.load) {   // (the earlier saves: before ls_saved takes this one)
+                CK(cudaStreamWaitEvent(c.ls_in, c.ls_comp[p.set], 0));
+                CK(cudaStreamWaitEvent(c.ls_in, c.ls_saved, 0));
+            }
+            if (p.save) {
+                CK(cudaStreamWaitEvent(c.ls_out, c.ls_comp[p.set], 0));
+                if (!ls_move(c, p, true, c.ls_out, nullptr, c.ls_mode == 2 ? rec : nullptr, err)) return false;
+                CK(cudaEventRecord(c.ls_save[p.set], c.ls_out));
+                CK(cudaEventRecord(c.ls_saved, c.ls_out));
+            }
+        }
+        if (c.ls_mode == 2) {
+            if (x.load) {
+                if (!ls_move(c, x, false, c.ls_in, rec, nullptr, err)) return false;
+                CK(cudaStreamWaitEvent(c.ls_in, c.ls_saved, 0));   // (all of the save out before s writes the set)
+                CK(cudaEventRecord(c.ls_load[0], c.ls_in));
+                CK(cudaStreamWaitEvent(s, c.ls_load[0], 0));
+            } else
+                CK(cudaStreamWaitEvent(s, c.ls_save[0], 0));
+            return true;
+        }
+        ls_set(c, x.set);
+        CK(cudaStreamWaitEvent(s, x.load ? c.ls_load[x.set] : c.ls_save[x.set], 0));
+        if (u + 1 < lsu.size() && lsu[u + 1].load) {
+            const LsUnit& q = lsu[u + 1];
+            if (q.set == x.set) {
+                err = "DS4_LM_STATE_OVERLAP: a load planned into the set its unit before runs on";
+                return false;
+            }
+            CK(cudaStreamWaitEvent(c.ls_in, c.ls_comp[q.set], 0));
+            CK(cudaStreamWaitEvent(c.ls_in, c.ls_saved, 0));
+            if (!ls_move(c, q, false, c.ls_in, nullptr, nullptr, err)) return false;
+            CK(cudaEventRecord(c.ls_load[q.set], c.ls_in));
+        }
+        return true;
+    }
+    // DS4_LM_STATE_OVERLAP=1 or 2 (a layer-major run's start; unset or 0: off): the states' moves on ls_out / ls_in -
+    // 1: ping-pong when VRAM has room for a second state set (the chunk's own buffers' sizes) and 256 MiB more, the
+    // set allocated for the run (the experts' placement as it was), else as 2; 2: one set, piece by piece.  States in
+    // pageable memory, a remote stage's runs: off.  Its line printed when it differs from the last one
+    void ls_begin(Chunk& c) {
+        static const int want =
+            std::getenv("DS4_LM_STATE_OVERLAP") != nullptr ? std::atoi(std::getenv("DS4_LM_STATE_OVERLAP")) : 0;
+        static std::string said;
+        c.ls_mode = 0;
+        if (want != 1 && want != 2) return;
+        Dev& d = devs[0];
+        cudaSetDevice(d.id);
+        char b[320];
+        std::string why;
+        if (!c.lm_pinned) why = "off - the states' host memory is not pinned";
+        else if (linked()) why = "off - a remote stage's run";
+        else if (c.ls_out == nullptr && !ls_streams(c)) why = "off - its copy streams or events were not created";
+        if (why.empty()) {
+            const size_t C = (size_t) c.C;
+            c.ls_h[0] = c.h;
+            c.ls_pre[0] = c.pre;
+            c.ls_tk[0] = c.topk;
+            c.ls_cd[0] = c.cand;
+            c.ls_bytes[0] = align256(C * g.hc * g.dim * 4);
+            c.ls_bytes[1] = align256(C * 8 * 4);
+            c.ls_bytes[2] = align256(C * topk_stride() * 4);
+            c.ls_bytes[3] = align256(C * cand_stride() * 4);
+            const size_t need = c.ls_bytes[0] + c.ls_bytes[1] + c.ls_bytes[2] + c.ls_bytes[3];
+            int engines = 0;
+            cudaDeviceGetAttribute(&engines, cudaDevAttrAsyncEngineCount, d.id);
+            c.ls_mode = 2;
+            std::snprintf(b, sizeof b, "DS4_LM_STATE_OVERLAP=2");
+            if (want == 1) {
+                size_t fr = 0, tot = 0;
+                cudaMemGetInfo(&fr, &tot);
+                if (fr < need + ((size_t) 256 << 20))
+                    std::snprintf(b, sizeof b, "%zu MiB free, a second set needs %zu MiB and 256 more", fr >> 20, need >> 20);
+                else if (!ls_alloc(c, d))
+                    std::snprintf(b, sizeof b, "a second set's cudaMalloc failed");
+                else
+                    c.ls_mode = 1;
+            }
+            if (c.ls_mode == 1)
+                std::snprintf(b, sizeof b, "ping-pong: a second state set of %zu MiB in VRAM for the run", need >> 20);
+            else {
+                const std::string r = b;
+                std::snprintf(b, sizeof b, "one set: piece by piece, both directions at once (%s)", r.c_str());
+            }
+            why = "the chunks' states moved on two copy streams (" + std::to_string(engines) + " copy engines) - " + b;
+        }
+        why = "ds4: DS4_LM_STATE_OVERLAP=" + std::to_string(want) + ": " + why;
+        if (why != said) {
+            std::fprintf(stderr, "%s\n", why.c_str());
+            said = why;
+        }
+    }
+    bool ls_streams(Chunk& c) {
+        cudaEvent_t* ev[] = {&c.ls_comp[0], &c.ls_comp[1], &c.ls_save[0], &c.ls_save[1], &c.ls_load[0], &c.ls_load[1],
+                             &c.ls_saved};
+        bool ok = cudaStreamCreateWithFlags(&c.ls_out, cudaStreamNonBlocking) == cudaSuccess &&
+                  cudaStreamCreateWithFlags(&c.ls_in, cudaStreamNonBlocking) == cudaSuccess;
+        for (cudaEvent_t* e : ev) ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming) == cudaSuccess;
+        for (cudaEvent_t& e : c.ls_pc) ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
+        if (!ok) {
+            cudaGetLastError();
+            c.ls_out = c.ls_in = nullptr;
+        }
+        return ok;
+    }
+    // mode 1's second set: the chunk's own buffers copied in whole (what no unit has written yet the same bits as
+    // there), on d.st before the run's first unit
+    bool ls_alloc(Chunk& c, Dev& d) {
+        void* p[4] = {nullptr, nullptr, nullptr, nullptr};
+        const void* own[4] = {c.h, c.pre, c.topk, c.cand};
+        bool ok = true;
+        for (int i = 0; i < 4 && ok; ++i) ok = cudaMalloc(&p[i], c.ls_bytes[i]) == cudaSuccess;
+        for (int i = 0; i < 4 && ok; ++i)
+            ok = cudaMemcpyAsync(p[i], own[i], c.ls_bytes[i], cudaMemcpyDeviceToDevice, d.st) == cudaSuccess;
+        if (!ok) {
+            cudaGetLastError();
+            cudaStreamSynchronize(d.st);
+            for (void* q : p)
+                if (q != nullptr) cudaFree(q);
+            return false;
+        }
+        c.ls_h[1] = (float*) p[0];
+        c.ls_pre[1] = (float*) p[1];
+        c.ls_tk[1] = (int*) p[2];
+        c.ls_cd[1] = (int*) p[3];
+        return true;
+    }
+    // (lm_end, d.st done) the copy streams done, the chunk's own buffers back, mode 1's second set freed
+    void ls_end(Chunk& c) {
+        cudaStreamSynchronize(c.ls_out);
+        cudaStreamSynchronize(c.ls_in);
+        ls_set(c, 0);
+        if (c.ls_mode == 1) {
+            cudaFree(c.ls_h[1]);
+            cudaFree(c.ls_pre[1]);
+            cudaFree(c.ls_tk[1]);
+            cudaFree(c.ls_cd[1]);
+            c.ls_h[1] = c.ls_pre[1] = nullptr;
+            c.ls_tk[1] = c.ls_cd[1] = nullptr;
+        }
+        c.ls_mode = 0;
+    }
+
     // layer-major (c.lm: a run of several chunks, device di every trunk layer, the flow set up by run_dev_chunks):
     // layer after layer, each through all the chunks in order - a chunk's state to host memory after each of its
     // layers and back before the next - so a layer's experts are read from the files once for the whole run (the
@@ -9754,6 +10022,34 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc, nk = (int) run.T.size();
         Streamer S;   // (none: the flow streams)
         const size_t hb = chunk_hand_bytes();
+        // DS4_LM_STATE_OVERLAP (c.ls_mode): the run's units planned (ls_plan), each one's moves made by ls_enter
+        std::vector<LsUnit> lsu;
+        size_t ls_u = 0;
+        if (c.ls_mode != 0) {
+            ls_plan(c, run, lsu);
+            if (o.verbose || prof_chunk) {
+                const double rb = (double) g.hc * g.dim * 4 + 32, tb = (double) (topk_stride() + cand_stride()) * 4;
+                int nl = 0, ns = 0, nt = 0, nst = 0;
+                double mv = 0, mv0 = 0;
+                for (size_t u = 0; u < lsu.size(); ++u) {
+                    const LsUnit& x = lsu[u];
+                    nl += x.load, ns += x.save, nt += x.tc, nst += x.stay;
+                    mv += x.T * ((x.load ? rb + tb : 0) + (x.save ? rb + (x.tc ? tb : 0) : 0));
+                    const bool s0 = x.save || (u + 1 < lsu.size() && lsu[u + 1].stay);
+                    mv0 += x.T * ((x.load || x.stay ? rb + tb : 0) + (s0 ? rb + tb : 0));
+                }
+                std::fprintf(stderr,
+                             "ds4 lm state: mode %d, %zu units: %d loads, %d saves (%d with topk / cand), %d states kept on "
+                             "the device for the next unit; %.1f GB moved (off: %.1f GB)\n",
+                             c.ls_mode, lsu.size(), nl, ns, nt, nst, mv / 1e9, mv0 / 1e9);
+            }
+        }
+        struct LsBack {   // (every way out: the chunk's own buffers back)
+            Chunk& c;
+            ~LsBack() {
+                if (c.ls_mode != 0) Impl::ls_set(c, 0);
+            }
+        } ls_back{c};
         // the Engram rows: (layer, chunk) after (layer, chunk) in the run's order, each read on a helper thread while
         // the one before runs (slot u % 2, once unit u - 2's copy of it is done)
         std::vector<std::pair<int, int>> egu;   // (Engram layer, chunk)
@@ -9793,6 +10089,7 @@ struct Model::Impl {
                     wp.eg_slot = (int) (eg_u % 2);
                     if (++eg_u < egu.size()) eg_next = std::async(std::launch::async, read_eg, eg_u);
                 }
+                if (c.ls_mode != 0 && !ls_enter(c, s, lsu, ls_u++, k, err)) return false;
                 if (li == 0 && o.stage_worker) {   // (a remote stage's worker: the main process's rows)
                     if (!link_chunk_in(c, T, s, err)) return false;
                 } else if (li == 0) {   // the chunk's input: its embedding rows
@@ -9804,7 +10101,7 @@ struct Model::Impl {
                     CK(cudaEventRecord(c.emb_ev[slot], s));
                     embed(c.emb, T, c.h, D, H, s);
                     init_pre(c.pre, T, s);
-                } else {   // or its state after the layer before
+                } else if (c.ls_mode == 0) {   // or its state after the layer before (DS4_LM_STATE_OVERLAP: ls_enter's)
                     const Xfer x = chunk_xfer(c.lm_state + (size_t) k * hb, c, T, false);
                     for (int i = 0; i < x.n; ++i)
                         CK(cudaMemcpyAsync(x.dst[i], x.src[i], x.bytes[i], cudaMemcpyHostToDevice, s));
@@ -9824,6 +10121,7 @@ struct Model::Impl {
                 if (!run_layer(L0, 0, p0, T, wp, S, err, run, k, il)) return false;
                 if (dump_l != nullptr) dump_layer(d, c.h, il, p0, T);
                 if (kvo) continue;   // (no layer after it reads this chunk's state)
+                if (!last_l && c.ls_mode != 0) continue;   // (DS4_LM_STATE_OVERLAP: the next unit's ls_enter saves it)
                 if (!last_l) {   // the chunk's state kept for the next layer
                     const Xfer x = chunk_xfer(c.lm_state + (size_t) k * hb, c, T, true);
                     for (int i = 0; i < x.n; ++i)
@@ -10394,6 +10692,7 @@ struct Model::Impl {
         c.lc_bytes = lc_bytes;
         c.lc_of.assign(n_exp, -1);
         c.lc_writer.assign(n_exp, -1);
+        ls_begin(c);
         c.lm = true;
         lm_layers.store(0);
         return true;
@@ -10405,6 +10704,7 @@ struct Model::Impl {
             cudaSetDevice(devs[di].id);
             cudaStreamSynchronize(devs[di].st);   // (nothing of the run's still reads or writes them: the device's
             cudaStreamSynchronize(c.cs);          // copies done, every read the run issued done - a failed run's too)
+            if (c.ls_mode != 0) ls_end(c);
             for (size_t i = c.base; i < c.n_read; ++i)
                 while (fit(c, i).left.load(std::memory_order_acquire) != 0) c.io->wait_any(500);
             if (c.lm_pinned) cudaFreeHost(c.lm_state);
