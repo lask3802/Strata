@@ -198,6 +198,11 @@ struct Stats {
     // DS4_RX_FILL_ZC (its mode; 0 off): of rx_fill_bytes, the gate / up bytes sent through sendfile, from the mapping
     int64_t rx_fill_filed = 0, rx_fill_direct = 0;
     int rx_fill_zc = 0;
+    // DS4_RX_FILL_GATE=1 (on: rx_fill_gate): the fill thread's copies and sends that waited for the CPU lane's batches,
+    // their wait, those cut off at the cap
+    int64_t rx_fill_gw = 0, rx_fill_gw_over = 0;
+    double rx_fill_gw_ms = 0.0;
+    bool rx_fill_gate = false;
     // DS4_EP_SPLIT_VERIFY: the rows checked (a reply's slice sum against this lane's), the largest |d| / |ref| by layer
     // since the load; =2: the server's slice wrong on purpose (the check must see it)
     int64_t rx_split_n = 0;

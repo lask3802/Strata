@@ -1250,6 +1250,11 @@ struct Model::Impl {
     // VRAM expert a layer's swap under way takes out (rx_vout: no duplicate kept on the server), a tick's layers
     std::unique_ptr<rx::FillLink> rx_fill;
     bool rx_zc_noted = false;   // (DS4_RX_FILL_ZC=2: sendfile's refusal said)
+    // DS4_RX_FILL_GATE=1: the fill thread copies and sends only while the CPU lane's batches are not running (its
+    // traffic slowed them: ws-run2's N=128 gate / up 0.128 ms a pick with fills, 0.116 without) - lane_busy, > 0 while a
+    // lane call's gate / up and down batches run (cpu_experts_iq's LaneBusy), is the FillLink's gate
+    std::atomic<int> lane_busy{0};
+    bool fill_gate = false;
     std::unique_ptr<rx::FillBook> rx_book;
     std::vector<rx::FillGeo> rx_fgeo;
     std::vector<int> rx_vout;
@@ -6642,6 +6647,15 @@ struct Model::Impl {
             else
                 gg::iq_cpu_down(*fd[s], mx_part_ptr(l, en.e, 2, X) + d_off[s], hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
         };
+        struct LaneBusy {   // (DS4_RX_FILL_GATE=1: the fills' gate shut from here to the down's end; the last out wakes it)
+            std::atomic<int>* b;
+            explicit LaneBusy(std::atomic<int>* p) : b(p) {
+                if (b != nullptr) rx::lane_busy_in(*b);
+            }
+            ~LaneBusy() {
+                if (b != nullptr) rx::lane_busy_out(*b);
+            }
+        } busy(fill_gate ? &lane_busy : nullptr);
         std::function<void(int)> f[4];
         for (int X = 0; X < NH; ++X) f[X] = [&, X](int j) { gu_job(X, j); };
         if (lane_prof) {   // (DS4_LANE_PROF: the same calls, timed)
@@ -7684,6 +7698,12 @@ struct Model::Impl {
         auto fl = std::make_unique<rx::FillLink>();
         // DS4_RX_FILL_ZC: a split fill's gate and up from the pack - 1 the mapping, 2 sendfile from its file (0: gathered)
         fl->zc = std::clamp((int) env_f("DS4_RX_FILL_ZC", 0.0f), 0, 2);
+        // DS4_RX_FILL_GATE=1: the fill thread's copies and sends wait for the lane's batches (unset, empty or 0: not)
+        const char* gv = std::getenv("DS4_RX_FILL_GATE");
+        if (gv != nullptr && *gv != '\0' && std::strcmp(gv, "0") != 0 && std::strcmp(gv, "1") != 0)
+            std::fprintf(stderr, "ds4: DS4_RX_FILL_GATE=%s: 0, 1 or unset - not gated\n", gv);
+        const bool gate = gv != nullptr && std::strcmp(gv, "1") == 0;
+        if (gate) fl->gate = &lane_busy;
         std::string e;
         const int cpu = rx::fill_cpu();
         if (!fl->open(*rx_link, o.remote_experts, port, token, pace, cpu, 3000, e)) {
@@ -7700,6 +7720,12 @@ struct Model::Impl {
         if (fl->zc > 0)
             std::fprintf(stderr, "ds4: DS4_RX_FILL_ZC=%d: a split fill's gate and up %s, its downs gathered\n", fl->zc,
                          fl->zc == 2 ? "through sendfile from the pack's file" : "sent straight from the pack's mapping");
+        if (gate)
+            std::fprintf(stderr, "ds4: DS4_RX_FILL_GATE=1: the fill thread's copies and sends wait while the CPU lane's "
+                                 "gate / up and down batches run (%llu KB pieces, a wait cut off at %.1f ms)\n",
+                         (unsigned long long) (rx::FillLink::kGatePiece >> 10), rx::FillLink::kGateMaxMs);
+        fill_gate = gate;
+        st.rx_fill_gate = gate;
         rx_fill = std::move(fl);
     }
     // (a token boundary, cache_tick_swaps) the fills the server loaded since the last one: theirs from now; the link
@@ -7716,6 +7742,9 @@ struct Model::Impl {
         st.rx_fill_direct = (int64_t) rx_fill->direct.load();
         st.rx_fill_filed = (int64_t) rx_fill->filed.load();
         st.rx_fill_zc = rx_fill->zc;
+        st.rx_fill_gw = (int64_t) rx_fill->gate_waits.load();
+        st.rx_fill_gw_over = (int64_t) rx_fill->gate_over.load();
+        st.rx_fill_gw_ms = (double) rx_fill->gate_us.load() / 1000.0;
         if (rx_fill->zc == 2 && !rx_zc_noted) {   // (sendfile refused once: said once)
             const std::string n = rx_fill->zc_note();
             if (!n.empty()) {
@@ -8235,12 +8264,22 @@ struct Model::Impl {
         if (rx_book) {   // (DS4_RX_FILL=1 and the fills' socket came up)
             int64_t held = 0;
             for (uint8_t h : rx_has) held += h == rx::kHeld;
+            std::string gl;   // (DS4_RX_FILL_GATE=1: the waits for the lane, the sends' rate)
+            if (st.rx_fill_gate) {
+                const double fb = (double) (st.rx_fill_bytes - s0.rx_fill_bytes), fs = (st.rx_fill_ms - s0.rx_fill_ms) / 1000.0;
+                add_f(gl, "; DS4_RX_FILL_GATE=1: %.1f waits a token for the lane's batches, %.3f ms a token (%lld cut off "
+                          "at %.1f ms), the fills at %.2f GB/s over their sends",
+                      (double) (st.rx_fill_gw - s0.rx_fill_gw) / nt, (st.rx_fill_gw_ms - s0.rx_fill_gw_ms) / nt,
+                      (long long) (st.rx_fill_gw_over - s0.rx_fill_gw_over), rx::FillLink::kGateMaxMs,
+                      fs > 0 ? fb / fs / 1e9 : 0.0);
+            }
             add_f(out, "remote experts' fills: %lld queued (%.2f a token), %lld loaded, %lld refused, %.1f MB a token "
-                       "sent (%.2f s in the paced sends), %lld requests Stale; the server holds %lld experts now%s\n",
+                       "sent (%.2f s in the paced sends), %lld requests Stale; the server holds %lld experts now%s%s\n",
                   (long long) (st.rx_fills - s0.rx_fills), (double) (st.rx_fills - s0.rx_fills) / nt,
                   (long long) (st.rx_fill_ok - s0.rx_fill_ok), (long long) (st.rx_fill_fail - s0.rx_fill_fail),
                   (double) (st.rx_fill_bytes - s0.rx_fill_bytes) / 1e6 / nt, (st.rx_fill_ms - s0.rx_fill_ms) / 1000.0,
-                  (long long) (st.rx_stale - s0.rx_stale), (long long) held, rx_fill ? "" : " (the fills' link gone)");
+                  (long long) (st.rx_stale - s0.rx_stale), (long long) held, rx_fill ? "" : " (the fills' link gone)",
+                  gl.c_str());
             if (st.rx_fill_zc > 0) {
                 const double all = (double) (st.rx_fill_bytes - s0.rx_fill_bytes);
                 const double di = (double) (st.rx_fill_direct - s0.rx_fill_direct), fi = (double) (st.rx_fill_filed - s0.rx_fill_filed);

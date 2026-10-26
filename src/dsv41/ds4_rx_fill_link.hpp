@@ -90,6 +90,14 @@ public:
     int zc = 0;
     std::atomic<uint64_t> direct{0}, filed{0};   // gate / up bytes sent from the mapping, through sendfile
     std::string zc_note();                       // (zc 2) why sendfile went off, "" while it is on
+    /// (DS4_RX_FILL_GATE=1, set before open) the CPU lane's batches under way (the lane's count, its owner's: > 0 while a
+    /// call's gate / up and down batches run): the fill thread copies and sends only while it is 0 - each piece of
+    /// kGatePiece bytes (the gather's copies too) waits for it (an atomic wait, woken by the lane's last batch's end;
+    /// cut off kGateMaxMs after it began, then the piece goes anyway).  Off (null): 1 MB pieces, the gather in one go
+    std::atomic<int>* gate = nullptr;
+    static constexpr uint64_t kGatePiece = 64u << 10;
+    static constexpr double kGateMaxMs = 2.0;
+    std::atomic<uint64_t> gate_waits{0}, gate_us{0}, gate_over{0};   // pieces that found the lane busy, their wait, cut off
 
 private:
     void loop_();
@@ -107,6 +115,11 @@ private:
     int cpu_ = -1, port_ = 0;
     double pace_ = 0.0, due_ = 0.0;   // (the fill thread's: bytes a second; when the next piece may go, steady ms)
 };
+
+/// (DS4_RX_FILL_GATE) the lane's side of FillLink::gate: a call's batches begin / end; the last to end wakes the fill
+/// thread (here, not inline in a .cu: the atomic's wait and notify are C++20, the CUDA sources C++17)
+void lane_busy_in(std::atomic<int>& busy);
+void lane_busy_out(std::atomic<int>& busy);
 
 /// The server's end: dial the main's fills port (its host is the rx link's peer), the hello.  false (err)
 bool fill_dial(net::ep::Conn& c, const std::string& rx_peer, int port, uint64_t session, const std::string& token,
