@@ -912,6 +912,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # which lane computes which n_ff blocks of a pick under H' (ds4_rx_split.hpp): each block added once; no GPU, no model
       add_executable(ds4_rx_split_test tests/dsv41/rx_split_test.cpp)
       target_compile_features(ds4_rx_split_test PRIVATE cxx_std_17)
+      # DS4_IO_SPLIT (IoQueue's split read, ds4_pool.hpp): a read with a resident lead against a file of its own; Linux
+      add_executable(ds4_io_split_test tests/dsv41/io_split_test.cpp)
+      target_compile_features(ds4_io_split_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_io_split_test PRIVATE Threads::Threads)
       if(STRATA_ENABLE_CUDA)
         # the decode GPU-part changes (ds4_u9.hpp) against the path they replace, bit for bit; needs a GPU, no model
         add_executable(ds4_u9_test tests/dsv41/u9_bits_test.cu src/dsv41/ds4_gguf.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq.cu

@@ -380,6 +380,23 @@ inline size_t cold_bytes(const void* p, size_t n) {
     return cold * pg;
 #endif
 }
+/// The bytes of [p, p + n) of a file's mapping before its first page not in the page cache: n when every page is in, 0
+/// when p's own page is not, else up to that page's start (Linux mincore; elsewhere or on an error 0: not known)
+inline size_t resident_lead(const void* p, size_t n) {
+#if defined(_WIN32)
+    (void) p, (void) n;
+    return 0;
+#else
+    const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
+    const size_t len = n + (a - b), np = (len + pg - 1) / pg;
+    thread_local std::vector<unsigned char> v;
+    if (v.size() < np) v.resize(np);
+    if (mincore((void*) b, len, v.data()) != 0) return 0;
+    size_t i = 0;
+    while (i < np && (v[i] & 1) != 0) ++i;
+    return i == np ? n : i == 0 ? 0 : (size_t) (b + i * pg - a);
+#endif
+}
 
 /// Whether a range of a file's mapping looks resident, so that prefetch() would only cost CPU time (it walks every page:
 /// ~50 ns a 4 KiB page on Windows - 0.34 ms for a 6.3 MB expert matrix on a Strix Halo): `samples` pages spread over

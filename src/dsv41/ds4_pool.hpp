@@ -135,6 +135,10 @@ private:
 /// not all in the page cache already (the disk straight into dst, the cache neither used nor disturbed), buffered
 /// otherwise or when the unbuffered read fails - the bytes land at dst + off % os::kDirectAlign either way.  A job's `left` is
 /// counted down when it is done (`bad` set if it failed); wait_any() sleeps until some job finished or the timeout.
+/// split (DS4_IO_SPLIT): a job whose range has a resident lead but not all of it - the lane's warm reads the first
+/// blocks of an expert's gate / up rows, the pack's first 2/3 of each matrix - copies that lead from the mapping and
+/// reads the rest from the disk unbuffered, from the page that starts it (the two parts of dst apart, one thread),
+/// instead of all of it from the disk; split_check: each split job read again buffered and the bytes compared.
 class IoQueue {
 public:
     struct Job {
@@ -148,7 +152,7 @@ public:
         uint8_t* keep = nullptr;        // non-null (a read): the len bytes read copied here as well
         std::atomic<bool>* cancel = nullptr;   // set before the job starts: it is dropped unread (bad is set, left counted down)
     };
-    explicit IoQueue(int n) {
+    explicit IoQueue(int n, bool split = false, bool split_check = false) : split_(split), split_check_(split_check) {
         for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
     }
     ~IoQueue() {
@@ -176,8 +180,45 @@ public:
     double busy_ms() const { return busy_us_.load(std::memory_order_relaxed) / 1000.0; }
     uint64_t direct_bytes() const { return direct_.load(std::memory_order_relaxed); }
     uint64_t buffered_bytes() const { return buffered_.load(std::memory_order_relaxed); }
+    bool split() const { return split_; }
+    struct Split {   // (the split jobs: how many, their leads' bytes, their rests' read unbuffered; checked, not the same)
+        uint64_t jobs = 0, lead = 0, direct = 0, checked = 0, bad = 0;
+    };
+    Split split_stats() const {
+        return {sp_jobs_.load(std::memory_order_relaxed), sp_lead_.load(std::memory_order_relaxed),
+                sp_direct_.load(std::memory_order_relaxed), sp_checked_.load(std::memory_order_relaxed),
+                sp_bad_.load(std::memory_order_relaxed)};
+    }
 
 private:
+    // a split read (split above) of j, its bytes from dst + lead: 1 read, 0 failed, -1 not split (no resident lead, all
+    // of it resident, the mapping not page-aligned with the file) - the usual read then
+    int split_read(const Job& j, uint64_t lead) {
+        if (((uintptr_t) j.map - j.off) % os::kDirectAlign != 0) return -1;
+        const uint64_t h = os::resident_lead(j.map, (size_t) j.len);
+        if (h == 0 || h >= j.len) return -1;
+        std::memcpy(j.dst + lead, j.map, (size_t) h);
+        const uint64_t at = j.off + h, n = j.len - h;   // (at: a page's start, so the rest lands at d itself)
+        uint8_t* d = j.dst + lead + h;                    // (j.dst + (at - j.off rounded down): aligned as j.dst)
+        const bool dir = os::pread_direct(j.dfd, d, n, at);
+        if (!dir && !os::pread_par(j.fd, d, n, at)) return 0;
+        sp_jobs_.fetch_add(1, std::memory_order_relaxed);
+        sp_lead_.fetch_add(h, std::memory_order_relaxed);
+        buffered_.fetch_add(dir ? h : j.len, std::memory_order_relaxed);
+        if (dir) {
+            direct_.fetch_add(n, std::memory_order_relaxed);
+            sp_direct_.fetch_add(n, std::memory_order_relaxed);
+        }
+        if (split_check_) {
+            thread_local std::vector<uint8_t> v;
+            if (v.size() < j.len) v.resize((size_t) j.len);
+            const bool same = os::pread_par(j.fd, v.data(), j.len, j.off) &&
+                              std::memcmp(v.data(), j.dst + lead, (size_t) j.len) == 0;
+            sp_checked_.fetch_add(1, std::memory_order_relaxed);
+            if (!same) sp_bad_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return 1;
+    }
     void loop() {
         for (;;) {
             Job j;
@@ -202,7 +243,10 @@ private:
             const auto t0 = std::chrono::steady_clock::now();
             const uint64_t lead = j.off % os::kDirectAlign;
             bool ok = false;
-            if (j.mem != nullptr) {
+            const int sp = split_ && j.mem == nullptr && j.dfd != os::kBadFd && j.map != nullptr ? split_read(j, lead) : -1;
+            if (sp >= 0) {
+                ok = sp == 1;
+            } else if (j.mem != nullptr) {
                 std::memcpy(j.dst, j.mem, (size_t) j.len);
                 ok = true;
             } else if (j.dfd != os::kBadFd && !(j.map != nullptr && os::resident(j.map, (size_t) j.len)) &&
@@ -233,6 +277,8 @@ private:
     uint64_t done_ = 0;
     bool quit_ = false;
     std::atomic<uint64_t> busy_us_{0}, direct_{0}, buffered_{0};
+    bool split_ = false, split_check_ = false;
+    std::atomic<uint64_t> sp_jobs_{0}, sp_lead_{0}, sp_direct_{0}, sp_checked_{0}, sp_bad_{0};
 };
 
 }  // namespace strata::ds4

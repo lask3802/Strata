@@ -664,6 +664,7 @@ struct Chunk {
     double wait_ms = 0;                      // the compute waiting for a read
     uint64_t it_file = 0, it_ram = 0, it_spec = 0, it_spec_unused = 0;
     uint64_t io_d0 = 0, io_b0 = 0;           // io's unbuffered / buffered bytes when the run started
+    IoQueue::Split io_s0;                    // io's split jobs then (DS4_IO_SPLIT)
     // layer-major (a run of several chunks, every layer on this device): the layers one after another, each through
     // all the chunks; a chunk's state between its layers (h | pre | topk | cand, chunk k at k chunk_hand_bytes()) in
     // host memory, and the layer cache - RAM slots where the experts a layer's chunk reads from the files are kept for
@@ -1109,6 +1110,7 @@ struct Model::Impl {
         std::vector<const uint8_t*> at;       // expert -> its part's row 0, block a (empty: the layer has none)
     };
     std::vector<DownParts> dpl;               // by layer index
+    bool dp_pack = false;                     // (the cut check's W call: the pack's down, the parts' left out)
     // DS4_IQ_WARM=split: the load's read-ahead of the CPU lane's experts (load_experts_mx: each one whole, read into a
     // buffer - the page cache warm, the lane's mapping not) left out, warm_split after the expert server's upload
     // instead: of each CPU-lane expert only what the lane reads of a pick - its layer's slice [ep_ff0, ep_ff0 + ep_ffn)
@@ -2193,11 +2195,13 @@ struct Model::Impl {
     static const uint8_t* dpart_at(const DownParts& d, int e, int ff0) {
         return d.at[(size_t) e] + (size_t) (ff0 / 256 - d.a) * d.ub;
     }
-    // the layer's down parts when they serve the slice [ff0, ff0 + ffn) (it ends where they end), else null
+    // the layer's down parts when they serve the slice [ff0, ff0 + ffn) (whole blocks inside [a, b): a row's slice is
+    // its blocks from ff0 / 256 - a, the rows rb apart - a cut W pick's [0, cut) with cut < b too), else null
     const DownParts* down_parts(const Layer& l, int ff0, int ffn) const {
         if (dpl.empty() || l.il < 0 || (size_t) l.il >= dpl.size() || L[(size_t) l.il].il != l.il) return nullptr;
         const DownParts& d = dpl[(size_t) l.il];
-        return !d.at.empty() && ff0 % 256 == 0 && ff0 / 256 >= d.a && ff0 + ffn == 256 * d.b ? &d : nullptr;
+        return !d.at.empty() && ff0 % 256 == 0 && ffn > 0 && ffn % 256 == 0 && ff0 / 256 >= d.a && ff0 + ffn <= 256 * d.b
+                   ? &d : nullptr;
     }
     // DS4_IQ_WARM=split (iq_warm_split above), at the end of the load (the server's upload, rx_split's slices and the
     // parts known): what the CPU lane reads of each of its experts' picks read in and mapped, the most-routed up to
@@ -3528,7 +3532,13 @@ struct Model::Impl {
                     cudaSetDevice(devs[di].id);
                     cp->flow = true;
                     cp->dev = (int) di;
-                    cp->io = std::make_unique<IoQueue>(n_readers);
+                    // DS4_IO_SPLIT=1: a read whose resident lead is not all of it - a gate / up the lane's warm read
+                    // the first blocks of - takes that lead from the page cache, the rest from the disk unbuffered
+                    // (not the whole from the disk); DS4_IO_SPLIT_CHECK=1 reads each such one again and compares
+                    const char* sp = std::getenv("DS4_IO_SPLIT");
+                    const char* spk = std::getenv("DS4_IO_SPLIT_CHECK");
+                    cp->io = std::make_unique<IoQueue>(n_readers, sp != nullptr && std::atoi(sp) != 0,
+                                                       spk != nullptr && std::atoi(spk) != 0);
                     cp->stage_item.assign((size_t) cp->S, -1);
                     cp->stage_ev.resize((size_t) cp->S);
                     cp->ring_fill.resize((size_t) cp->ring_n);
@@ -6606,11 +6616,11 @@ struct Model::Impl {
         const gg::IqCpu* fd[2] = {sliced[0] ? &fs[0] : &fm, sliced[1] ? &fs[1] : &fm};
         // (DS4_IQ_DOWN_PARTS) the entries' down rows from the parts, contiguous - an expert read from the files only (a
         // RAM-tier copy or the store keeps the pack's layout): dpart(e, s) its slice's row 0, fp the rows' stride - each
-        // slice's own (the parts serve a slice that ends where they end: the cut W picks' [0, cut) takes the pack's)
+        // slice's own (the parts serve a slice inside theirs: the cut W picks' [0, cut) too while cut <= b; past b the pack's)
         const DownParts* dp[2] = {nullptr, nullptr};
         gg::IqCpu fp[2] = {*fd[0], *fd[1]};
         for (int s = 0; s < ns; ++s) {
-            dp[s] = store ? nullptr : down_parts(l, rf0[s], rfn[s]);
+            dp[s] = store || dp_pack ? nullptr : down_parts(l, rf0[s], rfn[s]);
             if (dp[s] != nullptr) fp[s].d_stride = dp[s]->rb;
         }
         auto dpart = [&](int e, int s) -> const uint8_t* {
@@ -8360,8 +8370,13 @@ struct Model::Impl {
                           (double) (st.rx_pool_blocks - s0.rx_pool_blocks) / std::max(1.0, nt), rx_k);
                 if (rx_cut_chk)
                     add_f(b, "the hybrid's cut check (DS4_EP_POOL_CUT_CHECK): %lld requests' one pass against two calls, "
-                             "%lld not the same bits\n",
+                             "%lld not the same bits (the second W call's down from the pack, the pass's from the down "
+                             "parts where they serve [0, cut))\n",
                           (long long) (st.rx_cut_chk - s0.rx_cut_chk), (long long) (st.rx_cut_bad - s0.rx_cut_bad));
+                if (rx_cut && st.rx_cut_sets > s0.rx_cut_sets)
+                    add_f(b, "the hybrid's cut down: %lld of %lld W sets computed here read [0, cut)'s down from the down "
+                             "parts (DS4_IQ_DOWN_PARTS), the rest the pack's rows\n",
+                          (long long) (st.rx_cut_dp - s0.rx_cut_dp), (long long) (st.rx_cut_sets - s0.rx_cut_sets));
                 std::string wb;
                 static const char* const kWb[5] = {"0", "1-3", "4-6", "7-12", "13+"};
                 for (int q = 0; q < 5; ++q) {
@@ -8670,6 +8685,8 @@ struct Model::Impl {
                     if (na < (int) ents.size()) {
                         rx::ff_range(rx::BlockRange{0, wcut}, rx_nb, g.ff, wf0, wfn);
                         wsb = FfSplit{na, wf0, wfn};
+                        ++st.rx_cut_sets;
+                        if (!store && down_parts(l, wf0, wfn) != nullptr) ++st.rx_cut_dp;
                     }
                     cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, ff0, ffn, wsb);
                     if (rx_cut_chk && wsb.from >= 0) {   // (DS4_EP_POOL_CUT_CHECK: the pass against two calls, bit for bit)
@@ -8677,7 +8694,9 @@ struct Model::Impl {
                         const std::vector<float> y1(c_yd.begin(), c_yd.begin() + (ptrdiff_t) ((size_t) nslots * D));
                         const std::vector<Ent> a(ents.begin(), ents.begin() + na), w(ents.begin() + na, ents.end());
                         if (!a.empty()) cpu_experts(l, &r.x[0][0], a, (size_t) kMaxDim, po, ff0, ffn);
+                        dp_pack = true;   // (the W part's down from the pack: the pass's from the parts checked against it)
                         cpu_experts(l, &r.x[0][0], w, (size_t) kMaxDim, nullptr, wf0, wfn);
+                        dp_pack = false;
                         ++st.rx_cut_chk;
                         if (std::memcmp(y1.data(), c_yd.data(), (size_t) nslots * D * sizeof(float)) != 0) ++st.rx_cut_bad;
                     }
@@ -9866,6 +9885,7 @@ struct Model::Impl {
             c.lc_first = c.lc_chk = 0;
             c.io_d0 = c.io->direct_bytes();
             c.io_b0 = c.io->buffered_bytes();
+            c.io_s0 = c.io->split_stats();
             if (!c.fl_layers.empty()) {
                 flow_spec(c, 0, c.fl_layers[0], run.T[0]);
                 if (!flow_pump(c, err)) return false;
@@ -10729,7 +10749,18 @@ struct Model::Impl {
                 const double db = (double) (c.io->direct_bytes() - c.io_d0) / 1e9;
                 const double bb = (double) (c.io->buffered_bytes() - c.io_b0) / 1e9;
                 const double fb = db + bb, rb = (double) c.it_ram * (double) L[0].blob / 1e9;   // (a member: its parts)
-                char lcs[160] = "";
+                char lcs[160] = "", sps[256] = "";
+                if (c.io->split()) {
+                    const IoQueue::Split s = c.io->split_stats();
+                    int w = std::snprintf(sps, sizeof sps, "; DS4_IO_SPLIT: %llu reads split, %.1f GB of them from the "
+                                          "page cache, %.1f GB from the disk unbuffered",
+                                          (unsigned long long) (s.jobs - c.io_s0.jobs), (double) (s.lead - c.io_s0.lead) / 1e9,
+                                          (double) (s.direct - c.io_s0.direct) / 1e9);
+                    if (s.checked > c.io_s0.checked && w > 0 && (size_t) w < sizeof sps)
+                        std::snprintf(sps + w, sizeof sps - (size_t) w, " (DS4_IO_SPLIT_CHECK: %llu read again, %llu "
+                                      "not the same bytes)", (unsigned long long) (s.checked - c.io_s0.checked),
+                                      (unsigned long long) (s.bad - c.io_s0.bad));
+                }
                 if (c.lm)
                     std::snprintf(lcs, sizeof lcs, ", %llu again from the layer cache (layer-major, %d chunks, %.1f GB "
                                   "of RAM)", (unsigned long long) c.it_lc, (int) run.T.size(), (double) c.lc_bytes / 1e9);
@@ -10737,11 +10768,11 @@ struct Model::Impl {
                              "ds4 prompt stream, CUDA%d: %d tokens in %.0f ms; %llu experts streamed: %llu from the files "
                              "(%.1f GB, %.2f GB/s: %.1f GB from the disk unbuffered, %.1f GB through the page cache), %llu "
                              "from RAM (%.1f GB)%s; %llu likely ones queued early, %llu of them unpicked; the compute waited "
-                             "%.0f ms for reads\n",
+                             "%.0f ms for reads%s\n",
                              devs[di].id, n, ms, (unsigned long long) (c.it_file + c.it_ram + c.it_lc),
                              (unsigned long long) c.it_file, fb, fb / std::max(1e-3, ms / 1000.0), db, bb,
                              (unsigned long long) c.it_ram, rb, lcs, (unsigned long long) c.it_spec,
-                             (unsigned long long) c.it_spec_unused, c.wait_ms);
+                             (unsigned long long) c.it_spec_unused, c.wait_ms, sps);
             }
         }
         if (pm.on && run.T.size() == 1) {   // (the picks' spread for pick_path: the CPU-lane experts this run picked)
