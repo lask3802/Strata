@@ -642,6 +642,9 @@ struct Chunk {
         const uint8_t* ram = nullptr;                  // its RAM-tier blob, copied into staging (not pinned there)
         uint8_t* keep = nullptr;                       // (layer-major) its layer-cache slot: what is read kept there
         int64_t after = -1;                            // (layer-major) the items up to this one read first
+        std::atomic<int>* pf = nullptr;                // (DS4_LAYER_CACHE_LAYERS=2) its slot's read-ahead: 0 once read
+        std::atomic<bool>* pf_bad = nullptr;
+        bool lc2 = false;                              // (the same) its layer-cache slot laid out as a staging slot
         std::atomic<int> left{0};                      // parts still being read
         std::atomic<bool> bad{false};
     };
@@ -679,6 +682,20 @@ struct Chunk {
     std::vector<int> lc_of;                  // expert -> its slot (-1: none)
     std::vector<int64_t> lc_writer;          // slot -> the item reading its expert into it
     uint64_t it_lc = 0;                      // items taken from the layer cache
+    // DS4_LAYER_CACHE_LAYERS=2: the layer cache in two halves of lc_half, each pf_slots slots of flow_stride() laid out
+    // as a staging slot (read into straight from the files); the stream's layer in half lc_cur, and the next layer's
+    // likely experts (pf_list, slot j = pf_list[j]) read from the files into the other half on IoQueue's low queue
+    // (after the stream's own reads) while this layer's later chunks run - once the items up to pf_after are read
+    // (the half's layer before is done with it): the next layer's first chunk then copies them from RAM
+    bool lc2 = false, pf_pending = false, pf_pushed = false;
+    size_t lc_half = 0, lc_first_prev = 0;           // (lc_first_prev: the layer before's first item)
+    int lc_cur = 1, pf_slots = 0, pf_il = -1, lc_ahead = 0;   // (lc_ahead: the stream's layer's slots read ahead)
+    int64_t pf_after = -1;
+    std::vector<int> pf_list;
+    std::unique_ptr<std::atomic<int>[]> pf_left;     // [2 pf_slots] a slot's parts still being read
+    std::unique_ptr<std::atomic<bool>[]> pf_bad;
+    std::vector<char> pf_hit;                        // [2 pf_slots] a read-ahead slot taken by an item
+    uint64_t pf_read = 0, pf_used = 0, it_pf = 0;    // experts read ahead, of them taken, items taken from them
 };
 
 struct Layer {
@@ -4042,6 +4059,137 @@ struct Model::Impl {
             if (member(L0, m).dev == c.dev) return m;
         return 0;
     }
+    // ---- DS4_LAYER_CACHE_LAYERS=2 (see Chunk::lc2)
+    // flow_push's layer cache: item `it` (chunk k, expert e of l) copies its expert from a slot (true), is kept in one
+    // for the chunks after, or neither. A layer's first item takes the half read ahead for it (else the other half,
+    // once any read ahead into it for another layer is done) and plans the next layer's read-ahead into the half the
+    // layer before used
+    bool lc2_push(Chunk& c, const Layer& l, Chunk::Item& it, int k, int e) {
+        const size_t i = c.base + c.items.size() - 1, stride = flow_stride();
+        if (c.lc_il != l.il) {
+            const int h = c.lc_cur ^ 1;
+            if (c.pf_pending && c.pf_il == l.il) lc2_pump(c);   // (out now if it can go; else dropped below)
+            const bool ahead = c.pf_pushed && c.pf_il == l.il;
+            if (!ahead) lc2_drain(c, h);   // (another layer's read ahead into it, or one before that not picked)
+            c.lc_il = l.il;
+            c.lc_cur = h;
+            c.lc_first_prev = c.lc_first;
+            c.lc_first = i;
+            c.lc_n = c.pf_slots;
+            std::fill(c.lc_of.begin(), c.lc_of.end(), -1);
+            c.lc_ahead = ahead ? (int) c.pf_list.size() : 0;
+            for (int j = 0; j < c.lc_ahead; ++j) c.lc_of[(size_t) c.pf_list[(size_t) j]] = j;
+            c.lc_used = c.lc_ahead;
+            c.pf_pushed = c.pf_pending = false;
+            lc2_plan(c, l.il, (int64_t) i - 1);
+        }
+        uint8_t* const half = c.lc + (size_t) c.lc_cur * c.lc_half;
+        it.lc2 = true;
+        const int j = c.lc_of[(size_t) e];
+        if (j >= 0) {
+            it.ram = half + (size_t) j * stride;
+            if (j < c.lc_ahead) {   // (copied out once its read ahead is done)
+                const size_t s = (size_t) c.lc_cur * (size_t) c.pf_slots + (size_t) j;
+                it.pf = &c.pf_left[s];
+                it.pf_bad = &c.pf_bad[s];
+                if (!c.pf_hit[s]) {
+                    c.pf_hit[s] = 1;
+                    ++c.pf_used;
+                }
+                ++c.it_pf;
+            } else
+                it.after = c.lc_writer[(size_t) j];
+            return true;
+        }
+        if (k + 1 < (int) c.fl_T.size() && c.lc_used < c.lc_n) {   // (a later chunk may pick it)
+            const int jn = c.lc_used++;
+            c.lc_of[(size_t) e] = jn;
+            c.lc_writer[(size_t) jn] = (int64_t) i;
+            it.keep = half + (size_t) jn * stride;
+            it.after = (int64_t) c.lc_first_prev - 1;   // (the half's layer before: the one before the layer before)
+        }
+        return false;
+    }
+    // the read-ahead of the layer after il on the device (none: no plan): its CPU-lane experts not in RAM whose chance to
+    // be picked at least once over all the rows the run streams it for is at least DS4_SPEC_Q (flow_spec's rule),
+    // likeliest first, as many as a half holds; read once the items up to `after` are read
+    void lc2_plan(Chunk& c, int il, int64_t after) {
+        static const double spec_q = std::getenv("DS4_SPEC_Q") ? std::atof(std::getenv("DS4_SPEC_Q")) : 0.9;
+        c.pf_list.clear();
+        c.pf_il = -1;
+        const auto at = std::find(c.fl_layers.begin(), c.fl_layers.end(), il);
+        if (at == c.fl_layers.end() || at + 1 == c.fl_layers.end()) return;
+        const Layer& l = L[(size_t) *(at + 1)];
+        if (l.nm != 1) return;
+        int64_t rows = 0;
+        for (int k = 0; k < (int) c.fl_T.size(); ++k)
+            if (c.fl_yoco < 0 || k >= c.fl_cut_k || l.il < c.fl_yoco) rows += fl_rows(c, k, l.il);
+        const uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
+        double sum = 0;
+        for (int e = 0; e < l.n_exp; ++e) sum += pr[e];
+        const double picks = (double) l.k_exp * (double) rows;
+        std::vector<std::pair<double, int>> cand;
+        for (int e : l.host_list) {
+            if ((!l.ram.empty() && l.ram[(size_t) e] >= 0) || (store && store->find(l.il, e) >= 0)) continue;
+            const double p = sum > 0 ? pr[e] / sum : 0.0;
+            const double q = p >= 1.0 ? 1.0 : 1.0 - std::exp(picks * std::log1p(-p));
+            if (q >= spec_q && spec_q <= 1.0) cand.push_back({q, e});
+        }
+        std::stable_sort(cand.begin(), cand.end(), [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+            return a.first > b.first;
+        });
+        if (cand.size() > (size_t) c.pf_slots) cand.resize((size_t) c.pf_slots);
+        if (cand.empty()) return;
+        for (const auto& x : cand) c.pf_list.push_back(x.second);
+        c.pf_il = l.il;
+        c.pf_after = after;
+        c.pf_pending = true;
+    }
+    // (flow_pump) the planned read-ahead out, on the low queue, once the items up to pf_after are read
+    void lc2_pump(Chunk& c) {
+        while (c.lc_chk < c.n_read && (c.lc_chk < c.base || fit(c, c.lc_chk).left.load(std::memory_order_acquire) == 0))
+            ++c.lc_chk;
+        if ((int64_t) c.lc_chk <= c.pf_after) return;
+        const Layer& l = L[(size_t) c.pf_il];
+        const int h = c.lc_cur ^ 1;
+        lc2_drain(c, h);   // (the half's read ahead two layers back: its unpicked slots, never waited on)
+        uint8_t* const half = c.lc + (size_t) h * c.lc_half;
+        const size_t stride = flow_stride();
+        std::vector<IoQueue::Job> jobs;
+        jobs.reserve(3 * c.pf_list.size());
+        for (size_t j = 0; j < c.pf_list.size(); ++j) {
+            const int e = c.pf_list[j];
+            const size_t s = (size_t) h * (size_t) c.pf_slots + j;
+            c.pf_left[s].store(3, std::memory_order_relaxed);
+            c.pf_bad[s].store(false, std::memory_order_relaxed);
+            c.pf_hit[s] = 0;
+            uint8_t* sb = half + j * stride;
+            for (int r = 0; r < 3; ++r) {   // (as flow_pump's file reads, into the slot's region r)
+                IoQueue::Job jb;
+                const os::fd_t pf = pk.pfds.empty() ? os::kBadFd : pk.pfds[(size_t) l.mx_file[r]];
+                jb.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[r]];
+                jb.dfd = pk.dfds.empty() ? os::kBadFd : pk.dfds[(size_t) l.mx_file[r]];
+                jb.off = l.mx_off[r] + (uint64_t) e * l.mx_stride[r] + mx_read_off(l, 0, r);
+                jb.len = mx_read_len(l, r);
+                jb.dst = sb;
+                jb.left = &c.pf_left[s];
+                jb.bad = &c.pf_bad[s];
+                jb.map = pk.at(l.mx_file[r], jb.off);
+                jobs.push_back(jb);
+                sb += flow_region(r);
+            }
+        }
+        c.io->push(jobs.data(), (int) jobs.size(), true);
+        c.pf_read += c.pf_list.size();
+        c.pf_pending = false;
+        c.pf_pushed = true;
+    }
+    // every read ahead into half h done (pushed ones: each lands; none of them is waited on otherwise)
+    void lc2_drain(Chunk& c, int h) {
+        for (int j = 0; j < c.pf_slots; ++j)
+            while (c.pf_left[(size_t) h * (size_t) c.pf_slots + (size_t) j].load(std::memory_order_acquire) != 0)
+                c.io->wait_any(500);
+    }
     void flow_push(Chunk& c, const Layer& l, int mi, int k, int e, int v) {
         c.items.emplace_back();
         Chunk::Item& it = c.items.back();
@@ -4069,7 +4217,8 @@ struct Model::Impl {
             it.ram = store_blob != nullptr ? store_blob
                      : copy_mode ? ram_part[(size_t) l.ram[(size_t) e]][0] : ram_slots[(size_t) l.ram[(size_t) e]];
         bool hit = false;
-        if (!in_ram && c.lc != nullptr && l.nm == 1) {   // layer-major: from the layer cache, or kept for the chunks after
+        if (!in_ram && c.lc != nullptr && l.nm == 1 && c.lc2) hit = lc2_push(c, l, it, k, e);
+        else if (!in_ram && c.lc != nullptr && l.nm == 1) {   // layer-major: from the layer cache, or kept for the chunks after
             const size_t i = c.base + c.items.size() - 1, stride = (l.blob + 63) & ~(size_t) 63;
             if (c.lc_il != l.il) {   // (a layer's first item: the slots the layer before used are its own again
                 c.lc_il = l.il;      // once that layer's items are all read - `after` below)
@@ -4212,8 +4361,17 @@ struct Model::Impl {
     bool flow_pump(Chunk& c, std::string& err) {
         const size_t end = c.base + c.items.size();
         IoQueue::Job jobs[6];
+        if (c.lc2 && c.pf_pending) lc2_pump(c);
         while (c.n_read < end) {
             Chunk::Item& it = fit(c, c.n_read);
+            if (it.pf != nullptr) {   // (DS4_LAYER_CACHE_LAYERS=2: its slot read ahead first)
+                if (it.pf->load(std::memory_order_acquire) != 0) break;
+                if (it.pf_bad->load(std::memory_order_acquire)) {
+                    err = "reading ahead layer " + std::to_string(it.il) + " expert " + std::to_string(it.e) +
+                          " from the model's files failed";
+                    return false;
+                }
+            }
             if (it.after >= 0) {   // layer-major: a slot's expert copied out of it once its reader is done; a slot
                 // written again once the layer before's items are all read (none still copies out of it)
                 bool wait = false;
@@ -4264,9 +4422,16 @@ struct Model::Impl {
                     j.dst = sb;
                     j.left = &it.left;
                     j.bad = &it.bad;
-                    j.mem = it.ram != nullptr ? it.ram + l.lay.trellis[r] + mx_read_off(l, it.mi, r) : nullptr;
+                    if (it.lc2) {   // (a layer-cache slot laid out as a staging slot: the part where a read put it)
+                        const size_t at = (size_t) (sb - (c.stage + (size_t) it.stage * c.stage_stride)) +
+                                          (size_t) (j.off % os::kDirectAlign);
+                        j.mem = it.ram != nullptr ? it.ram + at : nullptr;
+                        j.keep = it.keep != nullptr ? it.keep + at : nullptr;
+                    } else {
+                        j.mem = it.ram != nullptr ? it.ram + l.lay.trellis[r] + mx_read_off(l, it.mi, r) : nullptr;
+                        j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
+                    }
                     j.map = pk.at(l.mx_file[r], j.off);
-                    j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
                     sb += flow_region(r);
                 }
                 c.io->push(jobs, nj);
@@ -4337,7 +4502,8 @@ struct Model::Impl {
                 if (c.n_read > c.n_dma) c.io->wait_any(500);
                 else {
                     const Chunk::Item& it = fit(c, c.n_read);
-                    if (it.stage >= 0) CK(cudaEventSynchronize(c.stage_ev[(size_t) it.stage]));
+                    if (it.pf != nullptr && it.pf->load(std::memory_order_acquire) != 0) c.io->wait_any(500);   // (lc2)
+                    else if (it.stage >= 0) CK(cudaEventSynchronize(c.stage_ev[(size_t) it.stage]));
                 }
                 c.wait_ms += now_ms() - tw;
                 continue;
@@ -10350,7 +10516,7 @@ struct Model::Impl {
         if (devs.size() != 1 || run.T.size() < 2 || !stage::layer_major_allowed(linked(), env)) return false;
         Chunk& c = *chunks[0];
         if (!c.flow) return false;
-        size_t need = 0, n_exp = 0, blob_max = 0;
+        size_t need = 0, n_exp = 0, blob_max = 0, ne_max = 0;
         double file_b = 0;
         for (int il = 0; il < g.nl; ++il) {
             const Layer& l = L[(size_t) il];
@@ -10359,6 +10525,7 @@ struct Model::Impl {
                 if (l.ram.empty() || l.ram[(size_t) e] < 0) ++ne;
             const size_t stride = (l.blob + 63) & ~(size_t) 63;
             need = std::max(need, ne * stride);
+            ne_max = std::max(ne_max, ne);
             n_exp = std::max(n_exp, (size_t) l.n_exp);
             blob_max = std::max(blob_max, stride);
             file_b += (double) ne * (double) l.blob;
@@ -10376,6 +10543,35 @@ struct Model::Impl {
                 lc_bytes = std::min<uint64_t>(need, avail > kRamMargin + state_b ? avail - kRamMargin - state_b : 0);
         }
         if (lc_bytes < blob_max) return false;
+        // DS4_LAYER_CACHE_LAYERS=2 (Chunk::lc2): two halves of the largest layer's experts read from the files, in
+        // staging slots - if the RAM above allows both whole; else the one layer, said once
+        static const char* lc_layers = std::getenv("DS4_LAYER_CACHE_LAYERS");
+        const bool want2 = lc_layers != nullptr && std::atoi(lc_layers) == 2;
+        const size_t need2 = 2 * ne_max * flow_stride();
+        bool two = false;
+        if (want2) {
+            uint64_t cap = ~uint64_t{0};
+            if (const char* mb = std::getenv("DS4_LAYER_CACHE_MB")) cap = (uint64_t) std::atoll(mb) << 20;
+            else {
+                const uint64_t avail = ram_avail();
+                if (avail != ~uint64_t{0}) cap = avail > kRamMargin + state_b ? avail - kRamMargin - state_b : 0;
+            }
+            two = need2 <= cap;
+            static bool said[2] = {false, false};
+            if (!said[two]) {
+                said[two] = true;
+                if (two)
+                    std::fprintf(stderr, "ds4: DS4_LAYER_CACHE_LAYERS=2: the layer cache is two layers (%.1f GB of RAM, "
+                                 "%zu experts a layer), the next one's likely experts read ahead\n", (double) need2 / 1e9,
+                                 ne_max);
+                else
+                    std::fprintf(stderr, "ds4: DS4_LAYER_CACHE_LAYERS=2: two layers need %.1f GB of RAM, %.1f GB "
+                                 "allowed (%s): the layer cache stays one layer\n", (double) need2 / 1e9, (double) cap / 1e9,
+                                 std::getenv("DS4_LAYER_CACHE_MB") ? "DS4_LAYER_CACHE_MB" : "free RAM less 8 GB and the "
+                                 "chunks' states");
+            }
+            if (two) lc_bytes = need2;
+        }
         void* st_p = nullptr;
         c.lm_pinned = cudaHostAlloc(&st_p, state_b, cudaHostAllocPortable) == cudaSuccess;
         if (!c.lm_pinned) {
@@ -10394,6 +10590,24 @@ struct Model::Impl {
         c.lc_bytes = lc_bytes;
         c.lc_of.assign(n_exp, -1);
         c.lc_writer.assign(n_exp, -1);
+        if (two) {
+            c.lc2 = true;
+            c.lc_half = need2 / 2;
+            c.pf_slots = (int) ne_max;
+            c.pf_left = std::make_unique<std::atomic<int>[]>(2 * ne_max);
+            c.pf_bad = std::make_unique<std::atomic<bool>[]>(2 * ne_max);
+            for (size_t s = 0; s < 2 * ne_max; ++s) {
+                c.pf_left[s].store(0, std::memory_order_relaxed);
+                c.pf_bad[s].store(false, std::memory_order_relaxed);
+            }
+            c.pf_hit.assign(2 * ne_max, 0);
+            c.lc_cur = 1;   // (the run's first layer: half 0)
+            c.lc_ahead = 0;
+            c.pf_il = -1;
+            c.pf_pending = c.pf_pushed = false;
+            c.pf_list.clear();
+            c.pf_read = c.pf_used = c.it_pf = 0;
+        }
         c.lm = true;
         lm_layers.store(0);
         return true;
@@ -10407,6 +10621,11 @@ struct Model::Impl {
             cudaStreamSynchronize(c.cs);          // copies done, every read the run issued done - a failed run's too)
             for (size_t i = c.base; i < c.n_read; ++i)
                 while (fit(c, i).left.load(std::memory_order_acquire) != 0) c.io->wait_any(500);
+            if (c.lc2) {   // (and every read ahead)
+                lc2_drain(c, 0);
+                lc2_drain(c, 1);
+                c.lc2 = false;
+            }
             if (c.lm_pinned) cudaFreeHost(c.lm_state);
             else os::anon_free(c.lm_state, c.lm_state_bytes);
             os::anon_free(c.lc, c.lc_bytes);
@@ -10767,14 +10986,20 @@ struct Model::Impl {
                 if (c.lm)
                     std::snprintf(lcs, sizeof lcs, ", %llu again from the layer cache (layer-major, %d chunks, %.1f GB "
                                   "of RAM)", (unsigned long long) c.it_lc, (int) run.T.size(), (double) c.lc_bytes / 1e9);
+                char l2s[192] = "";
+                if (c.lm && c.lc2)
+                    std::snprintf(l2s, sizeof l2s, " (DS4_LAYER_CACHE_LAYERS=2: %llu experts read ahead, %.1f GB, %llu "
+                                  "of them picked, %llu of the items above from them)", (unsigned long long) c.pf_read,
+                                  (double) c.pf_read * (double) L[0].blob / 1e9, (unsigned long long) c.pf_used,
+                                  (unsigned long long) c.it_pf);
                 std::fprintf(stderr,
                              "ds4 prompt stream, CUDA%d: %d tokens in %.0f ms; %llu experts streamed: %llu from the files "
                              "(%.1f GB, %.2f GB/s: %.1f GB from the disk unbuffered, %.1f GB through the page cache), %llu "
-                             "from RAM (%.1f GB)%s; %llu likely ones queued early, %llu of them unpicked; the compute waited "
-                             "%.0f ms for reads%s\n",
+                             "from RAM (%.1f GB)%s%s; %llu likely ones queued early, %llu of them unpicked; the compute "
+                             "waited %.0f ms for reads%s\n",
                              devs[di].id, n, ms, (unsigned long long) (c.it_file + c.it_ram + c.it_lc),
                              (unsigned long long) c.it_file, fb, fb / std::max(1e-3, ms / 1000.0), db, bb,
-                             (unsigned long long) c.it_ram, rb, lcs, (unsigned long long) c.it_spec,
+                             (unsigned long long) c.it_ram, rb, lcs, l2s, (unsigned long long) c.it_spec,
                              (unsigned long long) c.it_spec_unused, c.wait_ms, sps);
             }
         }
