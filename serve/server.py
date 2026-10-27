@@ -999,6 +999,8 @@ class StrataEngine:
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     stage_err = None                     # a remote stage's last `ERR remote stage...`, when, the log's size then (Workers card)
+    stage_leaving = None                 # the process that said `ERR remote stage...` (it ends after it): settle_stage_exit
+    STAGE_EXIT_WAIT_S = 15.0             # how long the next request waits for that end
     stage_wait_at = None                 # when it last said a request waits for its worker (INFO remote_stage_wait=)
     ready_at = None                      # when the engine said READY (a remote stage's link is made just before)
     first_log_start = None               # where this server's first engine start began in the log (the Workers card)
@@ -1279,6 +1281,7 @@ class StrataEngine:
                     except OSError:
                         pos = None
                     self.stage_err = (line[4:].strip(), time.time(), pos)
+                    self.stage_leaving = proc           # (set before the request reads the line: see settle_stage_exit)
                 else:                                   # a request waits for the worker (every 10 s meanwhile)
                     self.stage_wait_at = time.time()
             lines.put(line)
@@ -1329,6 +1332,23 @@ class StrataEngine:
     def alive(self) -> bool:
         proc = self.proc                                 # read once: restart() / close() may set it to None meanwhile
         return proc is not None and not getattr(self, "ended", False) and proc.poll() is None
+
+    def settle_stage_exit(self) -> None:
+        """A remote stage's main ends after `ERR remote stage...` (generate.cpp: a link lost in the middle of a request,
+        or the worker's own error), but its output can still be open when the next request comes: alive() still says
+        yes, and that request would be sent to an engine on its way out and fail as well (Strata Link's fault test,
+        2026-10-27: a 503 "stopped unexpectedly" 0.9 s after the first one).  Waits for that end (STAGE_EXIT_WAIT_S at
+        most); the request then starts the engine again, as after any end.  A STOP while it connected again keeps the
+        engine running: then the wait runs out and the request goes on with it."""
+        proc, self.stage_leaving = self.stage_leaving, None
+        if proc is None or proc is not self.proc or proc.poll() is not None:
+            return
+        print("[strata] the engine ends after its remote stage's error: waiting for it", flush=True)
+        try:
+            proc.wait(timeout=self.STAGE_EXIT_WAIT_S)
+        except subprocess.TimeoutExpired:
+            print(f"[strata] the engine still runs {self.STAGE_EXIT_WAIT_S:g} s after its remote stage's error: going "
+                  "on with it", flush=True)
 
     def exit_code(self):
         if self.proc is None:
@@ -5689,7 +5709,10 @@ class Service:
                     # (parallel requests do not hold the fifo: one of them starts it, the others wait for that).
                     # #1603: a parallel request stays counted as queued until it is registered as running below -
                     # waiting here for the fifo (an image encode, a /v1/vram resize) left it neither - and one on a
-                    # loaded engine has nothing to start, so it does not wait for the fifo at all
+                    # loaded engine has nothing to start, so it does not wait for the fifo at all.  A remote stage's
+                    # main that said `ERR remote stage...` is on its way out: its end is waited for first
+                    if hasattr(self.engine, "settle_stage_exit"):
+                        self.engine.settle_stage_exit()
                     if not par:
                         self.ensure_loaded()
                     elif not (self.loaded() and not self._vision_down()):

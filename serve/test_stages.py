@@ -1112,6 +1112,9 @@ for line in sys.stdin:
         if not state.exists():   # the first request finds the link gone, and the engine ends
             state.write_text("lost")
             print("ERR remote stage: the peer closed the connection", flush=True)
+            if "--exit-after" in sys.argv:   # an end that takes a while (a real engine's teardown)
+                import time
+                time.sleep(float(sys.argv[sys.argv.index("--exit-after") + 1]))
             sys.exit(1)
         print("T 90\nDONE 1 1 0 1 stop", flush=True)
 '''
@@ -1134,9 +1137,11 @@ class EngineWiring(unittest.TestCase):
             exe = py
             py.write_text("#!" + sys.executable + "\n" + FAKE_MAIN)
             py.chmod(0o700)
-        self.e = StrataEngine(str(exe), ["--state", str(root / "state"), "--layer-split", "26", "--split-device", "0",
-                                         "--remote-stage", "10.10.10.2:7841"],
-                              log=str(root / "engine.log"), env=dict(os.environ, STRATA_STAGE_TOKEN=TOKEN))
+        self.start = lambda *more: StrataEngine(
+            str(exe), ["--state", str(root / "state"), "--layer-split", "26", "--split-device", "0",
+                       "--remote-stage", "10.10.10.2:7841", *more],
+            log=str(root / "engine.log"), env=dict(os.environ, STRATA_STAGE_TOKEN=TOKEN))
+        self.e = self.start()
         self.addCleanup(lambda: self.svc.engine.close())
         self.svc = Service(self.e, ByteTokenizer(), ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
         self.svc.stages.agents_cfg = False
@@ -1161,6 +1166,22 @@ class EngineWiring(unittest.TestCase):
         # the ERR's place among the log's lines: after the connect line the engine wrote before it
         pos, log = self.e.stage_err[2], self.svc.stages.main_log.state
         self.assertGreater(pos, log["link"]["pos"])
+
+    def test_the_next_request_waits_for_an_engine_on_its_way_out(self):
+        """The engine ends after `ERR remote stage...`, but that end can lag (its teardown): a request at once waits for
+        it and starts the engine again, instead of being sent to it and failing too (settle_stage_exit)."""
+        self.e.close()
+        self.e = self.start("--exit-after", "1.5")
+        self.svc = Service(self.e, ByteTokenizer(), ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        self.svc.stages.agents_cfg = False
+        with self.assertRaises(Exception):
+            self.request()
+        old = self.e.proc
+        self.assertIsNone(old.poll())                               # still on its way out
+        self.request()                                              # at once: answered by a new process
+        self.assertIsNot(self.e.proc, old)
+        self.assertEqual(old.poll(), 1)
+        self.assertIsNone(self.e.stage_leaving)
 
     def test_restart_before_the_first_look(self):
         """The Monitor opened after the engine was started again: that start's link is a reconnect all the same."""
