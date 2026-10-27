@@ -11328,8 +11328,10 @@ int main(int argc, char** argv) {
                     saved = checkpoint_at(done, nullptr, tail_checkpoint && !periodic_checkpoint);
                 }
                 if (!saved) {
-                    // #3350: only a GPU that is unwell ends the request; a copy that ran out of memory skips this checkpoint
-                    if (!ckpt_why.empty() || !checkpoint_failure_is_survivable()) {
+                    // #3350: only a GPU that is unwell ends the request; a copy that ran out of memory skips this checkpoint.
+                    // Not with a remote stage: the worker may have stored its part and dropped the checkpoints this side
+                    // still holds (the keep list), so a failed save still ends the request there, as before #3350
+                    if (!ckpt_why.empty() || remote_main || !checkpoint_failure_is_survivable()) {
                         e = "saving a conversation checkpoint failed" + ckpt_why;
                         return false;
                     }
@@ -16821,7 +16823,9 @@ int main(int argc, char** argv) {
                 at = to;
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
-                    if (!ckpt_why.empty() || !checkpoint_failure_is_survivable()) {   // #3350: only an unwell GPU ends the request
+                    // #3350: only an unwell GPU ends the request - and any failure with a remote stage (see the prompt's
+                    // checkpoints above: the worker may have dropped what this side still holds)
+                    if (!ckpt_why.empty() || remote_main || !checkpoint_failure_is_survivable()) {
                         // a remote stage's link lost in the middle of the request, or the worker's own error: the
                         // engine ends as on a lost window, with the link's or the worker's text first (the server
                         // answers it with a 503)

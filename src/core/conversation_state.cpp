@@ -116,7 +116,7 @@ bool checkpoint_validate(const ConversationCheckpoint& c, const SessionState& ss
 
 // the copies back (validated): the running state, and each indexer's pooled row at `tokens` / idx_block rewritten
 // from the saved dead marker; ple_prev and the final synchronize are the callers'.  `gdn`: where the GDN bytes are
-// read from (checkpoint_gdn_source: c.gdn, or the device copy STRATA_PARK_VRAM_MIB kept)
+// read from (checkpoint_gdn_source: c.gdn, or the device copy a STRATA_CKPT_VRAM_SLOTS slot kept)
 bool checkpoint_put_back(const ConversationCheckpoint& c, SessionState& ss, const ModelGeometry& g, size_t tokens,
                          const void* gdn, std::string& error) {
     ConversationStateSizes z;
@@ -309,7 +309,7 @@ void conversation_checkpoint_join(const void* only) {
 }
 
 namespace {
-// STRATA_PARK_VRAM_MIB: the device copy of a checkpoint's GDN state on this device, if one still holds it; without one
+// STRATA_CKPT_VRAM_SLOTS: the device copy of a checkpoint's GDN state on this device, if a slot still holds it; without one
 // the background copy into c.gdn (STRATA_CKPT_ASYNC) is waited for and c.gdn is the source
 const void* checkpoint_gdn_source(const ConversationCheckpoint& c) {
     const VramSlot* hit = nullptr;
