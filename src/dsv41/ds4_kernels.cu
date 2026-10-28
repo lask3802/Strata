@@ -6,6 +6,9 @@
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_attn_split.cuh"
+#if !defined(STRATA_USE_HIP)
+#include "ds4_attn_tc.cuh"
+#endif
 #include "ds4_u9.hpp"
 
 #include <cuda_fp16.h>
@@ -1981,8 +1984,29 @@ SplitScratch split_scratch(cudaStream_t s, int heads) {
     m[{dev, s}] = SplitScratch{sc, heads};
     return m[{dev, s}];
 }
+
+// DS4_ATTN_TC: the tensor-core prompt attention's mode (attn_tc: 0 off - unset, empty or 0; 2, 3; any other 1)
+int& tc_flag() {   // (a test sets it: both kernels in one process)
+    static int mode = [] {
+#if defined(STRATA_USE_HIP)
+        return 0;
+#else
+        const char* e = std::getenv("DS4_ATTN_TC");
+        const int v = e != nullptr ? std::atoi(e) : 0;
+        if (v == 0) return 0;
+        const int m = v == 2 || v == 3 ? v : 1;
+        static const char* const how[4] = {"", "q and P as FP16 hi + lo: F32-like", "q as FP16 hi + lo, P FP16",
+                                            "plain FP16 q and P"};
+        std::fprintf(stderr, "ds4: DS4_ATTN_TC=%s: the chunked prompt's sparse attention on tensor cores (%s)\n", e,
+                     how[m]);
+        return m;
+#endif
+    }();
+    return mode;
+}
 }  // namespace
 
+int& attn_tc() { return tc_flag(); }
 bool& attn_split() { return split_flag(); }
 unsigned long long attn_split_runs() { return g_split_runs.load(); }
 
@@ -2274,6 +2298,13 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
                                                                              heads, d, scale, out);
         return;
     }
+#if !defined(STRATA_USE_HIP)
+    // DS4_ATTN_TC (attn_tc): a prompt chunk's slab on tensor cores instead (FP16 inputs: not the packed kernel's bits)
+    if (a.gen == 1 && T > kAttnScratchT && heads_per_block == 0 && tc_flag() != 0 &&
+        attntc::sparse_attn_tc(tc_flag(), q, win, (const uint8_t*) ckv, kv_row_bytes(kKvFp4, d), sel, sel_stride, a,
+                               sink, heads, T, scale, out, s))
+        return;
+#endif
     // packed rows: as many heads a block as still leaves two blocks a multiprocessor (a decoded row serves them all)
     int G = heads_per_block;
     if (G != 1 && G != 2 && G != 4 && G != 8) {
