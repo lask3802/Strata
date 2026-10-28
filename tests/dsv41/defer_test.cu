@@ -4,8 +4,9 @@
 // attention's comb - up to the order of the float sums (the coefficients held fixed: in the engine the attention's
 // own coefficients and output differ, the deferral's error, which this does not test).  The head's case (comb null:
 // nothing ran since) the same against one hc_post.  A token whose flag is 0 keeps its streams whatever its part row
-// holds.  First on the host (the algebra), then the device kernels (hc_post, hc_late_add) against the host's; last
-// max_rel_diff, DS4_EP_DEFER_VERIFY's comparison.  Needs a GPU, no model.  defer_test
+// holds.  First on the host (the algebra), then the device kernels (hc_post, hc_late_add) against the host's; then
+// DS4_EP_DEFER_BELOW's split (run_split: the light part late from the mailbox's row 1); last max_rel_diff,
+// DS4_EP_DEFER_VERIFY's comparison.  Needs a GPU, no model.  defer_test
 #include "../../src/dsv41/ds4_kernels.cuh"
 
 #include <algorithm>
@@ -163,6 +164,88 @@ void run(int D, int H, int T) {
     cudaStreamDestroy(s);
 }
 
+// DS4_EP_DEFER_BELOW / TOP (a split layer, T 1): the mailbox's own Resp in host-mapped memory, the heavy part in row 0
+// (cpu[0]), the light one in row 1 (cpu[1]).  The layer adds the heavy part through the experts' sum (here: in y), the
+// next layer's late_flush the light one after its attention - hc_late_add on &part[1][0] with &cpu[1] - which must equal
+// the exact path (both parts in the FFN's hc_post); the head's form (comb null) and DS4_EP_DEFER_VERIFY's in-place add
+// on the exact streams (comb null right after the FFN hc_post) likewise.  The wrong row (part[0] / cpu[0], the heavy
+// part again: a late_row left at 0) must show; a light row with its flag 0 must leave the streams as they were
+void run_split(int D, int H) {
+    const int T = 1;
+    std::vector<float> h0 = rnd((size_t) H * D), y_dev = rnd((size_t) D), y_att = rnd((size_t) D);
+    std::vector<float> f_post = rnd(8, 2.0f), a_post = rnd(8, 2.0f), f_comb = rnd(64), a_comb = rnd(64);
+    std::vector<float> heavy = rnd((size_t) D, 0.5f), light = rnd((size_t) D, 0.5f);
+    std::vector<float> y_sum = y_dev, y_dh = y_dev;   // (the exact path's FFN output; the split layer's: the heavy part in it)
+    for (int e = 0; e < D; ++e) {
+        y_sum[(size_t) e] += heavy[(size_t) e] + light[(size_t) e];
+        y_dh[(size_t) e] += heavy[(size_t) e];
+    }
+    std::vector<float> f_ex, a_ex;
+    post_ref(y_sum, h0, f_post, f_comb, D, H, T, f_ex);
+    post_ref(y_att, f_ex, a_post, a_comb, D, H, T, a_ex);
+    sd::Resp* rp = nullptr;
+    CU(cudaHostAlloc((void**) &rp, sizeof(sd::Resp), cudaHostAllocMapped | cudaHostAllocPortable));
+    std::fill((char*) rp, (char*) rp + sizeof(sd::Resp), (char) 0x7f);   // (garbage past what the host writes)
+    std::copy(heavy.begin(), heavy.end(), rp->part[0]);
+    std::copy(light.begin(), light.end(), rp->part[1]);
+    rp->cpu[0] = rp->cpu[1] = 1;
+    float *d_h0 = dev(h0), *d_ydh = dev(y_dh), *d_yatt = dev(y_att), *d_fp = dev(f_post), *d_ap = dev(a_post),
+          *d_fc = dev(f_comb), *d_ac = dev(a_comb);
+    float *d_f = nullptr, *d_a = nullptr;
+    CU(cudaMalloc(&d_f, h0.size() * 4));
+    CU(cudaMalloc(&d_a, h0.size() * 4));
+    cudaStream_t s = nullptr;
+    CU(cudaStreamCreate(&s));
+    char nm[96];
+    // the layer (heavy in y), the next attention, then late_flush's add of row 1
+    auto layer_then_attention = [&]() {
+        sd::hc_post(d_ydh, d_h0, d_fp, d_fc, D, H, T, d_f, s);
+        sd::hc_post(d_yatt, d_f, d_ap, d_ac, D, H, T, d_a, s);
+    };
+    layer_then_attention();
+    sd::hc_late_add(d_a, &rp->part[1][0], (size_t) sd::kMaxDim, &rp->cpu[1], d_fp, d_ac, D, H, T, s);
+    CU(cudaStreamSynchronize(s));
+    std::snprintf(nm, sizeof nm, "split: row 1 a layer late vs exact, D %d H %d", D, H);
+    check(nm, diff(a_ex, host(d_a, h0.size())), 1e-5);
+    // the head's form, and VERIFY's exact streams: row 1 with comb null right after the FFN hc_post
+    sd::hc_late_add(d_f, &rp->part[1][0], (size_t) sd::kMaxDim, &rp->cpu[1], d_fp, nullptr, D, H, T, s);
+    CU(cudaStreamSynchronize(s));
+    std::snprintf(nm, sizeof nm, "split: row 1, comb null (head, VERIFY) vs exact, D %d H %d", D, H);
+    check(nm, diff(f_ex, host(d_f, h0.size())), 1e-5);
+    // the wrong row: row 0 (the heavy part again) late instead of row 1 - the comparison must see it
+    layer_then_attention();
+    sd::hc_late_add(d_a, &rp->part[0][0], (size_t) sd::kMaxDim, &rp->cpu[0], d_fp, d_ac, D, H, T, s);
+    CU(cudaStreamSynchronize(s));
+    {
+        const double d = diff(a_ex, host(d_a, h0.size()));
+        ++g_cases;
+        const bool seen = d > 1e-3;
+        if (!seen) ++g_fail;
+        std::snprintf(nm, sizeof nm, "split: row 0 late instead (the wrong row) seen, D %d H %d", D, H);
+        std::printf("%-58s max rel diff %.2e (> 1e-3) -> %s\n", nm, d, seen ? "ok" : "FAIL");
+    }
+    // a light row with its flag 0 (no light pick): the streams exactly as the hc_posts left them
+    layer_then_attention();
+    CU(cudaStreamSynchronize(s));
+    const std::vector<float> pre = host(d_a, h0.size());
+    rp->cpu[1] = 0;
+    sd::hc_late_add(d_a, &rp->part[1][0], (size_t) sd::kMaxDim, &rp->cpu[1], d_fp, d_ac, D, H, T, s);
+    CU(cudaStreamSynchronize(s));
+    CU(cudaGetLastError());
+    {
+        const std::vector<float> got = host(d_a, h0.size());
+        bool same = true;
+        for (size_t i = 0; i < got.size(); ++i) same = same && got[i] == pre[i];
+        ++g_cases;
+        if (!same) ++g_fail;
+        std::snprintf(nm, sizeof nm, "split: light flag 0 leaves the streams, D %d H %d", D, H);
+        std::printf("%-58s %s\n", nm, same ? "ok" : "FAIL");
+    }
+    cudaFree(d_h0), cudaFree(d_ydh), cudaFree(d_yatt), cudaFree(d_fp), cudaFree(d_ap), cudaFree(d_fc), cudaFree(d_ac);
+    cudaFree(d_f), cudaFree(d_a), cudaFreeHost(rp);
+    cudaStreamDestroy(s);
+}
+
 // max_rel_diff (DS4_EP_DEFER_VERIFY's comparison): 0 for the same rows, the largest |a - b| / (1 + |a|) otherwise, kept
 // across calls into one host-mapped value; a NaN counts as inf
 void run_diff() {
@@ -210,6 +293,8 @@ int main() {
     run(4096, 4, 1);   // (a model-sized row, 4 streams, a decode token)
     run(300, 4, 4);
     run(96, 2, 3);
+    run_split(64, 4);
+    run_split(4096, 4);
     run_diff();
     std::printf("%d of %d cases failed\n", g_fail, g_cases);
     return g_fail != 0;
