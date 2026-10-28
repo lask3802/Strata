@@ -4449,10 +4449,11 @@ struct Model::Impl {
         // done (the next flow_spec waits for vs_ev above; plan_streams).  Not sent: the sort copies them, as before
         if (bc_once != 0) {
             Layer& x = member(l, mi);
-            const bool sent =
-                cudaMemcpyAsync(x.vs_dev, x.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, c.cs) == cudaSuccess &&
-                cudaEventRecord(c.vs_ev, c.cs) == cudaSuccess;
+            const bool copied =
+                cudaMemcpyAsync(x.vs_dev, x.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, c.cs) == cudaSuccess;
+            const bool sent = copied && cudaEventRecord(c.vs_ev, c.cs) == cudaSuccess;
             kick(c.cs);
+            if (copied && !sent) cudaStreamSynchronize(c.cs);   // (no event to wait for: the copy done before vs_pin is written again)
             c.vs_k = sent ? k : -1;
             c.vs_il = sent ? il : -1;
             c.vs_mi = sent ? mi : -1;
@@ -11121,6 +11122,7 @@ struct Model::Impl {
         const char* why = devs.size() != 1                                            ? "more than one GPU"
                           : chunks.empty() || chunks[0] == nullptr || !chunks[0]->flow ? "the prompt is not on the flow"
                           : nc < 2                                                     ? "a prompt the context allows takes one chunk"
+                          : o.stage_worker                                             ? "a remote stage's worker: its runs are one chunk"
                           : !stage::layer_major_allowed(linked(), env)                 ? "no layer-major prompt here"
                                                                                        : nullptr;
         if (why != nullptr) {

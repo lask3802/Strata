@@ -87,12 +87,13 @@ int main() {
             const uint64_t n0 = rng() % 100000;
             auto vf = [&](size_t i) { return v[i - lb]; };
             std::vector<int> per((size_t) bc_n * bc_w, -7), up((size_t) bc_n * bc_w, -7);
-            uint64_t nb = n0;   // a batch at a time (the loop with DS4_BC_ONCE off)
+            uint64_t nb = n0;   // a batch at a time, as the loop wrote them at ece02640
             for (size_t i0 = lb; i0 < le;) {
                 const size_t i1 = ds4::flow_batch_end(i0, le, R, bmax);
-                int* bc = per.data() + ds4::bc_region(nb++, bc_n) * (size_t) bc_w;
-                ds4::flow_batch_bounds(b.data(), i0, i1, vf, bc);
+                int* bc = per.data() + (size_t) (nb++ % (uint64_t) bc_n) * bc_w;
                 const int n = (int) (i1 - i0);
+                for (int m = 0; m < n; ++m) bc[m] = b[(size_t) v[i0 + (size_t) m - lb]];   // (flow_layer at ece02640)
+                bc[n] = b[(size_t) v[i1 - 1 - lb] + 1];
                 (bc[n] > bc[0] ? rows_seen : zero_seen) = true;
                 i0 = i1;
             }

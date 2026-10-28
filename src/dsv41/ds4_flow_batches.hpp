@@ -74,8 +74,10 @@ inline int bc_runs(uint64_t n0, size_t nb, int bc_n, BcRun out[2]) {
 
 /// DS4_BC_ONCE's invariant: a layer's batches written up front each take a region of their own - at most bc_n of them
 /// (a layer streams at most its n_exp experts, one item each, and bc_n = n_exp_max + 2).  The regions the layers
-/// before used are read by nothing once those layers' work on the compute stream is done (flow_layer waits for it
-/// before it writes: bc_done), so the host never writes a region a copy or a kernel still reads
+/// before used are read by nothing once those layers' work on the compute stream is done - which the layer's bounds
+/// wait (layer_chunk's cudaStreamSynchronize before flow_layer) already made sure of; flow_bc_upfront waits for
+/// bc_done too, so the rule does not hang on that wait alone - and the host never writes a region a copy or a kernel
+/// still reads
 inline bool bc_layer_fits(size_t nb, int bc_n) { return bc_n > 0 && nb <= (size_t) bc_n; }
 
 }  // namespace strata::ds4

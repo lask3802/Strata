@@ -2,8 +2,9 @@
 // read in again on a thread of its own, the pages the prompt cost the page cache brought back for the decode after it.
 // One at a time: a start cancels the one still running and waits for it to stop first; the next prompt cancels it at
 // its start (Model::feed / feed_mark), so its reads never compete with a prompt's.  The work is given the stop flag
-// and checks it between ranges (a range is a few MB: a cancel waits for one).  It reads pages only - no number the
-// model computes depends on it.  No GPU, no model (tests/dsv41/rewarm_test.cpp).
+// and checks it between ranges (a range is a few MB: a cancel waits for one).  It reads pages only: the model's
+// state and sums never depend on it (only timings do - and pick_path, which learns from them, may choose otherwise).
+// No GPU, no model (tests/dsv41/rewarm_test.cpp).
 #pragma once
 
 #include <atomic>
