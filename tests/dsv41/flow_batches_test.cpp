@@ -173,8 +173,8 @@ int main() {
 
     // ---- DS4_BC_ONCE's text
     check(ds4::bc_once_mode(nullptr) == 0 && ds4::bc_once_mode("") == 0 && ds4::bc_once_mode("0") == 0, "off");
-    check(ds4::bc_once_mode("1") == 1 && ds4::bc_once_mode("2") == 2, "1, 2");
-    check(ds4::bc_once_mode("3") == -1 && ds4::bc_once_mode("on") == -1 && ds4::bc_once_mode(" 1") == -1 &&
+    check(ds4::bc_once_mode("1") == 1 && ds4::bc_once_mode("2") == 2 && ds4::bc_once_mode("3") == 3, "1, 2, 3");
+    check(ds4::bc_once_mode("4") == -1 && ds4::bc_once_mode("on") == -1 && ds4::bc_once_mode(" 1") == -1 &&
               ds4::bc_once_mode("01") == -1,
           "anything else: refused");
     std::printf(fails == 0 ? "ALL OK\n" : "FAILED\n");

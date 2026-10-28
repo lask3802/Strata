@@ -934,6 +934,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         add_executable(ds4_defer_test tests/dsv41/defer_test.cu src/dsv41/ds4_kernels.cu)
         target_include_directories(ds4_defer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
         target_link_libraries(ds4_defer_test PRIVATE ${_strata_gpu_runtime_target})
+        # DS4_BC_ONCE=3's pull (bc_pull): a layer's bounds from mapped host memory into the device table, against the
+        # host's, over a run of layers; needs a GPU, no model
+        add_executable(ds4_bc_pull_test tests/dsv41/bc_pull_test.cu)
+        target_include_directories(ds4_bc_pull_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+        target_link_libraries(ds4_bc_pull_test PRIVATE ${_strata_gpu_runtime_target})
       endif()
       # the remote experts (ds4_rx.hpp): this is the main process's end, an expert server (strata-dsv41
       # --expert-server-connect, a GPU) the other; its replies against the CPU lane's sums of the same random experts

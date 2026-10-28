@@ -3,8 +3,9 @@
 // bounds fixed by the stream alone - so a layer's whole partition, and every batch's compacted bounds, are known once
 // the layer routed (flow_rest).  Each batch's bounds go into region n_batch % bc_n of the pinned bc_pin (and of
 // bc_dev): bc_n regions of bc_w ints.  DS4_BC_ONCE (1: the layer's regions written up front and sent in one copy, two
-// where they wrap; 2: read by the kernels from mapped host memory, no copy) uses the same partition, the same regions
-// and the same values as the per-batch copies (unset / 0), so the sums are the same bits.  Pure functions, no state
+// where they wrap; 2: read by the kernels from mapped host memory, no copy; 3: pulled from mapped host memory into
+// bc_dev by one small kernel a layer) uses the same partition, the same regions and the same values as the per-batch
+// copies (unset / 0), so the sums are the same bits.  Pure functions, no state
 // (tests/dsv41/flow_batches_test.cpp).
 #pragma once
 
@@ -16,11 +17,13 @@
 
 namespace strata::ds4 {
 
-/// DS4_BC_ONCE's text: 0 off (unset, empty or "0"), 1 one copy a layer, 2 mapped host memory; -1 anything else
+/// DS4_BC_ONCE's text: 0 off (unset, empty or "0"), 1 one copy a layer, 2 mapped host memory, 3 pulled from mapped
+/// host memory into bc_dev by one small kernel a layer (ds4_bc_pull.cuh); -1 anything else
 inline int bc_once_mode(const char* env) {
     if (env == nullptr || *env == '\0' || std::strcmp(env, "0") == 0) return 0;
     if (std::strcmp(env, "1") == 0) return 1;
     if (std::strcmp(env, "2") == 0) return 2;
+    if (std::strcmp(env, "3") == 0) return 3;
     return -1;
 }
 

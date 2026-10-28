@@ -19,6 +19,7 @@
 #include "ds4_gguf.cuh"
 #include "ds4_iq.cuh"
 #include "ds4_gguf_cpu.hpp"
+#include "ds4_bc_pull.cuh"
 #include "ds4_ffslice.hpp"
 #include "ds4_flow_batches.hpp"
 #include "ds4_gemm16.cuh"
@@ -672,7 +673,8 @@ struct Chunk {
     int *bc_pin = nullptr, *bc_dev = nullptr;
     uint64_t n_batch = 0;
     // DS4_BC_ONCE (Impl::bc_once, ds4_flow_batches.hpp): a layer's batches and their bounds known up front (bc_list), in
-    // one copy (1) or read through bc_map, bc_pin's device address (2: bc_pin mapped); bc_done - the last layer's
+    // one copy (1), read through bc_map, bc_pin's device address (2: bc_pin mapped), or pulled into bc_dev from bc_map
+    // by a small kernel (3); bc_done - the last layer's
     // batches done on the compute stream, waited for before their regions are written again; vs_ev - the virtual
     // slots flow_spec decided for (chunk vs_k, layer vs_il, member vs_mi) copied to that member's vs_dev on cs (-1: none)
     int* bc_map = nullptr;
@@ -3684,8 +3686,8 @@ struct Model::Impl {
                 const int n_readers = std::max(1, nr != nullptr ? std::atoi(nr) : 8);
                 bc_once = bc_once_mode(std::getenv("DS4_BC_ONCE"));
                 if (bc_once < 0) {
-                    err = "DS4_BC_ONCE: 1 (a layer's batch bounds in one copy) or 2 (read from mapped host memory); "
-                          "unset, empty or 0: off";
+                    err = "DS4_BC_ONCE: 1 (a layer's batch bounds in one copy), 2 (read from mapped host memory) or 3 "
+                          "(pulled from mapped host memory by a kernel); unset, empty or 0: off";
                     return false;
                 }
                 const bool flow_on = std::getenv("DS4_FLOW") == nullptr || std::atoi(std::getenv("DS4_FLOW")) != 0;
@@ -3752,17 +3754,20 @@ struct Model::Impl {
                     // (a region is written again only bc_n batches later - more than a layer's items, so after that
                     // layer's bounds wait, which every copy from it precedes.  DS4_BC_ONCE: a layer's regions written
                     // up front, each batch its own (bc_layer_fits), once the layers before are done with theirs on
-                    // the compute stream - bc_done; 2: bc_pin mapped, the kernels read it there)
+                    // the compute stream - bc_done; 2: bc_pin mapped, the kernels read it there; 3: mapped too, a
+                    // small kernel pulls it into bc_dev)
                     cp->bc_n = n_exp_max + 2;
                     cp->bc_w = cp->ring_n + 1;
-                    if (!(bc_once == 2 ? hmap(cp->bc_pin, (size_t) cp->bc_n * cp->bc_w, err)
-                                       : halloc(cp->bc_pin, (size_t) cp->bc_n * cp->bc_w, err)) ||
+                    const bool mapped = bc_once == 2 || bc_once == 3;
+                    if (!(mapped ? hmap(cp->bc_pin, (size_t) cp->bc_n * cp->bc_w, err)
+                                 : halloc(cp->bc_pin, (size_t) cp->bc_n * cp->bc_w, err)) ||
                         !dalloc(devs[di], cp->bc_dev, (size_t) cp->bc_n * cp->bc_w, err))
                         return false;
-                    if (bc_once == 2) {
+                    if (mapped) {
                         void* m = nullptr;
                         if (cudaHostGetDevicePointer(&m, cp->bc_pin, 0) != cudaSuccess) {
-                            err = "DS4_BC_ONCE=2: no device address for the mapped batch bounds";
+                            err = "DS4_BC_ONCE=" + std::to_string(bc_once) +
+                                  ": no device address for the mapped batch bounds";
                             return false;
                         }
                         cp->bc_map = (int*) m;
@@ -4626,7 +4631,13 @@ struct Model::Impl {
     // (two where the regions wrap) before the first batch, instead of a copy a batch behind that batch's ring_fill -
     // a small copy on s queues behind the copy stream's DMAs on the same copy engine.  The regions: one each
     // (bc_layer_fits), and the layers before are done with theirs once bc_done is (their last work on s; the
-    // layer's bounds wait already waited for it)
+    // layer's bounds wait already waited for it).  3: pulled into bc_dev on s by one small kernel, both runs in the
+    // one launch (bc_pull, ds4_bc_pull.cuh), where 1 copies - the SMs, not the copy engine, so it cannot queue
+    // behind cs's DMAs; the batches read bc_dev as with 1.  The host's writes are the kernel's to see: bc_pin is
+    // pinned and mapped, not write-combined (hmap: cudaHostAllocMapped | cudaHostAllocPortable), and written here
+    // before the launch is issued.  No write after a read: a region is written again only once nothing reads it -
+    // the layer's bounds wait (layer_chunk's cudaStreamSynchronize(s) after the sort) had s finish every earlier
+    // layer's pull and batches, and bc_done (the last layer's last work on s) is waited for here before the writes
     bool flow_bc_upfront(Chunk& c, size_t le, const std::vector<int>& b, cudaStream_t s, std::string& err) {
         static std::once_flag said;
         std::call_once(said, [&] {
@@ -4634,9 +4645,13 @@ struct Model::Impl {
                          ? "ds4: DS4_BC_ONCE=1: the expert stage's batch bounds written once a layer routed and sent to "
                            "the GPU in one copy a layer (two where they wrap), not one a batch; a layer's virtual slots "
                            "sent on the copy stream when the stream decides them, not before the sort\n"
-                         : "ds4: DS4_BC_ONCE=2: the expert stage's batch bounds written once a layer routed and read by "
+                         : bc_once == 2
+                         ? "ds4: DS4_BC_ONCE=2: the expert stage's batch bounds written once a layer routed and read by "
                            "the kernels from mapped host memory, no copy; a layer's virtual slots sent on the copy "
-                           "stream when the stream decides them, not before the sort\n");
+                           "stream when the stream decides them, not before the sort\n"
+                         : "ds4: DS4_BC_ONCE=3: the expert stage's batch bounds written once a layer routed and pulled "
+                           "to the GPU by one small kernel a layer from mapped host memory (no copy engine); a layer's "
+                           "virtual slots sent on the copy stream when the stream decides them, not before the sort\n");
         });
         const size_t R = (size_t) c.ring_n, bmax = std::max<size_t>(1, R / 2);
         flow_batches(c.n_comp, le, R, bmax, c.bc_list);
@@ -4651,13 +4666,16 @@ struct Model::Impl {
         for (size_t j = 0; j < nb; ++j)
             flow_batch_bounds(b.data(), c.bc_list[j].i0, c.bc_list[j].i1, [&](size_t i) { return fit(c, i).v; },
                               c.bc_pin + bc_region(c.n_batch + j, c.bc_n) * (size_t) c.bc_w);
-        if (bc_once == 1) {
+        if (bc_once == 1 || bc_once == 3) {
             BcRun run[2];
             const int nr = bc_runs(c.n_batch, nb, c.bc_n, run);
             const size_t w = (size_t) c.bc_w;
-            for (int r = 0; r < nr; ++r)
-                CK(cudaMemcpyAsync(c.bc_dev + run[r].first * w, c.bc_pin + run[r].first * w, run[r].n * w * 4,
-                                   cudaMemcpyHostToDevice, s));
+            if (bc_once == 1)
+                for (int r = 0; r < nr; ++r)
+                    CK(cudaMemcpyAsync(c.bc_dev + run[r].first * w, c.bc_pin + run[r].first * w, run[r].n * w * 4,
+                                       cudaMemcpyHostToDevice, s));
+            else
+                CK(bc_pull(c.bc_map, c.bc_dev, w, run, nr, s));   // (both runs in the one launch)
             if (nr > 0) kick(s);
         }
         return true;
