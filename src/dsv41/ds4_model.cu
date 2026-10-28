@@ -1009,7 +1009,11 @@ struct Model::Impl {
     // by the kernels from mapped host memory.  1 and 2 also send a layer's virtual slots on the copy stream when
     // flow_spec decides them, not on the compute stream before the sort
     int bc_once = 0;
-    int chunk_own = -1;               // (a remote stage's main process, once set_stage_chunk ran) the chunk of its load
+    // DS4_LC_THP=0 (the load reads it): the prompt's host buffers - the layer-major prompt's layer cache and pageable
+    // chunk states, a remote stage's replies - mapped without MADV_HUGEPAGE, on 4 KiB pages: a fault near the cgroup's
+    // memory.high then reclaims a page, never compacts memory for a huge one.  Unset, empty or 1: huge pages advised, as before
+    bool lc_thp = true;
+    int chunk_own = -1;              // (a remote stage's main process, once set_stage_chunk ran) the chunk of its load
     static constexpr bool kChunkedPromptDefault = true;   // the layer-major prompt is the default (gate: KL 0.1685 vs 0.1686, 8K prompt 6x, decode within 2% - ds4 notes-dsv41-r97)
     static constexpr int kFlowChunkMin = 2;   // chunk_min with every device's layers on the flow (see load)
     // --prefill-chunk at most (route() runs in kVlRows-row slabs).  The default stays kVlRows: a 16384-token chunk
@@ -2545,6 +2549,15 @@ struct Model::Impl {
     bool load(const Options& opt, std::string& err) {
         o = opt;
         const double t0 = now_ms();
+        if (const char* v = std::getenv("DS4_LC_THP"); v != nullptr && *v != '\0' && std::strcmp(v, "1") != 0) {
+            if (std::strcmp(v, "0") != 0) {
+                err = "DS4_LC_THP: 0 (the prompt's host buffers on 4 KiB pages); unset, empty or 1: huge pages advised";
+                return false;
+            }
+            lc_thp = false;
+            std::fprintf(stderr, "ds4: DS4_LC_THP=0: the layer-major prompt's layer cache and chunk states, and the "
+                                 "prompt's other host buffers, on 4 KiB pages (no MADV_HUGEPAGE)\n");
+        }
         if (!pk.load(o.pack, err)) return false;
         g.from(pk);
         if (g.dim == 0 || g.nl == 0 || (int) g.ratios.size() < g.nl) {
@@ -11022,10 +11035,10 @@ struct Model::Impl {
         c.lm_pinned = cudaHostAlloc(&st_p, state_b, cudaHostAllocPortable) == cudaSuccess;
         if (!c.lm_pinned) {
             cudaGetLastError();
-            st_p = os::anon_alloc(state_b, -1, 1);
+            st_p = os::anon_alloc(state_b, -1, 1, lc_thp);
             if (st_p == nullptr) return false;
         }
-        c.lc = (uint8_t*) os::anon_alloc(lc_bytes, -1, 1);
+        c.lc = (uint8_t*) os::anon_alloc(lc_bytes, -1, 1, lc_thp);
         if (c.lc == nullptr) {
             if (c.lm_pinned) cudaFreeHost(st_p);
             else os::anon_free(st_p, state_b);
@@ -11209,7 +11222,7 @@ struct Model::Impl {
             int rows = 0;
             for (const int T : run.T) rows = std::max(rows, T);
             lrx.bytes = (size_t) (logits_all ? n : rows) * (size_t) full_floats() * 4;
-            lrx.rx = (float*) os::anon_alloc(lrx.bytes, -1, 1);
+            lrx.rx = (float*) os::anon_alloc(lrx.bytes, -1, 1, lc_thp);
             if (lrx.rx == nullptr) {
                 err = "remote stage: " + std::to_string(lrx.bytes >> 20) + " MiB of memory for the worker's replies";
                 lrx.bytes = 0;
