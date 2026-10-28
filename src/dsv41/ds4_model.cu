@@ -28,6 +28,7 @@
 #include "ds4_rx_fill_link.hpp"
 #include "ds4_rx.hpp"
 #include "ds4_rx_split.hpp"
+#include "ds4_small_prompt.hpp"
 #include "ds4_stage.hpp"
 #include "ds4_stage_slots.hpp"
 #include "ds4_store.hpp"
@@ -1247,6 +1248,9 @@ struct Model::Impl {
     // serve_lane reads both only once the device has written that request's seq - the launch, not layer_of's release /
     // acquire (the slot's previous store may hold the same layer), orders them, as it does layer_of
     bool ep_of[kRing] = {};
+    // ... and a small prompt's (small_feed when the seq was issued): the decode-only statistics (the lookahead's, the
+    // hybrid's decode-request tables) skip it.  Written and read as ep_of is
+    bool small_of[kRing] = {};
     std::thread service;
     std::atomic<bool> quit{false};
     // the link core (--remote-experts, ds4_rx.hpp): the service thread's CPU (DS4_EP_CPU; -1: none) and that core's
@@ -1336,6 +1340,15 @@ struct Model::Impl {
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
     bool win_prompt = false;   // (feed_windows: a prompt's windows - their cache ticks are the decode's, serve_T 0)
     rx::PromptSettle psettle;  // (a window prompt's settle: once a prompt, ds4_rx_fill.hpp)
+    // DS4_SMALL_PROMPT=N (0 off), DS4_SMALL_WIN=T: prompts of 2-N tokens in windows of T rows (small_setup,
+    // ds4_small_prompt.hpp); small_ms: their ms a token so far (a running mean, for --verbose), small_k how many
+    int small_n = 0, small_t = 1;
+    double small_ms = 0;
+    int64_t small_k = 0;
+    // feed_small's windows are on (set only there): they are a prompt's, though each is an EP window of one row, so the
+    // statistics that mean the decode's windows (DS4_PROF's, the lookahead's, ep_late, the defer checks' count, the
+    // hybrid's decode-request tables) leave them out.  Not routing, the caches, the settle or the expert server's lane
+    bool small_feed = false;
     // lookahead: while layer L runs, the device guesses the next layer's picks (its gate on L's FFN input, the same
     // choice) and publishes them with L's routing; the CPU lane asks for the guessed experts it will read from the files
     // at once (a thread of its own, os::prefetch), so the SSD reads them while L computes instead of on the next
@@ -1515,7 +1528,7 @@ struct Model::Impl {
     std::mutex prof_mu;
     std::vector<ProfMark> prof_marks;
     std::map<int, std::vector<cudaEvent_t>> prof_pool;   // by device: an event belongs to the device it was made on
-    bool prof_window = false;   // (decode windows only: T == 1)
+    bool prof_window = false;   // (decode windows only: T == 1, and not a small prompt's)
     // ... and a run of chunks' (prof_chunk): a layer's start, after its attention, after the routing and the shared
     // expert, after its experts (the streamed ones' waits for their reads in it); printed after the run
     bool prof_chunk = false;
@@ -3631,6 +3644,7 @@ struct Model::Impl {
             make_pools();
         }
         if (!defer_setup(err)) return false;
+        small_setup();   // (after defer_setup: its line says whether the deferral rides along)
         {
             void* m = nullptr;
             if (cudaHostAlloc(&m, sizeof(Req) * kRing, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
@@ -7417,8 +7431,9 @@ struct Model::Impl {
     }
     // lookahead on the CPU lane: request r (layer li, seq) carries the device's guesses for the next layers - the
     // guessed experts read from the files asked for now (each once a window), the guesses kept for the hit counts
+    // (count: not a small prompt's window - the experts asked for early are counted for the decode's tokens only)
     std::vector<std::pair<const void*, size_t>> pf_want;
-    void ahead_ask(int li, const Req& r, unsigned seq, int T) {
+    void ahead_ask(int li, const Req& r, unsigned seq, int T, bool count) {
         pf_want.clear();
         for (int a = 1; a <= 2; ++a) {
             const int m = std::min(r.na[a - 1], a == 1 ? kAhead1 : kPicks), j = li + a;
@@ -7440,7 +7455,7 @@ struct Model::Impl {
                     if ((fl[e] & 8) || !file_read(n, e)) continue;
                     fl[e] |= 8;
 #if defined(__linux__)
-                    if (!store && !rx_has.empty() && rx_has[(size_t) j * g.n_exp + e]) {   // (the server's: diagnostics)
+                    if (count && !store && !rx_has.empty() && rx_has[(size_t) j * g.n_exp + e]) {   // (the server's: diagnostics)
                         ++st.rx_ahead;
                         bool res = true;
                         for (int q = 0; q < 3 && res; ++q) res = os::resident_sampled(mx_mat(n, e, q), mx_part_bytes(n, q), 4);
@@ -7450,7 +7465,7 @@ struct Model::Impl {
                     if (store) store->prefetch(j, e);
                     else
                         for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
-                    ++st.ahead_pf;
+                    st.ahead_pf += count ? 1 : 0;
                 }
         }
         if (pf_want.empty()) return;
@@ -8192,7 +8207,8 @@ struct Model::Impl {
         if (got == 0 && !stale)   // (late for the lane's wait; for the link only past the fixed wait's deadline)
             for (int n = rx_late_book.add_late(seq, t0, rows, l.il, deadline, bound); n > 0; --n) rx_back_seen(true);
         st.rx_wait_ms += t1 - tw;
-        if (T == 1) {   // (by the W blocks of [0, k) this request moved there: where the lane's wait goes)
+        if (T == 1 && !small_of[seq % kRing]) {   // (by the W blocks of [0, k) this request moved there: where the lane's
+                                                  //  wait goes; a decode request's - not a small prompt's)
             const int64_t wb = (int64_t) wpk.size() * (rx_k - cut);
             const int bk = wb == 0 ? 0 : wb <= 3 ? 1 : wb <= 6 ? 2 : wb <= 12 ? 3 : 4;
             ++st.rx_wb_n[bk];
@@ -8578,7 +8594,10 @@ struct Model::Impl {
                 ents.clear();
                 if (store && li > 0 && li < g.nl) store->cancel_stale(li - 1);   // (guesses for layers the token has passed: dropped unread)
                 // lookahead: the guesses made for this layer (when they are for this request), counted on decode
-                const uint8_t* fl = T == 1 && !ahead_for.empty() && ahead_for[(size_t) li] == next
+                // (a small prompt's window of one is not a decode window: its guesses are asked for and kept all the
+                // same - ahead_ask, ahead_fl - but not counted)
+                const bool dec = !small_of[next % kRing];
+                const uint8_t* fl = T == 1 && dec && !ahead_for.empty() && ahead_for[(size_t) li] == next
                                         ? ahead_fl.data() + (size_t) li * 1024 : nullptr;
                 // the window's CPU-lane picks by expert (up to 8 tokens an entry), their weights by entry row
                 float wv[kWin * kPicks];
@@ -8671,7 +8690,7 @@ struct Model::Impl {
                         st.ahead_rank_hit[rk[e] - 1] += hit;
                     }
                 }
-                if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
+                if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T, dec);
                 double rx_t0 = 0.0;
                 // a request goes out (the gate and the link allowing) for the server's experts, or for slice picks
                 bool want = !rpicks.empty() || (spl && !picks.empty());
@@ -8843,7 +8862,8 @@ struct Model::Impl {
                     if (lane_prof) st.lp_add_ms += now_ms() - ta;
                     const double tl = now_ms() - tc;
                     st.cpu_ms += tl;
-                    if (T == 1 && sp.sent) {   // (by the request's CPU-lane picks: the lane's part at the same count)
+                    if (T == 1 && dec && sp.sent) {   // (by the request's CPU-lane picks: the lane's part at the same count;
+                                                      //  a decode request's - not a small prompt's)
                         const int q = std::min(nlane, 9);
                         ++st.rx_np_n[q];
                         st.rx_np_ms[q] += tl;
@@ -9018,6 +9038,7 @@ struct Model::Impl {
             const int il = g.nl + i;
             dp.seq[il] = ++seq_issued;
             ep_of[dp.seq[il] % kRing] = dp.ep;
+            small_of[dp.seq[il] % kRing] = small_feed;
             layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
         }
         const size_t hs = (size_t) T * H * D, rs = (size_t) g.win * g.hd;
@@ -10754,6 +10775,73 @@ struct Model::Impl {
         if (psettle.after_feed(rx_on, logits_rows) && (!o.stage_worker || stage_last)) cache_settle();
         return true;
     }
+    // DS4_SMALL_PROMPT: read once, at the load - N (0 off; past kPickMax held to it: from there on pick_path always
+    // takes the flow, and a long run of one-row windows would be a long prompt without the chunked path's progress),
+    // and DS4_SMALL_WIN's rows held to 1..min(kWin, DS4_ASYNC_T) (past DS4_ASYNC_T a window is synchronous, which is what
+    // the small path is not).  A text that is not a number, or out of range, is off (or 1) with a line saying why
+    void small_setup() {
+        std::string note;
+        small_n = small_prompt_n(std::getenv("DS4_SMALL_PROMPT"), kPickMax, note);
+        if (!note.empty()) std::fprintf(stderr, "ds4: %s\n", note.c_str());
+        if (small_n < 2) {
+            small_n = 0;
+            return;
+        }
+        if (o.remote_stage || o.stage_worker) {   // (the link's prompts keep their chunks and windows of 16)
+            std::fprintf(stderr, "ds4: DS4_SMALL_PROMPT=%d: off for this run - a remote stage\n", small_n);
+            small_n = 0;
+            return;
+        }
+        const int asked = small_win_ask(std::getenv("DS4_SMALL_WIN"), note);
+        if (!note.empty()) std::fprintf(stderr, "ds4: %s\n", note.c_str());
+        small_t = small_win(asked, kWin, async_max_t);
+        if (small_t != asked)
+            std::fprintf(stderr, "ds4: DS4_SMALL_WIN=%d: clamped to %d (1 to the smaller of %d and DS4_ASYNC_T %d)\n",
+                         asked, small_t, kWin, async_max_t);
+        std::fprintf(stderr, "ds4: DS4_SMALL_PROMPT=%d: prompts of 2-%d tokens in windows of %d through the decode's path%s\n",
+                     small_n, small_n, small_t, small_t == 1 && ep_defer && !ep_verify
+                                                    ? ", with the DS4_EP_DEFER deferral (the decode's approximation)" : "");
+    }
+    // DS4_SMALL_PROMPT: n tokens through windows of small_t rows as the decode runs them (ep: the n_ff slices, the
+    // expert server's async windows, at 1 row DS4_EP_DEFER's deferral), the last one's logits_rows rows of logits; the
+    // rest as feed_windows (win_prompt the whole prompt, the settle at its end).  A Stop (set_cancel, asked between
+    // windows as forward_chunks asks it while its run goes on) ends it there as a chunked prompt's does: false, halted,
+    // the state at the window it reached (the caller restores a checkpoint or resets).  Not before the first window: the
+    // serve loop asks before each feed, and feed_mark's last token comes after its checkpoint(slot) - a Stop there
+    // would leave the caller no checkpoint at the prompt's start (restore fails, the conversation is reset), where a
+    // chunked prompt never stops after its snapshot
+    bool feed_small(const int* tokens, int n, int logits_rows, std::string& err) {
+        logits_all = false;
+        {
+            struct Off {   // (win_prompt, small_feed false again on every way out)
+                bool& w;
+                bool& s;
+                ~Off() { w = false; s = false; }
+            } off{win_prompt, small_feed};
+            win_prompt = true;   // (its ticks the decode's; forward leaves psettle to the end here)
+            small_feed = true;   // (a prompt's windows: not the decode's statistics)
+            for (int a = 0; a < n; a += small_t) {
+                if (a > 0 && cancel && cancel()) {
+                    halted = true;
+                    err = "stopped while reading the prompt";
+                    return false;
+                }
+                const int T = std::min(small_t, n - a);
+                if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, true, err)) return false;
+            }
+        }
+        if (psettle.after_feed(rx_on, logits_rows) && (!o.stage_worker || stage_last)) cache_settle();   // (feed_windows')
+        return true;
+    }
+    // a small prompt of n tokens took ms: its own running mean, ms a token (pick_path's pm learns nothing from it)
+    void small_done(int n, double ms) {
+        const double a = ms / std::max(1, n);
+        small_ms = small_k == 0 ? a : 0.7 * small_ms + 0.3 * a;
+        ++small_k;
+        if (o.verbose)   // (ms a token: the running mean)
+            std::fprintf(stderr, "ds4: a prompt of %d tokens in windows of %d (DS4_SMALL_PROMPT=%d): %.0f ms (%.1f ms a token)\n",
+                         n, small_t, small_n, ms, small_ms);
+    }
     // the picked path took ms: the flow's predictions for the prompt's size class scaled by what it really takes (taken
     // / predicted), windows' time a window - running means
     void path_done(double ms) {
@@ -11369,7 +11457,8 @@ struct Model::Impl {
         hc_late_add(h, &rp.part[0][0], (size_t) kMaxDim, rp.cpu, d.late_post, comb, g.dim, g.hc, T, d.st);
         if (ep_verify) {
             max_rel_diff(d.h, h, (size_t) T * g.hc * g.dim, v_err + late_il, d.st);
-            ++st.ep_verify_n;
+            if (!small_feed) ++st.ep_verify_n;   // (the decode's checks: a small prompt's are made, but not counted; the
+                                                 //  largest differences, ep_verify[], stay since the load's)
         }
         late_slot = -1;
     }
@@ -11405,6 +11494,7 @@ struct Model::Impl {
             if (wp.async && !elsewhere(l)) {   // (the service thread answers the seqs in order: only the layers run here)
                 wp.seq[il] = ++seq_issued;
                 ep_of[wp.seq[il] % kRing] = wp.ep;
+                small_of[wp.seq[il] % kRing] = small_feed;
                 layer_of[wp.seq[il] % kRing].store(il, std::memory_order_release);
             }
         }
@@ -11546,7 +11636,7 @@ struct Model::Impl {
             std::memcpy(h_emb + (size_t) t * D, emb_row(p0 + t, tk[t]), (size_t) D * 2);
         late_slot = -1;   // (DS4_EP_DEFER: a window that failed midway leaves nothing for this one)
         plan_window(p0, T, ep, wplan);
-        prof_window = prof_on && T == 1;
+        prof_window = prof_on && T == 1 && !small_feed;
         n_logits = std::min(logits_rows, T);
         const double tl = now_ms();
         if (par) {
@@ -11572,7 +11662,8 @@ struct Model::Impl {
         pos += T;
         st.tokens += T;
         cache_tick(T, win_prompt ? 0 : -1);   // (a window prompt's: the server's experts as the decode's, rx_row(.., 0))
-        if (ep) psettle.next();   // (a decode window: the next prompt settles again)
+        psettle.window_end(ep, win_prompt);   // (a decode window: the next prompt settles again; a small prompt's
+                                              //  (feed_small) is the prompt's, which settles once at its end)
         if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err)) return false;
         return true;
     }
@@ -12266,7 +12357,7 @@ struct Model::Impl {
                 late_slot = slot;
                 late_seq = sq;
                 late_il = l.il;
-                if (!ep_verify) ++st.ep_late;
+                if (!ep_verify && !small_feed) ++st.ep_late;   // (the decode's layers: a small prompt's are not)
             }
             prof_mark(d, 5);
             return true;
@@ -12505,6 +12596,13 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     Impl& p = *p_;
     p.pm.last = -1;
     p.halted = false;
+    if (small_prompt(n, logits_rows, p.small_n, p.o.remote_stage || p.o.stage_worker)) {   // (DS4_SMALL_PROMPT: before
+        const double t0 = now_ms();   // pick_path and the windows of 16 below chunk_min; pm.last stays -1)
+        const bool ok = p.feed_small(tokens, n, logits_rows, err);
+        if (ok) p.small_done(n, now_ms() - t0);
+        if (logits_rows > 0) p.psettle.next();   // (as below)
+        return ok;
+    }
     if (p.chunk > 0 && n >= p.chunk_min) {   // a long run - or one the flow could take, if it is the faster path here
         const double t0 = now_ms();   // (every row's logits (tests): the chunked path, which keeps them all; a remote
                                       // stage's main process: chunks, where windows would cross the link 16 rows a time)
@@ -12524,6 +12622,14 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     p.pm.last = -1;
     p.halted = false;
     const double t0 = now_ms();
+    if (small_prompt(n, logits_rows, p.small_n, p.o.remote_stage || p.o.stage_worker)) {   // (DS4_SMALL_PROMPT, as feed's:
+        // the run but its last token in small windows, the checkpoint, then the last token as a window of 1)
+        const bool ok = p.feed_small(tokens, n - 1, 0, err) &&
+                        (p.checkpoint(slot), p.feed_small(tokens + n - 1, 1, logits_rows, err));
+        if (ok) p.small_done(n, now_ms() - t0);
+        if (logits_rows > 0) p.psettle.next();
+        return ok;
+    }
     if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.o.remote_stage && p.ckpt_ok()) {
         // (a remote stage that keeps checkpoints: the worker takes its part of one at the position it is at, so the run
         // stops short of its last row - its chunks, the checkpoint on both sides, then the last row as a window)

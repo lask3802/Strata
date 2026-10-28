@@ -980,6 +980,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # DS4_STAGE_N (ds4_stage_slots.hpp): the flow's staging slots apart from the ring's; no GPU, no model
       add_executable(ds4_stage_slots_test tests/dsv41/stage_slots_test.cpp)
       target_compile_features(ds4_stage_slots_test PRIVATE cxx_std_17)
+      # DS4_SMALL_PROMPT / DS4_SMALL_WIN (ds4_small_prompt.hpp): which feeds take the decode's windows; no GPU, no model
+      add_executable(ds4_small_prompt_test tests/dsv41/small_prompt_test.cpp)
+      target_compile_features(ds4_small_prompt_test PRIVATE cxx_std_17)
       # the kept conversations' .meta file and prefix matching (ds4_slotmeta.hpp): no GPU, no model
       add_executable(ds4_slot_test tests/dsv41/slot_test.cpp)
       target_include_directories(ds4_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
