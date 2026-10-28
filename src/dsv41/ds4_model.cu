@@ -10371,9 +10371,12 @@ struct Model::Impl {
     }
     // DS4_SMALL_PROMPT: n tokens through windows of small_t rows as the decode runs them (ep: the n_ff slices, the
     // expert server's async windows, at 1 row DS4_EP_DEFER's deferral), the last one's logits_rows rows of logits; the
-    // rest as feed_windows (win_prompt the whole prompt, the settle at its end).  A Stop (set_cancel, asked before every
-    // window as forward_chunks asks it while its run goes on) ends it there as a chunked prompt's does: false, halted,
-    // the state at the window it reached (the caller restores a checkpoint or resets)
+    // rest as feed_windows (win_prompt the whole prompt, the settle at its end).  A Stop (set_cancel, asked between
+    // windows as forward_chunks asks it while its run goes on) ends it there as a chunked prompt's does: false, halted,
+    // the state at the window it reached (the caller restores a checkpoint or resets).  Not before the first window: the
+    // serve loop asks before each feed, and feed_mark's last token comes after its checkpoint(slot) - a Stop there
+    // would leave the caller no checkpoint at the prompt's start (restore fails, the conversation is reset), where a
+    // chunked prompt never stops after its snapshot
     bool feed_small(const int* tokens, int n, int logits_rows, std::string& err) {
         logits_all = false;
         {
@@ -10385,7 +10388,7 @@ struct Model::Impl {
             win_prompt = true;   // (its ticks the decode's; forward leaves psettle to the end here)
             small_feed = true;   // (a prompt's windows: not the decode's statistics)
             for (int a = 0; a < n; a += small_t) {
-                if (cancel && cancel()) {
+                if (a > 0 && cancel && cancel()) {
                     halted = true;
                     err = "stopped while reading the prompt";
                     return false;
