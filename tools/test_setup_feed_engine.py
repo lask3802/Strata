@@ -73,6 +73,18 @@ class FeedEngine(unittest.TestCase):
                 self.assertIsNone(setup.get_prebuilt(setup.PREBUILT_URL, gpu, "none", updating=True, toolkit=toolkit))
             feed.assert_not_called()
 
+    def test_arm64_linux_compiles_instead_of_taking_the_feed_package(self):
+        # Strata Link: upstream 0.2.7.1 installs the linux-aarch64 feed package on a DGX Spark; Link compiles it there, as before
+        gpu = {"arch": 121, "archs": [121], "vram_gb": 100.0, "index": 0, "uma": True}
+        (self.eng / "BUILD.json").unlink()                                    # a first install
+        with mock.patch.object(setup, "engine_dir", lambda toolkit=13: self.eng), mock.patch.object(setup, "is_arm64", return_value=True), \
+                mock.patch.object(setup.sys, "platform", "linux"), mock.patch.object(setup, "_urlopen") as urlopen, \
+                mock.patch.object(setup, "engine_from_feed", return_value=self.eng) as feed:
+            for updating in (False, True):
+                self.assertIsNone(setup.get_prebuilt(setup.PREBUILT_URL, gpu, "none", updating=updating))
+            feed.assert_not_called()
+            urlopen.assert_not_called()
+
     def test_the_minimum_is_the_0_2_engine(self):
         self.assertLess((0, 1, 45), setup.MIN_ENGINE)
         self.assertGreaterEqual((0, 1, 46), setup.WIN_HIP_MIN_ENGINE)
