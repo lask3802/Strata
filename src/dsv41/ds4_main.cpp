@@ -1320,6 +1320,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        std::fprintf(stderr, "%s", m.defer_lines(s_dec).c_str());   // (DS4_EP_DEFER_STAT, the split: this answer's)
         m.save_profile();
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
@@ -1437,6 +1438,7 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
     std::vector<float> lg;
     std::vector<int> order;
     const double t0 = now_ms();
+    const strata::ds4::Stats s0 = m.stats();   // (the heavy-first deferral's lines at the end: DS4_EP_DEFER_STAT's)
     for (size_t si = 0; si < segs.size(); ++si) {
         const std::vector<int>& ids = segs[si].ids;
         m.reset();
@@ -1498,6 +1500,8 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
     std::fprintf(sj, "]}\n");
     std::fclose(sj);
     std::fclose(out);
+    // (DS4_EP_DEFER_STAT, DS4_EP_DEFER_BELOW / TOP and their CHECK: a score prints no decode stats but these)
+    std::fprintf(stderr, "%s", m.defer_lines(s0).c_str());
     return 0;
 }
 // ---- Strata H100 addition: profile run -------------------------------------------------------------------------
@@ -2155,6 +2159,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "ep defer: %lld layers' CPU-lane parts added a layer late (%.1f a token; DS4_PROF's wait for "
                              "the CPU lane is then the next layer's)\n", (long long) (s.ep_late - s0.ep_late),
                      (double) (s.ep_late - s0.ep_late) / (double) std::max<size_t>(1, out.size()));
+    std::fprintf(stderr, "%s", m.defer_lines(s0).c_str());   // (DS4_EP_DEFER_STAT, DS4_EP_DEFER_BELOW / TOP and their CHECK)
     if (s.ep_verify_n > s0.ep_verify_n) {   // DS4_EP_DEFER_VERIFY
         // float order (estimated: a few ulp of the terms; the slot measures it); any layer above it is a wiring bug or
         // a non-finite value (inf) - and under VERIFY=2 (the wrong comb) the check must see layers above it

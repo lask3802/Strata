@@ -235,10 +235,15 @@ struct Req {
 };
 struct Resp {
     unsigned seq;
-    int pad[3];
+    // DS4_EP_DEFER_BELOW / DS4_EP_DEFER_TOP (a split request, T 1): part[0] / cpu[0] (the heavy picks') final - written
+    // before seq on every path; seq: part[1] / cpu[1] (the light ones') too.  Unused otherwise
+    unsigned hseq;
+    int pad[2];
     int cpu[kWin];   // 1: part[t] is the CPU lane's weighted sum for token t
     float part[kWin][kMaxDim];
 };
+static_assert(offsetof(Resp, cpu) == 16 && sizeof(Resp) == 16 + sizeof(int) * kWin + sizeof(float) * kWin * kMaxDim,
+              "Resp's layout as before hseq took a pad word");
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
 /// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
