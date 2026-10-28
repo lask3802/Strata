@@ -1026,7 +1026,7 @@ struct Model::Impl {
     // layer-major prompt is done, cancelled at the next prompt's start
     bool rewarm_on = false;
     Rewarm rewarm;
-    int chunk_own = -1;            // (a remote stage's main process, once set_stage_chunk ran) the chunk of its load
+    int chunk_own = -1;               // (a remote stage's main process, once set_stage_chunk ran) the chunk of its load
     static constexpr bool kChunkedPromptDefault = true;   // the layer-major prompt is the default (gate: KL 0.1685 vs 0.1686, 8K prompt 6x, decode within 2% - ds4 notes-dsv41-r97)
     static constexpr int kFlowChunkMin = 2;   // chunk_min with every device's layers on the flow (see load)
     // --prefill-chunk at most (route() runs in kVlRows-row slabs).  The default stays kVlRows: a 16384-token chunk
@@ -3855,7 +3855,7 @@ struct Model::Impl {
             }
         calibrate_paths();
         lm_prealloc();     // (DS4_LM_PRE: pinned too, before the store's arena; its RAM out of the warm read's budget)
-        init_store();     // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
+        init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
         if (!ep_slices_ok(err)) return false;
         if (!init_down_parts(err)) return false;
