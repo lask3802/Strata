@@ -208,9 +208,10 @@ struct Stats {
     bool rx_split_wrong = false;
     int64_t ep_late = 0;   // DS4_EP_DEFER: the layers whose mailbox part the next layer (or the head) added
     // DS4_EP_DEFER_VERIFY: the checks made (a layer's deferred streams against the exact ones), and by the layer whose
-    // part it was the largest relative difference since the load (the last layer's: before the head)
+    // part it was the largest relative difference since the load (the last layer's: before the head) - ep_verify
+    // against 1 + |exact|, ep_verify_s (the verdict's) against the magnitude of the terms the two sides sum
     int64_t ep_verify_n = 0;
-    float ep_verify[64] = {};
+    float ep_verify[64] = {}, ep_verify_s[64] = {};
     bool ep_verify_wrong = false;   // DS4_EP_DEFER_VERIFY=2: the wrong comb on purpose (the check must see it)
     // DS4_EP_DEFER_BELOW / DS4_EP_DEFER_TOP (ds4_defer_split.hpp): the decode requests split (the heavy part added in the
     // layer, the light one a layer late), their CPU-lane picks, the heavy ones among them, and the split requests with a

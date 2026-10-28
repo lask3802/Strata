@@ -1357,17 +1357,25 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
 // DS4_EP_DEFER_VERIFY's line since s0 (nothing when no check was counted): the decode's stats and a score's end
 static void print_ep_verify(const strata::ds4::Stats& s, const strata::ds4::Stats& s0) {
     if (s.ep_verify_n > s0.ep_verify_n) {   // DS4_EP_DEFER_VERIFY
-        // float order (estimated: a few ulp of the terms; the slot measures it); any layer above it is a wiring bug or
-        // a non-finite value (inf) - and under VERIFY=2 (the wrong comb) the check must see layers above it
+        // |d| / S, S the magnitude of every term the two sides summed since they forked (ds4_kernels.cuh hc_mag): each
+        // side's value has at most 18 (deferred: the combine's add, the FFN hc_post's 5, add_diff's 2, the attention
+        // hc_post's 5, the late add's 4 + 1) or 13 (exact: the combine's 2, 5, the split's in-place add 1, 5) roundings
+        // on any path, so |fl(x) - x| <= gamma_n * S each (Higham, Accuracy and Stability, 3.1) and |d| <= (gamma_18 +
+        // gamma_13) S = 1.9e-6 S (u = 2^-24) however much the terms cancel.  The bound, 1e-5, leaves 5x for S's own
+        // rounding and the count; a layer above it is a wiring bug or a non-finite value (inf) - and under VERIFY=2 (the
+        // wrong comb) the check must see layers above it.  (|d| / (1 + |exact|), the line's before, is no bound: a
+        // residual stream of 1e3-1e4 that a layer's output cancels to ~1 puts it at 1e-4 - printed for reference)
         const float bound = 1e-5f;
-        int last = -1, worst = -1, above = 0, seen = 0;
-        for (int i = 0; i < 64; ++i)
-            if (s.ep_verify[i] != 0.0f) {
+        int last = -1, worst = -1, above = 0, seen = 0, wr = -1;
+        for (int i = 0; i < 64; ++i) {
+            if (s.ep_verify[i] != 0.0f && (wr < 0 || s.ep_verify[i] > s.ep_verify[wr])) wr = i;
+            if (s.ep_verify_s[i] != 0.0f) {
                 last = i;
                 ++seen;
-                if (worst < 0 || s.ep_verify[i] > s.ep_verify[worst]) worst = i;
-                if (!(s.ep_verify[i] <= bound)) ++above;
+                if (worst < 0 || s.ep_verify_s[i] > s.ep_verify_s[worst]) worst = i;
+                if (!(s.ep_verify_s[i] <= bound)) ++above;
             }
+        }
         // (VERIFY=2: every layer's add but the head's takes the wrong comb, so all of them but the last must be above)
         const char* verdict = s.ep_verify_wrong ? (above > 0 && above + 1 >= seen ? "the wrong comb seen: the check works"
                                                    : above > 0 ? "the wrong comb seen in some layers only: partly blind, "
@@ -1379,15 +1387,17 @@ static void print_ep_verify(const strata::ds4::Stats& s, const strata::ds4::Stat
         std::string ln;
         for (int i = 0; i <= last; ++i) {
             char b[32];
-            std::snprintf(b, sizeof b, " %d:%.1e", i, s.ep_verify[i]);
+            std::snprintf(b, sizeof b, " %d:%.1e", i, s.ep_verify_s[i]);
             ln += b;
         }
         std::fprintf(stderr, "ep defer verify: %lld checks of the deferred streams against the exact ones (the same "
-                             "attention: float order only); the largest |d| / (1 + |exact|) by the layer whose part it "
-                             "was (the last: before the head; since the load):%s; worst %.2e at layer %d; bound %.0e: "
-                             "%d of the %d layers that differed above it - %s%s\n",
-                     (long long) (s.ep_verify_n - s0.ep_verify_n), ln.c_str(), worst >= 0 ? s.ep_verify[worst] : 0.0f,
-                     worst, (double) bound, above, seen, s.ep_verify_wrong ? "DS4_EP_DEFER_VERIFY=2: " : "", verdict);
+                             "attention: float order only); the largest |d| / S, S the magnitude of the terms both sides "
+                             "summed (float order: <= 1.9e-6), by the layer whose part it was (the last: before the head; "
+                             "since the load):%s; worst %.2e at layer %d (|d| / (1 + |exact|): worst %.2e at layer %d); "
+                             "bound %.0e: %d of the %d layers that differed above it - %s%s\n",
+                     (long long) (s.ep_verify_n - s0.ep_verify_n), ln.c_str(), worst >= 0 ? s.ep_verify_s[worst] : 0.0f,
+                     worst, wr >= 0 ? s.ep_verify[wr] : 0.0f, wr, (double) bound, above, seen,
+                     s.ep_verify_wrong ? "DS4_EP_DEFER_VERIFY=2: " : "", verdict);
     }
 }
 

@@ -543,8 +543,8 @@ struct Dev {
     float* glog_a = nullptr;   // lookahead: the next two layers' gate logits on this layer's FFN input (rows 1024 apart)
     float* late_post = nullptr;   // DS4_EP_DEFER: the FFN post of the layer whose mailbox part is still out (rows 8 apart)
     // DS4_EP_DEFER_VERIFY: the deferred path beside the exact one - its FFN output without the part, its streams after
-    // that FFN, and after the next attention
-    float *v_moe = nullptr, *v_h = nullptr, *v_h2 = nullptr;
+    // that FFN, and after the next attention; v_a: the magnitude of the terms both sides summed since the fork (hc_mag)
+    float *v_moe = nullptr, *v_h = nullptr, *v_h2 = nullptr, *v_a = nullptr;
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *tok = nullptr;
     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
     uint8_t* eg_rows = nullptr;
@@ -1336,12 +1336,16 @@ struct Model::Impl {
     // streams after that attention (or before the head): up to the float sums' order they are the same, so a larger
     // difference is a wiring bug.  An Engram layer's in-place add to the exact streams (its gates from them) goes onto
     // the deferred ones too (add_diff).  v_err[il]: the largest relative difference for layer il's part (device; Stats
-    // gets a copy after each window)
+    // gets a copy after each window) - |d| / (1 + |exact|); v_errs[il], the verdict's, |d| / S with S the magnitude of
+    // every term the two sides summed since they forked (Dev::v_a, hc_mag): float order bounds |d| by ~31 roundings of
+    // S (31 u = 1.9e-6, u = 2^-24) however much the terms cancel, which |d| / (1 + |exact|) does not - a residual
+    // stream of 1e3-1e4 that a layer's output cancels to ~1 puts that one at 1e-4
+    // (ds4_main.cpp's print_ep_verify has the count)
     int defer_from = 0, late_il = -1;
     bool ep_verify = false;
     bool v_wrong = false;   // DS4_EP_DEFER_VERIFY=2: the check's own check - the deferred side given a wrong comb (layer
                             // l's FFN one) on purpose, which the comparison must show; decode stays exact
-    float* v_err = nullptr;
+    float *v_err = nullptr, *v_errs = nullptr;
     // DS4_EP_DEFER_BELOW=w / DS4_EP_DEFER_TOP=r (heavy-first deferral, ds4_defer_split.hpp; split_setup): a deferred
     // layer's CPU-lane part in two - the heavy picks' (a share of the token's route weights >= w, or its r largest) in
     // part[0], which the layer adds through the experts' sum as without the deferral, the light ones' in part[1]
@@ -11733,7 +11737,8 @@ struct Model::Impl {
         if (ep_verify) {
             const size_t W = kWin, D = (size_t) g.dim, H = (size_t) g.hc;
             if (!dalloc(d, d.v_moe, W * D, err) || !dalloc(d, d.v_h, W * H * D, err) || !dalloc(d, d.v_h2, W * H * D, err) ||
-                !dalloc(d, v_err, (size_t) kMaxL, err))
+                !dalloc(d, d.v_a, W * H * D, err) || !dalloc(d, v_err, (size_t) kMaxL, err) ||
+                !dalloc(d, v_errs, (size_t) kMaxL, err))
                 return false;
         }
         ep_defer = true;
@@ -11815,6 +11820,10 @@ struct Model::Impl {
         hc_late_add(h, &rp.part[late_row][0], (size_t) kMaxDim, &rp.cpu[late_row], d.late_post, comb, g.dim, g.hc, T, d.st);
         if (ep_verify) {
             max_rel_diff(d.h, h, (size_t) T * g.hc * g.dim, v_err + late_il, d.st);
+            // (the verdict's: against the terms' magnitude - the fork's, through this attention's hc_post when one ran;
+            // its own comb, not the add's, which VERIFY=2 makes wrong)
+            max_mag_diff(d.h, h, d.v_a, d.ao, d.a_post, comb != nullptr ? d.a_comb : nullptr, g.dim, g.hc, T,
+                         v_errs + late_il, d.st);
             if (!small_feed) ++st.ep_verify_n;   // (the decode's checks: a small prompt's are made, but not counted; the
                                                  //  largest differences, ep_verify[], stay since the load's)
         }
@@ -12018,6 +12027,7 @@ struct Model::Impl {
         if (!head_wait(d.st, err)) return false;
         if (ep_verify) {   // (the window's checks are in: its stream is done)
             CK(cudaMemcpy(st.ep_verify, v_err, sizeof(float) * (size_t) std::min(g.nl, 64), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(st.ep_verify_s, v_errs, sizeof(float) * (size_t) std::min(g.nl, 64), cudaMemcpyDeviceToHost));
             st.ep_verify_wrong = v_wrong;
         }
         prof_collect();
@@ -12315,7 +12325,10 @@ struct Model::Impl {
             const size_t nh = (size_t) T * H * D;
             if (vg) CK(cudaMemcpyAsync(d.v_h2, d.h, nh * 4, cudaMemcpyDeviceToDevice, s));
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
-            if (vg) add_diff(d.v_h, d.h, d.v_h2, nh, s);
+            if (vg) {
+                add_diff(d.v_h, d.h, d.v_h2, nh, s);
+                add_abs2(d.v_a, d.h, d.v_h2, nh, s);   // (the scale through add_diff's terms)
+            }
         }
         // attention
         if (hc2) {
@@ -12718,8 +12731,15 @@ struct Model::Impl {
             if (lead) st.experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
             if (hc2) CK(cudaStreamWaitEvent(s, d.ev_join, 0));
-            if (late && ep_verify) hc_post(hs ? d.moe_out : d.v_moe, d.h, d.f_post, d.f_comb, D, H, T, d.v_h, s);   // (the
-                                                                                                               //  deferred streams)
+            if (late && ep_verify) {
+                hc_post(hs ? d.moe_out : d.v_moe, d.h, d.f_post, d.f_comb, D, H, T, d.v_h, s);   // (the deferred streams)
+                // (their terms' magnitude from here, the fork: the exact side's FFN output (its combine's m + part, then +
+                // the shared expert's: |m| <= |v_moe| + |sh|), the deferred side's, the shared expert's and the part
+                // still out - a split layer's light one, which the exact side adds in place below)
+                const int pr = hs ? 1 : 0;
+                hc_mag(d.moe_out, hs ? nullptr : d.v_moe, d.sh_out, &resps[slot].part[pr][0], (size_t) kMaxDim,
+                       &resps[slot].cpu[pr], d.h, d.f_post, d.f_comb, D, H, T, d.v_a, s);
+            }
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             if (hs && ep_verify)   // (the exact streams: the light part in place, hc_post's term for it - comb null: c = post)

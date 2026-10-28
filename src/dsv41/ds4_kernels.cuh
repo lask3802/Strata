@@ -83,6 +83,18 @@ void hc_late_add(float* h, const float* part, size_t part_stride, const int* fla
 void max_rel_diff(const float* a, const float* b, size_t n, float* out, cudaStream_t s);
 /// y[i] += a[i] - b[i] (DS4_EP_DEFER_VERIFY: an in-place change of the exact streams, e.g. Engram's, onto the deferred).
 void add_diff(float* y, const float* a, const float* b, size_t n, cudaStream_t s);
+/// DS4_EP_DEFER_VERIFY's scale - the magnitude of every term the two sides sum, so a float-order difference is bounded
+/// by it however much the terms cancel (|fl(x) - x| <= gamma_n * x evaluated in absolute values, n the roundings on a
+/// path).  out[t][k][e] = |post[t][k]| (|ya| + |yb| + |yc| + |part| where flag[t]) + sum_j |comb[t][j][k]| res[t][j][e]
+/// (yb, yc, part: null for none; res: the streams, their |.| taken; out must not alias res).
+void hc_mag(const float* ya, const float* yb, const float* yc, const float* part, size_t part_stride, const int* flag,
+            const float* res, const float* post, const float* comb, int dim, int hc, int T, float* out, cudaStream_t s);
+/// y[i] += |a[i]| + |b[i]| (the scale through add_diff's two roundings).
+void add_abs2(float* y, const float* a, const float* b, size_t n, cudaStream_t s);
+/// *out = max(*out, max |a - b| / S) (a NaN, or a difference where S is 0, counts as inf): S = mag (comb null: the head)
+/// or the next attention's hc_post on it in absolute values, |post[t][k]| |y[t][e]| + sum_j |comb[t][j][k]| mag[t][j][e].
+void max_mag_diff(const float* a, const float* b, const float* mag, const float* y, const float* post, const float* comb,
+                  int dim, int hc, int T, float* out, cudaStream_t s);
 /// A chunk's hc_mix: the dots of each row with the n_mix weights already in mixes (a GEMM's, rows 32 apart), times
 /// rsqrt(mean(h_row^2) + eps) - hc_mix's value up to the dots' summation order.
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);

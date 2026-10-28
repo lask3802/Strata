@@ -1822,6 +1822,56 @@ __global__ void add_diff_kernel(float* __restrict__ y, const float* __restrict__
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] += a[i] - b[i];
 }
+// a thread a (token, stream, value): hc_post's terms in absolute value - |post| times the outputs' (each given one; the
+// part where flagged) plus |comb| times the streams'
+__global__ void hc_mag_kernel(const float* __restrict__ ya, const float* __restrict__ yb, const float* __restrict__ yc,
+                              const float* __restrict__ part, size_t part_stride, const int* __restrict__ flag,
+                              const float* __restrict__ res, const float* __restrict__ post,
+                              const float* __restrict__ comb, int dim, int hc, float* __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (i >= dim * hc) return;
+    const int k = i / dim, e = i - k * dim;
+    const size_t ye = (size_t) t * dim + e;
+    float y = fabsf(ya[ye]);
+    if (yb != nullptr) y += fabsf(yb[ye]);
+    if (yc != nullptr) y += fabsf(yc[ye]);
+    if (part != nullptr && flag[t] != 0) y += fabsf(part[(size_t) t * part_stride + e]);
+    float a = fabsf(post[(size_t) t * 8 + k]) * y;
+    const float* r = res + (size_t) t * hc * dim;
+    for (int j = 0; j < hc; ++j) a += fabsf(comb[(size_t) t * 64 + j * hc + k]) * fabsf(r[(size_t) j * dim + e]);
+    out[(size_t) t * hc * dim + i] = a;
+}
+__global__ void add_abs2_kernel(float* __restrict__ y, const float* __restrict__ a, const float* __restrict__ b, size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] += fabsf(a[i]) + fabsf(b[i]);
+}
+// a thread a (token, stream, value): |a - b| / S into *out as max_rel_diff_kernel does, S the terms' magnitude - mag
+// itself (comb null), else the attention hc_post's on it: |post| |y| + sum_j |comb[j][k]| mag[j].  S 0: 0 when a == b,
+// else inf
+__global__ void max_mag_diff_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                                    const float* __restrict__ mag, const float* __restrict__ y,
+                                    const float* __restrict__ post, const float* __restrict__ comb, int dim, int hc,
+                                    unsigned* out) {
+    __shared__ unsigned m;
+    if (threadIdx.x == 0) m = 0u;
+    __syncthreads();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (i < dim * hc) {
+        const int k = i / dim, e = i - k * dim;
+        const size_t at = (size_t) t * hc * dim + i;
+        float sc = mag[at];
+        if (comb != nullptr) {
+            const float* r = mag + (size_t) t * hc * dim;
+            sc = fabsf(post[(size_t) t * 8 + k]) * fabsf(y[(size_t) t * dim + e]);
+            for (int j = 0; j < hc; ++j) sc += fabsf(comb[(size_t) t * 64 + j * hc + k]) * r[(size_t) j * dim + e];
+        }
+        const float d = fabsf(a[at] - b[at]);
+        const float v = d == 0.0f ? 0.0f : sc > 0.0f ? d / sc : __int_as_float(0x7f800000);
+        atomicMax(&m, __float_as_uint(v == v ? v : __int_as_float(0x7f800000)));   // (a NaN: counted as inf)
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && m != 0u) atomicMax(out, m);
+}
 
 // a thread a (token, value): every stream's value read before any is written
 __global__ void hc_post_inplace_kernel(const float* __restrict__ y, float* h, const float* __restrict__ post,
@@ -2117,6 +2167,20 @@ void max_rel_diff(const float* a, const float* b, size_t n, float* out, cudaStre
 void add_diff(float* y, const float* a, const float* b, size_t n, cudaStream_t s) {
     if (n == 0) return;
     add_diff_kernel<<<(unsigned) ((n + kThreads - 1) / kThreads), kThreads, 0, s>>>(y, a, b, n);
+}
+void hc_mag(const float* ya, const float* yb, const float* yc, const float* part, size_t part_stride, const int* flag,
+            const float* res, const float* post, const float* comb, int dim, int hc, int T, float* out, cudaStream_t s) {
+    hc_mag_kernel<<<dim3(cdiv(dim * hc, kThreads), T), kThreads, 0, s>>>(ya, yb, yc, part, part_stride, flag, res, post,
+                                                                          comb, dim, hc, out);
+}
+void add_abs2(float* y, const float* a, const float* b, size_t n, cudaStream_t s) {
+    if (n == 0) return;
+    add_abs2_kernel<<<(unsigned) ((n + kThreads - 1) / kThreads), kThreads, 0, s>>>(y, a, b, n);
+}
+void max_mag_diff(const float* a, const float* b, const float* mag, const float* y, const float* post, const float* comb,
+                  int dim, int hc, int T, float* out, cudaStream_t s) {
+    max_mag_diff_kernel<<<dim3(cdiv(dim * hc, kThreads), T), kThreads, 0, s>>>(a, b, mag, y, post, comb, dim, hc,
+                                                                                (unsigned*) out);
 }
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
     hc_mix_scale_kernel<<<T, kThreads, 0, s>>>(h, hcdim, n_mix, eps, mixes);
