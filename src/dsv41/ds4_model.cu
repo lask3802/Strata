@@ -25,6 +25,7 @@
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
+#include "ds4_rewarm.hpp"
 #include "ds4_rx_fill.hpp"
 #include "ds4_rx_fill_link.hpp"
 #include "ds4_rx.hpp"
@@ -1021,7 +1022,11 @@ struct Model::Impl {
     bool lc_thp = true;
     // DS4_LM_PRE=1 (the load reads it; lm_prealloc): the layer-major prompt's host memory allocated once at the load
     bool lm_pre = false;
-    int chunk_own = -1;             // (a remote stage's main process, once set_stage_chunk ran) the chunk of its load
+    // DS4_REWARM=1 (the load reads it; rewarm_start): the warm set read in again on a thread of its own once a
+    // layer-major prompt is done, cancelled at the next prompt's start
+    bool rewarm_on = false;
+    Rewarm rewarm;
+    int chunk_own = -1;            // (a remote stage's main process, once set_stage_chunk ran) the chunk of its load
     static constexpr bool kChunkedPromptDefault = true;   // the layer-major prompt is the default (gate: KL 0.1685 vs 0.1686, 8K prompt 6x, decode within 2% - ds4 notes-dsv41-r97)
     static constexpr int kFlowChunkMin = 2;   // chunk_min with every device's layers on the flow (see load)
     // --prefill-chunk at most (route() runs in kVlRows-row slabs).  The default stays kVlRows: a 16384-token chunk
@@ -1642,6 +1647,7 @@ struct Model::Impl {
     }
 
     ~Impl() {
+        rewarm.cancel();   // (DS4_REWARM: its reads go through the pack's mappings)
         eg_io.stop();   // (its threads write into h_eg)
         for (auto& w : workers) w->stop();
         for (size_t i = 0; i < chunks.size(); ++i)
@@ -2280,32 +2286,22 @@ struct Model::Impl {
         return !d.at.empty() && ff0 % 256 == 0 && ffn > 0 && ffn % 256 == 0 && ff0 / 256 >= d.a && ff0 + ffn <= 256 * d.b
                    ? &d : nullptr;
     }
-    // DS4_IQ_WARM=split (iq_warm_split above), at the end of the load (the server's upload, rx_split's slices and the
-    // parts known): what the CPU lane reads of each of its experts' picks read in and mapped, the most-routed up to
-    // warm_bytes (in what order: DS4_IQ_WARM_ORDER), then with DS4_IQ_WARM_TOUCH=1 each of its pages read once through that mapping.  Neither read ahead nor dropped from the page cache (no POSIX_FADV_DONTNEED): a CPU-lane expert's
-    // rows past its layer's slice (its gate / up [k, 9); with the parts the pack's down), and the expert server's experts
-    // (rx_has; DS4_IQ_WARM_SRV=1: read as the lane's own, since a fill hands them back to it).  The lane reads those only when it computes a pick's [k, 9), or a pick whole, after all - a late or lost
-    // reply, a pick the send gate keeps here, the link given up - and then they come in by page faults through the same
-    // mapping: from the page cache where something left them, else from the disk (such an expert's first fallback pick
-    // waits for its reads: ~2.9 MB of the pack's down, 1.9 MB of gate / up [6, 9) at k 6 on this pack).  No range of a
-    // CPU-lane expert is one the lane never reads, so none is dropped; the VRAM experts' pages are, as before
-    // (load_experts_mx)
-    void warm_split() {
-        if (!iq_warm_split) return;
-        if (!file_experts || ram_tier || warm_bytes == 0) {
-            std::fprintf(stderr, "ds4: DS4_IQ_WARM=split: nothing read ahead (%s)\n",
-                         !file_experts ? "the CPU lane's experts are not read in place"
-                         : ram_tier    ? "the RAM tier holds the CPU lane's hottest experts"
-                                       : "no RAM to keep them: warm_bytes 0");
-            return;
-        }
-        struct Rg {   // a range of the lane's mapping and where a pread reads it from: the pack's file, or the parts'
-            const uint8_t* p;
-            size_t n;
-            int file;     // (the pack's; -1: the parts', fd)
-            uint64_t off;
-            os::fd_t fd;
-        };
+    // a range of the lane's mapping and where a pread reads it from: the pack's file, or the parts'
+    struct WarmRg {
+        const uint8_t* p;
+        size_t n;
+        int file;     // (the pack's; -1: the parts', fd)
+        uint64_t off;
+        os::fd_t fd;
+    };
+    // warm_split's plan (DS4_IQ_WARM=split, as the experts lie now: the placement, the profile): the ranges in the order
+    // it reads them, what they hold, how many experts within warm_bytes of how many (n_ws), the expert server's among them
+    struct WarmPlan {
+        std::vector<WarmRg> rg;
+        double gu = 0, dpb = 0, dwb = 0, b = 0;
+        size_t nw = 0, n_ws = 0, n_rx = 0;
+    };
+    WarmPlan warm_plan() {
         struct W {
             double share;
             int li, e;
@@ -2332,7 +2328,7 @@ struct Model::Impl {
         }
         std::stable_sort(ws.begin(), ws.end(), [](const W& a, const W& b) { return a.share > b.share; });
         const auto& pf = dparts.files();
-        auto ranges = [&](const W& w, std::vector<Rg>& out) {
+        auto ranges = [&](const W& w, std::vector<WarmRg>& out) {
             const Layer& l = L[(size_t) w.li];
             const int ff0 = l.ep_ff0, ffn = l.ep_ffn < 0 ? g.ff - ff0 : l.ep_ffn;
             const uint64_t eo[3] = {l.mx_off[0] + (uint64_t) w.e * l.mx_stride[0], l.mx_off[1] + (uint64_t) w.e * l.mx_stride[1],
@@ -2352,7 +2348,7 @@ struct Model::Impl {
             out.push_back({pk.at(l.mx_file[2], eo[2]), mx_part_bytes(l, 2), l.mx_file[2], eo[2], os::kBadFd});
         };
         // the budget, the most-routed first; the ranges by expert, read side by side by 12 threads
-        std::vector<Rg> rg;
+        std::vector<WarmRg> rg;
         double gu = 0, dpb = 0, dwb = 0, b = 0;
         size_t nw = 0;
         for (; nw < ws.size(); ++nw) {
@@ -2369,6 +2365,84 @@ struct Model::Impl {
             (rg[at + 2].file < 0 ? dpb : dwb) += (double) rg[at + 2].n;
         }
         if (iq_warm_cold_first) std::reverse(rg.begin(), rg.end());   // (DS4_IQ_WARM_ORDER: the budget's coldest first)
+        WarmPlan wp;
+        wp.rg = std::move(rg);
+        wp.gu = gu;
+        wp.dpb = dpb;
+        wp.dwb = dwb;
+        wp.b = b;
+        wp.nw = nw;
+        wp.n_ws = ws.size();
+        wp.n_rx = n_rx;
+        return wp;
+    }
+    // DS4_REWARM=1, once a layer-major prompt is done (after its settle: the placement it leaves): warm_split's ranges
+    // as the experts lie now read in again on one thread of its own (rewarm, ds4_rewarm.hpp: one at a time; the next
+    // prompt cancels it at its start, between two ranges) - the pages the prompt's memory cost the page cache brought
+    // back for the decode after it.  Reads only (MADV_POPULATE_READ, else pread): no number the model computes changes.
+    // Its line: how long, and the bytes it brought in (each range's pages not in the page cache, mincore, before and
+    // after)
+    void rewarm_start() {
+        if (!rewarm_on || !file_experts || ram_tier || warm_bytes == 0) return;
+        rewarm.cancel();   // (the last one stopped first, as start would: its reads not beside this plan's)
+        WarmPlan plan = warm_plan();
+        if (plan.rg.empty()) return;
+        rewarm.start([this, rg = std::move(plan.rg)](const std::atomic<bool>& stop) {
+            const double t0 = now_ms();
+            size_t done = 0;
+            uint64_t in = 0, cold0 = 0;
+            long long by_read = 0, failed = 0;
+            bool no_pop = false;
+            std::vector<uint8_t> buf;
+            for (const WarmRg& x : rg) {
+                if (stop.load(std::memory_order_acquire)) break;
+                const size_t c0 = os::cold_bytes(x.p, x.n);
+                cold0 += c0;
+                const int r = no_pop ? 0 : os::populate(x.p, x.n);
+                if (r == 0) no_pop = true;   // (not had here: pread from now on)
+                if (r != 1) {
+                    if (buf.size() < x.n) buf.resize(x.n);
+                    const bool ok = x.file >= 0 ? pk.read_at(x.file, x.off, x.n, buf.data())
+                                                : os::pread_full(x.fd, buf.data(), x.n, x.off);
+                    ++by_read;
+                    if (!ok) ++failed;
+                }
+                const size_t c1 = c0 > 0 ? os::cold_bytes(x.p, x.n) : 0;
+                in += c0 > c1 ? c0 - c1 : 0;
+                ++done;
+            }
+            std::fprintf(stderr, "ds4: DS4_REWARM=1: the warm set read in again after the layer-major prompt in %.0f ms: "
+                                 "%zu of %zu ranges, %.2f GB brought into the page cache of %.2f GB not in it (mincore "
+                                 "before / after)%s%s%s\n",
+                         now_ms() - t0, done, rg.size(), (double) in / 1e9, (double) cold0 / 1e9,
+                         done < rg.size() ? "; stopped by the next prompt" : "",
+                         by_read > 0 ? (no_pop ? "; by pread (MADV_POPULATE_READ not had here)" : "; some by pread") : "",
+                         failed > 0 ? "; some reads failed" : "");
+        });
+    }
+    // DS4_IQ_WARM=split (iq_warm_split above), at the end of the load (the server's upload, rx_split's slices and the
+    // parts known): what the CPU lane reads of each of its experts' picks read in and mapped, the most-routed up to
+    // warm_bytes (in what order: DS4_IQ_WARM_ORDER), then with DS4_IQ_WARM_TOUCH=1 each of its pages read once through that mapping.  Neither read ahead nor dropped from the page cache (no POSIX_FADV_DONTNEED): a CPU-lane expert's
+    // rows past its layer's slice (its gate / up [k, 9); with the parts the pack's down), and the expert server's experts
+    // (rx_has; DS4_IQ_WARM_SRV=1: read as the lane's own, since a fill hands them back to it).  The lane reads those only when it computes a pick's [k, 9), or a pick whole, after all - a late or lost
+    // reply, a pick the send gate keeps here, the link given up - and then they come in by page faults through the same
+    // mapping: from the page cache where something left them, else from the disk (such an expert's first fallback pick
+    // waits for its reads: ~2.9 MB of the pack's down, 1.9 MB of gate / up [6, 9) at k 6 on this pack).  No range of a
+    // CPU-lane expert is one the lane never reads, so none is dropped; the VRAM experts' pages are, as before
+    // (load_experts_mx)
+    void warm_split() {
+        if (!iq_warm_split) return;
+        if (!file_experts || ram_tier || warm_bytes == 0) {
+            std::fprintf(stderr, "ds4: DS4_IQ_WARM=split: nothing read ahead (%s)\n",
+                         !file_experts ? "the CPU lane's experts are not read in place"
+                         : ram_tier    ? "the RAM tier holds the CPU lane's hottest experts"
+                                       : "no RAM to keep them: warm_bytes 0");
+            return;
+        }
+        WarmPlan plan = warm_plan();
+        std::vector<WarmRg>& rg = plan.rg;
+        const double gu = plan.gu, dpb = plan.dpb, dwb = plan.dwb, b = plan.b;
+        const size_t nw = plan.nw, n_rx = plan.n_rx;
         const double t0 = now_ms();
         std::atomic<size_t> ri{0};
         std::atomic<int> no_pop{0};
@@ -2378,7 +2452,7 @@ struct Model::Impl {
             th.emplace_back([&] {
                 std::vector<uint8_t> buf;
                 for (size_t i; (i = ri.fetch_add(1)) < rg.size();) {
-                    const Rg& x = rg[i];
+                    const WarmRg& x = rg[i];
                     if (no_pop.load(std::memory_order_relaxed) == 0) {
                         const int r = os::populate(x.p, x.n);
                         if (r == 1) continue;
@@ -2403,7 +2477,7 @@ struct Model::Impl {
                              "of their slices %.1f GB, downs %.1f GB from the parts and %.1f GB the pack's whole ones) - %s; "
                              "left out: %zu past warm_bytes (%.1f GB), the expert server's %zu, and each one's rows past its "
                              "slice (read only by the lane's fallback: neither read ahead nor dropped)\n",
-                     nw, (now_ms() - t0) / 1000.0, b / 1e9, gu / 1e9, dpb / 1e9, dwb / 1e9, how.c_str(), ws.size() - nw,
+                     nw, (now_ms() - t0) / 1000.0, b / 1e9, gu / 1e9, dpb / 1e9, dwb / 1e9, how.c_str(), plan.n_ws - nw,
                      warm_bytes / 1e9, iq_warm_srv ? (size_t) 0 : n_rx);
         if (!iq_warm_touch) {
             std::fprintf(stderr, "ds4: DS4_IQ_WARM_TOUCH unset or 0: the pages read ahead not touched\n");
@@ -2580,6 +2654,15 @@ struct Model::Impl {
                 return false;
             }
             lm_pre = true;
+        }
+        if (const char* v = std::getenv("DS4_REWARM"); v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0) {
+            if (std::strcmp(v, "1") != 0) {
+                err = "DS4_REWARM: 1 (the warm set read in again after a layer-major prompt); unset, empty or 0: off";
+                return false;
+            }
+            rewarm_on = iq_warm_split;
+            if (!rewarm_on)
+                std::fprintf(stderr, "ds4: DS4_REWARM=1: nothing to read again (DS4_IQ_WARM is not split)\n");
         }
         if (!pk.load(o.pack, err)) return false;
         g.from(pk);
@@ -11213,6 +11296,7 @@ struct Model::Impl {
     // n tokens at positions pos .. in chunks of equal size (at most `chunk`), pipelined over the groups; the logits of
     // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits)
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1) {
+        if (rewarm_on) rewarm.cancel();   // (DS4_REWARM: also a run not through feed - a remote stage worker's)
         if (n < 1) return true;
         if (pos + n > o.max_context) {
             err = "the context is full";
@@ -11599,6 +11683,7 @@ struct Model::Impl {
             lm_end_.on = false;
         }
         if (!o.stage_worker || stage_last) cache_settle();   // (a worker: after its main process's whole run)
+        if (lm && rewarm_on) rewarm_start();   // (DS4_REWARM: the warm set again, as the settle left the placement)
         const int nr = std::min(T_last, tap_cap);
         if (!seed_drafter(pos - nr, nr, 0, err)) return false;
         if (snap_slot >= 0) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
@@ -12838,6 +12923,7 @@ bool Model::load(const Options& o, std::string& err) { return p_->load(o, err); 
 bool Model::step(int token, bool logits, std::string& err) { return p_->step(token, logits, err); }
 bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     Impl& p = *p_;
+    if (p.rewarm_on) p.rewarm.cancel();   // (DS4_REWARM: a prompt's start stops the last one's re-warm)
     p.pm.last = -1;
     p.halted = false;
     if (small_prompt(n, logits_rows, p.small_n, p.o.remote_stage || p.o.stage_worker)) {   // (DS4_SMALL_PROMPT: before
@@ -12863,6 +12949,7 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
 }
 bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
     Impl& p = *p_;
+    if (p.rewarm_on) p.rewarm.cancel();   // (DS4_REWARM, as feed's)
     p.pm.last = -1;
     p.halted = false;
     const double t0 = now_ms();

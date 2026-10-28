@@ -987,6 +987,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # regions and their reuse; no GPU, no model
       add_executable(ds4_flow_batches_test tests/dsv41/flow_batches_test.cpp)
       target_compile_features(ds4_flow_batches_test PRIVATE cxx_std_17)
+      # DS4_REWARM's runner (ds4_rewarm.hpp): one at a time, a cancel stops and waits for it; no GPU, no model
+      add_executable(ds4_rewarm_test tests/dsv41/rewarm_test.cpp)
+      target_compile_features(ds4_rewarm_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_rewarm_test PRIVATE Threads::Threads)
       # the kept conversations' .meta file and prefix matching (ds4_slotmeta.hpp): no GPU, no model
       add_executable(ds4_slot_test tests/dsv41/slot_test.cpp)
       target_include_directories(ds4_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
