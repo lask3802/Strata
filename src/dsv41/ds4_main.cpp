@@ -1354,6 +1354,42 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     return 0;
 }
 
+// DS4_EP_DEFER_VERIFY's line since s0 (nothing when no check was counted): the decode's stats and a score's end
+static void print_ep_verify(const strata::ds4::Stats& s, const strata::ds4::Stats& s0) {
+    if (s.ep_verify_n > s0.ep_verify_n) {   // DS4_EP_DEFER_VERIFY
+        // float order (estimated: a few ulp of the terms; the slot measures it); any layer above it is a wiring bug or
+        // a non-finite value (inf) - and under VERIFY=2 (the wrong comb) the check must see layers above it
+        const float bound = 1e-5f;
+        int last = -1, worst = -1, above = 0, seen = 0;
+        for (int i = 0; i < 64; ++i)
+            if (s.ep_verify[i] != 0.0f) {
+                last = i;
+                ++seen;
+                if (worst < 0 || s.ep_verify[i] > s.ep_verify[worst]) worst = i;
+                if (!(s.ep_verify[i] <= bound)) ++above;
+            }
+        // (VERIFY=2: every layer's add but the head's takes the wrong comb, so all of them but the last must be above)
+        const char* verdict = s.ep_verify_wrong ? (above > 0 && above + 1 >= seen ? "the wrong comb seen: the check works"
+                                                   : above > 0 ? "the wrong comb seen in some layers only: partly blind, "
+                                                                 "unless the others had no CPU-lane part in the run"
+                                                               : "the wrong comb NOT seen: the check is blind")
+                              : above  ? "MISMATCH (wiring, or inf)"
+                              : seen   ? "ok"
+                                       : "ok (no layer differed at all: exact, or not checked)";
+        std::string ln;
+        for (int i = 0; i <= last; ++i) {
+            char b[32];
+            std::snprintf(b, sizeof b, " %d:%.1e", i, s.ep_verify[i]);
+            ln += b;
+        }
+        std::fprintf(stderr, "ep defer verify: %lld checks of the deferred streams against the exact ones (the same "
+                             "attention: float order only); the largest |d| / (1 + |exact|) by the layer whose part it "
+                             "was (the last: before the head; since the load):%s; worst %.2e at layer %d; bound %.0e: "
+                             "%d of the %d layers that differed above it - %s%s\n",
+                     (long long) (s.ep_verify_n - s0.ep_verify_n), ln.c_str(), worst >= 0 ? s.ep_verify[worst] : 0.0f,
+                     worst, (double) bound, above, seen, s.ep_verify_wrong ? "DS4_EP_DEFER_VERIFY=2: " : "", verdict);
+    }
+}
 
 // ---- Strata addition: teacher-forced scoring (the quality gate) -------------------------------------------------
 // --score IDS.json --score-out RUN.tsv: every segment of a tools/quant_quality.py ids file (name + ids) is read through
@@ -1500,8 +1536,10 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
     std::fprintf(sj, "]}\n");
     std::fclose(sj);
     std::fclose(out);
-    // (DS4_EP_DEFER_STAT, DS4_EP_DEFER_BELOW / TOP and their CHECK: a score prints no decode stats but these)
+    // (DS4_EP_DEFER_STAT, DS4_EP_DEFER_BELOW / TOP and their CHECK, DS4_EP_DEFER_VERIFY's: a score prints no decode stats
+    // but these - so the window's short score arms are the wiring checks)
     std::fprintf(stderr, "%s", m.defer_lines(s0).c_str());
+    print_ep_verify(m.stats(), s0);
     return 0;
 }
 // ---- Strata H100 addition: profile run -------------------------------------------------------------------------
@@ -2160,39 +2198,7 @@ int main(int argc, char** argv) {
                              "the CPU lane is then the next layer's)\n", (long long) (s.ep_late - s0.ep_late),
                      (double) (s.ep_late - s0.ep_late) / (double) std::max<size_t>(1, out.size()));
     std::fprintf(stderr, "%s", m.defer_lines(s0).c_str());   // (DS4_EP_DEFER_STAT, DS4_EP_DEFER_BELOW / TOP and their CHECK)
-    if (s.ep_verify_n > s0.ep_verify_n) {   // DS4_EP_DEFER_VERIFY
-        // float order (estimated: a few ulp of the terms; the slot measures it); any layer above it is a wiring bug or
-        // a non-finite value (inf) - and under VERIFY=2 (the wrong comb) the check must see layers above it
-        const float bound = 1e-5f;
-        int last = -1, worst = -1, above = 0, seen = 0;
-        for (int i = 0; i < 64; ++i)
-            if (s.ep_verify[i] != 0.0f) {
-                last = i;
-                ++seen;
-                if (worst < 0 || s.ep_verify[i] > s.ep_verify[worst]) worst = i;
-                if (!(s.ep_verify[i] <= bound)) ++above;
-            }
-        // (VERIFY=2: every layer's add but the head's takes the wrong comb, so all of them but the last must be above)
-        const char* verdict = s.ep_verify_wrong ? (above > 0 && above + 1 >= seen ? "the wrong comb seen: the check works"
-                                                   : above > 0 ? "the wrong comb seen in some layers only: partly blind, "
-                                                                 "unless the others had no CPU-lane part in the run"
-                                                               : "the wrong comb NOT seen: the check is blind")
-                              : above  ? "MISMATCH (wiring, or inf)"
-                              : seen   ? "ok"
-                                       : "ok (no layer differed at all: exact, or not checked)";
-        std::string ln;
-        for (int i = 0; i <= last; ++i) {
-            char b[32];
-            std::snprintf(b, sizeof b, " %d:%.1e", i, s.ep_verify[i]);
-            ln += b;
-        }
-        std::fprintf(stderr, "ep defer verify: %lld checks of the deferred streams against the exact ones (the same "
-                             "attention: float order only); the largest |d| / (1 + |exact|) by the layer whose part it "
-                             "was (the last: before the head; since the load):%s; worst %.2e at layer %d; bound %.0e: "
-                             "%d of the %d layers that differed above it - %s%s\n",
-                     (long long) (s.ep_verify_n - s0.ep_verify_n), ln.c_str(), worst >= 0 ? s.ep_verify[worst] : 0.0f,
-                     worst, (double) bound, above, seen, s.ep_verify_wrong ? "DS4_EP_DEFER_VERIFY=2: " : "", verdict);
-    }
+    print_ep_verify(s, s0);   // DS4_EP_DEFER_VERIFY
     if (s.rx_split_n > s0.rx_split_n) {   // DS4_EP_SPLIT_VERIFY
         // the server's slice sums in bf16 against this lane's for the same x in bf16: the bf16 rounding of a sum (~4e-3);
         // a layer above it is the server's share wired wrong (its blocks, its picks, its parts) - and under =2 (the
