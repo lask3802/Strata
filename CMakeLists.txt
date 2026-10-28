@@ -934,6 +934,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         add_executable(ds4_defer_test tests/dsv41/defer_test.cu src/dsv41/ds4_kernels.cu)
         target_include_directories(ds4_defer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
         target_link_libraries(ds4_defer_test PRIVATE ${_strata_gpu_runtime_target})
+        # DS4_ATTN_TC (ds4_attn_tc.cuh): the prompt slab's tensor-core sparse attention against the packed rows' kernel
+        # and a double reference, --bench their times; needs a GPU, no model.  _k8: Turing's m16n8k8 path on any GPU
+        foreach(_t ds4_attn_tc_test ds4_attn_tc_test_k8)
+          add_executable(${_t} tests/dsv41/attn_tc_test.cu src/dsv41/ds4_kernels.cu)
+          target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+          target_link_libraries(${_t} PRIVATE ${_strata_gpu_runtime_target})
+        endforeach()
+        target_compile_definitions(ds4_attn_tc_test_k8 PRIVATE DS4_ATTN_TC_K8=1)
       endif()
       # the remote experts (ds4_rx.hpp): this is the main process's end, an expert server (strata-dsv41
       # --expert-server-connect, a GPU) the other; its replies against the CPU lane's sums of the same random experts

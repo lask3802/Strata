@@ -168,6 +168,12 @@ struct AttnRows {
 /// defaults); the first call prints it.  A test may set it; attn_split_runs counts the split kernel's launches.
 bool& attn_split();
 unsigned long long attn_split_runs();
+/// DS4_ATTN_TC: sparse_attn takes the tensor-core kernel (ds4_attn_tc.cuh: FP16 mma, F32 softmax and sums) for a
+/// prompt chunk's slab - gen 1, packed rows, more than kAttnScratchT queries, heads_per_block 0, heads a multiple of
+/// 32 - in mode 1 (q and P as FP16 hi + lo pairs: F32-like), 2 (q hi + lo, P FP16) or 3 (plain FP16); 0 off (unset,
+/// empty or 0: the packed kernel, as before; any other number: 1).  The first such slab reads it and prints it when
+/// on.  A test may set it.  CUDA only (HIP: 0).
+int& attn_tc();
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
                  int ckv_fmt = kKvFp4, int heads_per_block = 0, const AttnScratch* scr = nullptr);
