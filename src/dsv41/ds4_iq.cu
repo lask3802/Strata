@@ -1442,12 +1442,142 @@ __global__ void __launch_bounds__(kThreads) dq_rows_kernel(const uint8_t* __rest
     }
 }
 
+// DS4_DQ_NEW=1 (Strata upstream 8abe826f): dq_rows_kernel's sub-blocks and arithmetic, its 32 values a thread through
+// shared memory and written coalesced - the block's 256 sub-blocks are 8192 contiguous values of dst (rows included), a
+// warp's store 64 contiguous bytes where dq_rows_kernel's lanes write 2 bytes every 64 (a warp's store touches 32 cache
+// lines; the 30K prompt's attention slabs reconstruct their weights at ~95 GB/s on the 2080 Ti with it).  The same values.
+template <int T>
+__global__ void __launch_bounds__(kThreads) dq_rows_kernel2(const uint8_t* __restrict__ raw, size_t ld, int k, int n,
+                                                            uint16_t* __restrict__ dst, bool bf16) {
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    __shared__ uint16_t sm[kThreads * 32];
+    load_tab<T>(tab);
+    __syncthreads();
+    const int nsb = k / 32;
+    const size_t total = (size_t) n * (size_t) nsb;   // 32-value sub-blocks
+    const size_t vals = (size_t) n * (size_t) k;
+    for (size_t base = (size_t) blockIdx.x * kThreads; base < total; base += (size_t) gridDim.x * kThreads) {
+        const size_t i = base + threadIdx.x;
+        uint16_t* o = sm + threadIdx.x * 32;
+        if (i < total) {
+            const size_t r = i / (size_t) nsb;
+            const int kb = (int) (i - r * (size_t) nsb);
+            Sub sb;
+            sb.m0 = sb.m1 = 0.0f;
+            decode<T>(raw + r * ld, kb, tab, sb);
+            const float d0 = __fmul_rn(sb.d, (float) sb.s0), d1 = __fmul_rn(sb.d, (float) sb.s1);
+#pragma unroll
+            for (int j = 0; j < 32; ++j) {
+                const int q = (int) (int8_t) ((uint32_t) sb.q[j >> 2] >> (8 * (j & 3)));
+                const float v = j < 16 ? __fsub_rn(__fmul_rn(d0, (float) q), sb.m0) : __fsub_rn(__fmul_rn(d1, (float) q), sb.m1);
+                o[j] = bf16 ? strata::ds4::bf16_rn(v) : __half_as_ushort(__float2half_rn(v));
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 32; ++j) o[j] = 0;
+        }
+        __syncthreads();
+        // sm[m] is the block's value m: written a thread's 32 values apart
+        const size_t go = base * 32;
+        uint16_t* d = dst + go;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const size_t m = (size_t) j * kThreads + threadIdx.x;
+            if (go + m < vals) d[m] = sm[m];
+        }
+        __syncthreads();
+    }
+}
+
+// DS4_DQ_NEW=2 (Strata upstream 03056168, which upstream defaults to on gfx11 only): dq_rows_kernel's row-per-lane sub-blocks,
+// a sub-block's 32 values packed into four 16-byte stores, and a warp's 32 sub-blocks (4 blocks of a row) staged in shared
+// by contiguous uint4 loads, decoded at the index relative to the staged copy (kb0 is a multiple of the 8 sub-blocks of a
+// block: exactly equivalent).  The same values.  Here the staging is only for the types whose 4 blocks are whole uint4s
+// (Q4_K 36, Q5_K 44, Q2_K 21 of them; not Q6_K's 840 bytes or Q3_K's 440 - upstream's 44-uint4 buffer took Q6_K's 52 into
+// the next warp's and dropped the last block's d) and a 16-byte aligned raw / ld; a lane waits for its warp before the
+// next staging overwrites what the others decode.  dst 16-byte aligned (dequant_rows checks).
+template <int T>
+__global__ void __launch_bounds__(kThreads) dq_rows_kernel3(const uint8_t* __restrict__ raw, size_t ld, int k, int n,
+                                                            uint16_t* __restrict__ dst, bool bf16) {
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    load_tab<T>(tab);
+    __syncthreads();
+    const int nsb = k / 32;
+    const size_t total = (size_t) n * (size_t) nsb;
+    constexpr int kQKv = kQK<T>;
+    constexpr int kSpan = (kQKv == 32 ? 32 : 4) * Ty<T>::B;               // bytes of a warp's 32 sub-blocks
+    constexpr bool kCanStage = Ty<T>::TAB == 0 && kSpan % 16 == 0;        // (a codebook table already fills shared)
+    constexpr int kV4 = kCanStage ? kSpan / 16 : 1;
+    const bool staged = kCanStage && nsb % 32 == 0 && ((uintptr_t) raw & 15u) == 0 && ld % 16 == 0;
+    __shared__ uint4 sin4[(kThreads / 32) * kV4];
+    const int lane32 = threadIdx.x & 31, wq = threadIdx.x >> 5;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
+        const size_t r = i / (size_t) nsb;
+        const int kb = (int) (i - r * (size_t) nsb);
+        Sub sb;
+        sb.m0 = sb.m1 = 0.0f;
+        if (staged) {   // (nsb % 32 == 0: a warp's 32 sub-blocks are in one row, and every lane of it runs each pass)
+            const size_t wbase = i - (size_t) lane32;
+            const size_t r0 = wbase / (size_t) nsb;
+            const int kb0 = (int) (wbase - r0 * (size_t) nsb);
+            const uint8_t* srcp = raw + r0 * ld + (size_t) (kb0 * Ty<T>::B) / (kQKv / 32);
+            uint4* st = sin4 + wq * kV4;
+            __syncwarp();   // (the warp's last pass decoded from st)
+            for (int c = lane32; c < kV4; c += 32) st[c] = ((const uint4*) srcp)[c];
+            __syncwarp();
+            decode<T>((const uint8_t*) st, kb - kb0, tab, sb);
+        } else
+            decode<T>(raw + r * ld, kb, tab, sb);
+        const float d0 = __fmul_rn(sb.d, (float) sb.s0), d1 = __fmul_rn(sb.d, (float) sb.s1);
+        uint16_t* o = dst + r * (size_t) k + (size_t) kb * 32;
+        uint32_t hw[16];
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int q0 = (int) (int8_t) ((uint32_t) sb.q[j >> 1] >> (8 * ((2 * j) & 3)));
+            const int q1 = (int) (int8_t) ((uint32_t) sb.q[j >> 1] >> (8 * ((2 * j + 1) & 3)));
+            const float v0 = 2 * j < 16 ? __fsub_rn(__fmul_rn(d0, (float) q0), sb.m0) : __fsub_rn(__fmul_rn(d1, (float) q0), sb.m1);
+            const float v1 = 2 * j + 1 < 16 ? __fsub_rn(__fmul_rn(d0, (float) q1), sb.m0) : __fsub_rn(__fmul_rn(d1, (float) q1), sb.m1);
+            const uint32_t h0 = bf16 ? strata::ds4::bf16_rn(v0) : __half_as_ushort(__float2half_rn(v0));
+            const uint32_t h1 = bf16 ? strata::ds4::bf16_rn(v1) : __half_as_ushort(__float2half_rn(v1));
+            hw[j] = h0 | (h1 << 16);
+        }
+        uint4* o4 = (uint4*) o;
+        o4[0] = make_uint4(hw[0], hw[1], hw[2], hw[3]);
+        o4[1] = make_uint4(hw[4], hw[5], hw[6], hw[7]);
+        o4[2] = make_uint4(hw[8], hw[9], hw[10], hw[11]);
+        o4[3] = make_uint4(hw[12], hw[13], hw[14], hw[15]);
+    }
+}
+
 }  // namespace
+
+int& dq_kernel() {
+    static int v = [] {
+        const char* e = std::getenv("DS4_DQ_NEW");
+        const int x = e != nullptr ? std::atoi(e) : 0;
+        if (e != nullptr && x != 1 && x != 2)   // (set to anything else: said, once - a mistyped arm is not silently off)
+            std::fprintf(stderr, "ds4: DS4_DQ_NEW=%s: off - 1 (stores coalesced through shared memory) or 2 (16-byte "
+                                 "stores, staged input) turns it on\n", e);
+        else if (x == 1 || x == 2)   // (on: said too, at the first dequant - an arm's log shows it took)
+            std::fprintf(stderr, "ds4: DS4_DQ_NEW=%d: the chunked prompt's dense dequant by dq_rows_kernel%d (%s)\n", x,
+                         x + 1, x == 1 ? "stores coalesced through shared memory" : "16-byte stores, staged input");
+        return x == 1 || x == 2 ? x : 0;
+    }();
+    return v;
+}
 
 bool dequant_rows(int type, const void* raw, size_t ld, int k, int n, uint16_t* dst, bool bf16, cudaStream_t s) {
     if (raw == nullptr || k % 256 != 0 || n <= 0) return false;
     const unsigned blocks = (unsigned) std::min<size_t>(((size_t) n * (size_t) (k / 32) + kThreads - 1) / kThreads, 65535);
-#define DS4_DQ(T) dq_rows_kernel<T><<<blocks, kThreads, 0, s>>>((const uint8_t*) raw, ld, k, n, dst, bf16)
+    const int kern = dq_kernel() == 2 && ((uintptr_t) dst & 15u) != 0 ? 1 : dq_kernel();   // (kernel3's stores: 16 bytes)
+#define DS4_DQ(T) do {                                                                                      \
+        if (kern == 0)                                                                                      \
+            dq_rows_kernel<T><<<blocks, kThreads, 0, s>>>((const uint8_t*) raw, ld, k, n, dst, bf16);       \
+        else if (kern == 1)                                                                                 \
+            dq_rows_kernel2<T><<<blocks, kThreads, 0, s>>>((const uint8_t*) raw, ld, k, n, dst, bf16);      \
+        else                                                                                                \
+            dq_rows_kernel3<T><<<blocks, kThreads, 0, s>>>((const uint8_t*) raw, ld, k, n, dst, bf16);      \
+    } while (0)
     switch (type) {
         case kIQ2_XXS: DS4_DQ(kIQ2_XXS); break;
         case kIQ2_XS: DS4_DQ(kIQ2_XS); break;
