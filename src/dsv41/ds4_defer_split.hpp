@@ -58,12 +58,16 @@ inline Val parse_top(const char* v, int& r) {
 /// the switches together: the rule and the line that says so (no "ds4: " prefix; empty: nothing to say).  below, top:
 /// the texts; deferred: DS4_EP_DEFER's deferral runs (or its VERIFY's); conflict: a check of the run's own that the split
 /// would change (null: none); the deferred layers defer_from .. nl - 1, the last of them never split (its add before the
-/// head is exact)
+/// head is exact); wait - what a split layer waits for: kWaitHeavy the heavy part alone (hseq: the speed path),
+/// kWaitBoth both (DS4_EP_DEFER_BELOW_WAIT=1, the quality probe: the speed path's numbers), kWaitVerify both
+/// (DS4_EP_DEFER_VERIFY: decode exact)
+enum Wait : int { kWaitHeavy = 0, kWaitBoth = 1, kWaitVerify = 2 };
 struct Setup {
     Rule rule;
     std::string line;
 };
-inline Setup setup(const char* below, const char* top, bool deferred, const char* conflict, int defer_from, int nl) {
+inline Setup setup(const char* below, const char* top, bool deferred, const char* conflict, int defer_from, int nl,
+                   int wait = kWaitHeavy) {
     Setup s;
     float w = 0.0f;
     int r = 0;
@@ -120,9 +124,13 @@ inline Setup setup(const char* below, const char* top, bool deferred, const char
         s.rule.r = r;
         std::snprintf(rule, sizeof rule, "each token's %d largest-share CPU-lane picks", r);
     }
+    const char* wt = wait == kWaitBoth   ? "DS4_EP_DEFER_BELOW_WAIT=1: the layer waits for both parts - a quality probe, the "
+                                           "speed path's numbers at about DS4_EP_DEFER=0's speed"
+                     : wait == kWaitVerify ? "the layer waits for both parts (DS4_EP_DEFER_VERIFY: decode exact)"
+                                           : "the layer waits for the heavy part alone (hseq: the speed path)";
     std::snprintf(b, sizeof b, "%s=%.32s: layers %d-%d split their CPU-lane part - %s (heavy) added in the layer, the rest "
-                               "a layer late (layer %d's whole, before the head); the layer waits for both parts: a "
-                               "quality probe, the speed path is not built yet", nm, tx, defer_from, nl - 2, rule, nl - 1);
+                               "a layer late (layer %d's whole, before the head); %s", nm, tx, defer_from, nl - 2, rule,
+                  nl - 1, wt);
     s.line = b;
     return s;
 }

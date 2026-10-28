@@ -1059,6 +1059,42 @@ int main(int argc, char** argv) {
         check(ok && rel < 1e-2, b);
     }
 
+    // DS4_EP_DEFER_BELOW's speed path: the lane reads the link between its jobs (wait_resp, its deadline past) - 0 at
+    // once while the reply is not in (not a late one: nothing in take_late), then the reply itself, the same bits as
+    // one waited for
+    {
+        rx::ReqRow r;
+        r.n = 3;
+        for (int i = 0; i < 3; ++i) {
+            r.e[i] = (int16_t) i;
+            r.w[i] = uw(rng);
+        }
+        std::vector<float> x((size_t) E);
+        for (int c = 0; c < E; ++c) x[(size_t) c] = ux(rng);
+        const float* xp[1] = {x.data()};
+        const uint16_t* y = nullptr;
+        int us = 0;
+        std::vector<uint16_t> yw((size_t) E);
+        (void) m.take_late();
+        bool ok = m.send_req(++seq, 0, 1, &r, xp, err) && m.wait_resp(seq, 1, rx::now_ms() + 20000.0, &y, us, err) == 1;
+        if (ok) std::copy(y, y + E, yw.begin());
+        ok = ok && m.send_req(++seq, 0, 1, &r, xp, err);
+        const double t0 = rx::now_ms();
+        const int g0 = ok ? m.wait_resp(seq, 1, 0.0, &y, us, err) : -2;
+        const double dt0 = rx::now_ms() - t0;
+        const bool st0 = m.last_stale();
+        int g = g0, polls = 1;
+        for (const double end = rx::now_ms() + 20000.0; g == 0 && !m.last_stale() && rx::now_ms() < end; ++polls)
+            g = m.wait_resp(seq, 1, 0.0, &y, us, err);
+        bool same = g == 1;
+        for (int c = 0; same && c < E; ++c) same = y[c] == yw[(size_t) c];
+        const auto late = m.take_late();
+        std::snprintf(b, sizeof b, "a poll right after the send: 0 at once (%.3f ms), not a Stale", dt0);
+        check(g0 == 0 && dt0 < 5.0 && !st0, b);
+        check(same && polls > 1 && late.empty(), "polled again: the reply after " + std::to_string(polls) +
+                                                     " reads, the same bits as the one waited for; nothing in take_late");
+    }
+
     // a late reply: 0 by its deadline; the next request has its own; the late one in take_late
     {
         rx::ReqRow r;

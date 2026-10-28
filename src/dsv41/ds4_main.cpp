@@ -2207,6 +2207,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "ep defer: %lld layers' CPU-lane parts added a layer late (%.1f a token; DS4_PROF's wait for "
                              "the CPU lane is then the next layer's)\n", (long long) (s.ep_late - s0.ep_late),
                      (double) (s.ep_late - s0.ep_late) / (double) std::max<size_t>(1, out.size()));
+    if (s.ep_late_split > s0.ep_late_split)   // DS4_EP_DEFER_BELOW / TOP
+        std::fprintf(stderr, "ep defer: %lld split layers' light parts added a layer late, their heavy parts in the layer "
+                             "(%.1f a token)\n", (long long) (s.ep_late_split - s0.ep_late_split),
+                     (double) (s.ep_late_split - s0.ep_late_split) / (double) std::max<size_t>(1, out.size()));
     std::fprintf(stderr, "%s", m.defer_lines(s0).c_str());   // (DS4_EP_DEFER_STAT, DS4_EP_DEFER_BELOW / TOP and their CHECK)
     print_ep_verify(s, s0);   // DS4_EP_DEFER_VERIFY
     if (s.rx_split_n > s0.rx_split_n) {   // DS4_EP_SPLIT_VERIFY

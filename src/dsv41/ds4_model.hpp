@@ -223,6 +223,17 @@ struct Stats {
     int64_t ep_chk_n = 0, ep_chk_bad = 0, ep_chk_cmp = 0, ep_chk_cmp_bad = 0, ep_chk2_n = 0, ep_chk2_bad = 0;
     int split_check = 0;   // (the run's DS4_EP_DEFER_BELOW_CHECK: the lines say which)
     dsplit::Tally ep_stat;   // DS4_EP_DEFER_STAT=1: what each rule would make heavy (passive)
+    // DS4_EP_DEFER_BELOW / TOP: the split layers whose light part the next layer (or the head) added (ep_late: the
+    // layers deferred whole).  The split's timing (the host's clock from a decode split request's pickup - protocol 6's
+    // question, does the heavy part's remote wait bind): the requests timed, their sums to hseq and to seq, to hseq in
+    // kSpBinMs bins (the last: past it); those with a heavy pick on the server and their heavy waits (the lane's heavy
+    // part done to hseq) summed; those whose reply was not in when the lane's light part was done, their hseq after it
+    int64_t ep_late_split = 0;
+    static constexpr int kSpBins = 512;
+    static constexpr double kSpBinMs = 0.05;
+    int64_t sp_t_n = 0, sp_t_hrem = 0, sp_t_late = 0;
+    double sp_t_hseq = 0.0, sp_t_seq = 0.0, sp_t_hwait = 0.0, sp_t_after = 0.0;
+    int64_t sp_t_bin[kSpBins] = {};
 };
 
 class Model {

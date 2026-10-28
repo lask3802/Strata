@@ -5,14 +5,24 @@
 // weights and which CPU-lane picks are heavy (the threshold's >=, the top r with its ties, the lane's picks alone); the
 // adds check (every CPU-lane pick's n_ff blocks once, into its part) over serve_lane's flow - rx::split_plan's ranges, the
 // reply on time or the fallback, the request sent tagged, untagged or not at all - and the faults it must see; the
-// STAT tally and its lines.  No GPU, no model.
+// STAT tally and its lines.  ds4_defer_rows.hpp, the engine's own functions: rx_send's rows (against stage 1's loop,
+// which it replaced, for every request unsplit), the adds of the lane's slots, of a reply's rows and of the fallback by
+// part through the same check; Pool::help_one, the speed path's poll between the caller's jobs.  No GPU, no model.
 //   ds4_defer_split_test     exit 0: all passed
+#include "../../src/dsv41/ds4_defer_rows.hpp"
 #include "../../src/dsv41/ds4_defer_split.hpp"
+#include "../../src/dsv41/ds4_pool.hpp"
 #include "../../src/dsv41/ds4_rx_split.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace ds = strata::ds4::dsplit;
@@ -80,8 +90,15 @@ static void case_setup() {
     s = ds::setup("0.15", nullptr, true, nullptr, 0, 43);
     check(s.rule.kind == ds::Kind::kBelow && s.rule.w == 0.15f && has(s.line, "DS4_EP_DEFER_BELOW=0.15: layers 0-41 split") &&
               has(s.line, ">= 0.15 (heavy) added in the layer") && has(s.line, "layer 42's whole") &&
-              has(s.line, "the layer waits for both parts: a quality probe, the speed path is not built yet"),
+              has(s.line, "; the layer waits for the heavy part alone (hseq: the speed path)"),
           "setup: BELOW 0.15 on (" + s.line + ")");
+    s = ds::setup("0.15", nullptr, true, nullptr, 0, 43, ds::kWaitBoth);
+    check(s.rule.on() && has(s.line, "; DS4_EP_DEFER_BELOW_WAIT=1: the layer waits for both parts - a quality probe, the "
+                                     "speed path's numbers at about DS4_EP_DEFER=0's speed") && !has(s.line, "hseq"),
+          "setup: BELOW 0.15, BELOW_WAIT=1: both parts (" + s.line + ")");
+    s = ds::setup(nullptr, "2", true, nullptr, 0, 43, ds::kWaitVerify);
+    check(s.rule.on() && has(s.line, "; the layer waits for both parts (DS4_EP_DEFER_VERIFY: decode exact)"),
+          "setup: TOP 2 under VERIFY: both parts (" + s.line + ")");
     s = ds::setup(nullptr, "2", true, nullptr, 10, 43);
     check(s.rule.kind == ds::Kind::kTop && s.rule.r == 2 && has(s.line, "DS4_EP_DEFER_TOP=2: layers 10-41 split") &&
               has(s.line, "each token's 2 largest-share CPU-lane picks"),
@@ -279,12 +296,235 @@ static void case_tally() {
     std::printf("%s", ln.c_str());
 }
 
+// stage 1's rx_send loop (8aaf2437, ds4_model.cu), word for word but for its names: what dsplit::req_rows replaced
+static unsigned old_rows(int T, const float* w, const ds::Picks& rpk, const ds::Picks& spk, const ds::Picks& wpk,
+                         const uint8_t* hv, std::vector<rx::ReqRow>& rx_rows, std::vector<uint8_t>& rx_dst) {
+    constexpr int kPicks = ds::kTokPicks, kWin = rx::kMaxRows;
+    rx_rows.clear();
+    rx_dst.clear();
+    int row_of[2 * kWin];
+    for (int t = 0; t < 2 * kWin; ++t) row_of[t] = -1;
+    unsigned toks = 0;
+    for (int hp = 0; hp < (hv != nullptr ? 2 : 1); ++hp)
+        for (int pass = 0; pass < 3; ++pass)
+            for (const auto& q : pass == 0 ? rpk : pass == 1 ? spk : wpk) {
+                const int t = q.second / kPicks, i = q.second % kPicks;
+                if (t >= T) continue;
+                if (hv != nullptr && (hv[q.second] != 0) != (hp == 0)) continue;
+                const int key = hv != nullptr ? 2 * t + hp : t;
+                if (row_of[key] < 0) {
+                    row_of[key] = (int) rx_rows.size();
+                    rx_rows.emplace_back();
+                    rx_rows.back().t = (uint8_t) t;
+                    rx_dst.push_back((uint8_t) (hv != nullptr ? hp : t));
+                    toks |= 1u << t;
+                }
+                rx::ReqRow& r = rx_rows[(size_t) row_of[key]];
+                if (pass >= 1) r.slice |= (uint16_t) (1u << r.n);
+                if (pass == 2) r.slice |= (uint16_t) (1u << (rx::kPoolBit + r.n));
+                r.e[r.n] = (int16_t) q.first;
+                r.w[r.n] = w[t * kPicks + i];
+                ++r.n;
+            }
+    return toks;
+}
+static bool rows_same(const std::vector<rx::ReqRow>& a, const std::vector<rx::ReqRow>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t j = 0; j < a.size(); ++j)
+        if (std::memcmp(&a[j], &b[j], sizeof(rx::ReqRow)) != 0) return false;
+    return true;
+}
+
+static void case_rows() {
+    float w[ds::kMaxPk];
+    for (int p = 0; p < ds::kMaxPk; ++p) w[p] = 0.01f * (float) (p + 1);
+    // a split request (T 1): the heavy picks' row first (pick 1 the server's whole, pick 4 a slice one), then the light
+    // ones' (pick 2 slice, pick 3 W: slice and pool)
+    uint8_t hv[ds::kMaxPk] = {};
+    hv[1] = hv[4] = 1;
+    const ds::Picks rpk = {{10, 1}}, spk = {{12, 2}, {14, 4}}, wpk = {{13, 3}};
+    std::vector<rx::ReqRow> rows;
+    std::vector<uint8_t> dst;
+    unsigned toks = ds::req_rows(1, w, rpk, spk, wpk, hv, rows, dst);
+    const bool two = rows.size() == 2 && dst.size() == 2 && toks == 1u;
+    check(two && dst[0] == 0 && dst[1] == 1 && rows[0].t == 0 && rows[1].t == 0,
+          "req_rows, a split request: two rows of token 0 - part row 0 (heavy) first, then 1");
+    check(two && rows[0].n == 2 && rows[0].e[0] == 10 && rows[0].e[1] == 14 && rows[0].slice == (1u << 1) &&
+              rows[0].w[0] == w[1] && rows[0].w[1] == w[4],
+          "req_rows: the heavy row - the server's whole pick, then the slice one (its slice bit), their weights");
+    check(two && rows[1].n == 2 && rows[1].e[0] == 12 && rows[1].e[1] == 13 &&
+              rows[1].slice == ((1u << 0) | (1u << 1) | (1u << (rx::kPoolBit + 1))) && rows[1].w[0] == w[2] &&
+              rows[1].w[1] == w[3],
+          "req_rows: the light row - the slice pick, then W's (slice and pool bits)");
+    // unsplit, T 2: a row a token, made by its first pick; a pick past T left out
+    const ds::Picks r2 = {{20, 8 + 0}, {21, 2}}, s2 = {{22, 1}}, w2 = {{23, 8 + 5}, {24, 2 * 8 + 1}};
+    toks = ds::req_rows(2, w, r2, s2, w2, nullptr, rows, dst);
+    check(rows.size() == 2 && toks == 3u && rows[0].t == 1 && dst[0] == 1 && rows[1].t == 0 && dst[1] == 0 &&
+              rows[0].n == 2 && rows[0].e[1] == 23 && rows[0].slice == ((1u << 1) | (1u << (rx::kPoolBit + 1))) &&
+              rows[1].n == 2 && rows[1].e[0] == 21 && rows[1].e[1] == 22 && rows[1].slice == (1u << 1),
+          "req_rows, unsplit T 2: token 1's row first (its pick came first), each row its token's picks; token 2's left out");
+    // every request unsplit and split, random, against stage 1's loop
+    std::mt19937 rng(11);
+    int same = 0, n = 0;
+    for (int it = 0; it < 4000; ++it) {
+        const int T = 1 + (int) (rng() % rx::kMaxRows);
+        const bool split = it % 2 == 1;
+        ds::Picks a[3];
+        uint8_t h[ds::kMaxPk] = {};
+        for (int t = 0; t < std::min(rx::kMaxRows, T + 1); ++t)   // (a token past T too: left out by both)
+            for (int i = 0; i < ds::kTokPicks; ++i) {
+                const int c = (int) (rng() % 5);   // (0-2: rpk / spk / wpk; else the device's or the lane's own)
+                if (c < 3) a[c].push_back({(int) (rng() % 256), t * ds::kTokPicks + i});
+                h[t * ds::kTokPicks + i] = (uint8_t) (rng() % 2);
+            }
+        for (auto& v : a) std::shuffle(v.begin(), v.end(), rng);
+        std::vector<rx::ReqRow> ra, rb;
+        std::vector<uint8_t> da, db;
+        const unsigned ta = ds::req_rows(T, w, a[0], a[1], a[2], split ? h : nullptr, ra, da);
+        const unsigned tb = old_rows(T, w, a[0], a[1], a[2], split ? h : nullptr, rb, db);
+        same += ta == tb && da == db && rows_same(ra, rb);
+        ++n;
+    }
+    check(same == n, "req_rows against stage 1's loop: " + std::to_string(same) + " of " + std::to_string(n) +
+                         " random requests (unsplit and split, T 1-16) the same rows, bytes, part rows and tokens");
+}
+
+// a split request's adds as the engine makes them now (ds4_defer_rows.hpp): the lane's slots (local_adds), then the
+// reply's rows (req_rows, then row_adds) or the fallback by part (fallback_parts, fallback_adds)
+static void case_adds() {
+    const int nb = 9, k = 6;
+    int ids[ds::kMaxPk];
+    for (int p = 0; p < ds::kMaxPk; ++p) ids[p] = 100 + p;   // (pick p: expert 100 + p)
+    float w[ds::kMaxPk] = {};
+    uint8_t lane[ds::kMaxPk] = {}, hv[ds::kMaxPk] = {};
+    for (int pk : {0, 1, 2, 3, 5}) lane[pk] = 1;   // (pick 4: the device's)
+    hv[0] = hv[2] = hv[5] = 1;   // (the server's GPU's, W's and one of the lane's own heavy)
+    std::string why;
+    auto run = [&](bool spl, bool out, bool reply, int cut, std::vector<ds::Add>& a) {
+        a.clear();
+        const rx::SplitPlan sp = rx::split_plan(spl, out, true, k, nb);
+        ds::Picks own = {{101, 1}, {103, 3}, {105, 5}}, rpk = {{100, 0}}, wpk = {{102, 2}}, spk;
+        if (!sp.sent) {   // (not sent: all here, whole)
+            own.insert(own.end(), rpk.begin(), rpk.end());
+            own.insert(own.end(), wpk.begin(), wpk.end());
+            rpk.clear();
+            wpk.clear();
+        }
+        if (!sp.tagged) {   // (W's go only with a tagged request; the lane's own whole here)
+            own.insert(own.end(), wpk.begin(), wpk.end());
+            wpk.clear();
+            cut = 0;
+        } else {
+            spk = own;
+        }
+        int pk_of[ds::kMaxPk], ns = 0;
+        for (const auto& q : own) pk_of[ns++] = q.second;
+        const int nmain = ns;
+        if (cut > 0)
+            for (const auto& q : wpk) pk_of[ns++] = q.second;
+        ds::local_adds(pk_of, ns, nmain, hv, sp.here, cut, a);
+        if (!sp.sent) return;
+        if (reply) {
+            std::vector<rx::ReqRow> rows;
+            std::vector<uint8_t> dst;
+            ds::req_rows(1, w, rpk, spk, wpk, hv, rows, dst);
+            ds::row_adds(rows, dst, ids, 8, k, cut, nb, a);
+        } else {
+            ds::FallPart fp[2];
+            ds::fallback_parts(rpk, spk, wpk, hv, sp, cut, nb, fp);
+            for (int p = 0; p < 2; ++p) ds::fallback_adds(fp[p], p, a);
+        }
+    };
+    std::vector<ds::Add> a;
+    for (int reply = 0; reply < 2; ++reply)
+        for (int cut : {0, 3}) {
+            run(true, true, reply != 0, cut, a);
+            check(ds::ledger_ok(lane, hv, ds::kMaxPk, a, nb, &why),
+                  std::string("adds (the engine's): sent tagged, ") + (reply ? "the reply" : "the fallback") + ", W cut " +
+                      std::to_string(cut) + ": every block once, into its part (" + why + ")");
+        }
+    run(false, true, true, 0, a);
+    check(ds::ledger_ok(lane, hv, ds::kMaxPk, a, nb, &why), "adds (the engine's): sent untagged, the reply (" + why + ")");
+    run(false, true, false, 0, a);
+    check(ds::ledger_ok(lane, hv, ds::kMaxPk, a, nb, &why), "adds (the engine's): sent untagged, the fallback (" + why + ")");
+    run(true, false, false, 0, a);
+    check(ds::ledger_ok(lane, hv, ds::kMaxPk, a, nb, &why), "adds (the engine's): not sent, all here (" + why + ")");
+    // the fallback's parts: each pick by hv, each list over sp's late ranges and W's [cut, nb)
+    const rx::SplitPlan sp = rx::split_plan(true, true, true, k, nb);
+    ds::FallPart fp[2];
+    ds::fallback_parts({{100, 0}, {101, 1}}, {{103, 3}, {105, 5}}, {{102, 2}}, hv, sp, 3, nb, fp);
+    check(fp[0].pk[0].size() == 1 && fp[0].pk[0][0].second == 0 && fp[1].pk[0].size() == 1 &&
+              fp[0].pk[1].size() == 1 && fp[0].pk[1][0].second == 5 && fp[1].pk[1].size() == 1 &&
+              fp[1].pk[1][0].second == 3 && fp[0].pk[2].size() == 1 && fp[1].pk[2].empty(),
+          "fallback_parts: each pick into its part (heavy 0), the server's whole, slice and W picks apart");
+    check(fp[0].br[0].b0 == sp.late_whole.b0 && fp[0].br[0].b1 == sp.late_whole.b1 && fp[1].br[1].b0 == k &&
+              fp[1].br[1].b1 == nb && fp[0].br[2].b0 == 3 && fp[0].br[2].b1 == nb,
+          "fallback_parts: the ranges - [0, nb) whole, [k, nb) slice, [cut, nb) W - in both parts");
+    // the faults the check must see in what these functions make
+    run(true, true, true, 3, a);
+    auto b = a;
+    for (ds::Add& x : b)
+        if (x.pk == 2) x.part ^= 1;
+    const bool flip_ok = ds::ledger_ok(lane, hv, ds::kMaxPk, b, nb, &why);
+    check(!flip_ok && has(why, "part"), "adds: a W pick's adds into the other part: seen (" + why + ")");
+    std::vector<rx::ReqRow> rows;
+    std::vector<uint8_t> dst;
+    ds::req_rows(1, w, {{100, 0}}, {{101, 1}, {103, 3}, {105, 5}}, {{102, 2}}, hv, rows, dst);
+    rows[0].e[0] = 99;   // (an expert of no pick)
+    b.clear();
+    ds::row_adds(rows, dst, ids, 8, k, 3, nb, b);
+    bool lost = false;
+    for (const ds::Add& x : b) lost = lost || x.pk == -1;
+    check(lost, "row_adds: a row's expert of no pick: pick -1 (which the check refuses)");
+}
+
+// Pool::help_one: the speed path's caller takes its jobs one at a time and polls between them (run_nodes' help_polled)
+static void case_pool() {
+    strata::ds4::Pool pool(2);
+    const int n = 300;
+    std::vector<std::atomic<int>> cnt((size_t) n);
+    for (auto& c : cnt) c = 0;
+    const std::thread::id me = std::this_thread::get_id();
+    std::string log;   // (the caller's: J a job it ran, P a poll)
+    const std::function<void(int)> fn = [&](int j) {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - t0 < std::chrono::microseconds(20)) {
+        }
+        cnt[(size_t) j].fetch_add(1);
+        if (std::this_thread::get_id() == me) log += 'J';
+    };
+    for (int batch = 0; batch < 2; ++batch) {
+        log.clear();
+        for (auto& c : cnt) c = 0;
+        pool.start(n, fn);
+        log += 'P';
+        while (pool.help_one()) log += 'P';
+        while (!pool.done()) log += 'P';
+        const bool drained = !pool.help_one();
+        pool.wait();
+        int once = 0, jobs = 0;
+        for (auto& c : cnt) once += c.load() == 1;
+        for (char ch : log) jobs += ch == 'J';
+        check(once == n && drained && pool.done(),
+              "Pool::help_one (batch " + std::to_string(batch) + "): every job once (" + std::to_string(once) + " of " +
+                  std::to_string(n) + "), none left after it, done()");
+        check(jobs >= 2 && log.find("JJ") == std::string::npos,
+              "Pool::help_one: a poll between each two of the caller's " + std::to_string(jobs) + " jobs");
+    }
+    pool.start(0, fn);
+    check(!pool.help_one() && pool.done(), "Pool::help_one: an empty batch - nothing to take, done()");
+    pool.wait();
+}
+
 int main() {
     case_parse();
     case_setup();
     case_kind();
     case_heavy();
     case_ledger();
+    case_rows();
+    case_adds();
+    case_pool();
     case_tally();
     if (checks_bad == 0) std::printf("ALL OK\n");
     else std::printf("%d FAILED\n", checks_bad);
