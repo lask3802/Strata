@@ -2,9 +2,15 @@
 // path) with each kernel DS4_DQ_NEW selects against the row-per-lane one it is unset, byte for byte: random blocks of
 // every type dequant_rows takes (any code bits, F16 scales random and at the edges: zeros, subnormals, the largest),
 // several row counts, first rows (gemm()'s column pieces: a view's rows c0 ..) and widths, F16 and BF16, and the bytes
-// around the output untouched.  Needs a GPU, no model.  dq_test [--bench: the attention slab's pieces timed, each kernel]
+// around the output untouched.  Then DS4_DQ_ONCE's order (ds4_gemm16.cuh): the attention slab's matrices at their
+// shapes, reconstructed once and every slab's GEMMs over them, against gemm()'s (each slab reconstructing each piece into
+// the w16 scratch, then its GEMM), the outputs byte for byte - with each dequant kernel.  Needs a GPU, no model.
+//   dq_test [--bench: the attention slab's pieces timed, each kernel]
+#include "../../src/dsv41/ds4_gemm16.cuh"
+#include "../../src/dsv41/ds4_gguf.cuh"
 #include "../../src/dsv41/ds4_iq.cuh"
 
+#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -13,11 +19,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
 
 namespace iq = strata::ds4::gguf::iq;
+namespace gg = strata::ds4::gguf;
+namespace x3 = strata::dsv41k::exl3;
+namespace g16 = strata::ds4::gemm16;
 
 namespace {
 
@@ -37,9 +47,9 @@ uint16_t f16(float f) { return __half_as_ushort(__float2half_rn(f)); }
 
 // an F16 scale: a typical one either sign, or (one in four) an edge value - +-0, the smallest subnormal, the largest
 // subnormal, the smallest normal, 1, the largest finite (no Inf / NaN: not a valid scale)
-uint16_t scale16() {
+uint16_t scale16(bool edges = true) {
     static const uint16_t edge[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x0400, 0x3c00, 0x7bff, 0xfbff, 0x1400};
-    if (rng() % 4 == 0) return edge[rng() % (sizeof(edge) / sizeof(edge[0]))];
+    if (edges && rng() % 4 == 0) return edge[rng() % (sizeof(edge) / sizeof(edge[0]))];
     const float m = 0.0005f + 0.05f * (float) (rng() % 10000) / 10000.0f;
     return f16(rng() % 8 == 0 ? -m : m);
 }
@@ -55,23 +65,23 @@ const TypeInfo kTypes[] = {
     {iq::kQ6_K, 208, -1},  {iq::kQ2_K, 80, 82},  {iq::kQ3_K, 108, -1},
 };
 
-// rows x k of random blocks of the type
-std::vector<uint8_t> blocks(const TypeInfo& t, int rows, int k) {
+// rows x k of random blocks of the type (edges false: typical scales only)
+std::vector<uint8_t> blocks(const TypeInfo& t, int rows, int k, bool edges = true) {
     const int bb = iq::block_bytes(t.type);
     std::vector<uint8_t> w(iq::row_bytes(t.type, k) * (size_t) rows);
     for (auto& v : w) v = (uint8_t) (rng() & 0xff);
     for (size_t o = 0; o + bb <= w.size(); o += (size_t) bb) {
         uint8_t* p = &w[o];
         if (t.type == iq::kIQ1_M) {
-            const uint16_t d = scale16();
+            const uint16_t d = scale16(edges);
             p[49] = (uint8_t) ((p[49] & 0x0f) | ((d & 0x000f) << 4));
             p[51] = (uint8_t) ((p[51] & 0x0f) | (d & 0x00f0));
             p[53] = (uint8_t) ((p[53] & 0x0f) | ((d & 0x0f00) >> 4));
             p[55] = (uint8_t) ((p[55] & 0x0f) | ((d & 0xf000) >> 8));
             continue;
         }
-        put16(p + t.d, scale16());
-        if (t.dmin >= 0) put16(p + t.dmin, scale16());
+        put16(p + t.d, scale16(edges));
+        if (t.dmin >= 0) put16(p + t.dmin, scale16(edges));
     }
     return w;
 }
@@ -173,6 +183,167 @@ void test_types(cudaStream_t s) {
                 g_fail == g0 ? "ok" : "FAIL");
 }
 
+// ---- DS4_DQ_ONCE: the slab loop's GEMMs over the matrix reconstructed once against gemm()'s per-slab order
+// a k x n weight of the engine's formats (as mat_gg / mat_bf16 put them on the device): a GGUF's Q5_K, Q8_0 or BF16
+struct W {
+    x3::Mat m;
+    uint8_t* raw = nullptr;
+    W(int fmt, int k, int n) {
+        std::vector<uint8_t> h;
+        if (fmt == gg::kFmtGG) {
+            h = blocks(kTypes[9], n, k, false);
+            m.K = iq::kQ5_K;
+            m.ld = (int) gg::type_row_bytes(iq::kQ5_K, k);
+        } else if (fmt == gg::kFmtQ8_0) {
+            h.resize((size_t) n * (k / 32) * gg::kQ8Bytes);
+            for (auto& v : h) v = (uint8_t) (rng() & 0xff);
+            for (size_t o = 0; o < h.size(); o += gg::kQ8Bytes) put16(&h[o], scale16(false));
+            m.ld = (int) gg::q8_row_bytes(k);
+        } else {
+            h.resize((size_t) n * k * 2);
+            for (size_t o = 0; o < h.size(); o += 2) {
+                const float f = 0.05f * ((float) (rng() % 20001) / 10000.0f - 1.0f);
+                uint32_t u;
+                std::memcpy(&u, &f, 4);
+                const uint16_t b = (uint16_t) (u >> 16);
+                std::memcpy(&h[o], &b, 2);
+            }
+            m.ld = k;
+        }
+        CU(cudaMalloc(&raw, h.size()));
+        CU(cudaMemcpy(raw, h.data(), h.size(), cudaMemcpyHostToDevice));
+        CU(cudaDeviceSynchronize());
+        m.fmt = fmt;
+        m.raw = raw;
+        m.k = k;
+        m.n = n;
+    }
+    ~W() { cudaFree(raw); }
+};
+
+// a device buffer of n random FP16 values in [-1, 1]
+uint16_t* rand16(size_t n) {
+    std::vector<uint16_t> h(n);
+    for (auto& v : h) v = f16((float) (rng() % 20001) / 10000.0f - 1.0f);
+    uint16_t* p = nullptr;
+    CU(cudaMalloc(&p, n * 2));
+    CU(cudaMemcpy(p, h.data(), n * 2, cudaMemcpyHostToDevice));
+    return p;
+}
+
+// layer_chunk's attention slab projections for T rows in slabs of A (wq_b, the og wo_a groups, wo_b at the engine's
+// shapes, x and y strides), in its two orders: gemm()'s (each slab's pieces reconstructed into the w16 scratch, then
+// their GEMMs) and DS4_DQ_ONCE's (the three in one buffer at gemm16::places, each reconstructed whole by dequant_whole
+// once, every slab's pieces GEMMs over gemm16::piece).  The inputs are random (not chained through the attention) and
+// each slab's outputs land at its own rows; every dequant kernel in the once order against kernel 0 in gemm()'s
+void check_once(const char* what, int fmt, int T, int A, cublasHandle_t blas, cudaStream_t s) {
+    const size_t w16_elems = (size_t) 8 << 20;   // (alloc_chunks' w16 scratch)
+    const int QL = 1280, HQ = 32768, OG = 8, OL = 1024, D = 5120, per = HQ / OG;
+    W wq_b(fmt, QL, HQ), wo_b(fmt, OG * OL, D);
+    std::vector<std::unique_ptr<W>> wa;
+    x3::Mat wo_a[16];
+    for (int gi = 0; gi < OG; ++gi) {
+        wa.emplace_back(new W(fmt, per, OL));
+        wo_a[gi] = wa.back()->m;
+    }
+    uint16_t* qr16 = rand16((size_t) T * QL);
+    uint16_t* o16 = rand16((size_t) T * HQ);
+    uint16_t* oa16 = rand16((size_t) T * OG * OL);
+    const g16::Places sz = g16::places(nullptr, wq_b.m, wo_a, OG, wo_b.m);
+    uint16_t *w16 = nullptr, *once = nullptr;
+    CU(cudaMalloc(&w16, w16_elems * 2));
+    CU(cudaMalloc(&once, sz.elems * 2));
+    struct Out {
+        float* p;
+        size_t n;
+    };
+    Out q{nullptr, (size_t) T * HQ}, oa{nullptr, (size_t) T * OG * OL}, acc{nullptr, (size_t) T * D};
+    for (Out* o : {&q, &oa, &acc}) CU(cudaMalloc(&o->p, o->n * 4));
+    CU(cudaDeviceSynchronize());
+    // gemm()'s loop: pre null - each piece reconstructed into w16; else its piece of pre
+    auto gemm = [&](const x3::Mat& m, const uint16_t* pre, const uint16_t* x16, int ldx, int rows, float* y, int ldy) {
+        const int cs = g16::cols(m, w16_elems);
+        for (int c0 = 0; c0 < m.n; c0 += cs) {
+            const int nc = std::min(cs, m.n - c0);
+            if (pre == nullptr) g16::dequant(m, c0, nc, w16, s);
+            const uint16_t* wp = pre != nullptr ? g16::piece(pre, c0, m.k) : w16;
+            if (g16::mm(blas, wp, m.k, nc, x16, ldx, rows, y + c0, ldy, 0.0f) != CUBLAS_STATUS_SUCCESS) {
+                std::printf("cublasGemmEx failed\n");
+                std::exit(1);
+            }
+        }
+    };
+    auto run = [&](bool once_on) {
+        for (Out* o : {&q, &oa, &acc}) CU(cudaMemsetAsync(o->p, 0xA5, o->n * 4, s));
+        const g16::Places wp = once_on ? g16::places(once, wq_b.m, wo_a, OG, wo_b.m) : g16::Places{};
+        if (once_on) {
+            auto none = [](int, int) {};
+            auto none0 = [] {};
+            g16::dequant_whole(wq_b.m, w16_elems, wp.qb, s, none, none0);
+            for (int gi = 0; gi < OG; ++gi) g16::dequant_whole(wo_a[gi], w16_elems, wp.oa[gi], s, none, none0);
+            g16::dequant_whole(wo_b.m, w16_elems, wp.ob, s, none, none0);
+        }
+        for (int a0 = 0; a0 < T; a0 += A) {
+            const int na = std::min(A, T - a0);
+            gemm(wq_b.m, wp.qb, qr16 + (size_t) a0 * QL, QL, na, q.p + (size_t) a0 * HQ, HQ);
+            for (int gi = 0; gi < OG; ++gi)
+                gemm(wo_a[gi], wp.oa[gi], o16 + (size_t) a0 * HQ + (size_t) gi * per, HQ, na,
+                     oa.p + (size_t) a0 * OG * OL + (size_t) gi * OL, OG * OL);
+            gemm(wo_b.m, wp.ob, oa16 + (size_t) a0 * OG * OL, OG * OL, na, acc.p + (size_t) a0 * D, D);
+        }
+        CU(cudaStreamSynchronize(s));
+        CU(cudaGetLastError());
+        std::vector<uint8_t> r;
+        for (Out* o : {&q, &oa, &acc}) {
+            std::vector<uint8_t> h(o->n * 4);
+            CU(cudaMemcpy(h.data(), o->p, h.size(), cudaMemcpyDeviceToHost));
+            r.insert(r.end(), h.begin(), h.end());
+        }
+        return r;
+    };
+    const int keep = iq::dq_kernel();
+    iq::dq_kernel() = 0;
+    const std::vector<uint8_t> ref = run(false);
+    size_t filled = 0;   // (outputs gemm()'s order left at the fill: every one must be written)
+    for (size_t i = 0; i + 3 < ref.size(); i += 4) filled += std::memcmp(&ref[i], "\xA5\xA5\xA5\xA5", 4) == 0;
+    for (int kern = 0; kern < (fmt == gg::kFmtGG ? kKernels : 1); ++kern) {
+        iq::dq_kernel() = kern;
+        const std::vector<uint8_t> got = run(true);
+        size_t diff = 0, first = 0;
+        for (size_t i = 0; i < ref.size(); ++i)
+            if (got[i] != ref[i] && diff++ == 0) first = i;
+        const bool ok = diff == 0 && filled == 0 && gg::launch_errors() == 0;
+        ++g_cases;
+        if (!ok) ++g_fail;
+        std::printf("%-4s once %-4s wq_b + %d wo_a + wo_b (%.1f MB as FP16), T %d in slabs of %d, dequant kernel %d: %zu "
+                    "bytes, %zu differ%s\n",
+                    ok ? "ok" : "FAIL", what, OG, (double) sz.elems * 2 / 1e6, T, A, kern, ref.size(), diff,
+                    diff ? (" (first at " + std::to_string(first) + ")").c_str() : filled ? " (not all written)" : "");
+    }
+    iq::dq_kernel() = keep;
+    for (Out* o : {&q, &oa, &acc}) CU(cudaFree(o->p));
+    CU(cudaFree(once));
+    CU(cudaFree(w16));
+    CU(cudaFree(oa16));
+    CU(cudaFree(o16));
+    CU(cudaFree(qr16));
+}
+
+void test_once(cudaStream_t s) {
+    cublasHandle_t blas = nullptr;
+    if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas, s) != CUBLAS_STATUS_SUCCESS) {
+        std::printf("FAIL cuBLAS\n");
+        ++g_fail;
+        return;
+    }
+    // (gemm()'s pieces at these shapes: wq_b 1280 x 32768 6, a wo_a group 4096 x 1024 one, wo_b 8192 x 5120 5) T = 2
+    // slabs of 256 and a short one; Q5_K (the dense K-quants' path, each DS4_DQ_NEW kernel), Q8_0 and BF16
+    check_once("Q5_K", gg::kFmtGG, 700, 256, blas, s);
+    check_once("Q8_0", gg::kFmtQ8_0, 520, 256, blas, s);
+    check_once("BF16", gg::kFmtBF16, 520, 256, blas, s);
+    cublasDestroy(blas);
+}
+
 // --bench: the pieces timed, each kernel (Q5_K, F16)
 void bench(cudaStream_t s) {
     struct P {
@@ -230,7 +401,10 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     if (do_bench) bench(s);
-    else test_types(s);
+    else {
+        test_types(s);
+        test_once(s);
+    }
     std::printf("%d of %d cases failed\n", g_fail, g_cases);
     return g_fail ? 1 : 0;
 }

@@ -20,6 +20,7 @@
 #include "ds4_iq.cuh"
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_ffslice.hpp"
+#include "ds4_gemm16.cuh"
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
@@ -599,6 +600,10 @@ struct Chunk {
     uint16_t *x16 = nullptr, *qr16 = nullptr, *o16 = nullptr, *oa16 = nullptr, *lat16 = nullptr, *sh16 = nullptr,
              *h16 = nullptr, *eg_x16 = nullptr, *ext = nullptr, *w16 = nullptr, *emb = nullptr;
     size_t w16_elems = 0;
+    // DS4_DQ_ONCE: a (chunk, layer)'s attention slab weights (wq_b, wo_a's groups, wo_b) as FP16, w16_once_elems of them
+    // (null: off, or not had - the slabs reconstruct them each into w16)
+    uint16_t* w16_once = nullptr;
+    size_t w16_once_elems = 0;
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *bounds = nullptr, *row_tok = nullptr, *pos = nullptr;
     uint8_t* eg_rows = nullptr;
     int* bounds_pin = nullptr;   // pinned: the sort's bounds, read back
@@ -1523,7 +1528,8 @@ struct Model::Impl {
     };
     std::vector<EkMark> ek_marks;
     // DS4_PROF (a run of chunks): gemm()'s pieces - its FP16 reconstruction of W (e0 - e1) apart from cuBLAS's GEMM
-    // (e1 - e2), by the matrix (k x n); nc the piece's columns, first: a call's first piece
+    // (e1 - e2), by the matrix (k x n); nc the piece's columns, first: a call's first piece.  DS4_DQ_ONCE: a piece of
+    // dq_whole's reconstruction is a mark of its own (no GEMM: rows 0, first 0 - not a call), the slabs' pieces GEMMs alone
     struct GmMark {
         cudaEvent_t e0, e1, e2;
         int k, n, nc, rows, dev, first;
@@ -3395,6 +3401,11 @@ struct Model::Impl {
                 aerr.clear();
             }
             if (chunk > 0 && aerr.empty()) err.clear();
+            static const char* dq_once_env = std::getenv("DS4_DQ_ONCE");
+            static const bool dq_once = dq_once_env != nullptr && std::atoi(dq_once_env) == 1;
+            if (dq_once_env != nullptr && !dq_once)   // (set to anything else: said - a mistyped arm is not silently off)
+                std::fprintf(stderr, "ds4: DS4_DQ_ONCE=%s: off - 1 turns it on\n", dq_once_env);
+            if (chunk > 0 && dq_once) alloc_dq_once();
         }
         // a remote stage's prompt chunks: the main process's two slots of rows out, the worker's four the link lends
         // (and with bf16 rows its two fp32 ones) - pageable (a chunk's rows cross the network at its pace; on Linux a
@@ -3793,10 +3804,11 @@ struct Model::Impl {
     }
 
     // y[r][c] = x16[r] . W[:, c] (+ beta y) for r < rows: W reconstructed to FP16 in whole 128-column blocks, cuBLAS
+    // (pre: W reconstructed whole there already by dq_whole, DS4_DQ_ONCE - the same pieces' GEMMs, each over its own)
     bool gemm(Dev& d, Chunk& c, const x3::Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy, float beta,
-              std::string& err) {
+              std::string& err, const uint16_t* pre = nullptr) {
         if (rows <= 0) return true;
-        const int cols = std::max(128, (int) std::min<size_t>((size_t) m.n, c.w16_elems / (size_t) m.k) / 128 * 128);
+        const int cols = gemm16::cols(m, c.w16_elems);
         const bool gp = prof_chunk;
         for (int c0 = 0; c0 < m.n; c0 += cols) {
             const int nc = std::min(cols, m.n - c0);
@@ -3814,13 +3826,10 @@ struct Model::Impl {
                 cudaGetDevice(&gm.dev);
                 cudaEventRecord(gm.e0, d.st);
             }
-            if (m.fmt != 0) gg::rows(nc == m.n ? m : gg::view(m, c0, nc), c.w16, false, d.st);   // (a GGUF's)
-            else x3::reconstruct_rows(nc == m.n ? m : x3::view(m, c0, nc), c.w16, false, d.st);
+            if (pre == nullptr) gemm16::dequant(m, c0, nc, c.w16, d.st);
             if (gp) cudaEventRecord(gm.e1, d.st);
-            const float one = 1.0f;
-            const cublasStatus_t st = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, m.k, &one, c.w16, CUDA_R_16F,
-                                                   m.k, x16, CUDA_R_16F, ldx, &beta, y + c0, CUDA_R_32F, ldy,
-                                                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            const uint16_t* w16 = pre != nullptr ? gemm16::piece(pre, c0, m.k) : c.w16;
+            const cublasStatus_t st = gemm16::mm(c.blas, w16, m.k, nc, x16, ldx, rows, y + c0, ldy, beta);
             if (gp) {
                 cudaEventRecord(gm.e2, d.st);
                 std::lock_guard<std::mutex> lk(prof_mu);
@@ -3832,6 +3841,62 @@ struct Model::Impl {
             }
         }
         return true;
+    }
+    // DS4_DQ_ONCE: W reconstructed whole into dst in gemm()'s pieces (piece c0 at dst + c0 k), for gemm(.., pre = dst)
+    void dq_whole(Dev& d, Chunk& c, const x3::Mat& m, uint16_t* dst) {
+        const bool gp = prof_chunk;
+        GmMark gm{};
+        gemm16::dequant_whole(
+            m, c.w16_elems, dst, d.st,
+            [&](int, int nc) {
+                if (!gp) return;
+                gm = GmMark{};
+                std::lock_guard<std::mutex> lk(prof_mu);
+                gm.e0 = ek_ev();
+                gm.e1 = ek_ev();
+                gm.e2 = ek_ev();
+                gm.k = m.k;
+                gm.n = m.n;
+                gm.nc = nc;
+                cudaGetDevice(&gm.dev);
+                cudaEventRecord(gm.e0, d.st);
+            },
+            [&] {
+                if (!gp) return;
+                cudaEventRecord(gm.e1, d.st);
+                cudaEventRecord(gm.e2, d.st);
+                std::lock_guard<std::mutex> lk(prof_mu);
+                gm_marks.push_back(gm);
+            });
+    }
+    // DS4_DQ_ONCE's buffer: l's slab weights' FP16 values at their places (0: l has no heads)
+    static size_t once_elems(const Layer& l) {
+        return l.ahn == 0 ? 0 : gemm16::places(nullptr, l.wq_b, l.wo_a, l.ogn, l.wo_b).elems;
+    }
+    // DS4_DQ_ONCE=1: room on each device for its widest layer's attention slab weights (wq_b, wo_a's groups, wo_b) as
+    // FP16, reconstructed once a (chunk, layer) - made before the experts take what VRAM is left.  Not had: that
+    // device's slabs reconstruct them each, as without it
+    void alloc_dq_once() {
+        for (size_t di = 0; di < devs.size() && di < chunks.size(); ++di) {
+            Chunk& c = *chunks[di];
+            size_t need = 0;
+            for (const Layer& l0 : L)
+                for (int m = 0; m < l0.nm; ++m)
+                    if (member(l0, m).dev == (int) di) need = std::max(need, once_elems(member(l0, m)));
+            if (need == 0) continue;
+            std::string e;
+            if (!dalloc(devs[di], c.w16_once, need, e)) {
+                cudaGetLastError();   // (the failed cudaMalloc's error, not left for a kernel's check to find)
+                c.w16_once = nullptr;
+                std::fprintf(stderr, "ds4: DS4_DQ_ONCE: %s - the attention slabs reconstruct their weights each slab\n",
+                             e.c_str());
+                continue;
+            }
+            c.w16_once_elems = need;
+            std::fprintf(stderr, "ds4: DS4_DQ_ONCE: the attention slabs' weights as FP16 once a (chunk, layer): %.1f MB on "
+                                 "CUDA%d (the w16 scratch's %.1f MB as before)\n",
+                         (double) need * 2 / 1e6, devs[di].id, (double) c.w16_elems * 2 / 1e6);
+        }
     }
     // y[r][c] = alpha x16[r] . W[c] for F16 weights W [n][k] (the indexer's weights_proj)
     bool gemm_f16w(Chunk& c, const uint16_t* W, int n, int k, const uint16_t* x16, int ldx, int rows, float alpha,
@@ -9410,9 +9475,18 @@ struct Model::Impl {
         prof_mark(d, 7);
         // the attention in slabs: q, the sparse attention, wo_a, wo_b (this member's share) into acc
         if (NHL == 0) CK(cudaMemsetAsync(c.acc, 0, (size_t) T * D * sizeof(*c.acc), s));   // (no heads)
+        // DS4_DQ_ONCE (more than one slab): wq_b, wo_a's groups and wo_b reconstructed once for the chunk, in the pieces
+        // gemm() cuts, and every slab's GEMMs over them (the same operands and calls: the same bits)
+        const bool once = NHL > 0 && T > c.A && c.w16_once != nullptr && once_elems(l) <= c.w16_once_elems;
+        const gemm16::Places wp16 = once ? gemm16::places(c.w16_once, l.wq_b, l.wo_a, OG, l.wo_b) : gemm16::Places{};
+        if (once) {
+            dq_whole(d, c, l.wq_b, wp16.qb);
+            for (int gi = 0; gi < OG; ++gi) dq_whole(d, c, l.wo_a[gi], wp16.oa[gi]);
+            dq_whole(d, c, l.wo_b, wp16.ob);
+        }
         for (int a0 = 0; a0 < T && NHL > 0; a0 += c.A) {
             const int na = std::min(c.A, T - a0);
-            if (!gemm(d, c, l.wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.q, HQ, 0.0f, err)) return false;
+            if (!gemm(d, c, l.wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.q, HQ, 0.0f, err, wp16.qb)) return false;
             Finish fr;
             fr.rd = g.rd;
             fr.pos = (int) (p0 + a0);
@@ -9442,10 +9516,10 @@ struct Model::Impl {
             const int per = HQ / OG;
             for (int gi = 0; gi < OG; ++gi)
                 if (!gemm(d, c, l.wo_a[gi], c.o16 + (size_t) gi * per, HQ, na, c.oa + (size_t) gi * g.o_lora,
-                          OG * g.o_lora, 0.0f, err))
+                          OG * g.o_lora, 0.0f, err, wp16.oa[gi]))
                     return false;
             x3::rows_f16(c.oa, OG * g.o_lora, nullptr, na, OG * g.o_lora, c.oa16, s);
-            if (!gemm(d, c, l.wo_b, c.oa16, OG * g.o_lora, na, c.acc + (size_t) a0 * D, D, 0.0f, err)) return false;
+            if (!gemm(d, c, l.wo_b, c.oa16, OG * g.o_lora, na, c.acc + (size_t) a0 * D, D, 0.0f, err, wp16.ob)) return false;
         }
         if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
         hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
