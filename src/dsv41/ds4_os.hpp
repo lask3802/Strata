@@ -496,6 +496,25 @@ inline void* anon_alloc(size_t bytes, int node, int nodes, bool huge = true) {
     return m;
 #endif
 }
+/// [p, p + n) of new anonymous memory faulted in now, for writing (Linux 5.14+ madvise MADV_POPULATE_WRITE; without it,
+/// and on Windows, a zero written to every 4 KiB page - new memory reads as zeros either way), so no later write to it
+/// faults; what did it
+inline const char* populate_write(void* p, size_t n) {
+    if (n == 0) return "nothing";
+#if !defined(_WIN32)
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+    const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
+    int r;
+    while ((r = madvise((void*) b, n + (a - b), MADV_POPULATE_WRITE)) != 0 && errno == EINTR) {}
+    if (r == 0) return "MADV_POPULATE_WRITE";
+#endif
+    volatile uint8_t* q = (volatile uint8_t*) p;
+    for (size_t i = 0; i < n; i += 4096) q[i] = 0;
+    q[n - 1] = 0;
+    return "a zero written to every 4 KiB page";
+}
 /// An address range of `bytes` reserved (no memory behind it yet), and pieces of it made real: the store's arena is one range so a
 /// kernel can tell its pointers by [lo, hi).  nullptr: it could not be had.
 inline void* range_reserve(size_t bytes) {

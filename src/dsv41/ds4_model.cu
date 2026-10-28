@@ -693,6 +693,12 @@ struct Chunk {
     size_t lm_state_bytes = 0;
     uint8_t* lc = nullptr;                   // lc_bytes of slots, a layer's experts' blobs side by side
     size_t lc_bytes = 0;
+    // DS4_LM_PRE=1 (lm_prealloc; after DS4_LC_ONCE, 9aae6eee): the layer cache (lc_cap bytes) and the chunks' states
+    // (st_cap, pinned or not) allocated and faulted in at the load and kept for the process - lc / lm_state point
+    // into them while a run is on; freed with the model
+    uint8_t *lc_kept = nullptr, *st_kept = nullptr;
+    size_t lc_cap = 0, st_cap = 0;
+    bool st_kept_pinned = false;
     int lc_il = -1, lc_used = 0, lc_n = 0;   // the layer the cache holds, its slots taken, its slots in all
     size_t lc_first = 0, lc_chk = 0;         // the layer's first item; the items before lc_chk all read
     std::vector<int> lc_of;                  // expert -> its slot (-1: none)
@@ -1013,7 +1019,9 @@ struct Model::Impl {
     // chunk states, a remote stage's replies - mapped without MADV_HUGEPAGE, on 4 KiB pages: a fault near the cgroup's
     // memory.high then reclaims a page, never compacts memory for a huge one.  Unset, empty or 1: huge pages advised, as before
     bool lc_thp = true;
-    int chunk_own = -1;              // (a remote stage's main process, once set_stage_chunk ran) the chunk of its load
+    // DS4_LM_PRE=1 (the load reads it; lm_prealloc): the layer-major prompt's host memory allocated once at the load
+    bool lm_pre = false;
+    int chunk_own = -1;             // (a remote stage's main process, once set_stage_chunk ran) the chunk of its load
     static constexpr bool kChunkedPromptDefault = true;   // the layer-major prompt is the default (gate: KL 0.1685 vs 0.1686, 8K prompt 6x, decode within 2% - ds4 notes-dsv41-r97)
     static constexpr int kFlowChunkMin = 2;   // chunk_min with every device's layers on the flow (see load)
     // --prefill-chunk at most (route() runs in kVlRows-row slabs).  The default stays kVlRows: a 16384-token chunk
@@ -1658,6 +1666,14 @@ struct Model::Impl {
         for (std::thread& t : cache_ths)
             if (t.joinable()) t.join();
         if (ram_th.joinable()) ram_th.join();
+        for (auto& cp : chunks) {   // (DS4_LM_PRE's layer cache and chunks' states)
+            if (cp == nullptr) continue;
+            if (cp->lc_kept != nullptr) os::anon_free(cp->lc_kept, cp->lc_cap);
+            if (cp->st_kept != nullptr) {
+                if (cp->st_kept_pinned) cudaFreeHost(cp->st_kept);
+                else os::anon_free(cp->st_kept, cp->st_cap);
+            }
+        }
         for (size_t i = 0; i < ram_chunks.size(); ++i) os::anon_free(ram_chunks[i], ram_chunk_bytes[i]);
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
@@ -2557,6 +2573,13 @@ struct Model::Impl {
             lc_thp = false;
             std::fprintf(stderr, "ds4: DS4_LC_THP=0: the layer-major prompt's layer cache and chunk states, and the "
                                  "prompt's other host buffers, on 4 KiB pages (no MADV_HUGEPAGE)\n");
+        }
+        if (const char* v = std::getenv("DS4_LM_PRE"); v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0) {
+            if (std::strcmp(v, "1") != 0) {
+                err = "DS4_LM_PRE: 1 (the layer-major prompt's host memory allocated at the load); unset, empty or 0: off";
+                return false;
+            }
+            lm_pre = true;
         }
         if (!pk.load(o.pack, err)) return false;
         g.from(pk);
@@ -3748,7 +3771,8 @@ struct Model::Impl {
                 workers.back()->start();
             }
         calibrate_paths();
-        init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
+        lm_prealloc();     // (DS4_LM_PRE: pinned too, before the store's arena; its RAM out of the warm read's budget)
+        init_store();     // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
         if (!ep_slices_ok(err)) return false;
         if (!init_down_parts(err)) return false;
@@ -10998,6 +11022,81 @@ struct Model::Impl {
     // (DS4_LAYER_MAJOR=0: never); then its host memory: the chunks' states (pinned, else pageable) and the layer cache,
     // the largest layer's experts read from the files if RAM allows (ram_avail() less kRamMargin; DS4_LAYER_CACHE_MB
     // sets it) - at least one expert, or not layer-major
+    // DS4_LM_PRE=1, at the load (before the store's arena and the warm read): the layer-major prompt's host memory once
+    // for the process - the layer cache for a layer whose every expert but the RAM tier's is the CPU lane's (lm_begin's
+    // need over any placement the expert cache moves to; DS4_LAYER_CACHE_MB caps it), the chunks' states for the longest
+    // prompt the context allows (ceil(max_context / chunk) chunks: lm_begin's state_b at its largest), pinned where the
+    // driver gives it - each faulted in now (os::populate_write; pinned memory is), so no prompt allocates or faults
+    // either: the 6.7 GB lm_begin took at every such prompt's start, where the cgroup may be at memory.high and every
+    // fault reclaims (reanalysis-r09 section 3.3).  Not where no run can be layer-major, nor where it does not fit the
+    // RAM this process can get beside kRamMargin; then lm_begin allocates at each run, as before.  The warm read's
+    // budget is held to what is left
+    void lm_prealloc() {
+        if (!lm_pre) return;
+        static const char* env = std::getenv("DS4_LAYER_MAJOR");
+        const int nc = chunk > 0 ? (int) ((o.max_context + chunk - 1) / chunk) : 0;
+        const char* why = devs.size() != 1                                            ? "more than one GPU"
+                          : chunks.empty() || chunks[0] == nullptr || !chunks[0]->flow ? "the prompt is not on the flow"
+                          : nc < 2                                                     ? "a prompt the context allows takes one chunk"
+                          : !stage::layer_major_allowed(linked(), env)                 ? "no layer-major prompt here"
+                                                                                       : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "ds4: DS4_LM_PRE=1: nothing allocated at the load (%s)\n", why);
+            return;
+        }
+        Chunk& c = *chunks[0];
+        size_t need = 0;
+        for (int il = 0; il < g.nl; ++il) {
+            const Layer& l = L[(size_t) il];
+            size_t ne = 0;
+            for (int e = 0; e < l.n_exp; ++e)
+                if (l.ram.empty() || l.ram[(size_t) e] < 0) ++ne;
+            need = std::max(need, ne * ((l.blob + 63) & ~(size_t) 63));
+        }
+        size_t lc_b = need;
+        if (const char* mb = std::getenv("DS4_LAYER_CACHE_MB")) lc_b = std::min(need, (size_t) std::atoll(mb) << 20);
+        const size_t st_b = (size_t) nc * chunk_hand_bytes();
+        const uint64_t avail = ram_avail();
+        if (lc_b == 0 || (avail != ~uint64_t{0} && (double) lc_b + (double) st_b + (double) kRamMargin > (double) avail)) {
+            std::fprintf(stderr, "ds4: DS4_LM_PRE=1: nothing allocated at the load (the layer cache %.2f GB and the chunks' "
+                                 "states %.2f GB do not fit the %.1f GB of RAM this process can get beside %.0f GB)\n",
+                         (double) lc_b / 1e9, (double) st_b / 1e9, avail == ~uint64_t{0} ? 0.0 : (double) avail / 1e9,
+                         (double) kRamMargin / 1e9);
+            return;
+        }
+        const double t = now_ms();
+        void* st = nullptr;
+        const bool pinned = cudaHostAlloc(&st, st_b, cudaHostAllocPortable) == cudaSuccess;
+        const char* st_how = "pinned";
+        if (!pinned) {
+            cudaGetLastError();
+            st = os::anon_alloc(st_b, -1, 1, lc_thp);
+            if (st != nullptr) st_how = os::populate_write(st, st_b);
+        }
+        uint8_t* lc = st != nullptr ? (uint8_t*) os::anon_alloc(lc_b, -1, 1, lc_thp) : nullptr;
+        if (lc == nullptr) {
+            if (st != nullptr) {
+                if (pinned) cudaFreeHost(st);
+                else os::anon_free(st, st_b);
+            }
+            std::fprintf(stderr, "ds4: DS4_LM_PRE=1: nothing allocated at the load (%.2f GB not had)\n",
+                         (double) (lc_b + st_b) / 1e9);
+            return;
+        }
+        const char* lc_how = os::populate_write(lc, lc_b);
+        c.lc_kept = lc;
+        c.lc_cap = lc_b;
+        c.st_kept = (uint8_t*) st;
+        c.st_cap = st_b;
+        c.st_kept_pinned = pinned;
+        const uint64_t av = ram_avail();
+        if (av != ~uint64_t{0}) warm_bytes = av > kRamMargin ? std::min<uint64_t>(warm_bytes, av - kRamMargin) : 0;
+        std::fprintf(stderr, "ds4: DS4_LM_PRE=1: the layer-major prompt's layer cache %.2f GB (%s, %s) and chunk states "
+                             "%.2f GB (%d chunks of %d rows, %s) allocated at the load and faulted in, in %.1f s; kept for "
+                             "the process\n",
+                     (double) lc_b / 1e9, lc_thp ? "huge pages advised" : "4 KiB pages", lc_how, (double) st_b / 1e9, nc,
+                     chunk, pinned ? "pinned" : st_how, (now_ms() - t) / 1000.0);
+    }
     bool lm_begin(const Run& run) {
         static const char* env = std::getenv("DS4_LAYER_MAJOR");
         // (a remote stage: chunk after chunk, which is what overlaps with the other side - layer-major only with
@@ -11023,8 +11122,12 @@ struct Model::Impl {
         const size_t hb = chunk_hand_bytes(), state_b = run.T.size() * hb;
         const double moved = 2.0 * (double) rows * ((double) hb / (double) chunk) * (double) (hi - lo);   // (its layers)
         if (need == 0 || (double) (run.T.size() - 1) * file_b <= moved) return false;
+        // (DS4_LM_PRE: the load's layer cache, at most lc_cap - the RAM is the process's already, no check; its
+        // chunks' states where they hold the run's, else this run's own, as without it)
+        const bool kept = c.lc_kept != nullptr;
         size_t lc_bytes = need;
-        if (const char* mb = std::getenv("DS4_LAYER_CACHE_MB")) lc_bytes = std::min(need, (size_t) std::atoll(mb) << 20);
+        if (kept) lc_bytes = std::min(need, c.lc_cap);
+        else if (const char* mb = std::getenv("DS4_LAYER_CACHE_MB")) lc_bytes = std::min(need, (size_t) std::atoll(mb) << 20);
         else {
             const uint64_t avail = ram_avail();
             if (avail != ~uint64_t{0})
@@ -11032,13 +11135,18 @@ struct Model::Impl {
         }
         if (lc_bytes < blob_max) return false;
         void* st_p = nullptr;
-        c.lm_pinned = cudaHostAlloc(&st_p, state_b, cudaHostAllocPortable) == cudaSuccess;
-        if (!c.lm_pinned) {
-            cudaGetLastError();
-            st_p = os::anon_alloc(state_b, -1, 1, lc_thp);
-            if (st_p == nullptr) return false;
+        if (kept && c.st_cap >= state_b) {
+            st_p = c.st_kept;
+            c.lm_pinned = c.st_kept_pinned;
+        } else {
+            c.lm_pinned = cudaHostAlloc(&st_p, state_b, cudaHostAllocPortable) == cudaSuccess;
+            if (!c.lm_pinned) {
+                cudaGetLastError();
+                st_p = os::anon_alloc(state_b, -1, 1, lc_thp);
+                if (st_p == nullptr) return false;
+            }
         }
-        c.lc = (uint8_t*) os::anon_alloc(lc_bytes, -1, 1, lc_thp);
+        c.lc = kept ? c.lc_kept : (uint8_t*) os::anon_alloc(lc_bytes, -1, 1, lc_thp);
         if (c.lc == nullptr) {
             if (c.lm_pinned) cudaFreeHost(st_p);
             else os::anon_free(st_p, state_b);
@@ -11064,9 +11172,11 @@ struct Model::Impl {
             if (c.ls_mode != 0) ls_end(c);
             for (size_t i = c.base; i < c.n_read; ++i)
                 while (fit(c, i).left.load(std::memory_order_acquire) != 0) c.io->wait_any(500);
-            if (c.lm_pinned) cudaFreeHost(c.lm_state);
-            else os::anon_free(c.lm_state, c.lm_state_bytes);
-            os::anon_free(c.lc, c.lc_bytes);
+            if (c.lm_state != c.st_kept) {   // (DS4_LM_PRE: the load's ones stay, Chunk::lc_kept)
+                if (c.lm_pinned) cudaFreeHost(c.lm_state);
+                else os::anon_free(c.lm_state, c.lm_state_bytes);
+            }
+            if (c.lc != c.lc_kept) os::anon_free(c.lc, c.lc_bytes);
             c.lm_state = c.lc = nullptr;
             c.lm_state_bytes = c.lc_bytes = 0;
             c.lm = c.lm_pinned = false;
