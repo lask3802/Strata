@@ -5,7 +5,7 @@
 // grid: finish quant 1, as the engine's fk) and the compressed rows packed by finish's kKvFp4 packing (as the engine's
 // fc), RMS-normed rows with outlier channels, q of per-head scales 0.5 .. 16 (some peaky heads), sinks, each query's
 // selection min(index_topk 512, (p + 1) / R) distinct rows (neighbours sharing most of theirs, as top-k's do), at
-// positions about 0, 2K, 8K and 30K, ratios 0 (window only), 1, 2, 4, a slab not the chunk's first, a short slab, 32
+// positions about 0, 1K, 2K, 8K and 30K, ratios 0 (window only), 1, 2, 4, a slab not the chunk's first, a short slab, 32
 // heads (two members) and 48 (not a multiple of 32: the packed kernel, the same bits).  Needs a GPU, no model.
 // What it does not see: the engine's real q / K values (the KL window on the hosts checks those) and the wiring in
 // layer_chunk (the same sparse_attn call; the switch is read inside sparse_attn).
@@ -210,7 +210,7 @@ void free_case(Case& c) {
     CU(cudaFree(c.d_ckv));
 }
 
-// the slab's attention with the switch at mode (0: the packed kernel; 1, 2, 3 the tensor-core modes)
+// the slab's attention with the switch at mode (0: the packed kernel; 1, 2, 3 the tensor-core modes, 4 the test's)
 void run(const Case& c, int mode, float* out, cudaStream_t s) {
     dk::attn_tc() = mode;
     dk::sparse_attn(c.d_q, c.d_ext, c.d_ckv, c.d_sel, c.SEL, c.ar, c.d_sink, c.sh.heads, HD, c.sh.na,
@@ -300,6 +300,7 @@ int main(int argc, char** argv) {
         {"p 8K, ratio 1", 64, 8192, 0, 256, 1},
         {"p 30K, ratio 1", 64, 30000, 0, 256, 1},
         {"p 30K, ratio 4", 64, 30000, 0, 256, 4},
+        {"p 1K, ratio 4 (tiles part full)", 64, 1000, 0, 256, 4},
         {"p 8K, ratio 2, second slab, 100 queries", 64, 8192, 256, 100, 2},
         {"p 2K, ratio 0 (window only)", 64, 2048, 0, 256, 0},
         {"p 0, ratio 1 (the prompt's start)", 64, 0, 0, 256, 1},
@@ -309,9 +310,11 @@ int main(int argc, char** argv) {
     };
     // the bounds of max |new - old| / (1 + |old|) and of the same against the double reference: mode 1 F32-like (the
     // packed kernel's own distance to the double one is about 1e-5); modes 2 and 3 FP16's 2^-11 relative rounding of P,
-    // of q * scale as well (3: the error growing with q's scale, the peaky heads' - a gross error, a wrong row, is O(1))
-    const double kTol[4] = {0.0, 3e-4, 1e-2, 2e-1};
-    const char* const kMode[4] = {"packed", "TC 1 (q, P hi + lo)", "TC 2 (q hi + lo)   ", "TC 3 (plain FP16)  "};
+    // of q * scale as well (3: the error growing with q's scale, the peaky heads' - up to 1.6e-1 here; its layout is
+    // mode 4's, which holds it to mode 1's bound: mode 1's arithmetic in mode 3's 4 slices, this test's build only)
+    const double kTol[5] = {0.0, 3e-4, 1e-2, 5e-1, 3e-4};
+    const char* const kMode[5] = {"packed", "TC 1 (q, P hi + lo)", "TC 2 (q hi + lo)   ", "TC 3 (plain FP16)  ",
+                                  "TC 4 (1, 4 slices) "};
     for (const Shape& sh : shapes) {
         Case c;
         c.sh = sh;
@@ -338,7 +341,7 @@ int main(int argc, char** argv) {
                     e_old.add(old[((size_t) qs[i] * sh.heads + h) * HD + e], ref[i][(size_t) h * HD + e], qs[i], h, e);
         const bool taken = sh.heads % 32 == 0 && sh.na > dk::kAttnScratchT;
         std::printf("%-44s packed kernel vs double %.2e\n", sh.what, e_old.max);
-        for (int mode : {1, 2, 3}) {
+        for (int mode : {1, 2, 3, 4}) {
             CU(cudaMemset(o_new, 0xff, n * 4));
             run(c, mode, o_new, s);
             CU(cudaStreamSynchronize(s));

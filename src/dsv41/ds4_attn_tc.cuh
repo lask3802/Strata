@@ -15,6 +15,15 @@
 #include "ds4_numerics.cuh"
 #include <cuda_fp16.h>
 
+#include <atomic>
+#include <cstdio>
+
+// (sm_60 / sm_70 builds, STRATA_EXPERIMENTAL_SM60: no ldmatrix or m16n8k8 - the kernel compiles to a trap there and
+// sparse_attn_tc never launches it below compute capability 7.5)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#define DS4_ATTN_TC_NONE 1
+#endif
+
 namespace strata::ds4 {
 namespace attntc {
 
@@ -24,14 +33,16 @@ __device__ __forceinline__ uint32_t h2u(__half2 h) { return *(uint32_t*) &h; }
 __device__ __forceinline__ float e2m1_x2p14(uint32_t c) {
     return __half2float(__ushort_as_half((unsigned short) (((c & 8u) << 12) | ((c & 7u) << 9))));
 }
+__device__ __forceinline__ float clamp16(float v) { return fabsf(v) > 65504.0f ? copysignf(65504.0f, v) : v; }   // (a NaN stays)
 __device__ __forceinline__ __half2 bf2h2(uint32_t w) {   // two BF16 -> FP16, clamped to +-65504
-    const float lo = __uint_as_float(w << 16), hi = __uint_as_float(w & 0xffff0000u);
-    return __floats2half2_rn(fminf(fmaxf(lo, -65504.0f), 65504.0f), fminf(fmaxf(hi, -65504.0f), 65504.0f));
+    return __floats2half2_rn(clamp16(__uint_as_float(w << 16)), clamp16(__uint_as_float(w & 0xffff0000u)));
 }
 
 // c += a b: m16 x k16 (row) times k16 x n8 (col), FP16 in, F32 accumulate (Turing: two m16n8k8)
 __device__ __forceinline__ void mma16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(DS4_ATTN_TC_K8)
+#if defined(DS4_ATTN_TC_NONE)
+    __trap();
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(DS4_ATTN_TC_K8)
     asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
@@ -45,19 +56,30 @@ __device__ __forceinline__ void mma16(float (&c)[4], const uint32_t (&a)[4], uin
 #endif
 }
 __device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const __half* p) {
+#if defined(DS4_ATTN_TC_NONE)
+    r[0] = r[1] = r[2] = r[3] = 0u;
+    __trap();
+#else
     const uint32_t a = (uint32_t) __cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(a));
+#endif
 }
 __device__ __forceinline__ void ldsm4t(uint32_t (&r)[4], const __half* p) {
+#if defined(DS4_ATTN_TC_NONE)
+    r[0] = r[1] = r[2] = r[3] = 0u;
+    __trap();
+#else
     const uint32_t a = (uint32_t) __cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(a));
+#endif
 }
 
-// FP16 hi and lo of two F32s: hi + lo is x to about 2^-22 relative (the split modes' operands)
+// FP16 hi and lo of two F32s: hi + lo is x to about 2^-22 relative (below about 2^-3, lo subnormal: to about 6e-8)
+// - the split modes' operands
 __device__ __forceinline__ void split2(float x, float y, uint32_t& hi, uint32_t& lo) {
     const __half2 h = __floats2half2_rn(x, y);
     const float2 f = __half22float2(h);
@@ -275,25 +297,65 @@ __global__ void __launch_bounds__(64 * NQ, NQ == 4 ? 2 : 1)
     }
 }
 
+// the current device's state for the kernels, cached a device (4: cached): bit 0 its compute capability 7.5 or more;
+// the first call sets the 4-slice kernels' shared-memory carveout on it
+inline int device_state() {
+    static std::atomic<int> cached[64];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) dev = 0;
+    int v = cached[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        int ma = 0, mi = 0;
+        cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, dev);
+        v = 4 | (ma * 10 + mi >= 75 ? 1 : 0);
+        if (v & 1) {   // (two blocks a multiprocessor: Turing's 64 KB of shared memory)
+            bool ok = cudaFuncSetAttribute(attn_tc_kernel<4, 0>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                           cudaSharedmemCarveoutMaxShared) == cudaSuccess;
+#if defined(DS4_ATTN_TC_TEST)
+            ok = cudaFuncSetAttribute(attn_tc_kernel<4, 3>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                      cudaSharedmemCarveoutMaxShared) == cudaSuccess && ok;
+#endif
+            if (!ok) cudaGetLastError();   // (a hint only: not this call's error)
+        }
+        cached[dev].store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
+
 // mode 1: q and P as FP16 hi + lo, 2: q hi + lo and P plain (both 8 d slices, 16 warps a block), 3: plain FP16 (4
-// slices, 8 warps; two blocks a multiprocessor); false: not taken (heads not a multiple of 32, another mode)
+// slices, 8 warps; two blocks a multiprocessor); 4 (a test's, DS4_ATTN_TC_TEST builds): mode 1's arithmetic in mode
+// 3's 4-slice layout.  False: not taken - heads not a multiple of 32, a GPU below compute capability 7.5 (each said
+// once), another mode
 inline bool sparse_attn_tc(int mode, const float* q, const uint16_t* win, const uint8_t* ckv, size_t crow,
                            const int* sel, int sel_stride, const AttnRows& a, const float* sink, int heads, int T,
                            float scale, float* out, cudaStream_t s) {
-    if (mode < 1 || mode > 3 || heads % kHeads != 0 || T <= 0) return false;
+    if (mode < 1 || mode > 4 || T <= 0) return false;
+    static std::atomic<bool> told_heads{false}, told_cc{false};
+    if (heads % kHeads != 0) {
+        if (!told_heads.exchange(true))
+            std::fprintf(stderr, "ds4: DS4_ATTN_TC: %d heads a device, not a multiple of %d - the packed kernel\n", heads,
+                         kHeads);
+        return false;
+    }
+    if ((device_state() & 1) == 0) {
+        if (!told_cc.exchange(true))
+            std::fprintf(stderr, "ds4: DS4_ATTN_TC: a GPU below compute capability 7.5 - the packed kernel\n");
+        return false;
+    }
     const dim3 grid(heads / kHeads, T);
     if (mode == 1)
         attn_tc_kernel<8, 3><<<grid, 512, 0, s>>>(q, win, ckv, crow, sel, sel_stride, a, sink, heads, scale, out);
     else if (mode == 2)
         attn_tc_kernel<8, 1><<<grid, 512, 0, s>>>(q, win, ckv, crow, sel, sel_stride, a, sink, heads, scale, out);
-    else {
-        static const bool once = [] {   // (two blocks a multiprocessor: Turing's 64 KB of shared memory)
-            cudaFuncSetAttribute(attn_tc_kernel<4, 0>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                                 cudaSharedmemCarveoutMaxShared);
-            return true;
-        }();
-        (void) once;
+    else if (mode == 3)
         attn_tc_kernel<4, 0><<<grid, 256, 0, s>>>(q, win, ckv, crow, sel, sel_stride, a, sink, heads, scale, out);
+    else {
+#if defined(DS4_ATTN_TC_TEST)
+        attn_tc_kernel<4, 3><<<grid, 256, 0, s>>>(q, win, ckv, crow, sel, sel_stride, a, sink, heads, scale, out);
+#else
+        return false;
+#endif
     }
     return true;
 }
