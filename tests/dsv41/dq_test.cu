@@ -5,6 +5,9 @@
 // around the output untouched.  Then DS4_DQ_ONCE's order (ds4_gemm16.cuh): the attention slab's matrices at their
 // shapes, reconstructed once and every slab's GEMMs over them, against gemm()'s (each slab reconstructing each piece into
 // the w16 scratch, then its GEMM), the outputs byte for byte - with each dequant kernel.  Needs a GPU, no model.
+// What it does not see: the once order here is this file's own loop over ds4_gemm16.cuh's pieces, not ds4_model.cu's
+// gemm(), layer_chunk's wiring (wp16) or alloc_dq_once - those are checked end to end by a teacher-forced --score of
+// the model with DS4_DQ_ONCE=1 against one without it (r09's FQ arm: the same scores byte for byte)
 //   dq_test [--bench: the attention slab's pieces timed, each kernel]
 #include "../../src/dsv41/ds4_gemm16.cuh"
 #include "../../src/dsv41/ds4_gguf.cuh"

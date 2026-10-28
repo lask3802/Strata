@@ -1558,6 +1558,9 @@ int& dq_kernel() {
         if (e != nullptr && x != 1 && x != 2)   // (set to anything else: said, once - a mistyped arm is not silently off)
             std::fprintf(stderr, "ds4: DS4_DQ_NEW=%s: off - 1 (stores coalesced through shared memory) or 2 (16-byte "
                                  "stores, staged input) turns it on\n", e);
+        else if (x == 1 || x == 2)   // (on: said too, at the first dequant - an arm's log shows it took)
+            std::fprintf(stderr, "ds4: DS4_DQ_NEW=%d: the chunked prompt's dense dequant by dq_rows_kernel%d (%s)\n", x,
+                         x + 1, x == 1 ? "stores coalesced through shared memory" : "16-byte stores, staged input");
         return x == 1 || x == 2 ? x : 0;
     }();
     return v;

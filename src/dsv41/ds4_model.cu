@@ -3880,9 +3880,9 @@ struct Model::Impl {
         for (size_t di = 0; di < devs.size() && di < chunks.size(); ++di) {
             Chunk& c = *chunks[di];
             size_t need = 0;
-            for (const Layer& l0 : L)
+            for (const Layer& l0 : L)   // (not the MTP layers: alloc_chunks leaves them out, no layer_chunk runs them)
                 for (int m = 0; m < l0.nm; ++m)
-                    if (member(l0, m).dev == (int) di) need = std::max(need, once_elems(member(l0, m)));
+                    if (member(l0, m).dev == (int) di && !l0.mtp) need = std::max(need, once_elems(member(l0, m)));
             if (need == 0) continue;
             std::string e;
             if (!dalloc(devs[di], c.w16_once, need, e)) {
