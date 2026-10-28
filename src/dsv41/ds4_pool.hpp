@@ -77,6 +77,24 @@ public:
     void help() {
         if (n_ > 0) work(gen_.load(std::memory_order_acquire));
     }
+    /// help() a job at a time: at most one job of the batch run here; false when none was left to take (the caller
+    /// polls something between its jobs, DS4_EP_DEFER_BELOW's speed path the expert server's link)
+    bool help_one() {
+        if (n_ <= 0) return false;
+        const uint64_t g = gen_.load(std::memory_order_acquire);
+        for (;;) {
+            uint64_t t = ticket_.load(std::memory_order_acquire);
+            if ((t >> 32) != g) return false;
+            const int n = total_.load(std::memory_order_acquire);
+            if ((int) (t & 0xffffffffu) >= n) return false;
+            if (!ticket_.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel)) continue;
+            (*fn_)((int) (t & 0xffffffffu));
+            done_.fetch_add(1, std::memory_order_acq_rel);
+            return true;
+        }
+    }
+    /// every job of the batch done (wait() returns at once)
+    bool done() const { return n_ <= 0 || done_.load(std::memory_order_acquire) >= n_; }
     void wait() {
         if (n_ <= 0) return;
         while (done_.load(std::memory_order_acquire) < n_) cpu_relax();

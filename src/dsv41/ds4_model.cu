@@ -13,6 +13,7 @@
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_model.hpp"
+#include "ds4_defer_rows.hpp"
 #include "ds4_engram_io.hpp"
 #include "ds4_epparts.hpp"
 
@@ -546,8 +547,8 @@ struct Dev {
     float* glog_a = nullptr;   // lookahead: the next two layers' gate logits on this layer's FFN input (rows 1024 apart)
     float* late_post = nullptr;   // DS4_EP_DEFER: the FFN post of the layer whose mailbox part is still out (rows 8 apart)
     // DS4_EP_DEFER_VERIFY: the deferred path beside the exact one - its FFN output without the part, its streams after
-    // that FFN, and after the next attention
-    float *v_moe = nullptr, *v_h = nullptr, *v_h2 = nullptr;
+    // that FFN, and after the next attention; v_a: the magnitude of the terms both sides summed since the fork (hc_mag)
+    float *v_moe = nullptr, *v_h = nullptr, *v_h2 = nullptr, *v_a = nullptr;
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *tok = nullptr;
     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
     uint8_t* eg_rows = nullptr;
@@ -1318,7 +1319,12 @@ struct Model::Impl {
     rx::LateBook rx_late_book;   // the late requests, for their replies' round trips if they come
     bool rx_kts = false;         // the link has given a kernel arrival time (then a late request waits for its reply's)
     static_assert(rx::kMaxRows == kWin && rx::kMaxPicks == kPicks, "a request's rows and picks are a window's");
+    static_assert(dsplit::kTokPicks == kPicks && dsplit::kMaxPk == kWin * kPicks, "the split's picks are a window's");
     std::vector<rx::ReqRow> rx_rows;
+    // (rx_send's) each row's part row - its token's, or (a split request) its part's - and the tokens the rows hold (the
+    // gate's and the deadline's rows: a split request's two rows of one token are one)
+    std::vector<uint8_t> rx_dst;
+    int rx_toks = 0;
     // expert parallelism H' (DS4_EP_K, ds4_rx_split.hpp): the n_ff blocks a layer's CPU-lane picks split at (rx_nb: none)
     // - a request of an EP window that goes to the server takes them tagged slice, the server's CPU lane computes their
     // [k, nb) from its parts and this one [0, k) - and the layers that split (rx_split_l[il]; checked at rx_setup).
@@ -1367,12 +1373,51 @@ struct Model::Impl {
     // streams after that attention (or before the head): up to the float sums' order they are the same, so a larger
     // difference is a wiring bug.  An Engram layer's in-place add to the exact streams (its gates from them) goes onto
     // the deferred ones too (add_diff).  v_err[il]: the largest relative difference for layer il's part (device; Stats
-    // gets a copy after each window)
+    // gets a copy after each window) - |d| / (1 + |exact|); v_errs[il], the verdict's, |d| / S with S the magnitude of
+    // every term the two sides summed since they forked (Dev::v_a, hc_mag): float order bounds |d| by ~31 roundings of
+    // S (31 u = 1.9e-6, u = 2^-24) however much the terms cancel, which |d| / (1 + |exact|) does not - a residual
+    // stream of 1e3-1e4 that a layer's output cancels to ~1 puts that one at 1e-4
+    // (ds4_main.cpp's print_ep_verify has the count)
     int defer_from = 0, late_il = -1;
     bool ep_verify = false;
     bool v_wrong = false;   // DS4_EP_DEFER_VERIFY=2: the check's own check - the deferred side given a wrong comb (layer
                             // l's FFN one) on purpose, which the comparison must show; decode stays exact
-    float* v_err = nullptr;
+    float *v_err = nullptr, *v_errs = nullptr;
+    // DS4_EP_DEFER_BELOW=w / DS4_EP_DEFER_TOP=r (heavy-first deferral, ds4_defer_split.hpp; split_setup): a deferred
+    // layer's CPU-lane part in two - the heavy picks' (a share of the token's route weights >= w, or its r largest) in
+    // part[0], which the layer adds through the experts' sum as without the deferral, the light ones' in part[1]
+    // (row 1 is free at T 1), which late_flush adds a layer late (late_row 1).  The speed path: the layer waits for
+    // hseq alone (part[0] final: serve_lane publishes it before seq on every path); below_wait (DS4_EP_DEFER_BELOW_WAIT=1,
+    // the quality probe) and DS4_EP_DEFER_VERIFY wait for seq, both parts (about DS4_EP_DEFER=0's speed) - the host's
+    // work is the same in all three.  defer_of[slot]: 0 the seq's layer not deferred, 1 deferred whole (as before), 2 split -
+    // plan_window's, from run_layer's `late` terms, written and read as ep_of is.  Never the last layer (its add before
+    // the head is exact), never a drafter layer or a window of more than one row (not deferred at all)
+    dsplit::Rule split_rule;
+    bool below_wait = false;
+    uint8_t defer_of[kRing] = {};
+    int late_row = 0;   // (late_flush: the part row of the part still out - 1 for a split layer's light part)
+    // DS4_EP_DEFER_BELOW_CHECK=1: each split request's adds checked (every CPU-lane pick's n_ff blocks once, into its
+    // part: dsplit::ledger_ok) and its local pass in two calls compared with one call, bit for bit; =2: its heavy part
+    // hashed at hseq and again at seq (nothing may touch it in between)
+    int split_check = 0;
+    bool defer_stat = false;   // DS4_EP_DEFER_STAT=1: what each rule would make heavy, counted (dsplit::tally; passive)
+    // (serve_lane's, the request in hand) hseq published, CHECK=2's hash then; CHECK=1's adds; the CPU-lane picks and the
+    // heavy ones (t * kPicks + i); STAT's picks, their local slots and weights (the energy: from c_yd, once sp_e_due)
+    bool sp_put = false;
+    uint64_t sp_hash = 0;
+    std::vector<dsplit::Add> sp_adds;
+    uint8_t sp_lane[kWin * kPicks] = {}, sp_hv[kWin * kPicks] = {};
+    dsplit::LanePick sp_lp[kPicks];
+    int sp_slot[kPicks] = {}, sp_nlp = 0;
+    float sp_w[kPicks] = {};
+    bool sp_tally = false, sp_e_due = false;
+    std::vector<float> sp_ey;   // (STAT: the counted picks' outputs, kept before a fallback takes c_yd - stat_keep)
+    bool sp_ey_kept = false;
+    // (the speed path's timing, a split request's - the host's clock: its pickup, the lane's heavy part done, its light
+    // part done, hseq out; a heavy pick on the server (h_rem), and its reply not in when the light part was done)
+    double sp_tq = 0.0, sp_th = 0.0, sp_tll = 0.0, sp_ths = 0.0;
+    bool sp_hrem = false, sp_hlate = false;
+    double sp_skip = 0.0;   // (split_local's ms out of the lane's part: the gate's sample and the balance's)
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
     bool win_prompt = false;   // (feed_windows: a prompt's windows - their cache ticks are the decode's, serve_T 0)
     rx::PromptSettle psettle;  // (a window prompt's settle: once a prompt, ds4_rx_fill.hpp)
@@ -3807,6 +3852,7 @@ struct Model::Impl {
             make_pools();
         }
         if (!defer_setup(err)) return false;
+        split_setup();   // (after defer_setup and rx_setup: the deferral's layers, the expert server's checks)
         small_setup();   // (after defer_setup: its line says whether the deferral rides along)
         {
             void* m = nullptr;
@@ -6794,13 +6840,56 @@ struct Model::Impl {
         FfSplit() : from(-1), ff0(0), ffn(0) {}
         FfSplit(int f, int a, int n) : from(f), ff0(a), ffn(n) {}
     };
+    // DS4_EP_DEFER_BELOW / TOP's speed path (serve_lane's, the split request in hand).  rx_pre: what the poll read while
+    // the lane computed its light picks (rx_poll) - the reply (its heavy rows in part[0], hseq out), its Stale or the
+    // link's failure - which rx_finish then takes without a wait (got kNotPolled: nothing - rx_finish waits as before);
+    // tp the last read's end, gap the reply's read after the one before it, ms the reads' time.  lane_poll: run_nodes'
+    // caller polls it between its jobs and while the workers finish theirs (null: none - help() as before).  pf_same:
+    // pf_tick not ticked (a split request's second call and CHECK=1's: one window of DS4_IQ_PF's calls, as unsplit)
+    static constexpr int kNotPolled = -2;
+    struct RxPre {
+        int got = kNotPolled;
+        const uint16_t* y = nullptr;
+        int srv_us = 0, lane_us = 0;
+        bool stale = false, heavy_in = false;
+        double t1 = 0.0, ta = -1.0, gap = 1e30, tp = 0.0, ms = 0.0;
+        std::string e;
+    };
+    RxPre rx_pre;
+    const std::function<void()>* lane_poll = nullptr;
+    bool poll_tail = false;   // (help_polled waits for the workers: reads then cost the lane no time - rx_pre.ms not)
+    bool pf_same = false;
+    // (DS4_EP_DEFER_BELOW_CHECK=1: the two calls' outputs and the one call's arguments - its compare runs after seq,
+    // off the device's wait and out of the gate's time)
+    bool sp_chk_due = false;
+    std::vector<float> sp_chk_y, sp_chk_x;
+    std::vector<Ent> sp_chk_ents;
+    const Layer* sp_chk_l = nullptr;
+    int sp_chk_li = 0, sp_chk_na = 0, sp_chk_ff0 = 0, sp_chk_ffn = 0, sp_chk_n = 0;
+    unsigned sp_chk_seq = 0;
+    FfSplit sp_chk_wsb;
     static int ent_cap(const Layer& l) {
         return l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay) ? kEntMax : kc::kExl3CpuMaxN;
     }
     void run_nodes(int n, const std::function<void(int)>* f) {
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, f[X]);
-        pools[0]->help();
+        if (lane_poll != nullptr) help_polled();
+        else pools[0]->help();
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
+    }
+    // (lane_poll set) pools[0]'s jobs a job at a time, lane_poll between them, then while the workers finish theirs
+    // (th: when the caller's jobs ran out - run_nodes_prof's tail from there)
+    void help_polled(double* th = nullptr) {
+        (*lane_poll)();
+        while (pools[0]->help_one()) (*lane_poll)();
+        if (th != nullptr) *th = now_ms();
+        poll_tail = true;
+        for (int X = 0; X < NH; ++X)
+            while (!pools[(size_t) X]->done()) {
+                (*lane_poll)();
+                cpu_relax();
+            }
+        poll_tail = false;
     }
     // (DS4_LANE_PROF) run_nodes timed: its wall time, its tail (the caller's wait once it ran out of jobs: the
     // barrier's wait for the slowest worker's last job) and its jobs' time in all (busy), each added to its own
@@ -6816,8 +6905,13 @@ struct Model::Impl {
             };
         const double t0 = now_ms();
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, g[X]);
-        pools[0]->help();
-        const double th = now_ms();
+        double th = 0.0;
+        if (lane_poll != nullptr) {
+            help_polled(&th);
+        } else {
+            pools[0]->help();
+            th = now_ms();
+        }
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
         const double t1 = now_ms();
         wall += t1 - t0;
@@ -6930,6 +7024,7 @@ struct Model::Impl {
             pf_calls.assign(L.size(), 0);
             pf_seen.assign(L.size() * pf_ne, 0);
         }
+        if (pf_same && l.il >= 0 && (size_t) l.il < pf_calls.size()) return pf_calls[(size_t) l.il];
         return l.il >= 0 && (size_t) l.il < pf_calls.size() ? ++pf_calls[(size_t) l.il] : 0;
     }
     bool pf_stale(const Layer& l, int e, uint32_t tick) {
@@ -8278,30 +8373,15 @@ struct Model::Impl {
     // request seq's picks the server holds ((expert, t * kPicks + i), in token order) and its slice picks (spk: tagged,
     // from block rx_k) as rows of r's tokens
     // (wpk: the request's W picks - tagged slice and pool, [cut, nb) on the server's CPU lane: whole at cut 0)
+    // (hv, DS4_EP_DEFER_BELOW / TOP: a split request's heavy picks, T 1 - a row a (token, part), the heavy one first;
+    // the server's rows are independent of each other, so protocol 5 as it is.  rx_dst: each row's part row)
     bool rx_send(unsigned seq, int li, int T, const Req& r, const std::vector<std::pair<int, int>>& rpk,
                  const std::vector<std::pair<int, int>>& spk, const std::vector<std::pair<int, int>>& wpk = {},
-                 int cut = 0) {
-        rx_rows.clear();
-        const float* xs[kWin];
-        int row_of[kWin];
-        for (int t = 0; t < kWin; ++t) row_of[t] = -1;
-        for (int pass = 0; pass < 3; ++pass)
-            for (const auto& q : pass == 0 ? rpk : pass == 1 ? spk : wpk) {
-                const int t = q.second / kPicks, i = q.second % kPicks;
-                if (t >= T) continue;
-                if (row_of[t] < 0) {
-                    row_of[t] = (int) rx_rows.size();
-                    rx_rows.emplace_back();
-                    rx_rows.back().t = (uint8_t) t;
-                    xs[row_of[t]] = r.x[t];
-                }
-                rx::ReqRow& w = rx_rows[(size_t) row_of[t]];
-                if (pass >= 1) w.slice |= (uint16_t) (1u << w.n);
-                if (pass == 2) w.slice |= (uint16_t) (1u << (rx::kPoolBit + w.n));
-                w.e[w.n] = (int16_t) q.first;
-                w.w[w.n] = r.w[t][i];
-                ++w.n;
-            }
+                 int cut = 0, const uint8_t* hv = nullptr) {
+        const unsigned toks = dsplit::req_rows(T, &r.w[0][0], rpk, spk, wpk, hv, rx_rows, rx_dst);
+        const float* xs[2 * kWin];   // (each row's x: its token's)
+        for (size_t j = 0; j < rx_rows.size(); ++j) xs[j] = r.x[rx_rows[j].t];
+        rx_toks = (int) std::bitset<32>(toks).count();
         const int32_t c = spk.empty() && wpk.empty()
                               ? 0
                               : rx_k | (rx_verify > 0 ? rx::kReqSets : 0) | (rx_verify == 2 ? rx::kReqWrong : 0) |
@@ -8316,9 +8396,10 @@ struct Model::Impl {
         return true;
     }
     // picks (expert, t * kPicks + i) of request r over the n_ff blocks br (rx::fallback_range: the server's share of
-    // them) computed on the lane and added to rp's parts
-    void lane_add(const Layer& l, const Req& r, Resp& rp, int T, std::vector<std::pair<int, int>> pk2, rx::BlockRange br) {
-        lane_sum(l, &r.x[0][0], r, T, std::move(pk2), br, &rp.part[0][0], rp.cpu);
+    // them) computed on the lane and added to rp's parts (part, a split request's - T 1: its part row, 0 heavy, 1 light)
+    void lane_add(const Layer& l, const Req& r, Resp& rp, int T, std::vector<std::pair<int, int>> pk2, rx::BlockRange br,
+                  int part = 0) {
+        lane_sum(l, &r.x[0][0], r, T, std::move(pk2), br, &rp.part[part][0], &rp.cpu[part]);
     }
     // ... into out (kWin rows, kMaxDim apart; has[t]: row t holds a sum, else it is set by the first pick added) for x
     // (kWin rows, kMaxDim apart: r's, or the verify's in bf16)
@@ -8405,23 +8486,44 @@ struct Model::Impl {
     // after the lane's own picks, as long as the lane would take for these (rx::Gate::wait_ms), but not before 1.5 x the
     // round trip expected at these rows; the link's lateness (rx::Backoff) against the fixed wait's (rx::Gate::deadlines)
     // (spk: the request's slice picks - the reply holds their [k, nb), and so does the fallback: sp's late ranges)
+    // (hv, DS4_EP_DEFER_BELOW / TOP: a split request's heavy picks - each reply row into its part row (rx_dst), the
+    // fallback's heavy picks into part[0], then hseq, then its light ones into part[1]; null: as before.  A reply the
+    // speed path's poll took already (rx_pre: its heavy rows in part[0], hseq out) is not waited for again)
     void rx_finish(const Layer& l, const Req& r, Resp& rp, int T, unsigned seq, double t0,
                    const std::vector<std::pair<int, int>>& rpk, const std::vector<std::pair<int, int>>& spk,
-                   const rx::SplitPlan& sp, const std::vector<std::pair<int, int>>& wpk, double mb = 0.0, int cut = 0) {
+                   const rx::SplitPlan& sp, const std::vector<std::pair<int, int>>& wpk, double mb = 0.0, int cut = 0,
+                   const uint8_t* hv = nullptr) {
         const double tw = rx::now_ms();
-        const int rows = (int) rx_rows.size();
+        // (the reply's rows; the tokens they hold - the gate's and the deadline's rows, the same but for a split request)
+        const int rows = (int) rx_rows.size(), nrow = rx_toks;
         // (the lane's picks' worth the server computes: a W pick whole)
         const size_t n_srv = rx_npicks(rpk.size() + wpk.size(), spk.size());
-        const auto dl = rx_gate.deadlines(T, n_srv, rows, t0, tw, rx_timeout_ms, rx_wait_fixed, rx_kts);
+        const auto dl = rx_gate.deadlines(T, n_srv, nrow, t0, tw, rx_timeout_ms, rx_wait_fixed, rx_kts);
         const double deadline = dl.first, bound = dl.second;   // (the lane's; the link's, rx::Backoff's)
         const uint16_t* y = nullptr;
         int srv_us = 0, lane_us = 0;
         const int sets = !spk.empty() && rx_verify > 0 ? 2 : 1;
         std::string e;
-        const int got = rx_on ? rx_link->wait_resp(seq, rows, deadline, &y, srv_us, e, sets, &lane_us) : -1;
-        const double t1 = rx::now_ms();
-        const double ta = got == 1 ? rx_link->arrival_ms() : -1.0;   // (the kernel's time the reply came in: Linux)
-        const bool stale = got == 0 && rx_link->last_stale();   // (a fill took a slot it named: no reply will come)
+        const bool pre = rx_pre.got != kNotPolled;   // (the poll's: its reply, Stale or failure - no wait)
+        const int got = pre ? rx_pre.got : rx_on ? rx_link->wait_resp(seq, rows, deadline, &y, srv_us, e, sets, &lane_us) : -1;
+        if (pre) {
+            y = rx_pre.y;
+            srv_us = rx_pre.srv_us;
+            lane_us = rx_pre.lane_us;
+            e = rx_pre.e;
+        }
+        const double t1 = pre ? rx_pre.t1 : rx::now_ms();
+        const double ta = got == 1 ? (pre ? rx_pre.ta : rx_link->arrival_ms()) : -1.0;   // (the kernel's time the reply
+                                                                                        //  came in: Linux)
+        const bool stale = got == 0 && (pre ? rx_pre.stale : rx_link->last_stale());   // (a fill took a slot it named: no
+                                                                                      //  reply will come)
+        const bool h_in = pre && rx_pre.heavy_in;   // (the reply's heavy rows in part[0] already)
+        // (the lane's wait for the reply after its part: none when the poll took it during the light picks; the poll's
+        // read within 50 us of its last one is a round trip measured, not an upper bound)
+        const double wt = pre ? 0.0 : t1 - tw;
+        const bool waited = pre ? rx_pre.gap <= 0.05 : t1 - tw > 0.05;
+        const double skip_ms = hv != nullptr ? sp_skip : 0.0;   // (in tw - t0, not the lane's part: split_local's)
+        if (hv != nullptr) rx_pre = RxPre{};
         // earlier late requests' replies, skipped here: their round trips.  A stamp is a read's last skb: one equal to
         // the next reply's is that reply's; one read with only the next reply's head still over-states by that head
         const auto late = rx_link->take_late();
@@ -8448,20 +8550,20 @@ struct Model::Impl {
             if (rx_late_arr.size() < (size_t(1) << 20)) rx_late_arr.push_back({(float) (la - ts), ly});
         }
         if (ta >= 0) rx_kts = true;
-        if (ta >= t0 && ta <= t1) rx_seen(rows, ta - t0, true, t0);   // (outside: the realtime clock stepped)
+        if (ta >= t0 && ta <= t1) rx_seen(nrow, ta - t0, true, t0);   // (outside: the realtime clock stepped)
         else if (got == 1 || (got == 0 && !stale && !rx_kts))   // (late, with the kernel's times: its reply, if it
-            rx_seen(rows, t1 - t0, t1 - tw > 0.05, t0);   // comes, says) (read within 50 us of the lane's part: there already)
+            rx_seen(nrow, t1 - t0, waited, t0);   // comes, says) (read within 50 us of the lane's part: there already)
         for (int n = rx_late_book.expire(t1); n > 0; --n) rx_back_seen(true);   // (past the link's bound, not in)
         if (got == 0 && !stale)   // (late for the lane's wait; for the link only past the fixed wait's deadline)
-            for (int n = rx_late_book.add_late(seq, t0, rows, l.il, deadline, bound); n > 0; --n) rx_back_seen(true);
-        st.rx_wait_ms += t1 - tw;
+            for (int n = rx_late_book.add_late(seq, t0, nrow, l.il, deadline, bound); n > 0; --n) rx_back_seen(true);
+        st.rx_wait_ms += wt;
         if (T == 1 && !small_of[seq % kRing]) {   // (by the W blocks of [0, k) this request moved there: where the lane's
                                                   //  wait goes; a decode request's - not a small prompt's)
             const int64_t wb = (int64_t) wpk.size() * (rx_k - cut);
             const int bk = wb == 0 ? 0 : wb <= 3 ? 1 : wb <= 6 ? 2 : wb <= 12 ? 3 : 4;
             ++st.rx_wb_n[bk];
             st.rx_wb_part[bk] += tw - t0;
-            st.rx_wb_wait[bk] += t1 - tw;
+            st.rx_wb_wait[bk] += wt;
             if (got == 1 && ta >= t0 && ta <= t1) {
                 ++st.rx_wb_na[bk];
                 st.rx_wb_arr[bk] += ta - t0;
@@ -8474,25 +8576,25 @@ struct Model::Impl {
             std::lock_guard<std::mutex> lk(rx_mu);
             if (rx_rtt.size() < (size_t(1) << 22)) {   // (4M requests: the percentiles are of the first ones after)
                 rx_rtt.push_back(got == 1 ? (float) (t1 - t0) : -1.0f);
-                rx_wait.push_back((float) (t1 - tw));
+                rx_wait.push_back((float) wt);
                 rx_arr.push_back(ta >= t0 && ta <= t1 ? (float) (ta - t0) : -1.0f);
             }
         }
         if (got == 1) {
             const int D = g.dim;
             if (sets == 2) rx_split_check(l, r, T, spk, y + (size_t) rows * D);   // (before y is added: the same bits)
-            for (int s = 0; s < sets; ++s)   // (DS4_EP_SPLIT_VERIFY: the whole picks' sums, then the slice picks')
-                for (size_t j = 0; j < rx_rows.size(); ++j) {
-                    const int t = rx_rows[j].t;
-                    float* o = rp.part[t];
-                    const uint16_t* yj = y + ((size_t) s * rows + j) * (size_t) D;
-                    if (rp.cpu[t]) {
-                        for (int c = 0; c < D; ++c) o[c] += rx::bf2f(yj[c]);
-                    } else {
-                        for (int c = 0; c < D; ++c) o[c] = rx::bf2f(yj[c]);
-                        rp.cpu[t] = 1;
-                    }
-                }
+            // (each row into its token's part row - DS4_EP_SPLIT_VERIFY: the whole picks' sums, then the slice picks'.  A
+            // split request's: its heavy rows, unless the poll added them, then hseq - part[0] final - then the light ones)
+            float* pt = &rp.part[0][0];
+            if (hv == nullptr) {
+                dsplit::add_rows(rx_dst, y, rows, sets, D, pt, (size_t) kMaxDim, rp.cpu, -1, -1, rx::bf2f);
+            } else {
+                if (!h_in) dsplit::add_rows(rx_dst, y, rows, sets, D, pt, (size_t) kMaxDim, rp.cpu, 0, -1, rx::bf2f);
+                if (split_check == 1)
+                    dsplit::row_adds(rx_rows, rx_dst, &r.ids[0][0], l.k_exp, rx_k, cut, rx_nb, sp_adds);
+                hseq_put(rp, seq);
+                dsplit::add_rows(rx_dst, y, rows, sets, D, pt, (size_t) kMaxDim, rp.cpu, -1, 0, rx::bf2f);
+            }
             st.rx_picks += (int64_t) rpk.size();
             st.rx_split_picks += (int64_t) spk.size();
             st.rx_pool_picks += (int64_t) wpk.size();
@@ -8510,7 +8612,7 @@ struct Model::Impl {
                     ++rx_bal_ns;
                 }
                 if (rx_bal && T == 1 && mb > 0) {
-                    rx_bal_rm = rx::ewma(rx_bal_rm, (tw - t0) / mb, 0.05);
+                    rx_bal_rm = rx::ewma(rx_bal_rm, (tw - t0 - skip_ms) / mb, 0.05);
                     ++rx_bal_nm;
                 }
             }
@@ -8531,13 +8633,28 @@ struct Model::Impl {
             rx_lost(e.empty() ? "the link failed" : e);
         }
         rx_here_note(l, rpk);
+        if (sp_e_due) stat_keep();   // (DS4_EP_DEFER_STAT: the lane's slots, before the fallback's own take c_yd)
         const double tf = rx::now_ms();
         // exactly the server's share (the late reply is dropped when it comes): its experts whole, the slice picks' [k, nb)
-        lane_add(l, r, rp, T, rpk, sp.late_whole);
-        const int64_t ce = st.cpu_experts;   // (a slice pick is in cpu_experts once: serve_lane counted its [0, k))
-        lane_add(l, r, rp, T, spk, sp.late_slice);
-        st.cpu_experts = ce;
-        lane_add(l, r, rp, T, wpk, rx::BlockRange{cut, rx_nb});   // (W's: [cut, nb) here, [0, cut) computed before)
+        if (hv == nullptr) {
+            lane_add(l, r, rp, T, rpk, sp.late_whole);
+            const int64_t ce = st.cpu_experts;   // (a slice pick is in cpu_experts once: serve_lane counted its [0, k))
+            lane_add(l, r, rp, T, spk, sp.late_slice);
+            st.cpu_experts = ce;
+            lane_add(l, r, rp, T, wpk, rx::BlockRange{cut, rx_nb});   // (W's: [cut, nb) here, [0, cut) computed before)
+        } else {   // (a split request: the heavy picks' share into part[0], hseq, then the light ones' into part[1])
+            dsplit::FallPart fp[2];
+            dsplit::fallback_parts(rpk, spk, wpk, hv, sp, cut, rx_nb, fp);
+            for (int p = 0; p < 2; ++p) {
+                lane_add(l, r, rp, T, fp[p].pk[0], fp[p].br[0], p);
+                const int64_t ce = st.cpu_experts;
+                lane_add(l, r, rp, T, fp[p].pk[1], fp[p].br[1], p);
+                st.cpu_experts = ce;
+                lane_add(l, r, rp, T, fp[p].pk[2], fp[p].br[2], p);
+                if (split_check == 1) dsplit::fallback_adds(fp[p], p, sp_adds);
+                if (p == 0) hseq_put(rp, seq);
+            }
+        }
         st.rx_fallback += (int64_t) rpk.size();
         st.rx_split_fallback += (int64_t) spk.size();
         st.rx_pool_fallback += (int64_t) wpk.size();
@@ -8800,6 +8917,314 @@ struct Model::Impl {
         return b;
     }
 
+    // DS4_EP_DEFER_STAT's lines (dsplit::tally_lines), the split's own and its checks' since s0 ("" when none counted)
+    std::string defer_lines(const Stats& s0) const {
+        std::string out = dsplit::tally_lines(st.ep_stat, s0.ep_stat);
+        if (st.ep_split > s0.ep_split) {
+            const double n = (double) (st.ep_split - s0.ep_split), np = (double) (st.ep_split_picks - s0.ep_split_picks),
+                         nh = (double) (st.ep_split_heavy - s0.ep_split_heavy);
+            char rule[64];
+            if (split_rule.kind == dsplit::Kind::kBelow) std::snprintf(rule, sizeof rule, "DS4_EP_DEFER_BELOW=%g", (double) split_rule.w);
+            else std::snprintf(rule, sizeof rule, "DS4_EP_DEFER_TOP=%d", split_rule.r);
+            add_f(out, "ep defer split (%s): %.0f decode requests split - %.2f CPU-lane picks a request, %.1f%% of them "
+                       "heavy (%.2f a request, added in the layer), the rest a layer late; %.1f%% of the requests with a "
+                       "heavy pick the server computes\n",
+                  rule, n, np / n, np > 0 ? 100.0 * nh / np : 0.0, nh / n,
+                  100.0 * (double) (st.ep_split_hsrv - s0.ep_split_hsrv) / n);
+        }
+        if (st.sp_t_n > s0.sp_t_n) {   // (what decides protocol 6: does the heavy part's remote wait bind)
+            const double n = (double) (st.sp_t_n - s0.sp_t_n);
+            const long long nh = (long long) (st.sp_t_hrem - s0.sp_t_hrem), nl = (long long) (st.sp_t_late - s0.sp_t_late);
+            auto q = [&](double f) {   // (to hseq: the bin's upper edge)
+                int64_t c = 0;
+                for (int b = 0; b < Stats::kSpBins; ++b) {
+                    c += st.sp_t_bin[b] - s0.sp_t_bin[b];
+                    if ((double) c >= f * n) return (b + 1) * Stats::kSpBinMs;
+                }
+                return Stats::kSpBins * Stats::kSpBinMs;
+            };
+            add_f(out, "ep defer split timing (%s; the host's clock from a decode split request's pickup): %.0f requests - "
+                       "hseq at %.3f ms (p50 %.2f, p99 %.2f), seq at %.3f ms; %lld (%.1f%%) with a heavy pick on the server: "
+                       "the heavy wait (the lane's heavy part done to hseq) %.3f ms each, %.3f ms a split layer; the heavy "
+                       "reply not in when the lane's light part was done: %lld (%.1f%% of those, %.1f%% of all), hseq "
+                       "%.3f ms after it\n",
+                  below_wait  ? "DS4_EP_DEFER_BELOW_WAIT=1: the layer waits for seq"
+                  : ep_verify ? "DS4_EP_DEFER_VERIFY: the layer waits for seq"
+                              : "the layer waits for hseq",
+                  n, (st.sp_t_hseq - s0.sp_t_hseq) / n, q(0.5), q(0.99), (st.sp_t_seq - s0.sp_t_seq) / n, nh,
+                  100.0 * (double) nh / n, (st.sp_t_hwait - s0.sp_t_hwait) / (double) std::max(1LL, nh),
+                  (st.sp_t_hwait - s0.sp_t_hwait) / n, nl, 100.0 * (double) nl / (double) std::max(1LL, nh),
+                  100.0 * (double) nl / n, (st.sp_t_after - s0.sp_t_after) / (double) std::max(1LL, nl));
+        }
+        if (st.ep_chk_n > s0.ep_chk_n) {
+            const long long bad = (long long) (st.ep_chk_bad - s0.ep_chk_bad), cb = (long long) (st.ep_chk_cmp_bad - s0.ep_chk_cmp_bad);
+            add_f(out, "ep defer split check (DS4_EP_DEFER_BELOW_CHECK=1): %lld split requests' adds checked (every CPU-lane "
+                       "pick's n_ff blocks once, into its part), %lld wrong; %lld local passes in two calls against one "
+                       "call, %lld not the same bits - %s\n",
+                  (long long) (st.ep_chk_n - s0.ep_chk_n), bad, (long long) (st.ep_chk_cmp - s0.ep_chk_cmp), cb,
+                  bad == 0 && cb == 0 ? "ok" : "MISMATCH");
+        }
+        if (st.ep_chk2_n > s0.ep_chk2_n) {
+            const long long bad = (long long) (st.ep_chk2_bad - s0.ep_chk2_bad);
+            add_f(out, "ep defer split check (DS4_EP_DEFER_BELOW_CHECK=2): %lld split requests' heavy part hashed at hseq "
+                       "and again at seq, %lld changed in between - %s\n",
+                  (long long) (st.ep_chk2_n - s0.ep_chk2_n), bad, bad == 0 ? "ok" : "MISMATCH");
+        }
+        return out;
+    }
+    // (lookahead, ahead_order) the order the first na of ents are computed in: the entries asked for early (or in the
+    // RAM tier) first, so the ones asked for only now get the others' time to come in from the SSD (their slots, so the
+    // sums, stay the same); null: as they are
+    const int* ahead_ord(const Layer& l, int li, unsigned seq, const std::vector<Ent>& ents, int na, int* ord) {
+        if (!(ahead_order && !ahead_for.empty() && ahead_for[(size_t) li] == seq && na > 1 && na <= kWin * kPicks))
+            return nullptr;
+        const uint8_t* fa = ahead_fl.data() + (size_t) li * 1024;   // (the lane's own entries)
+        int n = 0;
+        for (int pass = 0; pass < 2; ++pass)
+            for (size_t q = 0; q < (size_t) na; ++q) {
+                const int e = ents[q].e;
+                const bool early = !file_read(l, e) || (fa[e] & 8) != 0;
+                if (early == (pass == 0)) ord[n++] = (int) q;
+            }
+        return ord;
+    }
+    // DS4_EP_DEFER_BELOW / TOP: a split request's part[0] final - hseq published (the fence, then hseq; once a request).
+    // DS4_EP_DEFER_BELOW_CHECK=2 hashes the part then, split_end again at seq
+    void hseq_put(Resp& rp, unsigned seq) {
+        if (sp_put) return;
+        sp_put = true;
+        sp_ths = now_ms();
+        if (split_check == 2) sp_hash = part_hash(rp, 0);
+        std::atomic_thread_fence(std::memory_order_release);
+        *(volatile unsigned*) &rp.hseq = seq;
+    }
+    // (FNV-1a) part row `row`'s flag, and its dim floats when the flag is set
+    uint64_t part_hash(const Resp& rp, int row) const {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&h](const void* p, size_t n) {
+            const uint8_t* b = (const uint8_t*) p;
+            for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+        };
+        const int f = *(const volatile int*) &rp.cpu[row];
+        mix(&f, sizeof f);
+        if (f) mix(rp.part[row], (size_t) g.dim * sizeof(float));
+        return h;
+    }
+    // DS4_EP_DEFER_BELOW / TOP: a split request's own CPU-lane entries (T 1: one token, an entry a pick) in two calls -
+    // the heavy ones' outputs summed into part[0] (hseq published at once when no heavy pick waits on the server: h_rem),
+    // then the light ones' into part[1].  Each entry keeps its slots (cpu_experts writes an entry's own rows of c_yd), so
+    // each output's bits are the one call's - DS4_EP_DEFER_BELOW_CHECK=1 compares them with the one call (split_chk,
+    // after seq), as DS4_EP_POOL_CUT_CHECK does.  ents: the lane's own na entries (over mr: [ff0, ff0 + ffn)), then the
+    // cut W picks' (wsb's [0, wcut)); nmain: the own entries' slots; wv, pk_of: each slot's route weight and pick
+    // (t * kPicks + i).  While a heavy pick waits on the server (h_rem) the light call polls the link (rx_poll): its
+    // reply taken as it lands, hseq out then.  The ms to leave out of the gate's time (the poll's reads, CHECK=1's copy):
+    // the gate's sample is the two calls' (the lane's work for its picks, split as it runs)
+    double split_local(const Layer& l, int li, const Req& r, Resp& rp, unsigned seq, const std::vector<Ent>& ents, int na,
+                       int nslots, int nmain, const float* wv, const int* pk_of, int ff0, int ffn, FfSplit wsb,
+                       rx::BlockRange mr, int wcut, bool h_rem) {
+        const int D = g.dim;
+        std::vector<Ent> pe[2];
+        int pna[2] = {0, 0};
+        for (int q = 0; q < (int) ents.size(); ++q) {
+            const Ent& en = ents[(size_t) q];
+            if (en.n != 1) {
+                std::fprintf(stderr, "ds4: DS4_EP_DEFER_BELOW: layer %d's split request %u has an entry of %d tokens (T 1: "
+                                     "one)\n", li, seq, en.n);
+                std::abort();
+            }
+            const int p = sp_hv[pk_of[en.slot0]] ? 0 : 1;
+            pe[p].push_back(en);
+            pna[p] += q < na;
+        }
+        const std::function<void()> poll = [&] { rx_poll(rp, seq); };
+        for (int p = 0; p < 2; ++p) {
+            if (!pe[p].empty()) {
+                int ord[kWin * kPicks];
+                lane_poll = p == 1 && h_rem && !sp_put && rx_on ? &poll : nullptr;
+                pf_same = p == 1 && !pe[0].empty();
+                cpu_experts(l, &r.x[0][0], pe[p], (size_t) kMaxDim, ahead_ord(l, li, seq, pe[p], pna[p], ord), ff0, ffn,
+                            pna[p] < (int) pe[p].size() ? FfSplit{pna[p], wsb.ff0, wsb.ffn} : FfSplit());
+                lane_poll = nullptr;
+                pf_same = false;
+            }
+            float* o = rp.part[p];   // (the part's slots in slot order, as the one-row sum adds them)
+            bool any = false;
+            for (int sl = 0; sl < nslots; ++sl) {
+                if ((sp_hv[pk_of[sl]] ? 0 : 1) != p) continue;
+                if (!any)
+                    for (int e = 0; e < D; ++e) o[e] = 0.0f;
+                any = true;
+                const float* y = c_yd.data() + (size_t) sl * D;
+                for (int e = 0; e < D; ++e) o[e] += wv[sl] * y[e];
+            }
+            if (any) rp.cpu[p] = 1;
+            if (p == 0 && !h_rem) hseq_put(rp, seq);
+            (p == 0 ? sp_th : sp_tll) = now_ms();
+        }
+        sp_hlate = h_rem && !sp_put;
+        double skip = rx_pre.ms;
+        if (split_check == 1) {   // (the two calls against the one call the request would make unsplit: split_chk's)
+            const double a = now_ms();
+            dsplit::local_adds(pk_of, nslots, nmain, sp_hv, mr, wcut, sp_adds);
+            sp_chk_y.assign(c_yd.begin(), c_yd.begin() + (ptrdiff_t) ((size_t) nslots * D));
+            sp_chk_x.assign(&r.x[0][0], &r.x[0][0] + kMaxDim);
+            sp_chk_ents = ents;
+            sp_chk_l = &l;
+            sp_chk_li = li;
+            sp_chk_seq = seq;
+            sp_chk_na = na;
+            sp_chk_ff0 = ff0;
+            sp_chk_ffn = ffn;
+            sp_chk_wsb = wsb;
+            sp_chk_n = nslots;
+            sp_chk_due = true;
+            skip += now_ms() - a;
+        }
+        sp_skip = skip;
+        return skip;
+    }
+    // (a decode split request's, after seq) its times into the stats: defer_lines' timing line
+    void split_timed(double t_seq) {
+        ++st.sp_t_n;
+        st.sp_t_hseq += sp_ths - sp_tq;
+        st.sp_t_seq += t_seq - sp_tq;
+        const int b = (int) ((sp_ths - sp_tq) / Stats::kSpBinMs);
+        ++st.sp_t_bin[std::max(0, std::min(Stats::kSpBins - 1, b))];
+        if (sp_hrem) {
+            ++st.sp_t_hrem;
+            st.sp_t_hwait += std::max(0.0, sp_ths - sp_th);
+        }
+        if (sp_hlate) {
+            ++st.sp_t_late;
+            st.sp_t_after += std::max(0.0, sp_ths - sp_tll);
+        }
+    }
+    // (DS4_EP_DEFER_BELOW_CHECK=1, after seq) split_local's two calls against the one call, bit for bit
+    void split_chk() {
+        if (!sp_chk_due) return;
+        sp_chk_due = false;
+        int ord[kWin * kPicks];
+        pf_same = true;
+        cpu_experts(*sp_chk_l, sp_chk_x.data(), sp_chk_ents, (size_t) kMaxDim,
+                    ahead_ord(*sp_chk_l, sp_chk_li, sp_chk_seq, sp_chk_ents, sp_chk_na, ord), sp_chk_ff0, sp_chk_ffn,
+                    sp_chk_wsb);
+        pf_same = false;
+        ++st.ep_chk_cmp;
+        if (std::memcmp(sp_chk_y.data(), c_yd.data(), (size_t) sp_chk_n * g.dim * sizeof(float)) != 0) ++st.ep_chk_cmp_bad;
+    }
+    // DS4_EP_DEFER_BELOW / TOP's speed path, between the light call's jobs (lane_poll): the split request's reply read if
+    // the link holds it (rx::Main::wait_resp, its deadline past: no wait) - its heavy rows into part[0] in rx_finish's
+    // order and hseq out at once; its light rows, its stats and the rest rx_finish's (rx_pre).  A Stale or a failure is
+    // kept for rx_finish too; nothing in: read again 10 us on.  (sets 1: the split is off beside DS4_EP_SPLIT_VERIFY)
+    void rx_poll(Resp& rp, unsigned seq) {
+        if (rx_pre.got != kNotPolled) return;
+        const double a = rx::now_ms();
+        if (a - rx_pre.tp < 0.01) return;
+        const uint16_t* y = nullptr;
+        int srv_us = 0, lane_us = 0;
+        std::string e;
+        const int rows = (int) rx_rows.size();
+        const int got = rx_link->wait_resp(seq, rows, 0.0, &y, srv_us, e, 1, &lane_us);
+        const double t1 = rx::now_ms();
+        const double gap = rx_pre.tp > 0.0 ? t1 - rx_pre.tp : 1e30;
+        rx_pre.tp = t1;
+        if (got == 0 && !rx_link->last_stale()) {   // (not in yet)
+            if (!poll_tail) rx_pre.ms += t1 - a;
+            return;
+        }
+        rx_pre.got = got;
+        rx_pre.y = y;
+        rx_pre.srv_us = srv_us;
+        rx_pre.lane_us = lane_us;
+        rx_pre.e = e;
+        rx_pre.stale = got == 0;
+        rx_pre.t1 = t1;
+        rx_pre.gap = gap;
+        rx_pre.ta = got == 1 ? rx_link->arrival_ms() : -1.0;
+        if (got == 1) {
+            dsplit::add_rows(rx_dst, y, rows, 1, g.dim, &rp.part[0][0], (size_t) kMaxDim, rp.cpu, 0, -1, rx::bf2f);
+            rx_pre.heavy_in = true;
+            hseq_put(rp, seq);
+        }
+        if (!poll_tail) rx_pre.ms += rx::now_ms() - a;
+    }
+    // DS4_EP_DEFER_BELOW / TOP: a split request's end, before its seq - hseq if no path published it yet (no CPU-lane
+    // pick, a layer past the table, the link down ...), and the checks
+    void split_end(Resp& rp, unsigned seq, int li) {
+        const bool put = sp_put;   // (hseq out before: CHECK=2's hash then - one put here hashes the same bits now)
+        hseq_put(rp, seq);
+        if (split_check == 2 && put) {   // (every split request's, a small prompt's too: a wiring check, not a decode stat)
+            ++st.ep_chk2_n;
+            if (part_hash(rp, 0) != sp_hash) ++st.ep_chk2_bad;
+        }
+        if (split_check == 1) {
+            std::string why;
+            ++st.ep_chk_n;
+            if (!dsplit::ledger_ok(sp_lane, sp_hv, kWin * kPicks, sp_adds, rx_nb, &why) && ++st.ep_chk_bad == 1)
+                std::fprintf(stderr, "ds4: DS4_EP_DEFER_BELOW_CHECK=1: request %u (layer %d): %s (said once; the count is in "
+                                     "the stats)\n", seq, li, why.c_str());
+            sp_adds.clear();
+        }
+    }
+    // DS4_EP_DEFER_STAT: a counted request's CPU-lane picks (T 1: pick t * kPicks + i is i) - where each runs, its n_ff
+    // blocks here and on the server, its local slot for the energy (stat_energy: after seq, or before a fallback takes
+    // c_yd).  picks: the lane's own (tagged slice when the request went with them); rpicks: the server's GPU's; wpicks:
+    // W's ([0, wcut) here)
+    void stat_take(const float* shr, const std::vector<std::pair<int, int>>& picks,
+                   const std::vector<std::pair<int, int>>& rpicks, const std::vector<std::pair<int, int>>& wpicks,
+                   const rx::SplitPlan& sp, int wcut, const int* pk_of, const float* wv, int nslots) {
+        sp_nlp = 0;
+        auto add = [&](int pk, int kind, rx::BlockRange here, rx::BlockRange srv) {
+            if (pk < 0 || pk >= kPicks || sp_nlp >= kPicks) return;
+            dsplit::LanePick& q = sp_lp[sp_nlp];
+            q = dsplit::LanePick{};
+            q.i = pk;
+            q.kind = kind;
+            q.s = shr[pk];
+            q.bh = here.empty() ? 0 : here.b1 - here.b0;
+            q.bs = srv.empty() ? 0 : srv.b1 - srv.b0;
+            sp_slot[sp_nlp] = -1;
+            for (int sl = 0; sl < nslots; ++sl)
+                if (pk_of[sl] == pk) {
+                    sp_slot[sp_nlp] = sl;
+                    sp_w[sp_nlp] = wv[sl];
+                }
+            ++sp_nlp;
+        };
+        for (const auto& q : picks) add(q.second, sp.tagged ? dsplit::kSlice : dsplit::kHere, sp.here, sp.late_slice);
+        for (const auto& q : rpicks) add(q.second, dsplit::kHeld, rx::BlockRange{}, sp.late_whole);
+        for (const auto& q : wpicks) add(q.second, dsplit::kW, rx::BlockRange{0, wcut}, rx::BlockRange{wcut, rx_nb});
+        sp_tally = sp_e_due = true;
+    }
+    // (DS4_EP_DEFER_STAT, a fallback about to take c_yd, before seq) the counted picks' outputs kept: their energies
+    // after seq all the same
+    void stat_keep() {
+        const int D = g.dim;
+        sp_ey.assign((size_t) sp_nlp * D, 0.0f);
+        for (int a = 0; a < sp_nlp; ++a)
+            if (sp_slot[a] >= 0)
+                std::memcpy(sp_ey.data() + (size_t) a * D, c_yd.data() + (size_t) sp_slot[a] * D, (size_t) D * sizeof(float));
+        sp_ey_kept = true;
+    }
+    // (DS4_EP_DEFER_STAT) the counted picks' local energies |w y|^2 from c_yd (the slots stat_take found), or from what
+    // stat_keep kept
+    void stat_energy() {
+        const int D = g.dim;
+        for (int a = 0; a < sp_nlp; ++a) {
+            double e = 0.0;
+            if (sp_slot[a] >= 0) {
+                const float* y = sp_ey_kept ? sp_ey.data() + (size_t) a * D : c_yd.data() + (size_t) sp_slot[a] * D;
+                for (int c = 0; c < D; ++c) {
+                    const double v = (double) sp_w[a] * (double) y[c];
+                    e += v * v;
+                }
+            }
+            sp_lp[a].e = e;
+        }
+        sp_e_due = false;
+        sp_ey_kept = false;
+    }
+
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
     // part, then the answer's seq.  Spins while requests come (a token's 40 layers), naps after 2 ms without one.
     void serve_lane() {
@@ -8836,6 +9261,25 @@ struct Model::Impl {
             Resp& rp = resps[next % kRing];
             const int T = std::max(1, std::min(kWin, r.T));
             for (int t = 0; t < T; ++t) rp.cpu[t] = 0;
+            // DS4_EP_DEFER_BELOW / TOP, a split request (T 1): the heavy picks' part in part[0], the light ones' in
+            // part[1] (its row 1, unused at T 1), hseq once part[0] is final (every path: split_end).  DS4_EP_DEFER_STAT:
+            // a decode request of a layer the split could take, counted whether it is split or not
+            const bool hsp = defer_of[next % kRing] == 2 && T == 1;
+            const bool hst = defer_stat && defer_of[next % kRing] != 0 && T == 1 && li != g.nl - 1 &&
+                             !small_of[next % kRing];
+            if (hsp) {
+                rp.cpu[1] = 0;
+                sp_put = false;
+                sp_adds.clear();
+                rx_pre = RxPre{};
+                sp_tq = now_ms();
+                sp_skip = 0.0;
+                sp_hrem = sp_hlate = false;
+            }
+            if (hsp || hst) {
+                std::memset(sp_lane, 0, sizeof sp_lane);
+                std::memset(sp_hv, 0, sizeof sp_hv);
+            }
             if (li >= 0 && li < (int) L.size()) {
                 Layer& l = L[(size_t) li];
                 uint32_t* pr = prof.data() + (size_t) li * g.n_exp;
@@ -8849,7 +9293,7 @@ struct Model::Impl {
                                         ? ahead_fl.data() + (size_t) li * 1024 : nullptr;
                 // the window's CPU-lane picks by expert (up to 8 tokens an entry), their weights by entry row
                 float wv[kWin * kPicks];
-                int tok_of[kWin * kPicks];
+                int tok_of[kWin * kPicks], pk_of[kWin * kPicks];   // (pk_of: the slot's pick, t * kPicks + i)
                 int nslots = 0;
                 std::vector<std::pair<int, int>> picks;   // (expert, t * kPicks + i), CPU-lane only
                 // (--remote-experts) the CPU-lane picks the expert server holds: sent before the lane computes the rest
@@ -8959,6 +9403,16 @@ struct Model::Impl {
                     rpicks.clear();
                     want = false;
                 }
+                // DS4_EP_DEFER_BELOW / TOP and DS4_EP_DEFER_STAT: the request's CPU-lane picks are final here (the gate's and
+                // the idle link's take the server's into picks; W's below move out of picks, a failed send back in) - their
+                // shares of the token's route weights, and a split request's heavy ones
+                float shr[kPicks] = {};
+                if (hsp || hst) {
+                    for (const auto& q : picks) sp_lane[q.second] = 1;
+                    for (const auto& q : rpicks) sp_lane[q.second] = 1;
+                    dsplit::shares(r.ids[0], r.w[0], l.k_exp, l.n_exp, shr);
+                }
+                if (hsp) dsplit::heavy(split_rule, shr, sp_lane, l.k_exp, sp_hv);
                 // the slice picks: every CPU-lane pick of the request (not one on this GPU: picks holds none) - which go
                 // tagged, the lane's range for them and the fallback's: rx::split_plan (ds4_rx_split.hpp)
                 std::vector<std::pair<int, int>> spicks, wpicks;
@@ -9000,7 +9454,8 @@ struct Model::Impl {
                     }
                     if (sp.tagged) spicks = picks;
                     rx_t0 = rx::now_ms();
-                    if (!rx_send(next, li, T, r, rpicks, spicks, wpicks, wcut)) {   // (no link: the lane computes them as it did before)
+                    if (!rx_send(next, li, T, r, rpicks, spicks, wpicks, wcut, hsp ? sp_hv : nullptr)) {   // (no link: the lane
+                                                                                                          //  computes them as it did before)
                         rx_here_note(l, rpicks);
                         picks.insert(picks.end(), rpicks.begin(), rpicks.end());
                         picks.insert(picks.end(), wpicks.begin(), wpicks.end());
@@ -9024,6 +9479,7 @@ struct Model::Impl {
                         const int t = picks[a].second / kPicks, i = picks[a].second % kPicks;
                         en.tok[en.n++] = t;
                         tok_of[nslots] = t;
+                        pk_of[nslots] = picks[a].second;
                         wv[nslots] = r.w[t][i];
                         ++nslots;
                         ++a;
@@ -9045,6 +9501,7 @@ struct Model::Impl {
                             const int t = wp[a].second / kPicks, i = wp[a].second % kPicks;
                             en.tok[en.n++] = t;
                             tok_of[nslots] = t;
+                            pk_of[nslots] = wp[a].second;
                             wv[nslots] = r.w[t][i];
                             ++nslots;
                             ++a;
@@ -9055,19 +9512,26 @@ struct Model::Impl {
                 // lookahead: the entries asked for early (or in the RAM tier) computed first, so the ones asked for
                 // only now get the others' time to come in from the SSD (their slots, so the sums, stay the same)
                 int ord[kWin * kPicks];
-                const int* po = nullptr;
-                if (ahead_order && !ahead_for.empty() && ahead_for[(size_t) li] == next && na > 1 && na <= kWin * kPicks) {
-                    const uint8_t* fa = ahead_fl.data() + (size_t) li * 1024;   // (the lane's own entries)
-                    int n = 0;
-                    for (int pass = 0; pass < 2; ++pass)
-                        for (size_t q = 0; q < (size_t) na; ++q) {
-                            const int e = ents[q].e;
-                            const bool early = !file_read(l, e) || (fa[e] & 8) != 0;
-                            if (early == (pass == 0)) ord[n++] = (int) q;
-                        }
-                    po = ord;
+                const int* po = ahead_ord(l, li, next, ents, na, ord);
+                // (a split request: a heavy pick that waits on the server - the reply, or its fallback, finishes part[0])
+                bool h_rem = false;
+                if (hsp && sp.sent)
+                    for (const auto* v : {&rpicks, &spicks, &wpicks})
+                        for (const auto& q : *v) h_rem = h_rem || sp_hv[q.second] != 0;
+                if (hsp) {   // (no local entries: the lane's parts done now - split_local's times otherwise)
+                    sp_hrem = sp_hlate = h_rem;
+                    sp_th = sp_tll = now_ms();
+                }
+                if (hsp && dec) {
+                    ++st.ep_split;
+                    for (int i = 0; i < l.k_exp; ++i) {
+                        st.ep_split_picks += sp_lane[i];
+                        st.ep_split_heavy += sp_hv[i];
+                    }
+                    st.ep_split_hsrv += h_rem;
                 }
                 double bal_mb = 0.0;   // (this lane's bytes of the request: the balance's sample)
+                double t_skip = 0.0;   // (a split request's: out of the gate's time - split_local)
                 if (!ents.empty()) {
                     const double tc = now_ms();
                     if (lane_prof) st.lp_plan_ms += tc - lp_req;
@@ -9080,7 +9544,11 @@ struct Model::Impl {
                         ++st.rx_cut_sets;
                         if (!store && down_parts(l, wf0, wfn) != nullptr) ++st.rx_cut_dp;
                     }
-                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, ff0, ffn, wsb);
+                    if (hsp)   // (DS4_EP_DEFER_BELOW / TOP: the heavy entries, part[0], then the light ones, part[1])
+                        t_skip = split_local(l, li, r, rp, next, ents, na, nslots, nmain, wv, pk_of, ff0, ffn, wsb, mr, wcut,
+                                             h_rem);
+                    else
+                        cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, ff0, ffn, wsb);
                     if (rx_cut_chk && wsb.from >= 0) {   // (DS4_EP_POOL_CUT_CHECK: the pass against two calls, bit for bit)
                         const size_t D = (size_t) g.dim;
                         const std::vector<float> y1(c_yd.begin(), c_yd.begin() + (ptrdiff_t) ((size_t) nslots * D));
@@ -9094,7 +9562,7 @@ struct Model::Impl {
                     }
                     const double ta = lane_prof ? now_ms() : 0.0;
                     const int D = g.dim;
-                    for (int t = 0; t < T; ++t) {
+                    for (int t = 0; t < T && !hsp; ++t) {   // (a split request's parts: split_local's)
                         bool any = false;
                         for (int sl = 0; sl < nslots; ++sl) any = any || tok_of[sl] == t;
                         if (!any) continue;
@@ -9108,7 +9576,7 @@ struct Model::Impl {
                         rp.cpu[t] = 1;
                     }
                     if (lane_prof) st.lp_add_ms += now_ms() - ta;
-                    const double tl = now_ms() - tc;
+                    const double tl = now_ms() - tc - t_skip;
                     st.cpu_ms += tl;
                     if (T == 1 && dec && sp.sent) {   // (by the request's CPU-lane picks: the lane's part at the same count;
                                                       //  a decode request's - not a small prompt's)
@@ -9129,14 +9597,26 @@ struct Model::Impl {
                                          (double) std::max(1, rx_nb);
                     if (rx_on && whole > 0) rx_gate.pick_seen(T, tl / whole);
                 }
+                if (hst) stat_take(shr, picks, rpicks, wpicks, sp, wcut, pk_of, wv, nslots);
                 if (sp.sent) {
                     const double tr = lane_prof ? now_ms() : 0.0;
-                    rx_finish(l, r, rp, T, next, rx_t0, rpicks, spicks, sp, wpicks, bal_mb, wcut);
+                    rx_finish(l, r, rp, T, next, rx_t0, rpicks, spicks, sp, wpicks, bal_mb, wcut, hsp ? sp_hv : nullptr);
                     if (lane_prof) st.lp_rx_ms += now_ms() - tr;
                 }
             }
+            if (hsp) split_end(rp, next, li);   // (hseq before seq, on every path)
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;
+            const double t_seq = hsp ? now_ms() : 0.0;
+            if (sp_tally) {   // (DS4_EP_DEFER_STAT: after the answer, off the device's wait)
+                if (sp_e_due) stat_energy();
+                dsplit::tally(st.ep_stat, sp_lp, sp_nlp);
+                sp_tally = false;
+            }
+            if (hsp) {   // (after STAT's energies: CHECK=1's one call takes c_yd)
+                split_chk();
+                if (!small_of[next % kRing]) split_timed(t_seq);
+            }
             if (lane_prof) {
                 lp_ans = now_ms();
                 lp_li = li;
@@ -11773,7 +12253,8 @@ struct Model::Impl {
         if (ep_verify) {
             const size_t W = kWin, D = (size_t) g.dim, H = (size_t) g.hc;
             if (!dalloc(d, d.v_moe, W * D, err) || !dalloc(d, d.v_h, W * H * D, err) || !dalloc(d, d.v_h2, W * H * D, err) ||
-                !dalloc(d, v_err, (size_t) kMaxL, err))
+                !dalloc(d, d.v_a, W * H * D, err) || !dalloc(d, v_err, (size_t) kMaxL, err) ||
+                !dalloc(d, v_errs, (size_t) kMaxL, err))
                 return false;
         }
         ep_defer = true;
@@ -11788,6 +12269,66 @@ struct Model::Impl {
                                  "layers %d-%d is added a layer late, after the next layer's attention - an approximation "
                                  "(the last layer's add, before the head, is exact)\n", defer_from, g.nl - 1);
         return true;
+    }
+    // DS4_EP_DEFER_BELOW / DS4_EP_DEFER_TOP (dsplit::setup says what a text does), DS4_EP_DEFER_BELOW_CHECK and
+    // DS4_EP_DEFER_STAT: only with the deferral (ep_defer: DS4_EP_DEFER=1 or its VERIFY, and defer_setup kept it).  The
+    // split is off beside DS4_EP_SPLIT_VERIFY (its check takes a reply row as a token's whole server share: a split
+    // request has two) and DS4_EP_POOL_CUT_CHECK (its one pass against two calls: the split's local pass is two calls).
+    // DS4_EP_DEFER_BELOW_WAIT=1: a split layer waits for both parts (seq; the quality probe - DS4_EP_DEFER_VERIFY's do
+    // all the same).  STAT is off beside DS4_EP_SPLIT_VERIFY (its check computes the slice picks again over c_yd: the
+    // energies would be of other outputs)
+    void split_setup() {
+        const char* conflict = rx_verify > 0 ? "DS4_EP_SPLIT_VERIFY" : rx_cut_chk ? "DS4_EP_POOL_CUT_CHECK" : nullptr;
+        const char* bw = std::getenv("DS4_EP_DEFER_BELOW_WAIT");
+        const int bwv = bw != nullptr && *bw != '\0' ? std::atoi(bw) : 0;
+        const int wait = ep_verify ? dsplit::kWaitVerify : bwv == 1 ? dsplit::kWaitBoth : dsplit::kWaitHeavy;
+        const dsplit::Setup su = dsplit::setup(std::getenv("DS4_EP_DEFER_BELOW"), std::getenv("DS4_EP_DEFER_TOP"), ep_defer,
+                                               conflict, defer_from, g.nl, wait);
+        if (!su.line.empty()) std::fprintf(stderr, "ds4: %s\n", su.line.c_str());
+        split_rule = su.rule;
+        below_wait = split_rule.on() && wait == dsplit::kWaitBoth;
+        if (bwv != 0 && bwv != 1)
+            std::fprintf(stderr, "ds4: DS4_EP_DEFER_BELOW_WAIT=%.32s: ignored - 1 (a split layer waits for both parts) or "
+                                 "unset\n", bw);
+        else if (bwv == 1 && !split_rule.on())
+            std::fprintf(stderr, "ds4: DS4_EP_DEFER_BELOW_WAIT=1: ignored - no split (DS4_EP_DEFER_BELOW or DS4_EP_DEFER_TOP "
+                                 "with DS4_EP_DEFER=1)\n");
+        if (const char* c = std::getenv("DS4_EP_DEFER_BELOW_CHECK"); c != nullptr && *c != '\0' && std::atoi(c) != 0) {
+            const int v = std::atoi(c);
+            if (v != 1 && v != 2)
+                std::fprintf(stderr, "ds4: DS4_EP_DEFER_BELOW_CHECK=%.32s: ignored - 1 (each pick's blocks once into its "
+                                     "part, the two calls against one) or 2 (the heavy part at hseq against at seq)\n", c);
+            else if (!split_rule.on())
+                std::fprintf(stderr, "ds4: DS4_EP_DEFER_BELOW_CHECK=%d: ignored - no split (DS4_EP_DEFER_BELOW or "
+                                     "DS4_EP_DEFER_TOP with DS4_EP_DEFER=1)\n", v);
+            else {
+                split_check = st.split_check = v;
+                std::fprintf(stderr, "%s", v == 1 ? "ds4: DS4_EP_DEFER_BELOW_CHECK=1: each split request's adds checked "
+                                                    "(every CPU-lane pick's n_ff blocks once, into its part) and its local "
+                                                    "pass in two calls against one call, bit for bit (a wiring check, "
+                                                    "slower)\n"
+                                                  : "ds4: DS4_EP_DEFER_BELOW_CHECK=2: each split request's heavy part "
+                                                    "hashed when hseq is published and again at seq (a wiring check)\n");
+            }
+        }
+        if (const char* c = std::getenv("DS4_EP_DEFER_STAT"); c != nullptr && *c != '\0' && std::atoi(c) != 0) {
+            if (!ep_defer)
+                std::fprintf(stderr, "ds4: DS4_EP_DEFER_STAT=1: ignored - the deferral is off (DS4_EP_DEFER=1 not set, or "
+                                     "off for this run)\n");
+            else if (defer_from >= g.nl - 1)
+                std::fprintf(stderr, "ds4: DS4_EP_DEFER_STAT=1: ignored - the deferral takes the last layer alone, which "
+                                     "is never split\n");
+            else if (rx_verify > 0)
+                std::fprintf(stderr, "ds4: DS4_EP_DEFER_STAT=1: ignored - DS4_EP_SPLIT_VERIFY is on (its check computes the "
+                                     "slice picks again over the lane's outputs: the energies would be wrong)\n");
+            else {
+                defer_stat = true;
+                std::fprintf(stderr, "ds4: DS4_EP_DEFER_STAT=1: counting what DS4_EP_DEFER_BELOW (shares >= 0.05, 0.10, "
+                                     "0.15, 0.20) and DS4_EP_DEFER_TOP (1, 2, 3) would make heavy in the decode's layers "
+                                     "%d-%d (passive: no number changes); its lines at a score's end and with the decode's "
+                                     "stats\n", defer_from, g.nl - 2);
+            }
+        }
     }
     // DS4_EP_DEFER: the part still out (late_slot) into d.h once the service thread answered it - comb: the attention
     // hc_post's that ran since (null: none, the head); DS4_PROF counts the wait as the decode's wait for the CPU lane
@@ -11807,13 +12348,19 @@ struct Model::Impl {
                 h = d.v_h2;
             }
         }
-        hc_late_add(h, &rp.part[0][0], (size_t) kMaxDim, rp.cpu, d.late_post, comb, g.dim, g.hc, T, d.st);
+        // (late_row: 0 the whole part, as before; 1 a split layer's light part - T 1, so its row 1 and flag cpu[1])
+        hc_late_add(h, &rp.part[late_row][0], (size_t) kMaxDim, &rp.cpu[late_row], d.late_post, comb, g.dim, g.hc, T, d.st);
         if (ep_verify) {
             max_rel_diff(d.h, h, (size_t) T * g.hc * g.dim, v_err + late_il, d.st);
+            // (the verdict's: against the terms' magnitude - the fork's, through this attention's hc_post when one ran;
+            // its own comb, not the add's, which VERIFY=2 makes wrong)
+            max_mag_diff(d.h, h, d.v_a, d.ao, d.a_post, comb != nullptr ? d.a_comb : nullptr, g.dim, g.hc, T,
+                         v_errs + late_il, d.st);
             if (!small_feed) ++st.ep_verify_n;   // (the decode's checks: a small prompt's are made, but not counted; the
                                                  //  largest differences, ep_verify[], stay since the load's)
         }
         late_slot = -1;
+        late_row = 0;
     }
 
     // the window's plan, in window order (the indexer's and the candidate source's sizes carry from window to window)
@@ -11848,6 +12395,9 @@ struct Model::Impl {
                 wp.seq[il] = ++seq_issued;
                 ep_of[wp.seq[il] % kRing] = wp.ep;
                 small_of[wp.seq[il] % kRing] = small_feed;
+                // (run_layer's `late`, the same terms - its lead's: the deferral runs on one GPU - and the split's layers)
+                defer_of[wp.seq[il] % kRing] =
+                    (uint8_t) dsplit::defer_kind(wp.defer, l.mtp, moe_token_path, l.il, defer_from, g.nl, split_rule.on());
                 layer_of[wp.seq[il] % kRing].store(il, std::memory_order_release);
             }
         }
@@ -12009,6 +12559,7 @@ struct Model::Impl {
         if (!head_wait(d.st, err)) return false;
         if (ep_verify) {   // (the window's checks are in: its stream is done)
             CK(cudaMemcpy(st.ep_verify, v_err, sizeof(float) * (size_t) std::min(g.nl, 64), cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(st.ep_verify_s, v_errs, sizeof(float) * (size_t) std::min(g.nl, 64), cudaMemcpyDeviceToHost));
             st.ep_verify_wrong = v_wrong;
         }
         prof_collect();
@@ -12306,7 +12857,10 @@ struct Model::Impl {
             const size_t nh = (size_t) T * H * D;
             if (vg) CK(cudaMemcpyAsync(d.v_h2, d.h, nh * 4, cudaMemcpyDeviceToDevice, s));
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
-            if (vg) add_diff(d.v_h, d.h, d.v_h2, nh, s);
+            if (vg) {
+                add_diff(d.v_h, d.h, d.v_h2, nh, s);
+                add_abs2(d.v_a, d.h, d.v_h2, nh, s);   // (the scale through add_diff's terms)
+            }
         }
         // attention
         if (hc2) {
@@ -12558,7 +13112,16 @@ struct Model::Impl {
             // DS4_EP_DEFER: the mailbox part neither waited for nor added here (skip) - the next layer's late_flush adds
             // it; DS4_EP_DEFER_VERIFY: waited for and added here, and the deferred path built beside it (Dev::v_*)
             const bool late = wp.defer && lead && !l.mtp && T == 1 && moe_token_path && l.il >= defer_from;
-            const bool skip = late && !ep_verify;
+            // DS4_EP_DEFER_BELOW / TOP, a split layer (hs): its heavy part, part[0], waited for and added here through the
+            // experts' sum, its light one, part[1], the next layer's late_flush's (late_row 1).  The speed path waits for
+            // hseq (part[0] final); DS4_EP_DEFER_BELOW_WAIT=1 (the quality probe) and DS4_EP_DEFER_VERIFY for seq (both
+            // parts).  DS4_EP_DEFER_VERIFY: the exact streams get the light part in place too
+            if (defer_of[slot] == 2 && !late) {
+                std::fprintf(stderr, "ds4: DS4_EP_DEFER_BELOW: layer %d's request %u split, the layer not deferred\n", l.il, sq);
+                std::abort();
+            }
+            const bool hs = late && defer_of[slot] == 2;
+            const bool skip = late && !ep_verify && !hs;
             int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
             if (u9::on(u9::kRoute)) {   // U9 route: the gates in one GEMV, the lookahead and the routing in one launch
                 const Layer* nx[2] = {nullptr, nullptr};
@@ -12643,14 +13206,15 @@ struct Model::Impl {
                 const bool early = mx && u9::on(u9::kTail);
                 const bool down_ok = early && gg::moe_down_experts(ma, d.xg, s);   // (false: printed once, counted)
                 prof_mark(d, 3);
-                if (lead && !skip) wait_seq(&resps[slot].seq, sq, s);
+                if (lead && !skip) wait_seq(hs && !ep_verify && !below_wait ? &resps[slot].hseq : &resps[slot].seq, sq, s);
                 prof_mark(d, 4);
                 if (early) {
                     if (down_ok) gg::moe_down_combine(ma, d.sh_out, d.moe_out, s);
                 } else if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
-                if (late && ep_verify) {   // (the deferred path's FFN output: the same call without the part - a GGUF's
-                    x3::MoeArgs mv = ma;   //  combine of the partials the down above left, an EXL3's down again)
+                if (late && ep_verify && !hs) {   // (the deferred path's FFN output: the same call without the part - a
+                    x3::MoeArgs mv = ma;          //  GGUF's combine of the partials the down above left, an EXL3's down
+                                                  //  again; a split layer's keeps its heavy part: moe_out itself)
                     mv.cpu_part = nullptr;
                     mv.cpu_flag = nullptr;
                     if (mx) {
@@ -12700,9 +13264,19 @@ struct Model::Impl {
             if (lead) st.experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
             if (hc2) CK(cudaStreamWaitEvent(s, d.ev_join, 0));
-            if (late && ep_verify) hc_post(d.v_moe, d.h, d.f_post, d.f_comb, D, H, T, d.v_h, s);   // (the deferred streams)
+            if (late && ep_verify) {
+                hc_post(hs ? d.moe_out : d.v_moe, d.h, d.f_post, d.f_comb, D, H, T, d.v_h, s);   // (the deferred streams)
+                // (their terms' magnitude from here, the fork: the exact side's FFN output (its combine's m + part, then +
+                // the shared expert's: |m| <= |v_moe| + |sh|), the deferred side's, the shared expert's and the part
+                // still out - a split layer's light one, which the exact side adds in place below)
+                const int pr = hs ? 1 : 0;
+                hc_mag(d.moe_out, hs ? nullptr : d.v_moe, d.sh_out, &resps[slot].part[pr][0], (size_t) kMaxDim,
+                       &resps[slot].cpu[pr], d.h, d.f_post, d.f_comb, D, H, T, d.v_a, s);
+            }
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
+            if (hs && ep_verify)   // (the exact streams: the light part in place, hc_post's term for it - comb null: c = post)
+                hc_late_add(d.h, &resps[slot].part[1][0], (size_t) kMaxDim, &resps[slot].cpu[1], d.f_post, nullptr, D, H, T, s);
             CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
             if (late) {   // (f_post's own copy: the next layer's FFN hc_split writes f_post only after its late_flush
                           //  today; the copy keeps it so if that order changes)
@@ -12710,7 +13284,9 @@ struct Model::Impl {
                 late_slot = slot;
                 late_seq = sq;
                 late_il = l.il;
-                if (!ep_verify && !small_feed) ++st.ep_late;   // (the decode's layers: a small prompt's are not)
+                late_row = hs ? 1 : 0;
+                if (!ep_verify && !small_feed) ++(hs ? st.ep_late_split : st.ep_late);   // (the decode's layers: a small
+                                                                                       //  prompt's are not)
             }
             prof_mark(d, 5);
             return true;
@@ -13208,6 +13784,7 @@ const Stats& Model::stats() const {
 }
 std::string Model::describe() const { return p_->describe(); }
 std::string Model::rx_lines(const Stats& s0, double nt) const { return p_->rx_lines(s0, nt); }
+std::string Model::defer_lines(const Stats& s0) const { return p_->defer_lines(s0); }
 bool Model::rx_held_save(const std::string& path, std::string& note) const { return p_->rx_held_save(path, note); }
 std::vector<std::string> Model::info_lines() const { return p_->info_lines(); }
 

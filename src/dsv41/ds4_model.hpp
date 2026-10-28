@@ -13,6 +13,8 @@
 // compressed KV and index keys included, which a checkpoint leaves in place - through a file or a host buffer.
 #pragma once
 
+#include "ds4_defer_split.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -206,10 +208,32 @@ struct Stats {
     bool rx_split_wrong = false;
     int64_t ep_late = 0;   // DS4_EP_DEFER: the layers whose mailbox part the next layer (or the head) added
     // DS4_EP_DEFER_VERIFY: the checks made (a layer's deferred streams against the exact ones), and by the layer whose
-    // part it was the largest relative difference since the load (the last layer's: before the head)
+    // part it was the largest relative difference since the load (the last layer's: before the head) - ep_verify
+    // against 1 + |exact|, ep_verify_s (the verdict's) against the magnitude of the terms the two sides sum
     int64_t ep_verify_n = 0;
-    float ep_verify[64] = {};
+    float ep_verify[64] = {}, ep_verify_s[64] = {};
     bool ep_verify_wrong = false;   // DS4_EP_DEFER_VERIFY=2: the wrong comb on purpose (the check must see it)
+    // DS4_EP_DEFER_BELOW / DS4_EP_DEFER_TOP (ds4_defer_split.hpp): the decode requests split (the heavy part added in the
+    // layer, the light one a layer late), their CPU-lane picks, the heavy ones among them, and the split requests with a
+    // heavy pick the server computes (blocks there)
+    int64_t ep_split = 0, ep_split_picks = 0, ep_split_heavy = 0, ep_split_hsrv = 0;
+    // DS4_EP_DEFER_BELOW_CHECK=1: the split requests checked (each CPU-lane pick's n_ff blocks added once, into its
+    // part) and the wrong ones; their local passes in two calls against one call, and those not the same bits.  =2: the
+    // split requests whose heavy part was hashed at hseq and again at seq, and those it changed in between
+    int64_t ep_chk_n = 0, ep_chk_bad = 0, ep_chk_cmp = 0, ep_chk_cmp_bad = 0, ep_chk2_n = 0, ep_chk2_bad = 0;
+    int split_check = 0;   // (the run's DS4_EP_DEFER_BELOW_CHECK: the lines say which)
+    dsplit::Tally ep_stat;   // DS4_EP_DEFER_STAT=1: what each rule would make heavy (passive)
+    // DS4_EP_DEFER_BELOW / TOP: the split layers whose light part the next layer (or the head) added (ep_late: the
+    // layers deferred whole).  The split's timing (the host's clock from a decode split request's pickup - protocol 6's
+    // question, does the heavy part's remote wait bind): the requests timed, their sums to hseq and to seq, to hseq in
+    // kSpBinMs bins (the last: past it); those with a heavy pick on the server and their heavy waits (the lane's heavy
+    // part done to hseq) summed; those whose reply was not in when the lane's light part was done, their hseq after it
+    int64_t ep_late_split = 0;
+    static constexpr int kSpBins = 512;
+    static constexpr double kSpBinMs = 0.05;
+    int64_t sp_t_n = 0, sp_t_hrem = 0, sp_t_late = 0;
+    double sp_t_hseq = 0.0, sp_t_seq = 0.0, sp_t_hwait = 0.0, sp_t_after = 0.0;
+    int64_t sp_t_bin[kSpBins] = {};
 };
 
 class Model {
@@ -399,6 +423,9 @@ public:
     /// (--remote-experts) the remote experts' lines since s0 (per token of nt): picks served there, the round trips
     /// and the lane's waits (mean, p50, p99), bytes; "" without an expert server
     std::string rx_lines(const Stats& s0, double nt) const;
+    /// (DS4_EP_DEFER_STAT, DS4_EP_DEFER_BELOW / DS4_EP_DEFER_TOP and their CHECK) the heavy-first deferral's lines since
+    /// s0: what each rule would make heavy, the split requests, the checks; "" when none of them counted anything
+    std::string defer_lines(const Stats& s0) const;
     /// (--remote-experts, DS4_RX_HELD_SAVE) the experts the expert server holds now into `path`, for a later run's
     /// DS4_RX_HELD_LOAD (the load's set: these first, then the profile's); false without a server or when the file
     /// cannot be written (`note` says why; on success its count)

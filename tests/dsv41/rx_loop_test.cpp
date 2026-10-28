@@ -421,6 +421,60 @@ static void case_parts(int port, const std::vector<Layer>& L) {
                       "within the server's roundings (|d| / |its part| %.2e < 0.10)", worst_split);
         check(worst_split < 0.10, b);
 
+        // DS4_EP_DEFER_BELOW's split request with slice picks (k 6): two rows of one token - row 0 the heavy picks (0
+        // whole, 3 slice), row 1 the light ones (1 whole, 4 slice) - each row its own whole picks' sum plus its slice
+        // picks' [6, 9), and the two rows' sum one row of all four within bf16 (the server's lane by row, not by token)
+        if (up) {
+            rx::ReqRow two[2], one;
+            two[0].t = two[1].t = one.t = 0;
+            const int16_t ex[4] = {0, 3, 1, 4};
+            const float wx[4] = {0.3f, 0.22f, 0.15f, 0.09f};
+            for (int i = 0; i < 4; ++i) {
+                rx::ReqRow& r = two[i / 2];
+                if (ex[i] >= 3) r.slice |= (uint16_t) (1u << r.n);
+                r.e[r.n] = ex[i];
+                r.w[r.n++] = wx[i];
+                if (ex[i] >= 3) one.slice |= (uint16_t) (1u << one.n);
+                one.e[one.n] = ex[i];
+                one.w[one.n++] = wx[i];
+            }
+            std::vector<float> x((size_t) E), xb((size_t) E);
+            for (int c = 0; c < E; ++c) {
+                x[(size_t) c] = ux(rng);
+                xb[(size_t) c] = rx::bf2f(rx::f2bf(x[(size_t) c]));
+            }
+            const float* xp2[2] = {x.data(), x.data()};
+            const float* xp1[1] = {x.data()};
+            const uint16_t* y = nullptr;
+            int us = 0;
+            std::vector<uint16_t> y2((size_t) 2 * E), y1((size_t) E);
+            bool ok = m.send_req(++seq, 1, 2, two, xp2, err, 6) && m.wait_resp(seq, 2, rx::now_ms() + 20000.0, &y, us, err) == 1;
+            if (ok) std::copy(y, y + 2 * E, y2.begin());
+            ok = ok && m.send_req(++seq, 1, 1, &one, xp1, err, 6) && m.wait_resp(seq, 1, rx::now_ms() + 20000.0, &y, us, err) == 1;
+            if (ok) std::copy(y, y + E, y1.begin());
+            double wr = 0;   // (each row against this test's sums for x in bf16)
+            for (int j = 0; ok && j < 2; ++j) {
+                std::vector<float> w0, w1;
+                slice_sum(L[1], two[j], ~(unsigned) two[j].slice, 0, NB, xb.data(), w0);
+                slice_sum(L[1], two[j], two[j].slice, 6, NB, xb.data(), w1);
+                std::vector<float> d0((size_t) E), want((size_t) E);
+                for (int c = 0; c < E; ++c) {
+                    want[(size_t) c] = w0[(size_t) c] + w1[(size_t) c];
+                    d0[(size_t) c] = rx::bf2f(y2[(size_t) j * E + c]) - want[(size_t) c];
+                }
+                wr = std::max(wr, norm(d0) / std::max(1e-30, norm(want)));
+            }
+            std::vector<float> d((size_t) E), whole((size_t) E);
+            for (int c = 0; ok && c < E; ++c) {
+                whole[(size_t) c] = rx::bf2f(y1[(size_t) c]);
+                d[(size_t) c] = rx::bf2f(y2[(size_t) c]) + rx::bf2f(y2[(size_t) E + c]) - whole[(size_t) c];
+            }
+            const double rel = ok ? norm(d) / std::max(1e-30, norm(whole)) : 1.0;
+            std::snprintf(b, sizeof b, "a split request's two rows of one token with slice picks: each row its own picks' sum "
+                          "(|d| / |it| %.2e < 1e-2), the rows' sum one row of all four (%.2e < 1e-2)", ok ? wr : 1.0, rel);
+            check(ok && wr < 1e-2 && rel < 1e-2, b);
+        }
+
         // the verify's two sets (kReqSets): the whole picks' sum, then the slice picks'; kReqWrong: the slice wrong
         for (int pass = 0; up && pass < 3; ++pass) {
             const int k = pass == 2 ? 6 : 7;   // (wrong at 7: [6, 9); wrong at 6: the parts hold no block 5 - twice)
@@ -959,6 +1013,87 @@ int main(int argc, char** argv) {
     std::snprintf(b, sizeof b, "the split sum is the all-here one within the server's roundings (|diff| / |its part| "
                   "%.2e < 0.10; / |the layer's output| %.2e)", worst_ratio, worst_whole);
     check(worst_ratio < 0.10, b);
+
+    // DS4_EP_DEFER_BELOW's split request: two rows of one token (the heavy picks', then the light ones', the same x) -
+    // each row its own picks' sum, bit for bit, and the two rows' sum one row of all of them within bf16
+    {
+        rx::ReqRow two[2], one;
+        two[0].t = two[1].t = one.t = 0;
+        const int16_t ex[3] = {0, 2, 1};   // (0, 2 heavy - row 0; 1 light - row 1)
+        const float wx[3] = {0.31f, 0.17f, 0.12f};
+        for (int i = 0; i < 3; ++i) {
+            rx::ReqRow& r = two[i < 2 ? 0 : 1];
+            r.e[r.n] = ex[i];
+            r.w[r.n++] = wx[i];
+            one.e[one.n] = ex[i];
+            one.w[one.n++] = wx[i];
+        }
+        std::vector<float> x((size_t) E), xb((size_t) E);
+        for (int c = 0; c < E; ++c) {
+            x[(size_t) c] = ux(rng);
+            xb[(size_t) c] = rx::bf2f(rx::f2bf(x[(size_t) c]));
+        }
+        const float* xp2[2] = {x.data(), x.data()};
+        const float* xp1[1] = {x.data()};
+        const uint16_t* y = nullptr;
+        int us = 0;
+        std::vector<uint16_t> y2((size_t) 2 * E), y1((size_t) E);
+        bool ok = m.send_req(++seq, 0, 2, two, xp2, err) && m.wait_resp(seq, 2, rx::now_ms() + 20000.0, &y, us, err) == 1;
+        if (ok) std::copy(y, y + 2 * E, y2.begin());
+        ok = ok && m.send_req(++seq, 0, 1, &one, xp1, err) && m.wait_resp(seq, 1, rx::now_ms() + 20000.0, &y, us, err) == 1;
+        if (ok) std::copy(y, y + E, y1.begin());
+        bool rbits = ok;
+        for (int j = 0; ok && j < 2; ++j) {
+            std::vector<float> want;
+            lane_sum(L[0], two[j], 0, two[j].n, xb.data(), want);
+            for (int c = 0; c < E; ++c) rbits = rbits && y2[(size_t) j * E + c] == rx::f2bf(want[(size_t) c]);
+        }
+        std::vector<float> d((size_t) E), whole((size_t) E);
+        for (int c = 0; ok && c < E; ++c) {
+            whole[(size_t) c] = rx::bf2f(y1[(size_t) c]);
+            d[(size_t) c] = rx::bf2f(y2[(size_t) c]) + rx::bf2f(y2[(size_t) E + c]) - whole[(size_t) c];
+        }
+        const double rel = ok ? norm(d) / std::max(1e-30, norm(whole)) : 1.0;
+        check(ok && rbits, "a split request's two rows of one token: each row the CPU lane's sum of its own picks, bit for bit");
+        std::snprintf(b, sizeof b, "... and their sum one row of all three picks within bf16 (|d| / |it| %.2e < 1e-2)", rel);
+        check(ok && rel < 1e-2, b);
+    }
+
+    // DS4_EP_DEFER_BELOW's speed path: the lane reads the link between its jobs (wait_resp, its deadline past) - 0 at
+    // once while the reply is not in (not a late one: nothing in take_late), then the reply itself, the same bits as
+    // one waited for
+    {
+        rx::ReqRow r;
+        r.n = 3;
+        for (int i = 0; i < 3; ++i) {
+            r.e[i] = (int16_t) i;
+            r.w[i] = uw(rng);
+        }
+        std::vector<float> x((size_t) E);
+        for (int c = 0; c < E; ++c) x[(size_t) c] = ux(rng);
+        const float* xp[1] = {x.data()};
+        const uint16_t* y = nullptr;
+        int us = 0;
+        std::vector<uint16_t> yw((size_t) E);
+        (void) m.take_late();
+        bool ok = m.send_req(++seq, 0, 1, &r, xp, err) && m.wait_resp(seq, 1, rx::now_ms() + 20000.0, &y, us, err) == 1;
+        if (ok) std::copy(y, y + E, yw.begin());
+        ok = ok && m.send_req(++seq, 0, 1, &r, xp, err);
+        const double t0 = rx::now_ms();
+        const int g0 = ok ? m.wait_resp(seq, 1, 0.0, &y, us, err) : -2;
+        const double dt0 = rx::now_ms() - t0;
+        const bool st0 = m.last_stale();
+        int g = g0, polls = 1;
+        for (const double end = rx::now_ms() + 20000.0; g == 0 && !m.last_stale() && rx::now_ms() < end; ++polls)
+            g = m.wait_resp(seq, 1, 0.0, &y, us, err);
+        bool same = g == 1;
+        for (int c = 0; same && c < E; ++c) same = y[c] == yw[(size_t) c];
+        const auto late = m.take_late();
+        std::snprintf(b, sizeof b, "a poll right after the send: 0 at once (%.3f ms), not a Stale", dt0);
+        check(g0 == 0 && dt0 < 5.0 && !st0, b);
+        check(same && polls > 1 && late.empty(), "polled again: the reply after " + std::to_string(polls) +
+                                                     " reads, the same bits as the one waited for; nothing in take_late");
+    }
 
     // a late reply: 0 by its deadline; the next request has its own; the late one in take_late
     {
