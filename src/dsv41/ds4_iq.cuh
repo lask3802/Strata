@@ -127,6 +127,11 @@ unsigned long long q5k_staged_runs();
 /// n rows of k values of a matrix of the type (ld bytes a row) as BF16 (bf16) or F16 bits, dst[n][k]: the chunked prompt path's
 /// dense GEMM operand.  false: a type not covered.
 bool dequant_rows(int type, const void* raw, size_t ld, int k, int n, uint16_t* dst, bool bf16, cudaStream_t s);
+/// dequant_rows' kernel, DS4_DQ_NEW (read once): 0 (unset) the row-per-lane one, 1 its stores coalesced through shared
+/// memory (Strata upstream 8abe826f), 2 its stores 16 bytes and its input staged (03056168); the same values from each.
+/// Set to anything else: 0, said in one line.
+/// (a test sets it to compare them in one process)
+int& dq_kernel();
 
 /// The trellis types' kernels (ds4_tq.cu), reached from the entry points above for those types: arithmetic as the CPU lane's
 /// (ds4_tq_cpu.cpp: int8 activations with an F32 scale a 32, exact weights), on the tensor cores of gfx12 (WMMA) or in FMAs.

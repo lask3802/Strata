@@ -923,6 +923,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         target_include_directories(ds4_u9_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
                                    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
         target_link_libraries(ds4_u9_test PRIVATE ${_strata_gpu_runtime_target})
+        # the chunked prompt's dense dequant: DS4_DQ_NEW's kernels against the default one, bit for bit; needs a GPU, no model
+        add_executable(ds4_dq_test tests/dsv41/dq_test.cu src/dsv41/ds4_iq.cu src/dsv41/ds4_tq.cu)
+        target_include_directories(ds4_dq_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+        target_link_libraries(ds4_dq_test PRIVATE ${_strata_gpu_runtime_target})
         # DS4_EP_DEFER's late add (hc_late_add) against hc_post of the summed output, host and device; needs a GPU, no model
         add_executable(ds4_defer_test tests/dsv41/defer_test.cu src/dsv41/ds4_kernels.cu)
         target_include_directories(ds4_defer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
