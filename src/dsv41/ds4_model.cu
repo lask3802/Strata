@@ -28,6 +28,7 @@
 #include "ds4_rx.hpp"
 #include "ds4_rx_split.hpp"
 #include "ds4_stage.hpp"
+#include "ds4_stage_slots.hpp"
 #include "ds4_store.hpp"
 #include "ds4_u9.hpp"
 #include "ds4_vision.cuh"
@@ -610,8 +611,8 @@ struct Chunk {
     int ring_n = 0;
     cudaStream_t cs = nullptr;
     cudaEvent_t filled[kParts] = {}, freed[kParts] = {};
-    // in place (file_experts): each streamed expert's file region read into pinned staging (ring_n slots of
-    // stage_stride bytes, a part's slots free again once its `filled` copies are done) by the readers, in parallel,
+    // in place (file_experts): each streamed expert's file region read into pinned staging (S slots - ring_n, more on
+    // the flow with DS4_STAGE_N - of stage_stride bytes, a part's slots free again once its `filled` copies are done) by the readers, in parallel,
     // and DMA'd from there - a copy from the files' pages goes through the driver's staging, one thread at ~1.3 GB/s
     uint8_t* stage = nullptr;
     size_t stage_stride = 0;
@@ -634,7 +635,8 @@ struct Chunk {
     // it routed itself; never an expert no token of the chunk picked unless it was a likely one.  Each item read by io
     // (unbuffered: the disk straight into its staging slot, every part of every item in flight at once - none waits
     // for a batch) or taken from its RAM-tier slot as it lies, then DMA'd into the ring in order, item i into slot
-    // i % ring_n; the compute takes the items as they land, in runs of what has.
+    // i % ring_n (its read into staging slot n_file % S; S = ring_n unless DS4_STAGE_N); the compute takes the items as
+    // they land, in runs of what has.
     struct Item {
         int il = 0, k = 0, e = 0, v = 0, stage = -1;   // layer, chunk, expert, virtual slot, staging slot (-1: RAM)
         int mi = 0;                                    // the device's member index in the layer's group
@@ -3545,8 +3547,23 @@ struct Model::Impl {
                                 }
                     if (fl)   // (each part read unbuffered from its offset rounded down: a page more each)
                         cp->stage_stride = std::max(cp->stage_stride, flow_stride());
-                    cp->S = cp->ring_n;
-                    if (!halloc(cp->stage, (size_t) cp->S * cp->stage_stride, err)) return false;
+                    // DS4_STAGE_N=N (unset: as ring_n slots): a flow device's staging has N slots when that is more than
+                    // its ring's - the reads then run further ahead of the compute (ds4_stage_slots.hpp); pinned memory
+                    // that does not come falls back to ring_n slots
+                    cp->S = stage_slots(std::getenv("DS4_STAGE_N"), cp->ring_n, fl);
+                    if (!halloc(cp->stage, (size_t) cp->S * cp->stage_stride, err)) {
+                        if (cp->S == cp->ring_n) return false;
+                        (void) cudaGetLastError();
+                        std::fprintf(stderr, "ds4: DS4_STAGE_N=%d: %s - the flow's staging keeps its %d slots\n", cp->S,
+                                     err.c_str(), cp->ring_n);
+                        cp->S = cp->ring_n;
+                        err.clear();
+                        if (!halloc(cp->stage, (size_t) cp->S * cp->stage_stride, err)) return false;
+                    }
+                    if (cp->S > cp->ring_n && o.verbose)
+                        std::fprintf(stderr, "ds4: CUDA%d flow staging: %d slots of %.1f MB, %.2f GB pinned (DS4_STAGE_N; the ring: %d slots)\n",
+                                     devs[di].id, cp->S, (double) cp->stage_stride / 1e6,
+                                     (double) cp->S * (double) cp->stage_stride / 1e9, cp->ring_n);
                     cp->readers = std::make_unique<Pool>(n_readers - 1, std::vector<int>{}, 50);
                     if (!fl) continue;
                     cudaSetDevice(devs[di].id);
@@ -11129,7 +11146,10 @@ struct Model::Impl {
                 const double db = (double) (c.io->direct_bytes() - c.io_d0) / 1e9;
                 const double bb = (double) (c.io->buffered_bytes() - c.io_b0) / 1e9;
                 const double fb = db + bb, rb = (double) c.it_ram * (double) L[0].blob / 1e9;   // (a member: its parts)
-                char lcs[160] = "", sps[256] = "";
+                char lcs[160] = "", sps[256] = "", sts[128] = "";
+                if (c.S > c.ring_n)   // (DS4_STAGE_N)
+                    std::snprintf(sts, sizeof sts, "; DS4_STAGE_N: %d staging slots (%.2f GB), %d in the ring", c.S,
+                                  (double) c.S * (double) c.stage_stride / 1e9, c.ring_n);
                 if (c.io->split()) {
                     const IoQueue::Split s = c.io->split_stats();
                     int w = std::snprintf(sps, sizeof sps, "; DS4_IO_SPLIT: %llu reads split, %.1f GB of them from the "
@@ -11148,11 +11168,11 @@ struct Model::Impl {
                              "ds4 prompt stream, CUDA%d: %d tokens in %.0f ms; %llu experts streamed: %llu from the files "
                              "(%.1f GB, %.2f GB/s: %.1f GB from the disk unbuffered, %.1f GB through the page cache), %llu "
                              "from RAM (%.1f GB)%s; %llu likely ones queued early, %llu of them unpicked; the compute waited "
-                             "%.0f ms for reads%s\n",
+                             "%.0f ms for reads%s%s\n",
                              devs[di].id, n, ms, (unsigned long long) (c.it_file + c.it_ram + c.it_lc),
                              (unsigned long long) c.it_file, fb, fb / std::max(1e-3, ms / 1000.0), db, bb,
                              (unsigned long long) c.it_ram, rb, lcs, (unsigned long long) c.it_spec,
-                             (unsigned long long) c.it_spec_unused, c.wait_ms, sps);
+                             (unsigned long long) c.it_spec_unused, c.wait_ms, sps, sts);
             }
         }
         if (pm.on && run.T.size() == 1) {   // (the picks' spread for pick_path: the CPU-lane experts this run picked)
