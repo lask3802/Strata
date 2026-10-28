@@ -682,6 +682,7 @@ struct Chunk {
     double wait_ms = 0;                      // the compute waiting for a read
     uint64_t it_file = 0, it_ram = 0, it_spec = 0, it_spec_unused = 0;
     uint64_t io_d0 = 0, io_b0 = 0;           // io's unbuffered / buffered bytes when the run started
+    double io_busy0 = 0;                     // io's readers' busy ms then (summed over the readers)
     IoQueue::Split io_s0;                    // io's split jobs then (DS4_IO_SPLIT)
     // layer-major (a run of several chunks, every layer on this device): the layers one after another, each through
     // all the chunks; a chunk's state between its layers (h | pre | topk | cand, chunk k at k chunk_hand_bytes()) in
@@ -10461,6 +10462,7 @@ struct Model::Impl {
             c.lc_first = c.lc_chk = 0;
             c.io_d0 = c.io->direct_bytes();
             c.io_b0 = c.io->buffered_bytes();
+            c.io_busy0 = c.io->busy_ms();
             c.io_s0 = c.io->split_stats();
             if (!c.fl_layers.empty()) {
                 flow_spec(c, 0, c.fl_layers[0], run.T[0]);
@@ -11449,11 +11451,11 @@ struct Model::Impl {
                              "ds4 prompt stream, CUDA%d: %d tokens in %.0f ms; %llu experts streamed: %llu from the files "
                              "(%.1f GB, %.2f GB/s: %.1f GB from the disk unbuffered, %.1f GB through the page cache), %llu "
                              "from RAM (%.1f GB)%s; %llu likely ones queued early, %llu of them unpicked; the compute waited "
-                             "%.0f ms for reads%s%s\n",
+                             "%.0f ms for reads%s%s; the readers busy %.0f ms in all\n",
                              devs[di].id, n, ms, (unsigned long long) (c.it_file + c.it_ram + c.it_lc),
                              (unsigned long long) c.it_file, fb, fb / std::max(1e-3, ms / 1000.0), db, bb,
                              (unsigned long long) c.it_ram, rb, lcs, (unsigned long long) c.it_spec,
-                             (unsigned long long) c.it_spec_unused, c.wait_ms, sps, sts);
+                             (unsigned long long) c.it_spec_unused, c.wait_ms, sps, sts, c.io->busy_ms() - c.io_busy0);
             }
         }
         if (pm.on && run.T.size() == 1) {   // (the picks' spread for pick_path: the CPU-lane experts this run picked)
