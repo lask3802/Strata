@@ -1408,7 +1408,17 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
     // DS4_SCORE_PREFIX=N (a test of the long-prompt layer skip): the segments are joined into one stream, its first N
     // tokens are read as one prompt (logits of the last row only: the path a long prompt takes, where the skip applies)
     // and only the positions after them are scored, in windows
+    // DS4_SCORE_STEP=1 (unset or 0: as above): every scored position goes through Model::step - the decode's own path,
+    // forward(.., ep true): the expert server's split of the layer, the n_ff slices, and DS4_EP_DEFER's deferral at one
+    // row - and Model::logits (one row), the window forced to 1; Model::feed, which the windows above go through, runs
+    // the prompt paths (ep false), so a score never exercised those.  DS4_SCORE_PREFIX's prefix stays a feed.  The rows
+    // and the .seg.json have the same format; one position a step is slow, a window of 16 is not.
     const long long prefix_n = std::getenv("DS4_SCORE_PREFIX") ? std::atoll(std::getenv("DS4_SCORE_PREFIX")) : 0;
+    const char* step_env = std::getenv("DS4_SCORE_STEP");
+    const bool step_mode = step_env != nullptr && std::atoi(step_env) != 0;
+    if (step_mode)
+        std::fprintf(stderr, "strata-dsv41: DS4_SCORE_STEP=1: every position through Model::step (the decode path), window 1%s\n",
+                     prefix_n > 0 ? ", the DS4_SCORE_PREFIX prefix as a feed" : "");
     if (prefix_n > 0 && segs.size() > 1) {
         ScoreSeg all;
         all.name = "concat";
@@ -1442,8 +1452,9 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
             }
         }
         for (size_t a = a0; a + 1 < ids.size();) {
-            const int T = (int) std::min<size_t>((size_t) window, ids.size() - 1 - a);   // (positions a .. a+T-1 are scored)
-            if (!m.feed(ids.data() + a, T, T, err) || !m.logits(lg) || lg.size() < (size_t) T * (size_t) V) {
+            const int T = step_mode ? 1 : (int) std::min<size_t>((size_t) window, ids.size() - 1 - a);   // (positions a .. a+T-1 are scored)
+            if (!(step_mode ? m.step(ids[a], true, err) : m.feed(ids.data() + a, T, T, err)) || !m.logits(lg) ||
+                lg.size() < (size_t) T * (size_t) V) {
                 std::fprintf(stderr, "strata-dsv41: %s\n", err.empty() ? "no logits" : err.c_str());
                 return 1;
             }
