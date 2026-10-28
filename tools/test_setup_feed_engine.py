@@ -78,7 +78,9 @@ class FeedEngine(unittest.TestCase):
         gpu = {"arch": 121, "archs": [121], "vram_gb": 100.0, "index": 0, "uma": True}
         (self.eng / "BUILD.json").unlink()                                    # a first install
         with mock.patch.object(setup, "engine_dir", lambda toolkit=13: self.eng), mock.patch.object(setup, "is_arm64", return_value=True), \
-                mock.patch.object(setup.sys, "platform", "linux"), mock.patch.object(setup, "_urlopen") as urlopen, \
+                mock.patch.object(setup.sys, "platform", "linux"), \
+                mock.patch.object(setup, "_urlopen", side_effect=AssertionError("no network")) as urlopen, \
+                mock.patch.object(setup, "download", side_effect=AssertionError("no download")), \
                 mock.patch.object(setup, "engine_from_feed", return_value=self.eng) as feed:
             for updating in (False, True):
                 self.assertIsNone(setup.get_prebuilt(setup.PREBUILT_URL, gpu, "none", updating=updating))
