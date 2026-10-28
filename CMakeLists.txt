@@ -970,6 +970,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # DS4_FORCE_TOKENS (ds4_force.hpp): the decode emits a file's ids, for speed A/Bs on one token path; no GPU
       add_executable(ds4_force_test tests/dsv41/force_tokens_test.cpp)
       target_compile_features(ds4_force_test PRIVATE cxx_std_17)
+      # DS4_SMALL_PROMPT / DS4_SMALL_WIN (ds4_small_prompt.hpp): which feeds take the decode's windows; no GPU, no model
+      add_executable(ds4_small_prompt_test tests/dsv41/small_prompt_test.cpp)
+      target_compile_features(ds4_small_prompt_test PRIVATE cxx_std_17)
       # the kept conversations' .meta file and prefix matching (ds4_slotmeta.hpp): no GPU, no model
       add_executable(ds4_slot_test tests/dsv41/slot_test.cpp)
       target_include_directories(ds4_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)

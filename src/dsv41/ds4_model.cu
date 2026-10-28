@@ -27,6 +27,7 @@
 #include "ds4_rx_fill_link.hpp"
 #include "ds4_rx.hpp"
 #include "ds4_rx_split.hpp"
+#include "ds4_small_prompt.hpp"
 #include "ds4_stage.hpp"
 #include "ds4_store.hpp"
 #include "ds4_u9.hpp"
@@ -1317,6 +1318,11 @@ struct Model::Impl {
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
     bool win_prompt = false;   // (feed_windows: a prompt's windows - their cache ticks are the decode's, serve_T 0)
     rx::PromptSettle psettle;  // (a window prompt's settle: once a prompt, ds4_rx_fill.hpp)
+    // DS4_SMALL_PROMPT=N (0 off), DS4_SMALL_WIN=T: prompts of 2-N tokens in windows of T rows (small_setup,
+    // ds4_small_prompt.hpp); small_ms: their ms a token so far (a running mean, for --verbose), small_k how many
+    int small_n = 0, small_t = 1;
+    double small_ms = 0;
+    int64_t small_k = 0;
     // lookahead: while layer L runs, the device guesses the next layer's picks (its gate on L's FFN input, the same
     // choice) and publishes them with L's routing; the CPU lane asks for the guessed experts it will read from the files
     // at once (a thread of its own, os::prefetch), so the SSD reads them while L computes instead of on the next
@@ -3584,6 +3590,7 @@ struct Model::Impl {
             make_pools();
         }
         if (!defer_setup(err)) return false;
+        small_setup();   // (after defer_setup: its line says whether the deferral rides along)
         {
             void* m = nullptr;
             if (cudaHostAlloc(&m, sizeof(Req) * kRing, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
@@ -10321,6 +10328,58 @@ struct Model::Impl {
         if (psettle.after_feed(rx_on, logits_rows) && (!o.stage_worker || stage_last)) cache_settle();
         return true;
     }
+    // DS4_SMALL_PROMPT: read once, at the load - N (0 off), and DS4_SMALL_WIN's rows held to 1..min(kWin, DS4_ASYNC_T)
+    // (past DS4_ASYNC_T a window is synchronous, which is what the small path is not)
+    void small_setup() {
+        const char* v = std::getenv("DS4_SMALL_PROMPT");
+        small_n = v != nullptr ? std::max(0, std::atoi(v)) : 0;
+        if (small_n < 2) {   // (1: no prompt of 2 or more tokens fits)
+            small_n = 0;
+            return;
+        }
+        if (o.remote_stage || o.stage_worker) {   // (the link's prompts keep their chunks and windows of 16)
+            std::fprintf(stderr, "ds4: DS4_SMALL_PROMPT=%d: off for this run - a remote stage\n", small_n);
+            small_n = 0;
+            return;
+        }
+        const char* w = std::getenv("DS4_SMALL_WIN");
+        const int asked = w != nullptr && *w != '\0' ? std::atoi(w) : 1;
+        small_t = small_win(asked, kWin, async_max_t);
+        if (small_t != asked)
+            std::fprintf(stderr, "ds4: DS4_SMALL_WIN=%d: clamped to %d (1 to the smaller of %d and DS4_ASYNC_T %d)\n",
+                         asked, small_t, kWin, async_max_t);
+        std::fprintf(stderr, "ds4: DS4_SMALL_PROMPT=%d: prompts of 2-%d tokens in windows of %d through the decode's path%s\n",
+                     small_n, small_n, small_t, small_t == 1 && ep_defer && !ep_verify
+                                                    ? ", with the DS4_EP_DEFER deferral (the decode's approximation)" : "");
+    }
+    // DS4_SMALL_PROMPT: n tokens through windows of small_t rows as the decode runs them (ep: the n_ff slices, the
+    // expert server's async windows, at 1 row DS4_EP_DEFER's deferral), the last one's logits_rows rows of logits; the
+    // rest as feed_windows (win_prompt the whole prompt, the settle at its end)
+    bool feed_small(const int* tokens, int n, int logits_rows, std::string& err) {
+        logits_all = false;
+        {
+            struct Off {   // (win_prompt false again on every way out)
+                bool& f;
+                ~Off() { f = false; }
+            } off{win_prompt};
+            win_prompt = true;   // (its ticks the decode's; forward leaves psettle to the end here)
+            for (int a = 0; a < n; a += small_t) {
+                const int T = std::min(small_t, n - a);
+                if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, true, err)) return false;
+            }
+        }
+        if (psettle.after_feed(rx_on, logits_rows) && (!o.stage_worker || stage_last)) cache_settle();   // (feed_windows')
+        return true;
+    }
+    // a small prompt of n tokens took ms: its own running mean, ms a token (pick_path's pm learns nothing from it)
+    void small_done(int n, double ms) {
+        const double a = ms / std::max(1, n);
+        small_ms = small_k == 0 ? a : 0.7 * small_ms + 0.3 * a;
+        ++small_k;
+        if (o.verbose)   // (ms a token: the running mean)
+            std::fprintf(stderr, "ds4: a prompt of %d tokens in windows of %d (DS4_SMALL_PROMPT=%d): %.0f ms (%.1f ms a token)\n",
+                         n, small_t, small_n, ms, small_ms);
+    }
     // the picked path took ms: the flow's predictions for the prompt's size class scaled by what it really takes (taken
     // / predicted), windows' time a window - running means
     void path_done(double ms) {
@@ -11101,7 +11160,8 @@ struct Model::Impl {
         pos += T;
         st.tokens += T;
         cache_tick(T, win_prompt ? 0 : -1);   // (a window prompt's: the server's experts as the decode's, rx_row(.., 0))
-        if (ep) psettle.next();   // (a decode window: the next prompt settles again)
+        if (ep && !win_prompt) psettle.next();   // (a decode window: the next prompt settles again; a small prompt's
+                                                 //  (feed_small) is the prompt's, which settles once at its end)
         if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err)) return false;
         return true;
     }
@@ -12034,6 +12094,13 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     Impl& p = *p_;
     p.pm.last = -1;
     p.halted = false;
+    if (small_prompt(n, logits_rows, p.small_n, p.o.remote_stage || p.o.stage_worker)) {   // (DS4_SMALL_PROMPT: before
+        const double t0 = now_ms();   // pick_path and the windows of 16 below chunk_min; pm.last stays -1)
+        const bool ok = p.feed_small(tokens, n, logits_rows, err);
+        if (ok) p.small_done(n, now_ms() - t0);
+        if (logits_rows > 0) p.psettle.next();   // (as below)
+        return ok;
+    }
     if (p.chunk > 0 && n >= p.chunk_min) {   // a long run - or one the flow could take, if it is the faster path here
         const double t0 = now_ms();   // (every row's logits (tests): the chunked path, which keeps them all; a remote
                                       // stage's main process: chunks, where windows would cross the link 16 rows a time)
@@ -12053,6 +12120,14 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     p.pm.last = -1;
     p.halted = false;
     const double t0 = now_ms();
+    if (small_prompt(n, logits_rows, p.small_n, p.o.remote_stage || p.o.stage_worker)) {   // (DS4_SMALL_PROMPT, as feed's:
+        // the run but its last token in small windows, the checkpoint, then the last token as a window of 1)
+        const bool ok = p.feed_small(tokens, n - 1, 0, err) &&
+                        (p.checkpoint(slot), p.feed_small(tokens + n - 1, 1, logits_rows, err));
+        if (ok) p.small_done(n, now_ms() - t0);
+        if (logits_rows > 0) p.psettle.next();
+        return ok;
+    }
     if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.o.remote_stage && p.ckpt_ok()) {
         // (a remote stage that keeps checkpoints: the worker takes its part of one at the position it is at, so the run
         // stops short of its last row - its chunks, the checkpoint on both sides, then the last row as a window)
