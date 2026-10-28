@@ -389,6 +389,82 @@ static void case_rows() {
                          " random requests (unsplit and split, T 1-16) the same rows, bytes, part rows and tokens");
 }
 
+static float bf(uint16_t h) {   // (bf16 to float: rx::bf2f's, which lives in ds4_rx.cpp)
+    const uint32_t u = (uint32_t) h << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+// stage 1's rx_finish loop (32c2c590), word for word but for its names: a reply's rows into their part rows in one pass
+static void old_add(const std::vector<uint8_t>& rx_dst, const uint16_t* y, int rows, int sets, int D, float* part,
+                    size_t stride, int* cpu) {
+    for (int s = 0; s < sets; ++s)
+        for (size_t j = 0; j < rx_dst.size(); ++j) {
+            const int t = rx_dst[j];
+            float* o = part + (size_t) t * stride;
+            const uint16_t* yj = y + ((size_t) s * rows + j) * (size_t) D;
+            if (cpu[t]) {
+                for (int c = 0; c < D; ++c) o[c] += bf(yj[c]);
+            } else {
+                for (int c = 0; c < D; ++c) o[c] = bf(yj[c]);
+                cpu[t] = 1;
+            }
+        }
+}
+
+// add_rows: rx_finish's one pass (unsplit, sets 1 and 2), and a split reply's heavy rows first (the poll's, or rx_finish's
+// before hseq) then the light ones - each against stage 1's loop, bit for bit, the parts' flags too
+static void case_add_rows() {
+    constexpr int D = 64, S = 80;   // (S: a part row's stride)
+    std::mt19937 rng(5);
+    std::uniform_real_distribution<float> u(-2.0f, 2.0f);
+    int same_u = 0, same_s = 0, n_u = 0, n_s = 0;
+    float w[ds::kMaxPk] = {};
+    for (int it = 0; it < 2000; ++it) {
+        const bool split = it % 2 == 1;
+        const int T = split ? 1 : 1 + (int) (rng() % rx::kMaxRows), sets = !split && it % 4 == 0 ? 2 : 1;
+        ds::Picks a[3];
+        uint8_t h[ds::kMaxPk] = {};
+        for (int t = 0; t < T; ++t)
+            for (int i = 0; i < ds::kTokPicks; ++i) {
+                const int c = (int) (rng() % 4);
+                if (c < 3) a[c].push_back({(int) (rng() % 256), t * ds::kTokPicks + i});
+                h[t * ds::kTokPicks + i] = (uint8_t) (rng() % 2);
+            }
+        std::vector<rx::ReqRow> rows;
+        std::vector<uint8_t> dst;
+        ds::req_rows(T, w, a[0], a[1], a[2], split ? h : nullptr, rows, dst);
+        const int nr = (int) rows.size();
+        std::vector<uint16_t> y((size_t) sets * nr * D);
+        for (auto& v : y) {
+            const float f = u(rng);
+            uint32_t b;
+            std::memcpy(&b, &f, 4);
+            v = (uint16_t) (b >> 16);
+        }
+        std::vector<float> p0((size_t) rx::kMaxRows * S), p1;
+        int c0[rx::kMaxRows], c1[rx::kMaxRows];
+        for (auto& v : p0) v = u(rng);   // (a lane's own sums in some rows, garbage in the others)
+        for (int t = 0; t < rx::kMaxRows; ++t) c0[t] = (int) (rng() % 2);
+        p1 = p0;
+        std::memcpy(c1, c0, sizeof c0);
+        old_add(dst, y.data(), nr, sets, D, p0.data(), S, c0);
+        if (!split) {
+            ds::add_rows(dst, y.data(), nr, sets, D, p1.data(), S, c1, -1, -1, bf);
+        } else {
+            ds::add_rows(dst, y.data(), nr, sets, D, p1.data(), S, c1, 0, -1, bf);   // (the poll's: the heavy rows)
+            ds::add_rows(dst, y.data(), nr, sets, D, p1.data(), S, c1, -1, 0, bf);   // (rx_finish's: the rest)
+        }
+        const bool ok = std::memcmp(p0.data(), p1.data(), p0.size() * 4) == 0 && std::memcmp(c0, c1, sizeof c0) == 0;
+        (split ? same_s : same_u) += ok;
+        ++(split ? n_s : n_u);
+    }
+    check(same_u == n_u, "add_rows, unsplit (T 1-16, sets 1 and 2): " + std::to_string(same_u) + " of " +
+                             std::to_string(n_u) + " replies the same parts and flags as stage 1's loop, bit for bit");
+    check(same_s == n_s, "add_rows, split: the heavy rows (the poll's), then the rest (rx_finish's) - " +
+                             std::to_string(same_s) + " of " + std::to_string(n_s) + " the same as stage 1's one pass");
+}
+
 // a split request's adds as the engine makes them now (ds4_defer_rows.hpp): the lane's slots (local_adds), then the
 // reply's rows (req_rows, then row_adds) or the fallback by part (fallback_parts, fallback_adds)
 static void case_adds() {
@@ -523,6 +599,7 @@ int main() {
     case_heavy();
     case_ledger();
     case_rows();
+    case_add_rows();
     case_adds();
     case_pool();
     case_tally();

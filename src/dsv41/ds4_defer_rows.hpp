@@ -1,7 +1,8 @@
 // src/dsv41/ds4_defer_rows.hpp - a request's rows to the expert server and the adds a split request makes
 // (DS4_EP_DEFER_BELOW / TOP, ds4_defer_split.hpp): rx_send's rows (a row a token; a split request's a row a (token,
-// part), the heavy ones first), the adds of the lane's own slots and of a reply's rows (DS4_EP_DEFER_BELOW_CHECK=1's
-// ledger), and the fallback's picks by part (a reply late or lost).  Pure functions, no state - serve_lane's, rx_send's,
+// part), the heavy ones first), a reply's rows into the parts (rx_finish's, and the speed path's poll's heavy rows), the
+// adds of the lane's own slots and of a reply's rows (DS4_EP_DEFER_BELOW_CHECK=1's ledger), and the fallback's picks by
+// part (a reply late or lost).  Pure functions, no state - serve_lane's, rx_send's,
 // rx_finish's and defer_split_test's, so the rows and the fallback the engine makes are the ones tested.
 #pragma once
 
@@ -51,6 +52,29 @@ inline unsigned req_rows(int T, const float* w, const Picks& rpk, const Picks& s
                 ++r.n;
             }
     return toks;
+}
+
+/// a reply's rows into their part rows - rx_finish's, and the speed path's poll's (its heavy rows as they land): y holds
+/// sets x rows rows of D bf16 (set s's at s * rows), row j into out + dst[j] * stride, set when has[dst[j]] is 0 (has
+/// set then) and else added, each set's rows in turn.  part: only the rows of that part row (-1: every row); skip: none
+/// of that one (-1: none) - the poll's part 0, then rx_finish's skip 0, makes each part row's adds in the order one pass
+/// makes them.  bf: bf16 to float (rx::bf2f)
+template <class Bf>
+inline void add_rows(const std::vector<uint8_t>& dst, const uint16_t* y, int rows, int sets, int D, float* out,
+                     size_t stride, int* has, int part, int skip, Bf bf) {
+    for (int s = 0; s < sets; ++s)
+        for (size_t j = 0; j < dst.size(); ++j) {
+            const int t = dst[j];
+            if ((part >= 0 && t != part) || t == skip) continue;
+            float* o = out + (size_t) t * stride;
+            const uint16_t* yj = y + ((size_t) s * rows + j) * (size_t) D;
+            if (has[t]) {
+                for (int c = 0; c < D; ++c) o[c] += bf(yj[c]);
+            } else {
+                for (int c = 0; c < D; ++c) o[c] = bf(yj[c]);
+                has[t] = 1;
+            }
+        }
 }
 
 /// (DS4_EP_DEFER_BELOW_CHECK=1) a reply's rows as adds: each row's picks into its part row (dst), over the server's

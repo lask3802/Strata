@@ -1381,6 +1381,7 @@ struct Model::Impl {
     // part done, hseq out; a heavy pick on the server (h_rem), and its reply not in when the light part was done)
     double sp_tq = 0.0, sp_th = 0.0, sp_tll = 0.0, sp_ths = 0.0;
     bool sp_hrem = false, sp_hlate = false;
+    double sp_skip = 0.0;   // (split_local's ms out of the lane's part: the gate's sample and the balance's)
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
     bool win_prompt = false;   // (feed_windows: a prompt's windows - their cache ticks are the decode's, serve_T 0)
     rx::PromptSettle psettle;  // (a window prompt's settle: once a prompt, ds4_rx_fill.hpp)
@@ -6608,6 +6609,7 @@ struct Model::Impl {
     };
     RxPre rx_pre;
     const std::function<void()>* lane_poll = nullptr;
+    bool poll_tail = false;   // (help_polled waits for the workers: reads then cost the lane no time - rx_pre.ms not)
     bool pf_same = false;
     // (DS4_EP_DEFER_BELOW_CHECK=1: the two calls' outputs and the one call's arguments - its compare runs after seq,
     // off the device's wait and out of the gate's time)
@@ -6628,11 +6630,18 @@ struct Model::Impl {
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
     }
     // (lane_poll set) pools[0]'s jobs a job at a time, lane_poll between them, then while the workers finish theirs
-    void help_polled() {
+    // (th: when the caller's jobs ran out - run_nodes_prof's tail from there)
+    void help_polled(double* th = nullptr) {
         (*lane_poll)();
         while (pools[0]->help_one()) (*lane_poll)();
+        if (th != nullptr) *th = now_ms();
+        poll_tail = true;
         for (int X = 0; X < NH; ++X)
-            while (!pools[(size_t) X]->done()) (*lane_poll)();
+            while (!pools[(size_t) X]->done()) {
+                (*lane_poll)();
+                cpu_relax();
+            }
+        poll_tail = false;
     }
     // (DS4_LANE_PROF) run_nodes timed: its wall time, its tail (the caller's wait once it ran out of jobs: the
     // barrier's wait for the slowest worker's last job) and its jobs' time in all (busy), each added to its own
@@ -6648,9 +6657,13 @@ struct Model::Impl {
             };
         const double t0 = now_ms();
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, g[X]);
-        if (lane_poll != nullptr) help_polled();
-        else pools[0]->help();
-        const double th = now_ms();
+        double th = 0.0;
+        if (lane_poll != nullptr) {
+            help_polled(&th);
+        } else {
+            pools[0]->help();
+            th = now_ms();
+        }
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
         const double t1 = now_ms();
         wall += t1 - t0;
@@ -8261,7 +8274,7 @@ struct Model::Impl {
         // read within 50 us of its last one is a round trip measured, not an upper bound)
         const double wt = pre ? 0.0 : t1 - tw;
         const bool waited = pre ? rx_pre.gap <= 0.05 : t1 - tw > 0.05;
-        const double poll_ms = rx_pre.ms;   // (the poll's reads in tw - t0: not the lane's part; 0 unsplit)
+        const double skip_ms = hv != nullptr ? sp_skip : 0.0;   // (in tw - t0, not the lane's part: split_local's)
         if (hv != nullptr) rx_pre = RxPre{};
         // earlier late requests' replies, skipped here: their round trips.  A stamp is a read's last skb: one equal to
         // the next reply's is that reply's; one read with only the next reply's head still over-states by that head
@@ -8322,24 +8335,17 @@ struct Model::Impl {
         if (got == 1) {
             const int D = g.dim;
             if (sets == 2) rx_split_check(l, r, T, spk, y + (size_t) rows * D);   // (before y is added: the same bits)
-            for (int s = 0; s < sets; ++s)   // (DS4_EP_SPLIT_VERIFY: the whole picks' sums, then the slice picks')
-                for (size_t j = 0; j < rx_rows.size(); ++j) {
-                    const int t = rx_dst[j];   // (the row's token; a split request's: its part)
-                    if (h_in && t == 0) continue;   // (the poll's: in part[0] already)
-                    if (hv != nullptr && t == 1) hseq_put(rp, seq);   // (the heavy rows first, req_rows': part[0] final)
-                    float* o = rp.part[t];
-                    const uint16_t* yj = y + ((size_t) s * rows + j) * (size_t) D;
-                    if (rp.cpu[t]) {
-                        for (int c = 0; c < D; ++c) o[c] += rx::bf2f(yj[c]);
-                    } else {
-                        for (int c = 0; c < D; ++c) o[c] = rx::bf2f(yj[c]);
-                        rp.cpu[t] = 1;
-                    }
-                }
-            if (hv != nullptr) {   // (the reply holds both parts: part[0] final now)
+            // (each row into its token's part row - DS4_EP_SPLIT_VERIFY: the whole picks' sums, then the slice picks'.  A
+            // split request's: its heavy rows, unless the poll added them, then hseq - part[0] final - then the light ones)
+            float* pt = &rp.part[0][0];
+            if (hv == nullptr) {
+                dsplit::add_rows(rx_dst, y, rows, sets, D, pt, (size_t) kMaxDim, rp.cpu, -1, -1, rx::bf2f);
+            } else {
+                if (!h_in) dsplit::add_rows(rx_dst, y, rows, sets, D, pt, (size_t) kMaxDim, rp.cpu, 0, -1, rx::bf2f);
                 if (split_check == 1)
                     dsplit::row_adds(rx_rows, rx_dst, &r.ids[0][0], l.k_exp, rx_k, cut, rx_nb, sp_adds);
                 hseq_put(rp, seq);
+                dsplit::add_rows(rx_dst, y, rows, sets, D, pt, (size_t) kMaxDim, rp.cpu, -1, 0, rx::bf2f);
             }
             st.rx_picks += (int64_t) rpk.size();
             st.rx_split_picks += (int64_t) spk.size();
@@ -8358,7 +8364,7 @@ struct Model::Impl {
                     ++rx_bal_ns;
                 }
                 if (rx_bal && T == 1 && mb > 0) {
-                    rx_bal_rm = rx::ewma(rx_bal_rm, (tw - t0 - poll_ms) / mb, 0.05);
+                    rx_bal_rm = rx::ewma(rx_bal_rm, (tw - t0 - skip_ms) / mb, 0.05);
                     ++rx_bal_nm;
                 }
             }
@@ -8826,6 +8832,7 @@ struct Model::Impl {
             sp_chk_due = true;
             skip += now_ms() - a;
         }
+        sp_skip = skip;
         return skip;
     }
     // (a decode split request's, after seq) its times into the stats: defer_lines' timing line
@@ -8874,7 +8881,7 @@ struct Model::Impl {
         const double gap = rx_pre.tp > 0.0 ? t1 - rx_pre.tp : 1e30;
         rx_pre.tp = t1;
         if (got == 0 && !rx_link->last_stale()) {   // (not in yet)
-            rx_pre.ms += t1 - a;
+            if (!poll_tail) rx_pre.ms += t1 - a;
             return;
         }
         rx_pre.got = got;
@@ -8887,22 +8894,11 @@ struct Model::Impl {
         rx_pre.gap = gap;
         rx_pre.ta = got == 1 ? rx_link->arrival_ms() : -1.0;
         if (got == 1) {
-            const int D = g.dim;
-            float* o = rp.part[0];
-            for (int j = 0; j < rows; ++j) {
-                if (rx_dst[(size_t) j] != 0) continue;
-                const uint16_t* yj = y + (size_t) j * D;
-                if (rp.cpu[0]) {
-                    for (int c = 0; c < D; ++c) o[c] += rx::bf2f(yj[c]);
-                } else {
-                    for (int c = 0; c < D; ++c) o[c] = rx::bf2f(yj[c]);
-                    rp.cpu[0] = 1;
-                }
-            }
+            dsplit::add_rows(rx_dst, y, rows, 1, g.dim, &rp.part[0][0], (size_t) kMaxDim, rp.cpu, 0, -1, rx::bf2f);
             rx_pre.heavy_in = true;
             hseq_put(rp, seq);
         }
-        rx_pre.ms += rx::now_ms() - a;
+        if (!poll_tail) rx_pre.ms += rx::now_ms() - a;
     }
     // DS4_EP_DEFER_BELOW / TOP: a split request's end, before its seq - hseq if no path published it yet (no CPU-lane
     // pick, a layer past the table, the link down ...), and the checks
@@ -9029,6 +9025,7 @@ struct Model::Impl {
                 sp_adds.clear();
                 rx_pre = RxPre{};
                 sp_tq = now_ms();
+                sp_skip = 0.0;
                 sp_hrem = sp_hlate = false;
             }
             if (hsp || hst) {
