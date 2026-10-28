@@ -1,8 +1,8 @@
 // Strata. The prompt flow's expert-stage batches (ds4_flow_batches.hpp): the batch partition flow_layer walks (bmax
 // items at most, never across the ring's end; none for an empty layer), DS4_BC_ONCE's up-front list against that walk,
 // each batch's compacted bounds written up front against written a batch at a time (zero-row batches included), the
-// regions a layer's batches take (one run, or two where they wrap) and the region-reuse invariant over a run of
-// layers; DS4_BC_ONCE's text.  No GPU, no model.
+// regions a layer's batches take (one run, or two where they wrap) and how many a layer can need; DS4_BC_ONCE's
+// text.  No GPU, no model.
 #include "../../src/dsv41/ds4_flow_batches.hpp"
 
 #include <algorithm>
@@ -142,30 +142,16 @@ int main() {
         check(cover, "the runs are the batches' regions in order, within the buffer (20000 layers)");
     }
 
-    // ---- the invariant: over a run of layers, a layer's up-front writes never touch a region a batch of the same
-    // layer took (they are only waited apart from the layers before - bc_done), nor more than bc_n
+    // ---- a layer's batches each their own region: at most bc_n of them (the reuse across layers rests on the engine's
+    // waits - the bounds wait, bc_done - which no pure function here holds; bc_pull_test runs that order on a GPU)
     {
         check(ds4::bc_layer_fits(0, 258) && ds4::bc_layer_fits(258, 258) && !ds4::bc_layer_fits(259, 258) &&
                   !ds4::bc_layer_fits(1, 0),
               "a layer fits: at most bc_n batches");
-        std::mt19937 rng(5);
         const int n_exp = 256, bc_n = n_exp + 2;
-        uint64_t n_batch = 0;
-        std::vector<int64_t> last(bc_n, -1);   // region -> the layer that last wrote it
-        bool ok = true;
-        for (int64_t layer = 0; layer < 5000; ++layer) {
-            const size_t items = rng() % (size_t) (n_exp + 1);   // a layer streams at most its n_exp experts
-            const size_t R = 2 + rng() % 80;
-            ds4::flow_batches(0, items, R, std::max<size_t>(1, R / 2), bs);
-            ok = ok && ds4::bc_layer_fits(bs.size(), bc_n);
-            for (size_t j = 0; j < bs.size(); ++j) {
-                const size_t reg = ds4::bc_region(n_batch + j, bc_n);
-                ok = ok && last[reg] < layer;   // (never a region this layer wrote already)
-                last[reg] = layer;
-            }
-            n_batch += bs.size();
-        }
-        check(ok, "5000 layers: each batch of a layer its own region, every layer within bc_n");
+        ds4::flow_batches(0, (size_t) n_exp, 1, 1, bs);   // (the most batches a layer can have: an item each)
+        check(bs.size() == (size_t) n_exp && ds4::bc_layer_fits(bs.size(), bc_n),
+              "n_exp items in batches of one: n_exp batches, within bc_n = n_exp + 2");
         std::set<size_t> regs;   // one batch more than bc_n: two batches share a region
         for (size_t j = 0; j < (size_t) bc_n + 1; ++j) regs.insert(ds4::bc_region(17 + j, bc_n));
         check(regs.size() == (size_t) bc_n, "bc_n + 1 batches: a region twice (what bc_layer_fits refuses)");

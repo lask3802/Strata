@@ -1019,8 +1019,9 @@ struct Model::Impl {
     // flow_spec decides them, not on the compute stream before the sort
     int bc_once = 0;
     // DS4_LC_THP=0 (the load reads it): the prompt's host buffers - the layer-major prompt's layer cache and pageable
-    // chunk states, a remote stage's replies - mapped without MADV_HUGEPAGE, on 4 KiB pages: a fault near the cgroup's
-    // memory.high then reclaims a page, never compacts memory for a huge one.  Unset, empty or 1: huge pages advised, as before
+    // chunk states, a remote stage's replies - advised MADV_NOHUGEPAGE, on 4 KiB pages even where THP is
+    // enabled=always: a fault near the cgroup's memory.high then reclaims a page, never compacts memory for a huge one
+    // (pinned chunk states are the driver's, not these).  Unset, empty or 1: huge pages advised, as before
     bool lc_thp = true;
     // DS4_LM_PRE=1 (the load reads it; lm_prealloc): the layer-major prompt's host memory allocated once at the load
     bool lm_pre = false;
@@ -2647,8 +2648,9 @@ struct Model::Impl {
                 return false;
             }
             lc_thp = false;
-            std::fprintf(stderr, "ds4: DS4_LC_THP=0: the layer-major prompt's layer cache and chunk states, and the "
-                                 "prompt's other host buffers, on 4 KiB pages (no MADV_HUGEPAGE)\n");
+            std::fprintf(stderr, "ds4: DS4_LC_THP=0: the layer-major prompt's layer cache, its chunk states where they "
+                                 "are not pinned, and a remote stage's replies on 4 KiB pages (MADV_NOHUGEPAGE); "
+                                 "pinned chunk states as the driver gives them\n");
         }
         if (const char* v = std::getenv("DS4_LM_PRE"); v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0) {
             if (std::strcmp(v, "1") != 0) {
@@ -3761,8 +3763,8 @@ struct Model::Impl {
                     const bool mapped = bc_once == 2 || bc_once == 3;
                     if (!(mapped ? hmap(cp->bc_pin, (size_t) cp->bc_n * cp->bc_w, err)
                                  : halloc(cp->bc_pin, (size_t) cp->bc_n * cp->bc_w, err)) ||
-                        !dalloc(devs[di], cp->bc_dev, (size_t) cp->bc_n * cp->bc_w, err))
-                        return false;
+                        (bc_once != 2 && !dalloc(devs[di], cp->bc_dev, (size_t) cp->bc_n * cp->bc_w, err)))
+                        return false;   // (2: no bc_dev, the kernels read bc_map)
                     if (mapped) {
                         void* m = nullptr;
                         if (cudaHostGetDevicePointer(&m, cp->bc_pin, 0) != cudaSuccess) {
@@ -4459,6 +4461,7 @@ struct Model::Impl {
             const bool sent = copied && cudaEventRecord(c.vs_ev, c.cs) == cudaSuccess;
             kick(c.cs);
             if (copied && !sent) cudaStreamSynchronize(c.cs);   // (no event to wait for: the copy done before vs_pin is written again)
+            if (!sent) cudaGetLastError();   // (the failed call's error not left for a later check to find)
             c.vs_k = sent ? k : -1;
             c.vs_il = sent ? il : -1;
             c.vs_mi = sent ? mi : -1;
@@ -11195,10 +11198,11 @@ struct Model::Impl {
         const uint64_t av = ram_avail();
         if (av != ~uint64_t{0}) warm_bytes = av > kRamMargin ? std::min<uint64_t>(warm_bytes, av - kRamMargin) : 0;
         std::fprintf(stderr, "ds4: DS4_LM_PRE=1: the layer-major prompt's layer cache %.2f GB (%s, %s) and chunk states "
-                             "%.2f GB (%d chunks of %d rows, %s) allocated at the load and faulted in, in %.1f s; kept for "
-                             "the process\n",
-                     (double) lc_b / 1e9, lc_thp ? "huge pages advised" : "4 KiB pages", lc_how, (double) st_b / 1e9, nc,
-                     chunk, pinned ? "pinned" : st_how, (now_ms() - t) / 1000.0);
+                             "%.2f GB (%d chunks of %d rows for a max_context of %lld, %s) allocated at the load and "
+                             "faulted in, in %.1f s; kept for the process\n",
+                     (double) lc_b / 1e9, lc_thp ? "huge pages advised" : "4 KiB pages, MADV_NOHUGEPAGE", lc_how,
+                     (double) st_b / 1e9, nc, chunk, (long long) o.max_context, pinned ? "pinned" : st_how,
+                     (now_ms() - t) / 1000.0);
     }
     bool lm_begin(const Run& run) {
         static const char* env = std::getenv("DS4_LAYER_MAJOR");

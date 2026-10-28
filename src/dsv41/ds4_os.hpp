@@ -475,8 +475,8 @@ inline bool in_ram(const void* p, size_t n) {
 }
 
 /// Anonymous memory on NUMA node `node` of `nodes` (node < 0 or nodes < 2: wherever the first touch puts it), on huge
-/// pages where the OS gives them (huge false: no MADV_HUGEPAGE - 4 KiB pages, so a fault never compacts memory for one);
-/// nullptr if it cannot be had.
+/// pages where the OS gives them (huge false: MADV_NOHUGEPAGE - 4 KiB pages, THP's enabled=always included, so a fault
+/// never compacts memory for one); nullptr if it cannot be had.
 inline void* anon_alloc(size_t bytes, int node, int nodes, bool huge = true) {
 #if defined(_WIN32)
     (void) huge;
@@ -487,7 +487,7 @@ inline void* anon_alloc(size_t bytes, int node, int nodes, bool huge = true) {
 #else
     void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) return nullptr;
-    if (huge) madvise(m, bytes, MADV_HUGEPAGE);
+    madvise(m, bytes, huge ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
     if (node >= 0 && nodes > 1) {
         unsigned long mask[4] = {0, 0, 0, 0};
         mask[node / 64] = 1ul << (node % 64);
