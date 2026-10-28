@@ -191,6 +191,12 @@ struct PromptSettle {
     bool after_feed(bool rx_on, int logits_rows) const { return rx_on && logits_rows > 0 && !done; }
     void settled() { done = true; }
     void next() { done = false; }
+    /// at the end of a forward() window: an EP window that is not a window prompt's (win_prompt: feed_windows', or
+    /// feed_small's - an EP window too) is a decode window, and the next prompt settles again.  A window prompt's
+    /// windows leave it to the prompt's end
+    void window_end(bool ep, bool win_prompt) {
+        if (ep && !win_prompt) next();
+    }
 };
 
 }  // namespace strata::ds4::rx
