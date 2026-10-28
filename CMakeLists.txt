@@ -912,6 +912,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # which lane computes which n_ff blocks of a pick under H' (ds4_rx_split.hpp): each block added once; no GPU, no model
       add_executable(ds4_rx_split_test tests/dsv41/rx_split_test.cpp)
       target_compile_features(ds4_rx_split_test PRIVATE cxx_std_17)
+      # heavy-first deferral's pure logic (ds4_defer_split.hpp: DS4_EP_DEFER_BELOW / TOP, their CHECK, DS4_EP_DEFER_STAT):
+      # the values, the layers split, the heavy picks, each pick's blocks once into its part, the tally; no GPU, no model
+      add_executable(ds4_defer_split_test tests/dsv41/defer_split_test.cpp)
+      target_compile_features(ds4_defer_split_test PRIVATE cxx_std_17)
       # DS4_IO_SPLIT (IoQueue's split read, ds4_pool.hpp): a read with a resident lead against a file of its own; Linux
       add_executable(ds4_io_split_test tests/dsv41/io_split_test.cpp)
       target_compile_features(ds4_io_split_test PRIVATE cxx_std_17)
