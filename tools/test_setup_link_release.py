@@ -73,6 +73,11 @@ class TheCheckoutsRelease(unittest.TestCase):
         self.assertLess(keys[2], keys[3])
         self.assertLess(setup.link_key("0.1.44.1-link.9"), setup.link_key("0.1.44.1-link.10"))
 
+    def test_link_required_is_the_tls_remote_stage(self):
+        """No release from before the remote stage's TLS: an older engine's worker, started by this checkout's
+        stage_node.py (STRATA_STAGE_TLS, no token), would accept anyone in plain text."""
+        self.assertGreaterEqual(setup.link_key(setup.LINK_REQUIRED), setup.link_key("0.1.54-link.1"))
+
     def test_link_required_is_not_newer_than_link_version(self):
         self.assertLessEqual(setup.link_key(setup.LINK_REQUIRED), setup.link_key(setup.link_version()))
         self.assertIsNotNone(re.fullmatch(r"\d+(\.\d+)+-link\.\d+", setup.LINK_REQUIRED))
@@ -98,6 +103,7 @@ class GetPrebuilt(unittest.TestCase):
         for p in (mock.patch.object(setup, "ROOT", self.root),
                   mock.patch.object(setup, "link_version", lambda: self.LINK),
                   mock.patch.object(setup, "source_version", lambda: self.LINK.split("-")[0]),
+                  mock.patch.object(setup, "LINK_REQUIRED", "0.1.44.1-link.1"),   # these cases' releases' era
                   mock.patch.object(setup, "UNCHECKED_ENGINES", set()),
                   mock.patch.object(setup, "RELEASE_RECHECK", False)):
             p.start()
