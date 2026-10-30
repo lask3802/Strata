@@ -10,8 +10,9 @@
 # Update 1 (cuBLAS 13.0.2.14) and 12.9 Update 1 (cuBLAS 12.9.1.4).  The archs are upstream's releases' (cuobjdump
 # of the 0.1.44.1 zips).  The AMD (HIP) zip is not built here: tools/hip/build_windows.bat.  The Linux zip is built on
 # Rocky Linux 8 (glibc 2.28) with libstdc++ linked in, and run on the oldest distributions before a release.  The
-# engine links OpenSSL statically (the remote stage's TLS 1.3): vcpkg's x64-windows-static on Windows, OpenSSL 3.0 LTS
-# built from its release tarball (sha256-pinned) on Rocky Linux 8; a release build without it stops at configure.
+# engine links OpenSSL statically (the remote stage's TLS 1.3): vcpkg's x64-windows-static on Windows (vcpkg pinned to
+# a release), OpenSSL 3.5 LTS built from its release tarball (sha256-pinned) on Rocky Linux 8; a release build without
+# it stops at configure.
 #
 # LINK_VERSION (<CMakeLists.txt's version>-link.<n>): bump n only when the engine binary changes (its sources, its
 # build, the toolkit); an upstream merge that changes CMakeLists.txt's version starts again at <new version>-link.1.
@@ -116,12 +117,17 @@ jobs:
         run: python -c "import setup; setup.get_llama_cpp()"
       # the engine's remote stage is TLS 1.3, and a release build (STRATA_PORTABLE) links OpenSSL statically
       # (CMakeLists.txt strata_stage_tls): vcpkg's x64-windows-static, the static C runtime as the engine's (/MT), from
-      # the runner's own vcpkg
-      - name: OpenSSL, static, for the engine (vcpkg x64-windows-static)
+      # a vcpkg checkout pinned to its 2026.10.16 release (not the runner's, which moves with the image), so the
+      # OpenSSL port is a known one (3.6.5#2 at that commit); `vcpkg list` prints it into the log
+      - name: OpenSSL, static, for the engine (vcpkg 2026.10.16, x64-windows-static)
         if: matrix.part == 'engine'
         run: |
-          "$VCPKG_INSTALLATION_ROOT/vcpkg.exe" install openssl:x64-windows-static
-          echo "OPENSSL_ROOT=$(cygpath -m "$VCPKG_INSTALLATION_ROOT")/installed/x64-windows-static" >> "$GITHUB_ENV"
+          git clone -q --filter=tree:0 https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
+          git -C "$RUNNER_TEMP/vcpkg" checkout -q 9eec002df1cd109f8f104cd966a763daf9751489
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          "$RUNNER_TEMP/vcpkg/vcpkg.exe" install openssl:x64-windows-static
+          "$RUNNER_TEMP/vcpkg/vcpkg.exe" list openssl
+          echo "OPENSSL_ROOT=$(cygpath -m "$RUNNER_TEMP")/vcpkg/installed/x64-windows-static" >> "$GITHUB_ENV"
       - name: build ${{ matrix.part }}
         run: >-
           python .github/scripts/build_release.py ${{ matrix.part }} --build build --cuda "$CUDA_ROOT"
@@ -190,18 +196,19 @@ jobs:
           /usr/local/cuda-13.0/bin/nvcc --version
       # the engine's remote stage is TLS 1.3, and a release build (STRATA_PORTABLE) links OpenSSL statically
       # (CMakeLists.txt strata_stage_tls); Rocky Linux 8's openssl-devel has the shared library only
-      - name: OpenSSL 3.0.22 LTS, static, for the engine (Rocky Linux 8 has no static libssl)
+      - name: OpenSSL 3.5.9 LTS, static, for the engine (Rocky Linux 8 has no static libssl)
         if: matrix.part == 'engine'
         run: |
           dnf install -y -q --setopt=install_weak_deps=False perl-core make curl
-          v=3.0.22
+          v=3.5.9
           curl -fsSL -o /tmp/openssl.tar.gz "https://github.com/openssl/openssl/releases/download/openssl-$v/openssl-$v.tar.gz"
-          echo "67ebca7e50d17383028045486653492195b83db95f8558709701bb47b5c1ef81  /tmp/openssl.tar.gz" | sha256sum -c -
+          echo "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a  /tmp/openssl.tar.gz" | sha256sum -c -
           tar -xzf /tmp/openssl.tar.gz -C /tmp
           cd "/tmp/openssl-$v"
           ./Configure linux-x86_64 no-shared no-tests --prefix=/opt/openssl --libdir=lib --openssldir=/opt/openssl/ssl
           make -s -j"$(nproc)" build_libs
           make -s install_dev
+          grep -m1 OPENSSL_FULL_VERSION_STR /opt/openssl/include/openssl/opensslv.h
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

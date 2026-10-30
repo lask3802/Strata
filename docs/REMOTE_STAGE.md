@@ -593,11 +593,15 @@ connection only with this PC's certificate in its own `peers/`. For the main PC'
 certificates the link already exchanges; a relay's next worker links with the relay, not with this PC, so its agent
 is reached only once the two PCs hold each other's `cert.pem` too.
 No proxy, no plain HTTP, and a redirect is not followed. An agent that refuses, or one this PC does not accept, shows
-its TLS error on the card. The run config and the key folder are read when the server starts: restart it after
-changing either.
+its TLS error on the card. The run config and the key folder are read when the server starts, and the agents'
+TLS context is kept for as long as it runs: after a new key (`strata --stage-keygen`) or a change in `peers/`,
+restart the server, or the card keeps the old certificates (and shows the agent's refusal once the agent has the new
+ones).
 
 ## What is turned off or refused
 
+- **Refused at start** on a build without TLS (`-DSTRATA_STAGE_TLS=OFF`: the Windows AMD engine,
+  `tools/hip/build_windows.bat`): every remote stage, as the main PC or as a worker ("this build has no TLS").
 - **Refused at start** with a remote stage: `--batch`, `--peer-device`, `--control-vector` (and the speed
   projection, which is one), `--expert-cache-remote`, `--prefill-head-alias`, and `--pipeline-windows` on a worker
   (the main process takes it, see [Overlapping the decode windows](#overlapping-the-decode-windows---pipeline-windows-2)).
@@ -711,7 +715,7 @@ window, a split that decodes as fast as without it, and ~32K-token prompts read 
 | Linux, NVIDIA (CUDA 13.0) | measured: Ubuntu 24.04 in an LXC container (main), a Linux host with kernel 6.14 (worker) |
 | Windows 11 native, NVIDIA (MSVC 2022, CUDA 13.0) | measured as a worker (and its node agent); as the main PC not tested here (a user ran one: see the AMD row) |
 | WSL2 (Windows 11, mirrored networking) | measured as a worker |
-| AMD (HIP) | Linux: builds (ROCm 7.0, gfx1100, in a container); not run here: no AMD card was available. A user ran a Radeon 8060S (gfx1151, Windows) as the worker of an RTX 5070 main PC over USB4, on 0.1.45.3-link.1 ([report](https://github.com/Niko1221/Strata/pull/1748#issuecomment-6332714185)), before TLS. The Windows AMD engine (`tools/hip/build_windows.bat`) is now built without TLS, so its remote stage refuses to start |
+| AMD (HIP) | Linux: builds (ROCm 7.0, gfx1100, in a container); not run here: no AMD card was available. A user ran a Radeon 8060S (gfx1151, Windows) as the worker of an RTX 5070 main PC over USB4, on 0.1.45.3-link.1 ([report](https://github.com/Niko1221/Strata/pull/1748#issuecomment-6332714185)), before TLS. **Since 0.1.54-link.1 a Windows AMD PC cannot take part in a remote stage**, as the main PC or as a worker: `tools/hip/build_windows.bat` builds with `-DSTRATA_STAGE_TLS=OFF` (no static OpenSSL has been tried with its compiler), and such an engine refuses `--remote-stage` and `--stage-worker` at start ("this build has no TLS"); Link's releases ship no Windows AMD engine of their own. A Linux AMD build has TLS as the others (a release build, `packaging/build_hip_linux.sh`, needs the static OpenSSL there too) |
 
 | Intel (SYCL) | the SYCL port builds (oneAPI 2026.1.1, in a container) but has no remote stage: it keeps its own copies of the engine files this feature changes |
 | Apple (Metal, 0.1.44) | refused at start: the Metal backend runs each verify window itself, past the remote stage's hooks. Its build compiles the link's code so the binary links (not built here: no Mac) |

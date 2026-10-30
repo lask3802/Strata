@@ -329,8 +329,9 @@ class MainLogTest(LogCase):
         start_errors = ["remote stage: no credentials folder (STRATA_STAGE_TLS): make one on each PC with `strata "
                         "--stage-keygen DIR`",
                         "remote stage: cannot read D:\\keys\\key.pem: No such file or directory",
-                        "remote stage: cannot open D:\\keys (Windows error 5)",
-                        "remote stage: TLS: key.pem and cert.pem do not belong together: key values mismatch"]
+                        "remote stage: TLS: key.pem and cert.pem do not belong together: key values mismatch",
+                        "remote stage: this build has no TLS (it was built without OpenSSL 1.1.1 or later); the remote "
+                        "stage needs it"]
         for text in start_errors:
             ml = stages.MainLog()                         # the first look's scan
             Path(self.log).write_text(STARTED + "strata generate: " + text + "\n", encoding="utf-8")
@@ -346,7 +347,10 @@ class MainLogTest(LogCase):
                       "strata generate: remote stage: conversation checkpoints are off, every prompt is read from "
                       "token 0",
                       "strata generate: remote stage: no PLE here (layer 1 runs in the main process)",
-                      "strata generate: remote stage: the dense weights of layers 20-39 only"]
+                      "strata generate: remote stage: the dense weights of layers 20-39 only",
+                      # (no such line today: under "strata generate: " only the key folder's errors count, not the
+                      # link's, whatever a later start line says)
+                      "strata generate: remote stage: cannot connect to 10.10.10.2:7841 is retried at the first request"]
         for line in start_info:
             ml = stages.MainLog()
             Path(self.log).write_text(STARTED + line + "\n", encoding="utf-8")

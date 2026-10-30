@@ -1,4 +1,5 @@
-"""Every tools/*.py that setup.py, strata_cli or strata_control runs BY PATH is in the packaged Terminal (and so in the Control bundle).
+"""Every tools/*.py that setup.py, strata_cli, strata_control or serve runs (or loads) BY PATH is in the packaged Terminal (and so in the
+Control bundle).
 
 0.2.4 shipped without tools/dsv41/pack_gguf.py: the tests ran from the checkout, where the file exists, and the packaged Terminal failed at
 "Preparing your model" with "can't open file .../tools/dsv41/pack_gguf.py".  This test reads the by-path references out of the source (an
@@ -33,8 +34,10 @@ def _flatten(node):
 
 
 def referenced_tools(root: Path = ROOT) -> dict[str, set[str]]:
-    """{'tools/dsv41/pack_gguf.py': {files that name it}} for setup.py, strata_cli/**, strata_control/**."""
-    files = [root / "setup.py"] + sorted((root / "strata_cli").rglob("*.py")) + sorted((root / "strata_control").rglob("*.py"))
+    """{'tools/dsv41/pack_gguf.py': {files that name it}} for setup.py, strata_cli/**, strata_control/**, serve/** (Link: serve/stages.py
+    loads tools/stage_node.py by path)."""
+    files = [root / "setup.py"] + sorted((root / "strata_cli").rglob("*.py")) + sorted((root / "strata_control").rglob("*.py")) + \
+        sorted(p for p in (root / "serve").rglob("*.py") if not p.name.startswith("test_"))
     found: dict[str, set[str]] = {}
     for f in files:
         tree = ast.parse(f.read_text(encoding="utf-8-sig"))
@@ -74,7 +77,8 @@ class ByPathToolsAreBundled(unittest.TestCase):
     def test_the_scan_finds_the_deepseek_scripts(self):
         # (a scan that finds nothing would make the next test pass for the wrong reason)
         refs = referenced_tools()
-        for name in ("tools/dsv41/pack_gguf.py", "tools/dsv41/smoke.py", "tools/dsv41/tune.py", "tools/iq_pack.py", "tools/mtp_fetch.py"):
+        for name in ("tools/dsv41/pack_gguf.py", "tools/dsv41/smoke.py", "tools/dsv41/tune.py", "tools/iq_pack.py", "tools/mtp_fetch.py",
+                     "tools/stage_node.py"):
             self.assertIn(name, refs)
         self.assertGreaterEqual(len(refs), 12)
 

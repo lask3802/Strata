@@ -93,12 +93,13 @@ class MainLog:
     # errors by its start, and the worker's own ("remote stage (worker): ..."); every other "strata serve: remote
     # stage: ..." line says how it goes (a checkpoint saved or restored, a session continued or dropped after
     # connecting again, a K/V check an earlier worker cannot take part in) and leaves the link as it is.  And the
-    # key folder's errors (src/net/stage_tls.cpp's TlsCredentials::load) as the start prints them before the model
-    # loads: "strata generate: remote stage: " + the error; that prefix's other lines say how the start goes.
-    ERROR = re.compile(r"strata (?:serve: |generate: (?=remote stage: (?:no credentials folder|cannot read |cannot open |"
-                       r"TLS: )))"
+    # key folder's errors (src/net/stage_tls.cpp's TlsCredentials::load, or a build without OpenSSL) as the start
+    # prints them before the model loads: "strata generate: remote stage: " + the error; that prefix's other lines say
+    # how the start goes.
+    ERROR = re.compile(r"strata (?:serve: |generate: (?=remote stage: (?:no credentials folder|cannot read |TLS: |"
+                       r"this build has no TLS)))"
                        r"(remote stage \(worker\): .*|"
-                       r"remote stage: (?:no credentials folder|cannot read |cannot open |TLS: |"
+                       r"remote stage: (?:no credentials folder|cannot read |TLS: |this build has no TLS|"
                        r"cannot connect to |cannot resolve |expected HOST:PORT|"
                        r"the sockets did not start|not connected|receive failed|send failed|the link failed earlier|"
                        r"the peer closed the connection|the two sides differ|"
