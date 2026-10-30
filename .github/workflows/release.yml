@@ -10,9 +10,9 @@
 # Update 1 (cuBLAS 13.0.2.14) and 12.9 Update 1 (cuBLAS 12.9.1.4).  The archs are upstream's releases' (cuobjdump
 # of the 0.1.44.1 zips).  The AMD (HIP) zip is not built here: tools/hip/build_windows.bat.  The Linux zip is built on
 # Rocky Linux 8 (glibc 2.28) with libstdc++ linked in, and run on the oldest distributions before a release.  The
-# engine links OpenSSL statically (the remote stage's TLS 1.3): vcpkg's x64-windows-static on Windows (vcpkg pinned to
-# a release), OpenSSL 3.5 LTS built from its release tarball (sha256-pinned) on Rocky Linux 8; a release build without
-# it stops at configure.
+# engine links OpenSSL statically (the remote stage's TLS 1.3): OpenSSL 3.5 LTS from its release tarball, pinned by
+# hash, in both: through vcpkg (pinned to a release, an overlay port) on Windows, built from source on Rocky Linux 8; a
+# release build without it stops at configure.
 #
 # LINK_VERSION (<CMakeLists.txt's version>-link.<n>): bump n only when the engine binary changes (its sources, its
 # build, the toolkit); an upstream merge that changes CMakeLists.txt's version starts again at <new version>-link.1.
@@ -117,16 +117,18 @@ jobs:
         run: python -c "import setup; setup.get_llama_cpp()"
       # the engine's remote stage is TLS 1.3, and a release build (STRATA_PORTABLE) links OpenSSL statically
       # (CMakeLists.txt strata_stage_tls): vcpkg's x64-windows-static, the static C runtime as the engine's (/MT), from
-      # a vcpkg checkout pinned to its 2026.10.16 release (not the runner's, which moves with the image), so the
-      # OpenSSL port is a known one (3.6.5#2 at that commit); `vcpkg list` prints it into the log
-      - name: OpenSSL, static, for the engine (vcpkg 2026.10.16, x64-windows-static)
+      # a vcpkg checkout pinned to its 2026.10.16 release (not the runner's, which moves with the image). Its own
+      # OpenSSL port is 3.6, which is not an LTS line; the overlay .github/vcpkg-ports/openssl is its 3.5.4 port on
+      # the 3.5.9 release tarball the Linux job pins, so both zips carry the same OpenSSL. `vcpkg list` prints it
+      - name: OpenSSL 3.5.9 LTS, static, for the engine (vcpkg 2026.10.16 + the overlay port, x64-windows-static)
         if: matrix.part == 'engine'
         run: |
           git clone -q --filter=tree:0 https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"
           git -C "$RUNNER_TEMP/vcpkg" checkout -q 9eec002df1cd109f8f104cd966a763daf9751489
           "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
-          "$RUNNER_TEMP/vcpkg/vcpkg.exe" install openssl:x64-windows-static
-          "$RUNNER_TEMP/vcpkg/vcpkg.exe" list openssl
+          "$RUNNER_TEMP/vcpkg/vcpkg.exe" install openssl:x64-windows-static --vcpkg-root "$RUNNER_TEMP/vcpkg" \
+            --overlay-ports="$GITHUB_WORKSPACE/.github/vcpkg-ports"
+          "$RUNNER_TEMP/vcpkg/vcpkg.exe" list openssl --vcpkg-root "$RUNNER_TEMP/vcpkg"
           echo "OPENSSL_ROOT=$(cygpath -m "$RUNNER_TEMP")/vcpkg/installed/x64-windows-static" >> "$GITHUB_ENV"
       - name: build ${{ matrix.part }}
         run: >-

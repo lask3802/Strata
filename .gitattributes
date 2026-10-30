@@ -28,3 +28,5 @@ docker/compose/* text eol=lf
 
 # vendored KaTeX (serve/web/vendor): the files are hashed byte for byte (PROVENANCE.json), never convert their line endings.
 serve/web/vendor/** -text
+# vcpkg overlay ports keep vcpkg's own bytes (its repository: * -text; the patches apply byte for byte)
+.github/vcpkg-ports/** -text
