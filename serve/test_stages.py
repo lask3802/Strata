@@ -324,6 +324,34 @@ class MainLogTest(LogCase):
             Path(self.log).write_text(STARTED + "strata serve: " + text + "\n", encoding="utf-8")
             s = ml.poll(self.log, None, 0)
             self.assertEqual(s["error"] and s["error"]["text"], text)
+        # the key folder's errors stop the start before the model loads ("strata generate: "); that prefix's other
+        # lines say how the start goes
+        start_errors = ["remote stage: no credentials folder (STRATA_STAGE_TLS): make one on each PC with `strata "
+                        "--stage-keygen DIR`",
+                        "remote stage: cannot read D:\\keys\\key.pem: No such file or directory",
+                        "remote stage: cannot open D:\\keys (Windows error 5)",
+                        "remote stage: TLS: key.pem and cert.pem do not belong together: key values mismatch"]
+        for text in start_errors:
+            ml = stages.MainLog()                         # the first look's scan
+            Path(self.log).write_text(STARTED + "strata generate: " + text + "\n", encoding="utf-8")
+            s = ml.poll(self.log, None, 0)
+            self.assertEqual(s["error"] and s["error"]["text"], text)
+            ml = stages.MainLog()                         # a line fed as it comes
+            Path(self.log).write_text(STARTED, encoding="utf-8")
+            ml.poll(self.log, None, 0)
+            self.append("strata generate: " + text + "\n")
+            s = ml.poll(self.log, None, 0)
+            self.assertEqual(s["error"] and s["error"]["text"], text)
+        start_info = ["strata generate: remote stage: this process holds layers 0-19, the worker 20-39",
+                      "strata generate: remote stage: conversation checkpoints are off, every prompt is read from "
+                      "token 0",
+                      "strata generate: remote stage: no PLE here (layer 1 runs in the main process)",
+                      "strata generate: remote stage: the dense weights of layers 20-39 only"]
+        for line in start_info:
+            ml = stages.MainLog()
+            Path(self.log).write_text(STARTED + line + "\n", encoding="utf-8")
+            s = ml.poll(self.log, None, 0)
+            self.assertIsNone(s["error"], line)
         # every error text src/net/stage_link.cpp has, as its literal starts
         src = Path(__file__).resolve().parents[1] / "src" / "net" / "stage_link.cpp"
         if not src.exists():

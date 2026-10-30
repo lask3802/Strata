@@ -57,13 +57,13 @@ sys.path.insert(0, sys.argv[1])
 import stage_node
 body = sys.argv[4]
 data = Path(body[1:]).read_bytes() if body.startswith("@") else body.encode()
-opener = stage_node.https_opener(stage_node.client_context(Path(sys.argv[2]).resolve(), "monitor-live-check"))
-try:
+try:   # (a key folder client_context cannot read: its sys.exit, as an answer)
+    opener = stage_node.https_opener(stage_node.client_context(Path(sys.argv[2]).resolve(), "monitor-live-check"))
     with opener.open(urllib.request.Request(sys.argv[3], data=data,
                                             headers={"Content-Type": "application/json"}),
                      timeout=float(sys.argv[5])) as r:
         sys.stdout.write(r.read().decode("utf-8", "replace"))
-except Exception as e:
+except (Exception, SystemExit) as e:
     print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))' "$HERE" "$TLS_DIR" "https://$WORKER$1" "$2" "${3:-60}"
 }
 chat() {   # chat MAX_TOKENS: the whole answer (JSON)

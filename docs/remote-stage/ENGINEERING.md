@@ -969,7 +969,8 @@ was applied on top as its own commit. What changed for a remote stage:
   all its CPU rows (said once).
 - **TLS 1.3 with mutual certificates** (the section above): protocol 8 here. `STRATA_STAGE_TOKEN` is gone from the
   engine, the node agent (`tls_dir` in place of `token_file`) and the server's stage page.
-- 0.2.8's other changes (the auto expert cache's margin, `STRATA_ROUTE_PRIOR` off by default, the arena's wait for
+- 0.2.8's other changes (the auto expert cache's margin, `STRATA_ROUTE_PRIOR` no longer on by itself on an NVIDIA card of 13 GiB or
+  less (0.2.7 turned it on there; now 0 on every card unless set), the arena's wait for
   RAM, the PLE lock given back, the slot-park guard) are each PC's own; a worker takes them as a main process does.
 
 These rest on the builds and the CPU tests (`stage_link_test` over TLS, `stage_ckpt_store_test`,

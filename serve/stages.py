@@ -92,9 +92,14 @@ class MainLog:
     # A failed link as the start prints it: "strata serve: " + the link's error.  Each of src/net/stage_link.cpp's
     # errors by its start, and the worker's own ("remote stage (worker): ..."); every other "strata serve: remote
     # stage: ..." line says how it goes (a checkpoint saved or restored, a session continued or dropped after
-    # connecting again, a K/V check an earlier worker cannot take part in) and leaves the link as it is.
-    ERROR = re.compile(r"strata serve: (remote stage \(worker\): .*|"
-                       r"remote stage: (?:cannot connect to |cannot resolve |expected HOST:PORT|"
+    # connecting again, a K/V check an earlier worker cannot take part in) and leaves the link as it is.  And the
+    # key folder's errors (src/net/stage_tls.cpp's TlsCredentials::load) as the start prints them before the model
+    # loads: "strata generate: remote stage: " + the error; that prefix's other lines say how the start goes.
+    ERROR = re.compile(r"strata (?:serve: |generate: (?=remote stage: (?:no credentials folder|cannot read |cannot open |"
+                       r"TLS: )))"
+                       r"(remote stage \(worker\): .*|"
+                       r"remote stage: (?:no credentials folder|cannot read |cannot open |TLS: |"
+                       r"cannot connect to |cannot resolve |expected HOST:PORT|"
                        r"the sockets did not start|not connected|receive failed|send failed|the link failed earlier|"
                        r"the peer closed the connection|the two sides differ|"
                        r"the wait was cancelled|the worker refused|the worker was started without --vision|"

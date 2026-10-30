@@ -17,6 +17,7 @@ ALLOWED = {
     # Windows'
     "kernel32.dll", "advapi32.dll", "ws2_32.dll", "user32.dll", "shell32.dll", "ole32.dll", "oleaut32.dll",
     "bcrypt.dll", "ntdll.dll", "shlwapi.dll", "dbghelp.dll", "psapi.dll", "iphlpapi.dll", "winmm.dll", "version.dll",
+    "crypt32.dll",                                     # (the static OpenSSL's: the remote stage's TLS)
 }
 
 
