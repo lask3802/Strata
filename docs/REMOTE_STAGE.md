@@ -582,15 +582,19 @@ The worker's GPU, VRAM, expert cache, engine version and its own time per window
 only while a Monitor tab is open:
 
 - `"stage_agents"` not set, or `false` (the default): no agent is asked.
-- `"stage_agents": true`: each worker's agent at the worker's host, port 7840, a relay's next worker's too. These
-  hosts already receive the stage token through the link.
-- `"stage_agents": {"192.0.2.11:7841": "http://192.0.2.21:7840"}`: the agents it names, and no other (a worker
+- `"stage_agents": true`: each worker's agent at the worker's host, port 7840, a relay's next worker's too.
+- `"stage_agents": {"192.0.2.11:7841": "https://192.0.2.21:7840"}`: the agents it names, and no other (a worker
   that is not in it is shown without them). Use it when the agent listens on another address than the worker, for
-  example a second network card.
+  example a second network card. An `http://` address from an earlier run config is asked as `https://`.
 
-The server sends the engine's `STRATA_STAGE_TOKEN` as `X-Stage-Token` straight to that URL: no proxy, and a redirect
-is not followed. The token never goes to the browser. The run config is read when the server starts: restart it
-after changing these settings.
+The server speaks HTTPS to that URL with the engine's key folder (`STRATA_STAGE_TLS` in the engine's environment),
+as the engine's link does: the agent's certificate must be this PC's or one in its `peers/`, and the agent takes the
+connection only with this PC's certificate in its own `peers/`. For the main PC's first worker these are the
+certificates the link already exchanges; a relay's next worker links with the relay, not with this PC, so its agent
+is reached only once the two PCs hold each other's `cert.pem` too.
+No proxy, no plain HTTP, and a redirect is not followed. An agent that refuses, or one this PC does not accept, shows
+its TLS error on the card. The run config and the key folder are read when the server starts: restart it after
+changing either.
 
 ## What is turned off or refused
 

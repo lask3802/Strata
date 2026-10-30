@@ -1,7 +1,8 @@
 #!/bin/bash
 # monitor-live-check.sh MAIN WORKER - the Monitor's Workers card (serve/stages.py) against a running remote-stage
 # split: MAIN is the server's HOST:PORT, WORKER the worker PC's node agent HOST:PORT (tools/stage_node.py).  Only HTTP:
-# the server's /metrics and /v1/chat/completions, the agent's /stop and /start; it starts no server.  One line
+# the server's /metrics and /v1/chat/completions, and over HTTPS with this PC's key folder (TLS_DIR) the agent's /stop
+# and /start; it starts no server.  One line
 # "PASS|FAIL|SKIP step N: ..." per step, and the number of FAILs as the exit code.
 #
 # The server must run with "stage_agents" in its run config (true, or the worker's address mapped to its agent) and
@@ -13,18 +14,20 @@
 #      started again (WORKER_START: the agent /start body the split was started with) and the request ends;
 #      connected again, reconnects + 1.  Without WORKER_START it is skipped and the worker is left alone; when the
 #      step fails between /stop and /start, the EXIT trap starts it again
-#   4  the stage token (TOKEN_FILE) is nowhere in /metrics, /metrics?workers=1 or the page
+#   4  this PC's private key (TLS_DIR/key.pem) is nowhere in /metrics, /metrics?workers=1 or the page
 #   5  decode tok/s (the engine's timings.predicted_per_second) with and without a Monitor polling
 #      /metrics?workers=1 every POLL_S, ROUNDS x ABBA; FAIL when the polled median is more than TOL below
 #   6  SINGLE (HOST:PORT of a server without a remote stage, optional): no "stages" in its /metrics?workers=1
-# env: TOKEN_FILE (/srv/strata/stage-token), WPORT (the worker's port, 7841), WORKER_START (a file), EXPECT_LAYERS
+# env: TLS_DIR (STRATA_STAGE_TLS: this PC's key folder, strata --stage-keygen, whose peers/ holds the worker PC's
+#      cert.pem; the agent's peers/ must hold this PC's), WPORT (the worker's port, 7841), WORKER_START (a file), EXPECT_LAYERS
 #      (26-47), EXPECT_GPU (a part of the GPU's name, e.g. "2080 Ti"; empty: any), API_KEY (the server's, if set),
 #      SINGLE, ROUNDS (2), TOL (0.05), POLL_S (1: the Monitor tab's cadence), TOKENS (300 a speed request),
 #      STEPS ("1 2 3 4 5 6")
 set -u
 MAIN=${1:?MAIN host:port}
 WORKER=${2:?WORKER agent host:port}
-TOKEN_FILE=${TOKEN_FILE:-/srv/strata/stage-token}
+TLS_DIR=${TLS_DIR:-${STRATA_STAGE_TLS:-}}
+HERE=$(cd "$(dirname "$0")" && pwd)
 WPORT=${WPORT:-7841}
 WORKER_START=${WORKER_START:-}
 EXPECT_LAYERS=${EXPECT_LAYERS:-26-47}
@@ -35,7 +38,7 @@ TOL=${TOL:-0.05}
 POLL_S=${POLL_S:-1}
 TOKENS=${TOKENS:-300}
 STEPS=${STEPS:-1 2 3 4 5 6}
-T=$(cat "$TOKEN_FILE") || { echo "FAIL: no token in $TOKEN_FILE"; exit 1; }
+[ -n "$TLS_DIR" ] && [ -f "$TLS_DIR/key.pem" ] || { echo "FAIL: no key folder (TLS_DIR or STRATA_STAGE_TLS, with key.pem)"; exit 1; }
 AUTH=()
 [ -n "${API_KEY:-}" ] && AUTH=(-H "Authorization: Bearer $API_KEY")
 TMP=$(mktemp -d)
@@ -46,7 +49,23 @@ say() { echo "$1 step $2: $3"; [ "$1" != FAIL ] || FAILS=$((FAILS + 1)); }
 note() { echo "  $*"; }
 want() { case " $STEPS " in *" $1 "*) return 0;; esac; return 1; }
 metrics() { curl -s -m 20 "${AUTH[@]}" "http://${2:-$MAIN}/metrics${1:+?$1}"; }
-agent() { curl -s -m "${3:-60}" -H "X-Stage-Token: $T" -H "Content-Type: application/json" -d "$2" "http://$WORKER$1"; }
+agent() {   # agent PATH BODY [TIMEOUT]: a POST to the worker PC's agent (BODY @FILE: that file), over HTTPS with TLS_DIR
+    python3 -I -c '
+import json, sys, urllib.request
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import stage_node
+body = sys.argv[4]
+data = Path(body[1:]).read_bytes() if body.startswith("@") else body.encode()
+opener = stage_node.https_opener(stage_node.client_context(Path(sys.argv[2]).resolve(), "monitor-live-check"))
+try:
+    with opener.open(urllib.request.Request(sys.argv[3], data=data,
+                                            headers={"Content-Type": "application/json"}),
+                     timeout=float(sys.argv[5])) as r:
+        sys.stdout.write(r.read().decode("utf-8", "replace"))
+except Exception as e:
+    print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))' "$HERE" "$TLS_DIR" "https://$WORKER$1" "$2" "${3:-60}"
+}
 chat() {   # chat MAX_TOKENS: the whole answer (JSON)
     curl -s -m 900 "${AUTH[@]}" -H "Content-Type: application/json" "http://$MAIN/v1/chat/completions" -d \
         "{\"messages\": [{\"role\": \"user\", \"content\": \"Write a short story about a lighthouse keeper who finds a map.\"}], \"max_tokens\": $1, \"temperature\": 0, \"stream\": false}"
@@ -156,13 +175,14 @@ if want 3; then
 fi
 
 if want 4; then
-    if [ ${#T} -lt 8 ]; then
-        say FAIL 4 "the token in $TOKEN_FILE is shorter than 8 characters: no check"
+    K=$(sed -n 2p "$TLS_DIR/key.pem")   # the key's first base64 line (never printed)
+    if [ ${#K} -lt 16 ]; then
+        say FAIL 4 "no base64 line in $TLS_DIR/key.pem: no check"
     else
         n=0
-        for q in "" workers=1 "requests=all&workers=1"; do metrics "$q" | grep -qF -- "$T" && { n=$((n + 1)); note "the token in /metrics?$q"; }; done
-        curl -s -m 20 "http://$MAIN/" | grep -qF -- "$T" && { n=$((n + 1)); note "the token in the page"; }
-        [ $n = 0 ] && say PASS 4 "the token is in no answer" || say FAIL 4 "the token in $n answer(s)"
+        for q in "" workers=1 "requests=all&workers=1"; do metrics "$q" | grep -qF -- "$K" && { n=$((n + 1)); note "the key in /metrics?$q"; }; done
+        curl -s -m 20 "http://$MAIN/" | grep -qF -- "$K" && { n=$((n + 1)); note "the key in the page"; }
+        [ $n = 0 ] && say PASS 4 "the private key is in no answer" || say FAIL 4 "the private key in $n answer(s)"
     fi
 fi
 

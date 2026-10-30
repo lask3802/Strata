@@ -1,5 +1,7 @@
 """The Monitor's Workers card (serve/stages.py): the main process's log, a worker's log, and the node agent's answers
-- with tools/stage_node.py's own HTTP handler in this process (no GPU, no engine, no network beyond 127.0.0.1).
+- with tools/stage_node.py's own HTTPS handler in this process (no GPU, no engine, no network beyond 127.0.0.1).
+The keys are made with the openssl command, as `strata --stage-keygen` makes them (tools/test_stage_node.py's
+make_keys; the tests that ask an agent are skipped without it).
 
     python -m unittest serve.test_stages
 """
@@ -24,37 +26,71 @@ from serve.server import ByteTokenizer, MockEngine, Service, serve
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import stage_node as sn  # noqa: E402
+from test_stage_node import OPENSSL, make_keys  # noqa: E402
 
-TOKEN = "the-shared-secret"
+# the key folders (setUpModule): this PC's (the main process's) and the worker PC's, which accept each other's
+# certificate, and a stranger's, which accepts the worker PC's while the worker PC does not accept it
+KEYS: dict[str, Path] = {}
+_KEYDIR = None
+
+
+def setUpModule():
+    global _KEYDIR
+    if OPENSSL is None:
+        return
+    _KEYDIR = tempfile.TemporaryDirectory()
+    k = Path(_KEYDIR.name)
+    for name in ("main", "node", "stranger"):
+        KEYS[name] = make_keys(k / name, name)
+    for a, b in (("main", "node"), ("node", "main"), ("node", "stranger")):
+        (KEYS[b] / "peers" / f"{a}.pem").write_bytes((KEYS[a] / "cert.pem").read_bytes())
+
+
+def tearDownModule():
+    if _KEYDIR is not None:
+        _KEYDIR.cleanup()
+
+
+def main_keys() -> str:
+    """This PC's key folder (STRATA_STAGE_TLS); "" without openssl (no agent is asked then)."""
+    return str(KEYS["main"]) if KEYS else ""
+
+
 STARTED = "[strata] 2026-10-16 09:00:00 engine started: strata --serve --layer-split 26 ...\n"
 MAIN_RUN = ("strata generate: remote stage: this process holds layers 0-25\n"
             "strata serve: layer split: layers 0-25 (CUDA0), 26-47 (10.10.10.2:7841), the head (CUDA0), one hand-off "
             "per window\n"
-            "strata serve: remote stage 10.10.10.2:7841: layers 26-47 there (prompt chunk 5888, context 131072, rows fp32)\n")
+            "strata serve: remote stage 10.10.10.2:7841: layers 26-47 there (prompt chunk 5888, context 131072, "
+            "rows fp32; node (SHA256:3f9a0c1d2e4b5a67), TLSv1.3 TLS_AES_128_GCM_SHA256)\n")
+# the same before TLS (protocol 7: rows, no certificate) and before the row formats (neither)
+MAIN_CONNECT_ROWS = ("strata serve: remote stage 10.10.10.2:7841: layers 26-47 there (prompt chunk 5888, context 131072, "
+                     "rows fp32)\n")
+MAIN_CONNECT_PLAIN = ("strata serve: remote stage 10.10.10.2:7841: layers 26-47 there (prompt chunk 5888, context "
+                      "131072)\n")
 MAIN_TIMING = ("strata remote: 64 windows: mean 23.04 ms a round trip = worker 21.87 + link 1.17 (last: T=4 at 900, "
                "22.10 = 21.00 + 1.10)\n"
                "strata remote: main process between windows 25.32 ms each (64 windows: head, drafter, layers 0-K)\n")
 WORKER_LOG = """strata generate: session is up (engine 0.1.44.1)
 strata generate: expert cache 2345 slots, 9.14 GiB of VRAM; policy is
 strata serve: stage worker: layers 26-47, no head, prompt chunk 5888, port 7841
-strata stage worker: listening on 10.10.10.2:7841 (a token is required)
+strata stage worker: listening on 10.10.10.2:7841 (TLS 1.3: this PC is node SHA256:3f9a0c1d2e4b5a67; 2 certificates accepted)
 strata stage worker: connection from 192.168.1.140
-strata stage worker: main process 192.168.1.140: layers 26.. here, context 131072, chunk 5888, rows fp32
+strata stage worker: main process 192.168.1.140 (main (SHA256:0b1c2d3e4f5a6b7c), TLSv1.3 TLS_AES_128_GCM_SHA256): layers 26.. here, context 131072, chunk 5888, rows fp32
 strata stage worker: windows: own layers 11.08 ms each (64 windows; wait for the GPU 10.42, pool + plan 0.41, host staging 0.00)
 """
 RELAY_LOG = """strata generate: session is up (engine 0.1.44.1)
 strata generate: expert cache 1800 slots, 7.02 GiB of VRAM; policy is
-strata serve: relay: layers 40-47 on 10.10.10.3:7841 (rows fp32)
+strata serve: relay: layers 40-47 on 10.10.10.3:7841 (rows fp32; last (SHA256:5d6e7f8091a2b3c4), TLSv1.3 TLS_AES_128_GCM_SHA256)
 strata serve: stage worker: layers 26-39, relaying to 10.10.10.3:7841, prompt chunk 5888, port 7841
-strata stage worker: listening on 10.10.10.2:7841 (a token is required)
-strata stage worker: main process 192.168.1.140: layers 26.. here, context 131072, chunk 5888, rows fp32
+strata stage worker: listening on 10.10.10.2:7841 (TLS 1.3: this PC is node SHA256:3f9a0c1d2e4b5a67; 3 certificates accepted)
+strata stage worker: main process 192.168.1.140 (main (SHA256:0b1c2d3e4f5a6b7c), TLSv1.3 TLS_AES_128_GCM_SHA256): layers 26.. here, context 131072, chunk 5888, rows fp32
 strata stage worker: windows: own layers 7.50 ms, next worker 9.25 ms each (64 windows; wait for the GPU 7.00, pool + plan 0.30, host staging 0.00)
 """
 LAST_LOG = """strata generate: session is up (engine 0.1.44.1)
 strata generate: expert cache 1500 slots, 5.80 GiB of VRAM; policy is
 strata serve: stage worker: layers 40-47, no head, prompt chunk 5888, port 7841
-strata stage worker: listening on 10.10.10.3:7841 (a token is required)
-strata stage worker: main process 10.10.10.2: layers 40.. here, context 131072, chunk 5888, rows fp32
+strata stage worker: listening on 10.10.10.3:7841 (TLS 1.3: this PC is last SHA256:5d6e7f8091a2b3c4; 2 certificates accepted)
+strata stage worker: main process 10.10.10.2 (node (SHA256:3f9a0c1d2e4b5a67), TLSv1.3 TLS_AES_128_GCM_SHA256): layers 40.. here, context 131072, chunk 5888, rows fp32
 strata stage worker: windows: own layers 8.40 ms each (64 windows; wait for the GPU 8.00, pool + plan 0.30, host staging 0.00)
 """
 GPU = [{"name": "NVIDIA GeForce RTX 2080 Ti", "vram_mib": 11264, "free_mib": 1100, "used_mib": 10164, "pcie_gen": "3",
@@ -63,11 +99,16 @@ _gpus = threading.local()
 
 
 class FakeAgent:
-    """tools/stage_node.py's handler on 127.0.0.1 with a worker log of our own (`log`, None: no worker started)."""
+    """tools/stage_node.py's handler on 127.0.0.1, over TLS with the worker PC's key (`keys`), with a worker log of
+    our own (`log`, None: no worker started)."""
 
-    def __init__(self, log: str | None, running: bool = True, gpus=None):
+    def __init__(self, log: str | None, running: bool = True, gpus=None, keys: str = "node"):
+        if not KEYS:
+            raise unittest.SkipTest("no openssl command to make the keys")
         self.dir = tempfile.TemporaryDirectory()
-        cfg = {"_token": TOKEN, "bind": "127.0.0.1", "log_dir": self.dir.name}
+        d = KEYS[keys]
+        cfg = {"bind": "127.0.0.1", "log_dir": self.dir.name, "_tls": d, "_server_ctx": sn.tls_context(d, True),
+               "_client_ctx": sn.tls_context(d, False)}
         self.workers = sn.Workers(cfg)
         self.running = running
         self.workers.running = lambda: [7841] if self.running else []
@@ -86,8 +127,8 @@ class FakeAgent:
             def do_GET(self):
                 _gpus.value = agent.gpus
                 super().do_GET()
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        self.httpd = sn.TlsServer(("127.0.0.1", 0), Handler, cfg["_server_ctx"])
+        self.url = f"https://127.0.0.1:{self.httpd.server_address[1]}"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
     def set_log(self, text: str | None) -> None:
@@ -118,8 +159,8 @@ class RemoteEngine(MockEngine):
     def __init__(self, tok, log_path: str, args=None, env=None):
         super().__init__(tok, "Hello.")
         args = args or ["--layer-split", "26", "--split-device", "0", "--remote-stage", "10.10.10.2:7841"]
-        self.spawn = ("strata", args, None, log_path, {"STRATA_STAGE_TOKEN": TOKEN} if env is None else env, False,
-                      None)
+        self.spawn = ("strata", args, None, log_path, {"STRATA_STAGE_TLS": main_keys()} if env is None else env,
+                      False, None)
         self.log_path, self.log_start = log_path, 0
         self.running, self.unloaded, self.proc = True, False, FakeProc()
         self.ready_at = 1_000_000.0
@@ -192,10 +233,13 @@ class MainLogTest(LogCase):
         self.assertEqual(s["connects"], 2)
         self.assertEqual(s["connect"]["rows"], "bf16")
         self.assertTrue(s["run_connected"])
-        # the remote stage before main-next: no rows in the line
-        self.append(STARTED + MAIN_RUN.replace(", rows fp32", ""))
+        # the remote stage before TLS (the rows, no certificate) and before main-next (no rows in the line)
+        self.append(STARTED + MAIN_CONNECT_ROWS)
         s = ml.poll(self.log, None, start2)
-        self.assertEqual((s["connects"], s["connect"]["rows"], s["connect"]["layers"]), (3, None, [26, 47]))
+        self.assertEqual((s["connects"], s["connect"]["rows"], s["connect"]["layers"]), (3, "fp32", [26, 47]))
+        self.append(STARTED + MAIN_CONNECT_PLAIN)
+        s = ml.poll(self.log, None, start2)
+        self.assertEqual((s["connects"], s["connect"]["rows"], s["connect"]["layers"]), (4, None, [26, 47]))
 
     def test_waiting_relink_and_errors(self):
         ml = stages.MainLog()
@@ -265,7 +309,10 @@ class MainLogTest(LogCase):
                   "remote stage: the peer closed the connection",
                   "remote stage: the two sides differ (K/V type --kv int8/f16)",
                   "remote stage: the wait was cancelled",
-                  "remote stage: the worker refused: a wrong token",
+                  "remote stage: the worker refused: TLS: the peer does not accept this PC's certificate",
+                  "remote stage: refused the worker at 10.10.10.2:7841: its certificate node (SHA256:3f9a0c1d2e4b5a67) "
+                  "is not this PC's nor in its peers/ folder",
+                  "remote stage: no TLS credentials for the link (STRATA_STAGE_TLS; docs/REMOTE_STAGE.md)",
                   "remote stage: the worker was started without --vision (its layers need the image positions too)",
                   "remote stage: unexpected reply to hello (type 3, 12 bytes)",
                   "remote stage: bad message magic (not a Strata stage peer?)",
@@ -399,7 +446,9 @@ class WorkerLogTest(unittest.TestCase):
         self.assertEqual((f["cache_slots"], f["cache_gib"]), (2345, 9.14))
         self.assertEqual((f["layers"], f["next"]), ([26, 47], None))
         self.assertEqual((f["own_ms"], f["next_ms"]), (11.08, None))
-        self.assertEqual(f["peer"], "192.168.1.140")
+        self.assertEqual(f["peer"], "192.168.1.140")              # the address, not its certificate
+        self.assertEqual(stages.WorkerLog.parse(["strata stage worker: main process 192.168.1.140: layers 26.. here, "
+                                                 "context 131072, chunk 5888, rows fp32"])["peer"], "192.168.1.140")
         f = stages.WorkerLog.parse(["strata stage worker: 192.168.1.140 disconnected: remote stage: the peer closed "
                                     "the connection"], f)
         self.assertIsNone(f["peer"])
@@ -470,7 +519,7 @@ class MonitorTest(LogCase):
         self.assertEqual(w["gpu"], {"name": "NVIDIA GeForce RTX 2080 Ti", "vram_mib": 11264, "used_mib": 10164})
         self.assertEqual((w["version"], w["cache_slots"], w["cache_gib"]), ("0.1.44.1", 2345, 9.14))
         self.assertTrue(w["agent"]["ok"])
-        self.assertNotIn(TOKEN, json.dumps(v))                      # the token never leaves the server
+        self.assertNotIn("PRIVATE KEY", json.dumps(v))
         # the worker process ended (the agent no longer runs it): down, though the main process has not noticed
         ag.running = False
         ag.set_log(WORKER_LOG + "strata stage worker: 192.168.1.140 disconnected: CUDA error: an illegal memory "
@@ -566,49 +615,59 @@ class MonitorTest(LogCase):
                          ("connecting", "remote stage: cannot connect to 10.10.10.2:7841: timed out"))
         self.assertIsNotNone(w["since"])
 
-    def test_wrong_token_and_no_agent(self):
+    def test_keys_refused_and_no_agent(self):
         ag = self.agent(WORKER_LOG)
         self.append(STARTED + MAIN_RUN)
         mon = stages.StageMonitor()
         mon.agents_cfg = {"10.10.10.2:7841": ag.url}
-        e = RemoteEngine(self.tok, self.log, env={"STRATA_STAGE_TOKEN": "not it"})
+        # a key the agent's PC does not accept (it accepts the agent's certificate): the agent ends the handshake
+        e = RemoteEngine(self.tok, self.log, env={"STRATA_STAGE_TLS": str(KEYS["stranger"])})
         w = view_now(mon, e)["workers"][0]
-        self.assertEqual((w["state"], w["agent"]["ok"], w["agent"]["error"]),
-                         ("connected", False, "the agent refused the token (X-Stage-Token)"))
+        self.assertEqual((w["state"], w["agent"]["ok"]), ("connected", False))
+        self.assertTrue(w["agent"]["error"])
         self.assertIsNone(w["gpu"])
-        mon.agents_cfg = {"10.10.10.2:7841": "http://127.0.0.1:9"}  # nothing listens there
+        # an agent whose certificate this PC does not accept (the stranger's key there): refused here
+        st = self.agent(WORKER_LOG, keys="stranger")
+        mon.agents_cfg = {"10.10.10.2:7841": st.url}
+        w = view_now(mon, RemoteEngine(self.tok, self.log))["workers"][0]
+        self.assertEqual((w["agent"]["ok"], w["gpu"]), (False, None))
+        self.assertIn("certificate", w["agent"]["error"])
+        # an engine without a key folder: no agent is reached, and it says why
+        mon.agents_cfg = {"10.10.10.2:7841": ag.url}
+        w = view_now(mon, RemoteEngine(self.tok, self.log, env={}))["workers"][0]
+        self.assertEqual((w["agent"]["ok"], w["gpu"]), (False, None))
+        self.assertIn("STRATA_STAGE_TLS", w["agent"]["error"])
+        mon.agents_cfg = {"10.10.10.2:7841": "https://127.0.0.1:9"}  # nothing listens there
         w = view_now(mon, RemoteEngine(self.tok, self.log))["workers"][0]
         self.assertFalse(w["agent"]["ok"])
         self.assertTrue(w["agent"]["error"])
         mon.agents_cfg = None                                       # the default: no agent is asked (opt-in)
         self.assertIsNone(mon.agent_for("10.10.10.2:7841"))
         mon.agents_cfg = True                                       # each worker's host, port 7840
-        self.assertEqual(mon.agent_for("10.10.10.2:7841").url, "http://10.10.10.2:7840")
-        self.assertEqual(mon.agent_for("[fe80::1]:7841").url, "http://[fe80::1]:7840")
+        self.assertEqual(mon.agent_for("10.10.10.2:7841").url, "https://10.10.10.2:7840")
+        self.assertEqual(mon.agent_for("[fe80::1]:7841").url, "https://[fe80::1]:7840")
+        mon.agents_cfg = {"10.10.10.2:7841": "http://10.10.10.9:7840/"}   # an earlier run config's http://: https
+        self.assertEqual(mon.agent_for("10.10.10.2:7841").url, "https://10.10.10.9:7840")
         mon.agents_cfg = {"10.10.10.2:7841": 7840, "10.10.10.3:7841": False, "10.10.10.4:7841": "ftp://x"}
         self.assertEqual([mon.agent_for(f"10.10.10.{i}:7841") for i in (2, 3, 4)], [None, None, None])
         self.assertIsNone(mon.agent_for("10.10.10.5:7841"))         # a map names every agent asked: not this one
-        self.assertEqual(stages.Agent("http://u:secret@h:7840", 7841).view()["url"], "http://h:7840")
+        self.assertEqual(stages.Agent("http://u:secret@h:7840", 7841).view()["url"], "https://h:7840")
 
-    def test_token_never_in_an_error(self):
-        """An error message that quotes the request (http.client's invalid header value quotes the token whole) is
-        not shown; the network's words are, without the token or the URL's user:password."""
-        ag = self.agent(WORKER_LOG)
+    def test_no_password_in_an_error(self):
+        """The network's words are shown without the URL's user:password; an error of another kind, by its type
+        only (its message may quote the request)."""
         self.append(STARTED + MAIN_RUN)
         mon = stages.StageMonitor()
-        mon.agents_cfg = {"10.10.10.2:7841": ag.url}
-        secret = "bad\r\nsecret-xyz"
-        v = view_now(mon, RemoteEngine(self.tok, self.log, env={"STRATA_STAGE_TOKEN": secret}))
-        self.assertEqual(v["workers"][0]["agent"]["error"], "the agent's request failed (ValueError)")
-        self.assertNotIn("secret-xyz", json.dumps(v))
-        mon.agents_cfg = {"10.10.10.2:7841": "http://user:pw-123@127.0.0.1:9"}
-        with mock.patch.object(stages.Agent, "get",
-                               side_effect=OSError(f"failed with {TOKEN} for http://user:pw-123@127.0.0.1:9")):
+        mon.agents_cfg = {"10.10.10.2:7841": "https://user:pw-123@127.0.0.1:9"}
+        with mock.patch.object(stages.Agent, "get", side_effect=OSError("failed for https://user:pw-123@127.0.0.1:9")):
             v = view_now(mon, RemoteEngine(self.tok, self.log))
         err = v["workers"][0]["agent"]["error"]
-        self.assertIn("failed with", err)
-        for s in (TOKEN, "pw-123"):
-            self.assertNotIn(s, json.dumps(v))
+        self.assertIn("failed for", err)
+        self.assertNotIn("pw-123", json.dumps(v))
+        with mock.patch.object(stages.Agent, "get", side_effect=RuntimeError("pw-123")):
+            v = view_now(mon, RemoteEngine(self.tok, self.log))
+        self.assertEqual(v["workers"][0]["agent"]["error"], "the agent's request failed (RuntimeError)")
+        self.assertNotIn("pw-123", json.dumps(v))
 
     def test_a_request_waits_for_the_worker(self):
         """main-next: a request that finds the link lost waits for the worker (INFO remote_stage_wait= every 10 s);
@@ -731,7 +790,7 @@ class MonitorTest(LogCase):
         self.assertEqual((v["workers"][0]["state"], v["timing"]), ("nolog", False))
         e.running, e.proc = False, FakeProc(rc=1)
         self.assertEqual(mon.view(e)["workers"][0]["state"], "down")
-        e = RemoteEngine(self.tok, self.log, env={"STRATA_STAGE_TOKEN": TOKEN, "STRATA_REMOTE_TIMING": "1"})
+        e = RemoteEngine(self.tok, self.log, env={"STRATA_STAGE_TLS": main_keys(), "STRATA_REMOTE_TIMING": "1"})
         self.assertTrue(mon.view(e)["timing"])
 
     def test_a_map_asks_only_the_agents_it_names(self):
@@ -747,10 +806,12 @@ class MonitorTest(LogCase):
         self.assertEqual((w2["address"], w2["agent"], w2["state"], w2["gpu"]), ("10.10.10.3:7841", None, "connected", None))
         self.assertNotIn("10.10.10.3:7841", mon.agents)
         mon.agents_cfg = True                                       # true: the relay's next worker's host too
-        self.assertEqual(mon.agent_for("10.10.10.3:7841").url, "http://10.10.10.3:7840")
+        self.assertEqual(mon.agent_for("10.10.10.3:7841").url, "https://10.10.10.3:7840")
 
     def test_no_redirect_and_no_proxy(self):
-        """The token goes to the agent named only: not on to where a redirect points, not through a proxy."""
+        """The agent named only: not on to where a redirect points, not through a proxy."""
+        if not KEYS:
+            self.skipTest("no openssl command to make the keys")
         hits = []
 
         class Record(BaseHTTPRequestHandler):
@@ -758,7 +819,7 @@ class MonitorTest(LogCase):
                 pass
 
             def do_GET(self):
-                hits.append((self.server.server_address[1], self.path, self.headers.get("X-Stage-Token")))
+                hits.append((self.server.server_address[1], self.path))
                 target = getattr(self.server, "target", None)
                 self.send_response(302 if target else 502)
                 if target:
@@ -767,25 +828,26 @@ class MonitorTest(LogCase):
                 self.end_headers()
         servers = []
         for _ in range(2):
-            h = ThreadingHTTPServer(("127.0.0.1", 0), Record)
+            h = sn.TlsServer(("127.0.0.1", 0), Record, sn.tls_context(KEYS["node"], True))
             threading.Thread(target=h.serve_forever, daemon=True).start()
             servers.append(h)
             self.addCleanup(h.server_close)
             self.addCleanup(h.shutdown)
         moved, other = servers
-        moved.target = f"http://127.0.0.1:{other.server_address[1]}"
-        a = stages.Agent(f"http://127.0.0.1:{moved.server_address[1]}", 7841)
-        a.refresh(TOKEN)
+        moved.target = f"https://127.0.0.1:{other.server_address[1]}"
+        a = stages.Agent(f"https://127.0.0.1:{moved.server_address[1]}", 7841)
+        a.refresh(main_keys())
         self.assertEqual((a.ok, a.error), (False, "HTTP 302"))
-        self.assertEqual([p for p, _, _ in hits], [moved.server_address[1]])   # the redirect was not followed
-        # a proxy in the environment (HTTP_PROXY) is not used
+        self.assertEqual([p for p, _ in hits], [moved.server_address[1]])   # the redirect was not followed
+        # a proxy in the environment (HTTPS_PROXY, HTTP_PROXY) is not used
         hits.clear()
         ag = self.agent(WORKER_LOG)
         proxy = f"http://127.0.0.1:{other.server_address[1]}"
         other.target = None
-        with mock.patch.dict(os.environ, {"HTTP_PROXY": proxy, "http_proxy": proxy, "NO_PROXY": "", "no_proxy": ""}):
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": proxy, "https_proxy": proxy, "HTTP_PROXY": proxy,
+                                          "http_proxy": proxy, "NO_PROXY": "", "no_proxy": ""}):
             a = stages.Agent(ag.url, 7841)
-            a.refresh(TOKEN)
+            a.refresh(main_keys())
         self.assertEqual((a.ok, hits), (True, []))
 
     def test_a_whole_log_too_long_to_read(self):
@@ -795,27 +857,27 @@ class MonitorTest(LogCase):
                          for i in range(stages.LOG_TAIL + 20))
         ag = self.agent(WORKER_LOG + filler)
         a = stages.Agent(ag.url, 7841)
-        a.refresh(TOKEN)
+        a.refresh(main_keys())
         self.assertEqual(a.facts["version"], "0.1.44.1")
         real = stages.Agent.log
 
-        def no_whole(self, token, whole):
+        def no_whole(self, keys, whole):
             if whole:
                 raise TimeoutError("timed out")
-            return real(self, token, whole)
+            return real(self, keys, whole)
         with mock.patch.object(stages.Agent, "log", no_whole):
             other = filler.replace("read in", "read again in")
             ag.set_log(WORKER_LOG.replace("0.1.44.1", "0.1.49") + other)   # a new worker, a long log
-            a.refresh(TOKEN)
+            a.refresh(main_keys())
             self.assertEqual((a.ok, a.facts["version"]), (True, "0.1.44.1"))   # its tail, with what was known
             ag.set_log(WORKER_LOG.replace("0.1.44.1", "0.1.49") + other +
                        "strata stage worker: windows: own layers 12.50 ms each (64 windows; ...)\n")
-            a.refresh(TOKEN)                                        # read on from that tail's end
+            a.refresh(main_keys())                                  # read on from that tail's end
             self.assertEqual((a.ok, a.facts["own_ms"]), (True, 12.5))
         # a first look whose whole read fails: the tail
         with mock.patch.object(stages.Agent, "log", no_whole):
             b = stages.Agent(ag.url, 7841)
-            b.refresh(TOKEN)
+            b.refresh(main_keys())
         self.assertEqual((b.ok, b.facts["own_ms"], b.read_whole), (True, 12.5, True))
 
     def test_a_relink_in_a_scanned_part(self):
@@ -1068,7 +1130,7 @@ class MonitorTest(LogCase):
             for _ in range(5):
                 mon.view(e, ask=True)
                 wait_agents(mon)
-        self.assertEqual(calls, [TOKEN])                            # once in AGENT_EVERY_S
+        self.assertEqual(calls, [main_keys()])                      # once in AGENT_EVERY_S
 
     def test_metrics_endpoint(self):
         ag = self.agent(WORKER_LOG)
@@ -1102,7 +1164,8 @@ FAKE_MAIN = r'''
 import sys
 from pathlib import Path
 state = Path(sys.argv[sys.argv.index("--state") + 1])
-sys.stderr.write("strata serve: remote stage 10.10.10.2:7841: layers 26-47 there (prompt chunk 5888, context 131072, rows fp32)\n")
+sys.stderr.write("strata serve: remote stage 10.10.10.2:7841: layers 26-47 there (prompt chunk 5888, context 131072, "
+                 "rows fp32; node (SHA256:3f9a0c1d2e4b5a67), TLSv1.3 TLS_AES_128_GCM_SHA256)\n")
 sys.stderr.flush()
 print("READY 4096 stop", flush=True)
 for line in sys.stdin:
@@ -1140,7 +1203,7 @@ class EngineWiring(unittest.TestCase):
         self.start = lambda *more: StrataEngine(
             str(exe), ["--state", str(root / "state"), "--layer-split", "26", "--split-device", "0",
                        "--remote-stage", "10.10.10.2:7841", *more],
-            log=str(root / "engine.log"), env=dict(os.environ, STRATA_STAGE_TOKEN=TOKEN))
+            log=str(root / "engine.log"), env=dict(os.environ, STRATA_STAGE_TLS=main_keys()))
         self.e = self.start()
         self.addCleanup(lambda: self.svc.engine.close())
         self.svc = Service(self.e, ByteTokenizer(), ChatTemplate(Path(__file__).parent / "chat_template.jinja"))

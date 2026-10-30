@@ -3,8 +3,9 @@
 The main process's own log says what it knows of its link: the worker's address and layers once the hello is through
 ("strata serve: remote stage HOST:PORT: layers 26-47 there (...)"), the round trips with STRATA_REMOTE_TIMING=1, and
 a lost link.  What only the worker PC knows - its GPU and VRAM, its engine's version, its expert cache, its own time
-per window, a relay's next worker - comes from its node agent (tools/stage_node.py: GET /info and GET /log, with the
-shared STRATA_STAGE_TOKEN in X-Stage-Token, which never leaves this server).  The agents are asked only when the run
+per window, a relay's next worker - comes from its node agent (tools/stage_node.py: GET /info and GET /log over
+HTTPS, with this PC's stage key - the engine's STRATA_STAGE_TLS folder - and the agent's certificate pinned to that
+folder's peers/, as the engine's link pins its worker's).  The agents are asked only when the run
 config says so ("stage_agents": true, or a map of worker address to agent URL: those only), on a thread of their
 own, at most every AGENT_EVERY_S and only while a Monitor tab asks for them (GET /metrics?workers=1), so neither a
 slow agent nor the agent's nvidia-smi is ever on a request's path.
@@ -16,13 +17,16 @@ remote stage's without them.  The run config is read when the server starts.
 from __future__ import annotations
 
 import http.client
+import importlib.util
 import json
 import os
 import re
+import ssl
 import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from urllib.parse import urlsplit
 
 AGENT_PORT = 7840          # tools/stage_node.py's default "agent_port"
@@ -77,8 +81,9 @@ class MainLog:
     what was read, or with other first bytes (rotated in place, then grown past it before a look), was rotated: the
     current run began in the old log, unless its start line is at its place in the new one (started after it)."""
     STARTED = " engine started: "
+    # (", rows FMT" since the row formats; "; " and the worker's certificate and TLS version after it since TLS)
     CONNECT = re.compile(r"strata serve: remote stage (\S+): layers (\d+)-(\d+) there \(prompt chunk (\d+), "
-                         r"context (\d+)(?:, rows (\w+))?\)")
+                         r"context (\d+)(?:, rows (\w+)(?:; .*)?)?\)")
     WAITING = re.compile(r"strata serve: remote stage: waiting for the worker at (\S+) \((.*?)\)(?:, up to |$)")
     RELINK = re.compile(r"strata serve: remote stage: the link to (\S+) was lost \((.*)\): connected again")
     WINDOWS = re.compile(r"strata remote: (\d+) windows: mean ([\d.]+) ms a round trip = worker ([\d.]+) \+ "
@@ -93,6 +98,7 @@ class MainLog:
                        r"the sockets did not start|not connected|receive failed|send failed|the link failed earlier|"
                        r"the peer closed the connection|the two sides differ|"
                        r"the wait was cancelled|the worker refused|the worker was started without --vision|"
+                       r"refused the worker at|no TLS credentials|"
                        r"unexpected reply|bad message magic|a window's rows|an empty position table).*)")
     # a scanned part of the log: the lines counted, and the lines looked for (the last of each kind; a start: a line
     # that begins "[strata]", as event() takes it; an error: the last line ERROR takes)
@@ -319,7 +325,7 @@ class WorkerLog:
     LAYERS = re.compile(r"strata serve: stage worker: layers (\d+)-(\d+), (?:relaying to ([^,\s]+)|no head)")
     LISTEN = re.compile(r"strata stage worker: listening on ")
     OWN = re.compile(r"strata stage worker: windows: own layers ([\d.]+) ms(?:, next worker ([\d.]+) ms)? each")
-    MAIN = re.compile(r"strata stage worker: main process (\S+): layers")
+    MAIN = re.compile(r"strata stage worker: main process (\S+)(?: \(.*\))?: layers")   # (its certificate, since TLS)
     GONE = re.compile(r"strata stage worker: (\S+) disconnected(?:: (.*))?")
     RELAY = re.compile(r"strata serve: relay: layers (\d+)-(\d+) on (\S+)")
     RELAY_ERR = re.compile(r"strata serve: relay: (?!layers \d)(.*)")
@@ -359,20 +365,63 @@ class AgentSaid(Exception):
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *a, **kw):   # the token goes to the agent named, never on to another address
+    def redirect_request(self, *a, **kw):   # the agent named, never on to another address
         return None
 
 
-def _opener():
-    """Straight to the agent: no redirect, and no proxy (HTTP_PROXY, the system's) that would see the token."""
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+_stage_node = None
+_contexts: dict[str, object] = {}
+_contexts_lock = threading.Lock()
+
+
+def stage_node():
+    """tools/stage_node.py, loaded from this tree once: the agent's own TLS (the same pinned certificates)."""
+    global _stage_node
+    if _stage_node is None:
+        p = Path(__file__).resolve().parent.parent / "tools" / "stage_node.py"
+        spec = importlib.util.spec_from_file_location("strata_stage_node", p)
+        if spec is None or spec.loader is None:
+            raise AgentSaid(f"no node agent's code at {p}")
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        _stage_node = m
+    return _stage_node
+
+
+def _opener(keys: str):
+    """Straight to the agent over HTTPS with this PC's stage key (`keys`: the engine's STRATA_STAGE_TLS): its
+    certificate one this PC accepts, no plain http, no redirect, and no proxy (HTTP_PROXY, the system's).  The folder
+    is read once per server start, as the engine reads it once per start."""
+    if not keys:
+        raise AgentSaid("no key folder: the agents speak HTTPS with this PC's stage key (STRATA_STAGE_TLS in the "
+                        "engine's environment)")
+    with _contexts_lock:
+        ctx = _contexts.get(keys)
+        if ctx is None:
+            sn = stage_node()
+            try:
+                ctx = _contexts[keys] = sn.tls_context(Path(keys).resolve(), server=False)
+            except (OSError, ssl.SSLError, ValueError) as e:
+                raise AgentSaid(f"the key folder (STRATA_STAGE_TLS): {e}") from None
+    o = urllib.request.OpenerDirector()
+    for h in (urllib.request.ProxyHandler({}), urllib.request.UnknownHandler(), urllib.request.HTTPSHandler(context=ctx),
+              urllib.request.HTTPDefaultErrorHandler(), _NoRedirect(), urllib.request.HTTPErrorProcessor()):
+        o.add_handler(h)
+    return o
+
+
+def agent_url(url: str) -> str:
+    """An agent's address as https:// (an http:// one from an earlier run config is the same agent)."""
+    url = url.rstrip("/")
+    scheme, sep, rest = url.partition("://")
+    return "https://" + rest if sep and scheme.lower() in ("http", "https") else url
 
 
 class Agent:
     """One node agent: its last /info and the facts of one worker's log, refreshed on a thread."""
 
     def __init__(self, url: str, port: int | None):
-        self.url, self.port = url.rstrip("/"), port
+        self.url, self.port = agent_url(url), port
         self.info = None          # the agent's /info, trimmed to what the card shows
         self.facts: dict = {}
         self.read_whole = False   # the worker's log was read since its start (whole, or its tail when that failed)
@@ -383,26 +432,25 @@ class Agent:
         self.at = None            # when it last answered (or failed)
         self.log_lines = 0
 
-    def get(self, path: str, token: str):
-        req = urllib.request.Request(self.url + path, headers={"X-Stage-Token": token})
-        with _opener().open(req, timeout=AGENT_TIMEOUT_S) as r:
+    def get(self, path: str, keys: str):
+        with _opener(keys).open(self.url + path, timeout=AGENT_TIMEOUT_S) as r:
             out = json.loads(r.read().decode("utf-8", "replace"))
         if not isinstance(out, dict):
             raise AgentSaid("not an agent's answer")
         return out
 
-    def log(self, token: str, whole: bool) -> list[str]:
+    def log(self, keys: str, whole: bool) -> list[str]:
         """The worker's log: its last LOG_TAIL lines, or all of them (once per worker start: its start-up lines)."""
-        log = self.get(f"/log?port={self.port}&lines={10 ** 7 if whole else LOG_TAIL}", token)
+        log = self.get(f"/log?port={self.port}&lines={10 ** 7 if whole else LOG_TAIL}", keys)
         return [str(x) for x in log.get("log") or []]
 
-    def whole_log(self, token: str, tail: list[str] | None) -> tuple[list[str], bool]:
+    def whole_log(self, keys: str, tail: list[str] | None) -> tuple[list[str], bool]:
         """All of the worker's log, and True; when that read fails (a log too long to send in time), its tail and
         False - read on from there next time, with the facts known so far, instead of failing at every look."""
         try:
-            return self.log(token, whole=True), True
+            return self.log(keys, whole=True), True
         except (AgentSaid, ValueError, OSError, http.client.HTTPException):
-            return (tail if tail is not None else self.log(token, whole=False)), False
+            return (tail if tail is not None else self.log(keys, whole=False)), False
 
     def new_lines(self, lines: list[str]) -> list[str] | None:
         """The lines of a tail after the last read's end, or None when it does not hold that end (a new worker's
@@ -415,17 +463,14 @@ class Agent:
                 return lines[i + k:]
         return None
 
-    def scrub(self, text: str, token: str) -> str:
-        """`text` without the token or the URL's user:password - an error goes to the browser."""
+    def scrub(self, text: str) -> str:
+        """`text` without the URL's user:password - an error goes to the browser."""
         user = urlsplit(self.url).netloc.rpartition("@")[0]
-        for s in (token, user):
-            if s:
-                text = text.replace(s, "...")
-        return text
+        return text.replace(user, "...") if user else text
 
-    def refresh(self, token: str) -> None:
+    def refresh(self, keys: str) -> None:
         try:
-            info = self.get("/info", token)
+            info = self.get("/info", keys)
             if not info.get("ok", True):
                 raise AgentSaid(str(info.get("error") or "the agent said no"))
             gpus = info.get("gpus") if isinstance(info.get("gpus"), list) else []
@@ -437,14 +482,14 @@ class Agent:
             if self.port is not None:
                 # the agent starts each worker's log anew (tools/stage_node.py): a tail that holds the last read's
                 # end goes on from it, any other is a new worker's log (or more than a tail was written since)
-                lines = self.log(token, whole=False) if self.read_whole else None
+                lines = self.log(keys, whole=False) if self.read_whole else None
                 new = self.new_lines(lines) if lines is not None and len(lines) >= LOG_TAIL else None
                 if new is not None:
                     self.facts = WorkerLog.parse(new, self.facts)
                 elif lines is not None and len(lines) < LOG_TAIL:
                     self.facts = WorkerLog.parse(lines)             # a tail shorter than LOG_TAIL is all of it
                 else:
-                    lines, whole = self.whole_log(token, lines)
+                    lines, whole = self.whole_log(keys, lines)
                     self.facts = WorkerLog.parse(lines, None if whole else self.facts)
                 self.read_whole = bool(lines)
                 self.last_lines = lines[-LOG_OVERLAP:]
@@ -452,14 +497,14 @@ class Agent:
             self.ok, self.error = True, None
         except urllib.error.HTTPError as e:
             self.ok = False
-            self.error = "the agent refused the token (X-Stage-Token)" if e.code == 403 else f"HTTP {e.code}"
+            self.error = f"HTTP {e.code}"
             e.close()
-        except (AgentSaid, urllib.error.URLError, OSError) as e:   # the network's or the agent's own words
+        except (AgentSaid, urllib.error.URLError, OSError) as e:   # the network's, TLS's or the agent's own words
             self.ok = False
             reason = getattr(e, "reason", None) or e
-            self.error = self.scrub(str(reason), token) or type(e).__name__
+            self.error = self.scrub(str(reason)) or type(e).__name__
         except Exception as e:   # noqa: BLE001 - any failure is this agent's state, never the thread's end
-            # its type only: a message may quote the request (http.client's invalid header value quotes the token)
+            # its type only: a message may quote the request
             self.ok = False
             self.error = f"the agent's request failed ({type(e).__name__})"
         self.at = time.time()
@@ -476,7 +521,7 @@ class StageMonitor:
     def __init__(self):
         self.main_log = MainLog()
         # the run config's "stage_agents" (opt-in): true asks each worker's agent at HOST:7840, a map
-        # {"HOST:PORT": "http://agent:7840", ...} asks the agents it names and no other
+        # {"HOST:PORT": "https://agent:7840", ...} asks the agents it names and no other (http:// is taken as https://)
         self.agents_cfg = None
         self.agents: dict[str, Agent] = {}
         self.lock = threading.Lock()
@@ -490,23 +535,23 @@ class StageMonitor:
         cfg = self.agents_cfg
         if not self.agents_on():
             return None
-        # a map names every agent that is asked (the token goes to those only); true: each worker's own host,
-        # which the stage token reaches through the link anyway
+        # a map names every agent that is asked; true: each worker's own host (its agent's certificate must be one
+        # this PC accepts, as the worker's is)
         url = cfg.get(addr) if isinstance(cfg, dict) else None
         if isinstance(cfg, dict) and not (isinstance(url, str) and url):
             return None
         if not url:
             h = host_of(addr)
-            url = f"http://{'[' + h + ']' if ':' in h else h}:{AGENT_PORT}"
+            url = f"https://{'[' + h + ']' if ':' in h else h}:{AGENT_PORT}"
         if urlsplit(url).scheme not in ("http", "https"):
             return None
         with self.lock:
             a = self.agents.get(addr)
-            if a is None or a.url != url.rstrip("/"):
+            if a is None or a.url != agent_url(url):
                 a = self.agents[addr] = Agent(url, port_of(addr))
             return a
 
-    def ask_agents(self, chain: list[str], token: str) -> None:
+    def ask_agents(self, chain: list[str], keys: str) -> None:
         """Every agent of the chain, on a thread, at most every AGENT_EVERY_S; a call while one runs does nothing."""
         now = time.time()
         with self.lock:
@@ -517,7 +562,7 @@ class StageMonitor:
         def run():
             try:
                 for a in [a for a in (self.agent_for(x) for x in chain) if a is not None]:
-                    a.refresh(token)
+                    a.refresh(keys)
             finally:
                 with self.lock:
                     self.busy = False
@@ -530,7 +575,7 @@ class StageMonitor:
         if not first:
             return None
         env = spawn[4] if len(spawn) > 4 and isinstance(spawn[4], dict) else None
-        token = (env or os.environ).get("STRATA_STAGE_TOKEN", "")
+        keys = (env or os.environ).get("STRATA_STAGE_TLS", "")   # the engine's key folder: this PC's
         log = self.main_log.poll(getattr(engine, "log_path", None), getattr(engine, "first_log_start", None),
                                  getattr(engine, "log_start", None), getattr(engine, "stage_err", None))
         # the chain: the main process's worker, then each relay's next worker as its log names it
@@ -543,7 +588,7 @@ class StageMonitor:
             chain.append(nxt)
         on = self.agents_on()
         if ask and on:
-            self.ask_agents(chain, token)
+            self.ask_agents(chain, keys)
         workers = [self.worker_view(i, addr, chain, engine, log, on) for i, addr in enumerate(chain)]
         c = log["connect"]
         rows = c.get("rows") if c else None

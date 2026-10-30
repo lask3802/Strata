@@ -952,6 +952,29 @@ Open: `STRATA_PRIMARY_DEVICE` other than 0 on a worker is allowed and not checke
 device 0); a checkpoint taken from `STRATA_CKPT_POOL` that the worker did not store is dropped rather than given back
 (`src/program/generate.cpp:9757-9760`); `clear_marks` (`src/program/generate.cpp:1788`) does not clear `remote_id`.
 
+### After the merge of 0.2.8 and TLS (2026-10-30)
+
+Upstream v0.2.8 (870aedd9, engine 0.1.54) was merged into the fork's line (merge branch `merge-028`, from the 0.2.7.1
+merge; the fork merges upstream, it does not rebase), and the remote stage's TLS change from upstream's pull request
+was applied on top as its own commit. What changed for a remote stage:
+- **Windows of up to 16 rows** (`STRATA_WINDOW_MAX_T`: auto is 16 on HIP, 8 on CUDA; `kWindowMaxT` and
+  `kVerifyNarrowT` in `include/strata/kernels/window_limits.hpp`). A speculative window stays at `kVerifyNarrowT` (8)
+  rows, so a remote last stage's MTP rows are allocated for `kVerifyNarrowT` as the local path's are
+  (`src/program/generate.cpp:10385`). The link's own buffers are sized for the build's widest window, the window a
+  remote stage sends is the speculative one, and the worker refuses a main process whose window is larger than its
+  own (`src/program/generate.cpp:13088`), so a main and a worker of different window builds cannot overrun a buffer.
+- **Expert Deferral's heavy and light jobs** (`STRATA_VERIFY_DEFER_CPU_BELOW`, the fork's): the split names an
+  expert's job by its last token only, which holds for windows of up to 8 rows. A window of more than 8 rows is not
+  split (`src/core/expert_source.cpp:5250`): an expert's tokens could take two jobs there, so that layer waits for
+  all its CPU rows (said once).
+- **TLS 1.3 with mutual certificates** (the section above): protocol 8 here. `STRATA_STAGE_TOKEN` is gone from the
+  engine, the node agent (`tls_dir` in place of `token_file`) and the server's stage page.
+- 0.2.8's other changes (the auto expert cache's margin, `STRATA_ROUTE_PRIOR` off by default, the arena's wait for
+  RAM, the PLE lock given back, the slot-park guard) are each PC's own; a worker takes them as a main process does.
+
+These rest on the builds and the CPU tests (`stage_link_test` over TLS, `stage_ckpt_store_test`,
+`tools/test_stage_node.py`, the server's tests); no engine has run on a GPU since the merge.
+
 ### The recovery's open points (2026-10-13)
 
 Faults injected on A + B (RTX 3080 main, RTX 2080 Ti worker, 10 GbE, RVN IQ3_S, K=26) with the branch on 0.1.43
