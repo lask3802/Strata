@@ -29,11 +29,14 @@ the head and the drafter on the worker would have saved that return trip and mov
 
 ### The protocol
 
-One TCP connection per main process. Every message is a 40-byte header (`magic` "STRM", `type`, three int64 fields
-`a b c`, payload `bytes`) and a payload. Protocol version 7 (3 before the hello carried the tail-skip rank, 4 before
-images, which added the Positions message and the hello's `vision`, 5 before the conversation checkpoints, which
-added `CkptSave` / `CkptRestore`, a keep list on `Reset` and the hello's `ckpt_max`: [CHECKPOINTS.md](CHECKPOINTS.md);
-6 before the row formats, below).
+One TCP connection per main process, TLS 1.3 from its first byte, both ends' certificates checked ([TLS 1.3 and
+mutual certificates](#tls-13-and-mutual-certificates)). Every message is a 40-byte header (`magic` "STRM", `type`,
+three int64 fields `a b c`, payload `bytes`) and a payload. Protocol version 8 (7 before TLS: plain TCP and a token in
+the hello; 6 before the row formats, below; 5 before the conversation checkpoints, which added `CkptSave` /
+`CkptRestore`, a keep list on `Reset` and the hello's `ckpt_max`: [CHECKPOINTS.md](CHECKPOINTS.md); 4 before images:
+the Positions message and the hello's `vision`; 3 before the hello carried the tail-skip rank). Upstream's TLS change
+numbers the same step 5 -> 6: its line has neither the checkpoints nor the row formats, and a fork build and an
+upstream build refuse each other at the hello either way.
 
 | message | header fields | payload | reply |
 |---|---|---|---|
@@ -59,12 +62,14 @@ element types must match and `kv_type` is not compared; when one lacks it (an ea
 `kv_type` itself) no K/V type is compared here and each side logs `... hello predates the K/V element check: --kv must
 match by hand`; when both lack it, `kv_type` is compared as before. `kv_type` still carries the placement, for the
 earlier builds. The worker also refuses a main
-process whose prompt chunk, context or window is larger than its own, and a wrong `STRATA_STAGE_TOKEN` (the token is
-the hello's last field; the worker's own hello carries none). The main process's `STRATA_ROUTE_TAIL_SKIP` rank rides
+process whose prompt chunk, context or window is larger than its own. (Protocol 7's token was the hello's last field;
+it is unused now, since the handshake has proven both ends before the hello.) The main process's
+`STRATA_ROUTE_TAIL_SKIP` rank rides
 along and the worker takes it (a relay passes it on), so every layer skips as in one process. So does whether the
 main process reads images (`vision`): a worker started without `--vision` refuses such a main process, and the main
 process checks the worker's hello for it too. The hello is 192 bytes in
-every protocol, so an older peer is refused for its protocol number. A peer that sends no hello within 10 s is dropped; after
+every protocol, so an older peer is refused for its protocol number (an older Strata fails at the TLS handshake
+before that). A peer that has not finished the handshake and sent its hello within 10 s is dropped; after
 the hello the worker waits for messages without a time limit (the next prompt may be hours away), while sends and the
 main process's receives time out after `STRATA_REMOTE_TIMEOUT_S` (300 s). Sockets: `TCP_NODELAY`, 8 MiB buffers,
 keepalive after 30 s idle, 3 probes 10 s apart.
@@ -86,8 +91,8 @@ served one has had no message read, being read, or a reply going out for `STRATA
 never) - the time counts from the last of those, so a relay's reply that waited long on its next worker starts it
 anew - and only then does the worker watch the listen socket, accept the new one and read its hello on a thread
 of its own (a shorter pause is no sign the main process went away: inside one request it can leave the worker
-waiting while it runs its own layers of a prompt chunk). A hello it accepts (the token,
-the hello's checks against the hello it gave the served main process, the worker's own checks) takes the worker over:
+waiting while it runs its own layers of a prompt chunk). A hello it accepts (after a handshake whose certificate it
+accepts: the hello's checks against the hello it gave the served main process, the worker's own checks) takes the worker over:
 the old connection ends as a closed one does (`disconnected`: the positions back to the identity, a relay's next link
 closed), and the new one is served; the log says how long the old one had been silent. A refused hello leaves the
 old connection alone; when the old connection closes, the new one is accepted at once as before. When the served
@@ -127,8 +132,8 @@ which tries anew. A link lost in the middle of a request still ends the main eng
 `Retry-After: 30` (`RemoteStageLost` in `serve/server.py`; an error event once a stream has started), not a 400. A
 Commit's error that the next Reset drops is written on the worker's stderr first. `stage_link_test` covers the
 take-over over loopback with `STRATA_REMOTE_TAKEOVER_S=1` (a second main not served while the first sends a message
-every 0.5 s, served once the first is silent past 1 s, served at once when the first closes; a wrong token or
-another model refused while the old one stays; a peer accepted while the first was idle with 8 bytes of its hello
+every 0.5 s, served once the first is silent past 1 s, served at once when the first closes; a certificate the
+worker does not hold or another model refused while the old one stays; a peer accepted while the first was idle with 8 bytes of its hello
 sent, closed as soon as the first sends again, the first answered at once, and the rest of that hello sent then not
 taking over at the first's next idle second; a chunk's reply held 1.5 s by a relay's handler, then
 0.4 s until the first's next message: not taken over), with `STRATA_REMOTE_TAKEOVER_S=0` (a second main not served
@@ -203,8 +208,9 @@ process is its client: windows go on synchronously and the next worker's rows ar
 go on through a `StageRelay` (one send in flight, in order), and the next worker's reply to a chunk is read and
 forwarded on the replying thread (`StageHandlers::prefill_reply` defers the answer until it arrives). A reset and a
 commit go on to the next worker first; a reset waits for a chunk reply still going out. The main process sees one
-worker. A relay connects to the next worker when it starts (30 tries, 2 s apart; a refused hello - a wrong token or
-a context mismatch - is not retried) and again at the first reset after each main process's hello (so the next worker
+worker. A relay connects to the next worker when it starts (30 tries, 2 s apart; a refusal - a certificate either
+side does not hold, or a context mismatch - is not retried), with its own key: the next worker checks the relay's
+certificate, not the main process's. It connects again at the first reset after each main process's hello (so the next worker
 hears that main process's values, such as its tail-skip rank) or after that link broke; when its main process goes
 away it drops the link to the next worker, so replies still owed on it cannot reach the next main process.
 
@@ -288,6 +294,183 @@ the CPU expert pool and the plan, and host staging) and, on a relay, the next wo
 time in every reply's header, so the main process can split a round trip without synchronized clocks. The GPU wait is
 what showed the Windows clock problem below.
 
+### TLS 1.3 and mutual certificates
+
+What has to be kept: a split's traffic is the conversation (token ids, and hidden states from which the text can be
+read back), and a worker or an agent obeys whoever drives it (an agent writes files and starts processes). Protocol 5
+sent both in plain TCP with a shared token in the hello, so anyone on the LAN could read the conversation, take the
+token, and drive a worker; and a main process could not tell its worker from a PC that answered at its address.
+
+**Who is who.** Each PC has its own key (`strata --stage-keygen DIR [NAME]`: Ed25519, a self-signed certificate with
+CN = NAME (the host name by default), `CA:FALSE`, key usage digitalSignature, extended key usage server and client
+auth) and a `peers/` folder of the certificates it accepts; the keygen makes the folder its user's alone (0700; on
+Windows a protected DACL of that user, SYSTEM and Administrators, as OpenSSH wants of a key's folder: one made under
+`C:\` would otherwise inherit Modify for every signed-in user, who could then add a certificate to `peers/`). The
+folder must be the user's own (on Windows its owner may also be the Administrators, which an elevated prompt makes
+the owner of what it makes): an owner may change the permissions whatever they say, so another user's folder is
+refused. It takes only a new or empty folder, or what a keygen left once its key was removed (a `cert.pem` file and
+an empty `peers/` folder): a link (on Windows a junction too, which any user may make and `std::filesystem` does not
+call a link), anything else, a `peers/` with a certificate in it, or a folder it cannot list is refused before its
+permissions are touched (a protected DACL set on a model folder would replace what everything in it inherits). The
+folder is then opened once, not through a link (`O_NOFOLLOW`, `FILE_FLAG_OPEN_REPARSE_POINT`), and its owner looked
+at and its permissions set through that handle: a link or another user's folder swapped in after the first look is
+refused, not changed. On Windows that handle is not shared for delete and is held until the key and the certificate
+are written: a process that holds the folder with the right to delete or move it (as one could that opened it while
+it inherited `C:\`'s Modify, to move it away and put a junction in its place) makes the keygen refuse, and none may
+open it so meanwhile. The folders above it are not looked at. Once the folder is the user's alone it is looked at again,
+for what another user put there in between, and the `cert.pem` and `peers/` that were there are removed and made
+again, the key and the certificate as new files (never written through): one another user made while the folder
+was open to them would stay theirs, and a certificate they appended to it later would be accepted. Every
+connection checks both ends (the server asks for the client's certificate and fails a handshake without one). The
+accepted certificates are trust anchors themselves (`X509_V_FLAG_PARTIAL_CHAIN`), and the verify callback then wants
+the peer's own certificate among them by SHA-256: pinned, so a CA's certificate put in `peers/` accepts that PC, not
+what it signed. A PC's own certificate is accepted as well, so one folder copied to every PC (the tests' "shared"
+folder) also works. No certificate authority: with two or three PCs of one owner, a CA would only add a key that can
+vouch for PCs nobody copied. Host names, addresses and dates are not checked (`X509_V_FLAG_NO_CHECK_TIME`: a PC whose
+clock went back would refuse every newer certificate): the certificate is the PC. A refusal names the certificate (CN,
+anything but printable ASCII replaced and cut at 64 bytes, since the peer chose it, and the SHA-256 fingerprint) and says
+which folder lacks it; the side that
+refused logs it, and the other side gets the TLS alert as "the worker refused: TLS: the peer does not accept this PC's
+certificate".
+
+**The connection.** TLS 1.3 only (`TLS1_3_VERSION` both min and max), suites AES-128-GCM, AES-256-GCM,
+ChaCha20-Poly1305 in that order, groups X25519 then P-256, security level 2 (set, since OpenSSL builds' defaults
+differ), no session tickets (`num_tickets 0`, `SSL_OP_NO_TICKET`) and so no resumption or 0-RTT data. The handshake is one round trip more at connect, which happens once at start and
+again after a lost link; a full handshake each time keeps no state between connections. OpenSSL is told not to read
+the PC's `openssl.cnf` (`OPENSSL_INIT_NO_LOAD_CONFIG`): the link sets everything it uses, so a distribution's crypto
+policy or a newer config than a release's static OpenSSL reads changes nothing. Checked in Ubuntu 24.04 with a
+`system_default` of `CipherString = DEFAULT@SECLEVEL=4` (192-bit keys, more than Ed25519's 128): `openssl s_server`
+refused its Ed25519 certificate (`ee key too small`), `stage_link_test` built without the init call failed, and with
+it passed. (A config with a syntax error, or one loading a provider that does not exist, changed nothing either way.)
+The price: a host's FIPS provider or policy does not reach the link. Each direction makes a KeyUpdate after
+16 GiB sealed (2^20 full records, far inside TLS 1.3's limit for AES-GCM); a 90K-token prompt is 3.7 GB out, so a
+long session updates now and then.
+
+**How it fits the link.** `TlsSession` (`src/net/stage_tls.cpp`) is OpenSSL over memory BIOs and does no I/O:
+`seal` turns plaintext into records in a buffer, `feed` + `open` turn received bytes into plaintext. The socket code
+in `stage_link.cpp` keeps its timeouts, polls, stop flags and the 10 s hello deadline as they were, and the handshake
+runs inside the connect's (and a waiting connection's hello's) deadline. A message is sealed a piece at a time and
+each piece is sent as soon as it is sealed, so sealing overlaps the send and the peer opens the first records while
+the rest are sealed: 64 KiB pieces for a message's first 512 KiB (a decode window's rows, 51-307 KB at T = 1-6, go
+in these), then 256 KiB pieces (a 241 MB prompt chunk takes a quarter of the sends 64 KiB pieces would). Reads take
+up to 256 KiB at a time. A poll asks the session first whether it holds decrypted bytes already
+(`buffered()`), since bytes in OpenSSL's buffer do not wake a socket poll. `StageClient::alive` (the relay's look at
+its next worker) peeks at the socket and never reads a record: with no tickets, an idle TLS 1.3 link sends nothing
+unasked.
+
+**What it costs.** `stage_link_bench` (a worker whose handlers copy the rows back, a main process that times verify
+windows and 2048-row prompt chunks at Qwen3.8-Flash-Next's sizes) over loopback, both ends on one PC (Ryzen 7 5700X3D,
+16 threads; Ubuntu 24.04 in Docker under WSL2, GCC 13, OpenSSL 3.0.13); medians of 9 runs in 3 passes, the variants
+interleaved; the CPU column is both ends' time for 12 chunks (1 GB each way):
+
+| link | window T=1 p50 | T=4 p50 | T=6 p50 | T=6 p99 | prompt chunks, each way | CPU |
+|---|---:|---:|---:|---:|---:|---:|
+| plain TCP (protocol 5) | 198 us | 229 us | 276 us | 538 us | 727 MB/s | 2.20 s |
+| TLS, 64 KiB pieces throughout | 262 us | 481 us | 630 us | 1130 us | 498 MB/s | 3.90 s |
+| TLS, 256 KiB pieces throughout | 286 us | 585 us | 669 us | 1042 us | 659 MB/s | 2.93 s |
+| **TLS as built** (64 KiB, after 512 KiB 256 KiB) | 256 us | 490 us | 631 us | 1128 us | 592 MB/s | 3.13 s |
+
+TLS adds 60-80 us to a one-token window and 250-360 us to a 4- to 6-token one, about what sealing and then opening
+the rows both ways takes one after the other (`TlsSession` seals 3.1 GB/s and opens 2.9 GB/s on this CPU, against
+OpenSSL's 5.1 GB/s for AES-128-GCM alone; Windows, 64 KiB pieces); a decode window here is 45-60 ms. Small pieces are
+what keeps a window's cost there: one 256 KiB piece seals a 4-token window's 205 KB whole before the first byte
+leaves. The chunk numbers of the last three rows spread by about 10% from run to run on this PC (the built mix and
+256 KiB throughout swapped places between runs; without the window phase before them the mix ran 630 and 256 KiB
+555 MB/s), so the mix is no slower for chunks than 256 KiB pieces; 64 KiB throughout was below both in every run, and
+16 KiB pieces far below (258 MB/s). Loopback runs both ends on the same cores and moves bytes at memory speed, the
+worst case for encryption's share. (Windows loopback is no measure here: plain TCP itself ran at ~100 MB/s there, with
+23 s of kernel time for 1 GB.)
+
+Between two PCs, the same bench: PC A (Ryzen 9 5900XT, RTX 2080 Ti, the main process) and PC B (Ryzen 9 5900X,
+RTX 3080, the worker) over 10 GbE, both Linux (the engines built in Ubuntu 24.04, GCC 13, OpenSSL 3.0.13 linked
+statically), on upstream 0.2.7.1 with this change (plain: the remote stage alone, protocol 5); 3 runs of each, the
+order rotated; medians of the runs (their range); the CPU column is the main process's for 12 chunks:
+
+| link | where | connect p50 | window T=1 p50 | T=4 p50 | T=6 p50 | T=6 p99 | prompt chunks, each way | CPU (main) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| plain TCP | loopback on PC A | 90 us | 41 us (39-45) | 80 us (77-80) | 102 us (98-103) | 164 us | 1690 MB/s | 1.10 s |
+| TLS 1.3 | loopback on PC A | 981 us | 91 us (91-94) | 232 us (231-232) | 313 us (309-316) | 432 us | 982 MB/s | 2.03 s |
+| plain TCP | A to B, 10 GbE | 174 us | 190 us (190-192) | 453 us (453-463) | 639 us (638-649) | 733 us | 488 MB/s | 0.92 s |
+| TLS 1.3 | A to B, 10 GbE | 1052 us | 200 us (199-200) | 478 us (477-481) | 655 us (654-660) | 759 us | 499 MB/s | 1.16 s |
+
+Over the wire TLS adds 10 us to a one-token window and 16-25 us to a 4- to 6-token one (2.5-5.5%), where loopback
+showed 50-210 us: a 64 KiB piece is sealed while the one before it is on the wire, so what is left is about the last
+piece's sealing and opening (a reading, not measured). The chunks run at the link's pace either way; the handshake
+adds about 0.9 ms to a connection, once at start and after a lost link.
+
+On the GPUs (the same two PCs, SC117 IQ3_S, layers 0-19 on PC A and 20-47 on PC B, `--prefill 5888`,
+`--spec 4 --mtp`, context 262144; 12 prompts of 200 tokens 3 times, then 3 prompts of ~32K tokens; the four split runs
+in the order plain, TLS, TLS, plain; the CI container on PC A's host idle throughout):
+
+| run | low context decode, tok/s (median of 3 rounds) | ~32K prompt read, tok/s | ~32K decode, tok/s |
+|---|---:|---:|---:|
+| PC A alone, upstream 0.2.7.1 | 81.84 | 885.7 | 62.4 |
+| split, plain (1st) | 103.38 | 1411.9 | 74.4 |
+| split, TLS (2nd) | 105.88 | 1361.0 | 77.7 |
+| split, TLS (3rd) | 105.77 | 1388.7 | 77.3 |
+| split, plain (4th) | 104.21 | 1466.1 | 78.0 |
+
+Decode is no slower with TLS. The ~32K prompt read was slower in both TLS runs than in both plain runs (by 1.6-7.2%,
+4.5% on the means), while the two plain runs differed by 3.8% themselves: two runs of each cannot size it. A likely
+cause, not measured: sealing and opening a prompt chunk's rows each way takes CPU time (the bench's main process spent
+0.24 s more for 1 GB each way) while the prompt path's CPU share runs beside it.
+
+**Refused or lost.** The recovery treats a refusal (not tried again) differently from a lost link (connect again), so
+the handshake's failures are sorted: a peer that closes the connection during the handshake ("... in the TLS
+handshake (a peer without TLS - an older Strata - or one that refused this PC)") counts as lost, since a worker that
+is starting or stopping does that too; a peer that answers with something other than TLS ("does not speak TLS 1.3")
+and a certificate refused by either side are refusals. A worker that refuses a main process
+answers nothing in plain text: the client sees TLS 1.3's alert on its first read, after its own side of the handshake
+finished, and the main process reads it there.
+
+**The agent.** `tools/stage_node.py` serves HTTPS with the same folder (Python's `ssl`: `TLSv1_3` minimum,
+`CERT_REQUIRED` both ways, the same PARTIAL_CHAIN and NO_CHECK_TIME flags, no tickets, security level 2 set before the
+key is loaded: Python reads `openssl.cnf`, and under the level-4 policy above 18 of the agent's tests failed with
+`ee key too small` without it and none with it; Python has no verify callback,
+so `PinnedSocket.do_handshake` checks the peer's certificate against the folder's fingerprints right after the
+handshake, before a byte of a request or a reply is read). Its handshake runs on the request's own thread
+with a 10 s limit, so a client that connects and sends nothing holds neither the accept loop nor other clients. The
+shipper and the tuner are its clients with their PC's folder; the agent starts its workers, and the tuner the main
+server, with `STRATA_STAGE_TLS` set (and `STRATA_STAGE_TOKEN` removed from their environment). A
+`peers/` file with no certificate in it stops the agent with that file's name, as it stops the engine (Python's
+`cadata` would have skipped it).
+
+**Builds.** OpenSSL 1.1.1 or later, linked statically on Windows and in a release build (`STRATA_PORTABLE`), so the
+engine imports no OpenSSL file the PC may lack: an engine that imports a missing DLL or `libssl.so` does not start at
+all, a remote stage or not (`packaging/binary_deps.py` refuses such a package). On Windows a DLL's import library
+(vcpkg's `x64-windows`, found by its `__IMPORT_DESCRIPTOR_` symbol) is not taken; neither is a `libssl.so` that a
+release build's cache kept from an earlier configure. Without static libraries a local build builds without TLS and says
+so, and a release build stops (`-DSTRATA_STAGE_TLS=OFF` builds it without TLS on purpose): a release without the remote
+stage would otherwise go out unnoticed. A static OpenSSL's fixes reach a PC only with a new Strata build, not with the
+system's updates. Measured: the statically linked `stage_link_test` grows from 0.33 to 5.0 MB on Windows (MSVC, OpenSSL
+3.3.1 `lib/VC/x64/MT`) and from 0.44 to 6.2 MB on Linux (Ubuntu 24.04, OpenSSL 3.0.13), and imports only Windows' own
+DLLs there (`CRYPT32`, `USER32`, `ADVAPI32`, `WS2_32`, `KERNEL32`) and no libssl or libcrypto here. A build with no
+OpenSSL compiles a stub whose remote stage refuses to start ("this build has no TLS"). The Metal build compiles the stub
+(the remote stage is refused there anyway); the SYCL port has its own `generate.cpp` and no remote stage.
+
+**Checked by `stage_link_test`** (loopback, every check also with the link's other cases above): a main process and a
+worker with different keys that accept each other; a worker that does not hold the main process's certificate, and
+the reverse, each with its message; a client with no certificate (raw OpenSSL); a plain-TCP main process (an older
+Strata's hello) and a plain-TCP worker that answers in plain text or closes; a ClientHello sent a byte at a time,
+dropped at the 10 s deadline (9-12 s measured) while the served main process goes on; a 65,536-token window's
+integrity; KeyUpdates every 4 KiB over 3 chunks and 200 windows (126 updates, every byte intact); a protocol-5 hello
+refused; the credential folder's errors (no folder, no key, a key with another PC's certificate, a `peers/` file with
+no certificate, a key that `--stage-keygen` does not overwrite, a folder of other files it refuses with its permissions
+kept, a new key where only `key.pem` was removed, its `cert.pem` and `peers/` made new (a hard link to the old
+`cert.pem` keeps the old bytes; POSIX: a sticky bit set on the old `peers/` is gone), a `cert.pem` that is a symbolic
+link, the folder given as a symbolic link (`DIR/`, `DIR/.`) or on Windows as a junction, a Windows folder another
+process holds with the right to delete it, another user's folder refused with its mode kept (POSIX, run as root),
+the keygen's folder this user's alone and this user's own); pinning (a CA's certificate in a worker's `peers/`
+accepted itself, a certificate it signed refused) and a certificate valid only from 2036 on accepted. Not checked: a
+Windows folder of another user (the test cannot make one without a privilege), and the swaps between the looks,
+which need a second user racing the keygen (so neither is that the held folder stays held until the key is
+written). Run on
+Windows (MSVC 2022, OpenSSL 3.3.1 static), Linux (GCC 14 and OpenSSL 3.5.7; Ubuntu 20.04, GCC 10 and OpenSSL 1.1.1f;
+Ubuntu 24.04's CMake build, static and shared OpenSSL 3.0.13). `tools/test_stage_node.py` checks the agent's side:
+a client it accepts, an unknown one, one with no certificate, plain HTTP, a client that refuses an unknown agent,
+a client whose certificate a CA in the agent's `peers/` signed (refused), a silent connection that does not hold
+the agent, and its key loaded under a host policy at security level 4.
+
 ## How it got here
 
 All on PCs A and B below, RVN IQ3_S, K=24, the 32K prompt, chunk 2048 (PC A's host ran heavy CI load during these
@@ -331,6 +514,9 @@ What went wrong on the way, and why:
   recovery after a main process goes away, the source fingerprint of shipped files (a model changed at the same path
   voids the old byte ranges) and the agent's limits (one `/start` at a time, a flag whitelist, no executables unless
   allowed, a constant-time token check).
+- **TLS (2026-10-29).** The first pull request (#1748) was closed because the token and the hidden states crossed the
+  LAN in plain text. The link and the agent became TLS 1.3, and the shared token became a key per PC with each end
+  checking the other's certificate ([TLS 1.3 and mutual certificates](#tls-13-and-mutual-certificates)).
 
 ## Measurements
 
@@ -831,7 +1017,7 @@ that can reach the port could send it: no hello, no token. A `Prefill` header th
   within 10 s in all, and nothing else (before, each recv had its own 10 s, so a peer that sent a byte every few
   seconds held the worker for over half an hour). Another first message, or a hello of a wrong size, is answered
   (`hello first`, `bad hello`) and its connection closed, its body neither waited for nor drained.
-- **After a hello, nothing is read until its token is taken** (the first hello, or another a served main process
+- **After a hello, nothing is read until it is decided** (the first hello, or another a served main process
   sends). A refused peer's next header, with a body that never comes, held the receiving thread in a recv; shutting
   the socket down does not wake that on Windows, and the worker waited for the thread for good. (A review of this
   fix found it; on Linux the shutdown wakes the recv.)
@@ -848,7 +1034,9 @@ that can reach the port could send it: no hello, no token. A `Prefill` header th
   flag is an atomic (written by the sending side, read by the receiving one under another lock).
 
 `stage_link_test` sends these headers by hand over loopback (and a hello a byte a second), and each fix undone fails
-it; the wait for the token only on Windows, where the recv it prevents is not woken.
+it; the wait for the hello's decision only on Windows, where the recv it prevents is not woken. Since TLS (protocol
+6) all of this happens after a handshake with an accepted certificate: a host that the worker does not accept gets no
+further than the handshake, and these checks guard against a PC that it does.
 
 ### Row formats: bf16 (2026-10-13)
 
@@ -926,7 +1114,10 @@ link that is the bottleneck.
 - **A relay's link carries everything twice.** On 1 GbE the middle PC's link was the limit of a three-PC prompt; put
   the fastest link there.
 - **Wait for pinned memory to be released between restarts** (more than 30 s for ~30 GB).
-- **Plain TCP on a LAN is enough for decode.** 1 GbE carried 117 MB/s; a hop was ~3-5 ms of a 45-60 ms window.
+- **A LAN is fast enough for decode, but not a place for plain TCP.** 1 GbE carried 117 MB/s and a hop was ~3-5 ms
+  of a 45-60 ms window; plain TCP also carried the conversation readable to the LAN and let whoever read the token
+  drive a worker. TLS 1.3 with a certificate on both ends added 0.06-0.36 ms a window over loopback
+  ([TLS 1.3 and mutual certificates](#tls-13-and-mutual-certificates)).
 - **Measure on a quiet host, or record the load.** The other CPU on PC A's host ranged from 10% to 109% between runs.
 - **One split serves both phases.** The best split for long prompts is not the best for decode; different splits per
   phase would need the K/V and GDN state of the moved layers to cross the network.

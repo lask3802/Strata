@@ -24,7 +24,7 @@ ARG RUNTIME_BASE=ubuntu:24.04
 FROM ${CUDA_IMAGE} AS engine-build
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PATH=/venv/bin:$PATH
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential ca-certificates git libgomp1 libatomic1 python3 python3-pip python3-venv unzip \
+        build-essential ca-certificates git libgomp1 libatomic1 libssl-dev python3 python3-pip python3-venv unzip \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .

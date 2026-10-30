@@ -1,6 +1,7 @@
 #!/bin/bash
 # Linux HIP engine package for the Radeon 780M (gfx1103), built on the mini PC (P2006). Needs the source tree as $HOME/split-tq/tq3-src.tar.gz
-# (git archive), the TheRock gfx110X-all SDK at $HOME/strata-poc/rocm/install and the llama.cpp sources at $GGML; edit the paths for another box.
+# (git archive), the TheRock gfx110X-all SDK at $HOME/strata-poc/rocm/install, the llama.cpp sources at $GGML and libssl-dev (the
+# remote stage's TLS 1.3, linked statically: STRATA_PORTABLE stops at configure without it); edit the paths for another box.
 # ROCm = TheRock gfx110X-all SDK of ~/strata-poc (as the earlier P2006 builds). Shared box lock for the build; nice.
 R=$HOME/split-tq
 S=$R/build.status

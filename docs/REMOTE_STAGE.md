@@ -145,6 +145,11 @@ with an in-process layer split; not measured.
   through WSL2. A Windows build needs MSVC 2022 and the CUDA 13 toolkit; when installing only some of the toolkit's
   parts, include `crt` and `nvvm` (CUDA 13 ships them separately, and nvcc fails without them). Put `cudart64_13.dll`,
   `cublas64_13.dll` and `cublasLt64_13.dll` (in CUDA 13's `bin\x64`) next to `strata.exe`.
+- **OpenSSL 1.1.1 or later when you build the engine** (the link's TLS): `libssl-dev` on Ubuntu / Debian; on Windows
+  its static libraries (the full "Win64 OpenSSL" install, or vcpkg's `x64-windows-static`; point `OPENSSL_ROOT_DIR`
+  at it), since an engine that needed an OpenSSL DLL would not start where that DLL is missing. A build without them
+  runs everything else and refuses a remote stage with "this build has no TLS"; a release build
+  (`STRATA_PORTABLE`) stops instead, unless `-DSTRATA_STAGE_TLS=OFF`.
 - **An NVIDIA card the engine supports on every PC** (RTX 20 or newer); each PC's build covers its own card.
 - **The same model on every PC:** the same pack directory (both sides compare a fingerprint of its `index.txt` and
   `native_experts.txt` and refuse a mismatch), the GGUF shards (a worker reads every shard's header and its own
@@ -164,13 +169,24 @@ with an in-process layer split; not measured.
 
 ## Two PCs
 
-**1. A shared secret.** Put the same string (up to 63 characters) in `STRATA_STAGE_TOKEN` on both PCs. A worker
-started without one prints a warning and takes orders from any host that reaches its port.
+**1. A key on each PC.** The link is TLS 1.3, and each PC links only with the PCs whose certificate it holds
+([Security](#security)). Make each PC's key once:
+
+```
+strata --stage-keygen /opt/strata/stage-tls pc-b      # on the worker PC; on the main PC: ... pc-a
+```
+
+The folder then holds `key.pem` (this PC's private key; it stays on this PC), `cert.pem` (its certificate, with the
+name given and a SHA-256 fingerprint, also printed) and an empty `peers/`. Copy the main PC's `cert.pem` into the
+worker's `peers/` (as `pc-a.pem`) and the worker's into the main PC's `peers/` (as `pc-b.pem`), by any route (scp, a
+USB stick): a certificate is not secret, but every certificate in a `peers/` folder may link with that PC, so put only
+your own PCs' there. Compare the fingerprint the other PC printed with the one in this PC's log when it first links
+(the log shows its first 16 hex digits).
 
 **2. Start the worker first** (the worker PC, here 192.0.2.11, running layers 26-47):
 
 ```
-export STRATA_STAGE_TOKEN="$(cat /opt/strata/stage-token)"
+export STRATA_STAGE_TLS=/opt/strata/stage-tls
 export LD_LIBRARY_PATH=/opt/strata/bin       # where the engine's CUDA libraries are, if not installed system-wide
 /opt/strata/bin/strata --serve --stage-worker 7841 --stage-begin 26 --stage-bind 192.0.2.11 \
   --pack /data/packs/<pack> \
@@ -180,18 +196,19 @@ export LD_LIBRARY_PATH=/opt/strata/bin       # where the engine's CUDA libraries
   --spec 4 --max-context 131072 --kv int8 --kv-resident 32768
 ```
 
-On Windows the same arguments go to `strata.exe` (`set STRATA_STAGE_TOKEN=...` first). It is ready when the log says
-`strata stage worker: listening on 192.0.2.11:7841 (a token is required)`. It runs without stdin and serves one main
+On Windows the same arguments go to `strata.exe` (`set STRATA_STAGE_TLS=%USERPROFILE%\strata\stage-tls` first). It is ready
+when the log says `strata stage worker: listening on 192.0.2.11:7841 (TLS 1.3: this PC is pc-b SHA256:1f0c9a7d5e2b8346;
+2 certificates accepted)` (its own and pc-a's). It runs without stdin and serves one main
 process at a time; when the main process goes away it waits for the next one. The worker does not read the PLE table
 (layer 1 always runs on the main PC), but the argument checks still want `--ple-gguf` or a shard that holds it.
 
-**3. Then the main PC.** Add these to the model's config (`strata-*.json`, `"args"`), and the token to its `"env"`:
+**3. Then the main PC.** Add these to the model's config (`strata-*.json`, `"args"`), and its key folder to `"env"`:
 
 ```json
 "args": [ "...the model's usual args...",
           "--prefill", "5888",
           "--layer-split", "26", "--split-device", "0", "--remote-stage", "192.0.2.11:7841" ],
-"env": { "STRATA_STAGE_TOKEN": "the same secret" }
+"env": { "STRATA_STAGE_TLS": "/opt/strata/stage-tls" }
 ```
 
 Then start the server as usual. `--layer-split K --split-device 0` keeps the head on this card and sends layers K
@@ -203,8 +220,12 @@ The main process connects once, at start, and stops if the worker is not listeni
 strata generate: remote stage: conversation checkpoints are off, every prompt is read from token 0
 strata generate: remote stage: this process holds layers 0-25, the rest on 192.0.2.11:7841
 strata serve: layer split: layers 0-25 (CUDA0), 26-47 (192.0.2.11:7841), the head (CUDA0), one hand-off per window
-strata serve: remote stage 192.0.2.11:7841: layers 26-47 there (prompt chunk 5888, context 131072)
+strata serve: remote stage: TLS 1.3, this PC is "pc-a" SHA256:8b51e2c04d9f6a13, 2 certificates accepted
+strata serve: remote stage 192.0.2.11:7841: layers 26-47 there (prompt chunk 5888, context 131072; pc-b (SHA256:1f0c9a7d5e2b8346), TLSv1.3 TLS_AES_128_GCM_SHA256)
 ```
+
+The worker's log names the main process the same way: `main process 192.0.2.10 (pc-a (SHA256:8b51e2c04d9f6a13),
+TLSv1.3 TLS_AES_128_GCM_SHA256): layers 26.. here`.
 
 **What must agree** (each side checks the other's hello and says which number differs): the model pack, `--kv`, and
 K (`--layer-split K` on the main PC, `--stage-begin K` on the worker). The worker's `--prefill`, `--max-context` and
@@ -239,6 +260,10 @@ strata --serve --stage-worker 7841 --stage-begin 24 --stage-end 40 --stage-next 
 Measured with three PCs (the tables above). A relay carries every prompt chunk and every window twice, so give it the
 fastest link: on 1 GbE the relay's link was the limit.
 
+Each PC needs the certificates of the PCs it links with: here B holds A's and C's, A and C hold B's (the node agents'
+clients count too: a PC that ships or tunes needs its certificate on every node). Holding every PC's on every PC is
+also fine.
+
 ## Images (`--vision`)
 
 Pictures work on a split as on one card ([DETAILS.md](DETAILS.md#images-vision)): the main PC's server config has its
@@ -265,14 +290,16 @@ main process without it.
 | `--stage-begin K` | worker | the first layer this worker runs: the main process's K (or the previous relay's `--stage-end`); 2 or more, below the layer count |
 | `--stage-end K2`, `--stage-next HOST:PORT` | relay worker | run layers K to K2-1 and hand the rest to the worker at HOST:PORT. Both or neither |
 | `--stage-bind ADDR` | worker | the address to listen on (default: every interface, IPv4 and IPv6) |
-| `STRATA_STAGE_TOKEN` | every PC | the shared secret in the hello (up to 63 characters). A worker without one warns and accepts anyone |
+| `STRATA_STAGE_TLS=DIR` | every PC | this PC's key folder: `key.pem`, `cert.pem` and `peers/` (`*.pem`, `*.crt`). Required: without it a remote stage does not start. Read at start; restart a stage after changing `peers/` |
+| `strata --stage-keygen DIR [NAME]` | every PC | make DIR's key and certificate (Ed25519, NAME or the PC's host name) and an empty `peers/`, and make DIR this user's alone (mode 0700; on Windows only this user, SYSTEM and Administrators). DIR must be new or empty, this user's own (another user's folder is refused; on Windows one the Administrators own is accepted too), not held open by a process that may move it, and not a link or, on Windows, a junction (a folder holding other files is refused, its permissions left as they were; what a keygen left once its `key.pem` was removed, a `cert.pem` and an empty `peers/`, is not in the way: both are made again), and it never overwrites a key |
+| `STRATA_STAGE_TOKEN` | | no longer used (it was the shared secret before TLS): a stage that finds it says so and goes on |
 | `STRATA_REMOTE_TIMING=1` | any | per-stage timing lines: each prompt chunk, and every 64 windows (see below) |
 | `STRATA_ADAPT_OVERLAP=1` | any | let the adaptive tier's copies land while the next window runs (opt-in on every PC since 0.1.43.1). On a worker it was not measured faster ([ENGINEERING.md](remote-stage/ENGINEERING.md#after-the-rebase-onto-0143-2026-10-12)) |
 | `STRATA_REMOTE_TIMEOUT_S` | any | seconds a send or receive may block before the link counts as dead (default 300). After the hello, a worker waits for the next message without a limit |
-| `STRATA_REMOTE_CONNECT_S` | main | seconds the main process keeps trying to connect, every 2 s, while the worker's name does not resolve, nothing listens at its address or the network does not reach it: at its start, and when a request finds the link lost (default 180; 0: one try, with the link's own time-outs). That is the whole wait: each try's connect and the worker's reply to its hello (a worker serving another main process answers once the new one takes it over) get what is left of it, at most `STRATA_REMOTE_TIMEOUT_S` a try (a name with several addresses: 10 s at most for each but the last; the name's lookup itself is not cut short). During a request the main process prints `INFO remote_stage_wait=S` every 10 s meanwhile, so the server does not take the wait for a frozen engine, and a STOP (the client went away) ends the wait at once: that request ends, the main engine stays, and the next request tries again. A refusal (token, model, layers, chunk) is not tried again. A worker down for longer is still found: the server's next request starts the main engine again, which tries anew |
+| `STRATA_REMOTE_CONNECT_S` | main | seconds the main process keeps trying to connect, every 2 s, while the worker's name does not resolve, nothing listens at its address or the network does not reach it: at its start, and when a request finds the link lost (default 180; 0: one try, with the link's own time-outs). That is the whole wait: each try's connect and the worker's reply to its hello (a worker serving another main process answers once the new one takes it over) get what is left of it, at most `STRATA_REMOTE_TIMEOUT_S` a try (a name with several addresses: 10 s at most for each but the last; the name's lookup itself is not cut short). During a request the main process prints `INFO remote_stage_wait=S` every 10 s meanwhile, so the server does not take the wait for a frozen engine, and a STOP (the client went away) ends the wait at once: that request ends, the main engine stays, and the next request tries again. A refusal (a certificate, the model, the layers, the chunk) is not tried again. A worker down for longer is still found: the server's next request starts the main engine again, which tries anew |
 | `STRATA_REMOTE_TAKEOVER_S` | worker | seconds the connection served must have had no message read, being read, or a reply going out before a new main process may take the worker over (default 30; 0: never, a new one waits until the old one closes) |
 
-Fixed: a peer that connects but sends no hello within 10 s is dropped; on an idle link, TCP keepalive notices a peer
+Fixed: a peer that connects but has not finished the TLS handshake and sent its hello within 10 s is dropped; on an idle link, TCP keepalive notices a peer
 that vanished without closing (power, cable) in about a minute. A new main process waits (in the worker's listen backlog, unread)
 until the connection served has had no message read, being read, or a reply going out for
 `STRATA_REMOTE_TAKEOVER_S` (30 s); then a hello the worker accepts takes it over and the old connection ends as a
@@ -404,12 +431,16 @@ What the measurements say (re-measure on your PCs; `tools/stage_tune.py` does it
 ## Tools
 
 Three Python scripts (standard library only) in `tools/`. The agent and the shipper run on Linux and Windows; `stage_tune.py tune` runs on a Linux main PC (it starts and stops the server with `pgrep` / `kill`), `stage_tune.py apply` anywhere. Their docstrings are the
-full usage; `python -m unittest tools.test_stage_node` tests the agent's file store and restarts, and the shipper's
-paths.
+full usage; `python -m unittest tools.test_stage_node` tests the agent's file store and restarts, its TLS, and the
+shipper's paths.
 
 **`tools/stage_node.py`: a node agent** on each worker PC. It starts and stops that PC's stage workers on request
-and reports the PC (GPU, RAM, CPU) and the link speed toward other nodes. Every request carries the token in an
-`X-Stage-Token` header.
+and reports the PC (GPU, RAM, CPU) and the link speed toward other nodes. It speaks HTTPS (TLS 1.3 only) with the
+PC's key folder, the workers' (`"tls_dir"`, or `STRATA_STAGE_TLS`, which wins), and serves only a client whose
+certificate is in that folder's `peers/` (or is its own); the shipper and the tuner check the agent's certificate the
+same way with theirs. A client that is refused is closed in the handshake, and the agent prints
+`stage_node: ADDRESS refused: TLS: ...`; every request it serves names its client in the agent's log. An `http://`
+agent address in an older config is taken as `https://`.
 
 ```
 python3 tools/stage_node.py node.json
@@ -419,7 +450,7 @@ python3 tools/stage_node.py node.json
 { "exe": "/opt/strata/bin/strata", "lib_dirs": ["/opt/strata/bin"],
   "bind": "192.0.2.11", "agent_bind": "0.0.0.0", "agent_port": 7840, "log_dir": "/opt/strata/stage",
   "args": ["--spec", "4", "--max-context", "131072", "--kv", "int8", "--kv-resident", "32768"],
-  "token_file": "/opt/strata/stage-token",
+  "tls_dir": "/opt/strata/stage-tls",
   "data_dir": "/data/stage",
   "gpu_clocks": {"graphics": [1500, 1905], "memory": [7001, 7001]} }
 ```
@@ -465,7 +496,7 @@ the pack directory, the expert profile and optionally the engine's directory. Wh
 compared on arrival.
 
 ```
-python3 tools/stage_ship.py --agent http://192.0.2.11:7840 --token-file /opt/strata/stage-token \
+python3 tools/stage_ship.py --agent https://192.0.2.11:7840 --tls-dir /opt/strata/stage-tls \
     --model-dir /data/models/<model> --pack-dir /data/packs/<pack> \
     --profile /opt/strata/data/expert-profile.bin --layers 26-47
 ```
@@ -502,13 +533,13 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 { "main": {"config": "/opt/strata/strata-q4_k_xl.json", "exe": "/opt/strata/build/strata",
            "cwd": "/opt/strata", "python": "/opt/strata/.venv/bin/python", "port": 8080,
            "api_key_file": "/opt/strata/api-key", "extra": []},
-  "nodes": [{"name": "pc-b", "agent": "http://192.0.2.11:7840", "host": "192.0.2.11", "port": 7841, "ship": true,
+  "nodes": [{"name": "pc-b", "agent": "https://192.0.2.11:7840", "host": "192.0.2.11", "port": 7841, "ship": true,
              "cache": "auto", "max_layers": 24},
-            {"name": "pc-c", "agent": "http://192.0.2.12:7840", "host": "192.0.2.12", "port": 7841, "ship": true,
+            {"name": "pc-c", "agent": "https://192.0.2.12:7840", "host": "192.0.2.12", "port": 7841, "ship": true,
              "cache": 1000, "max_layers": 14}],
   "ship": {"model_dir": "/data/models/<model>", "pack_dir": "/data/packs/<pack>",
            "profile": "/opt/strata/data/expert-profile.bin"},
-  "token_file": "/opt/strata/stage-token", "corpus": "/opt/strata/corpus.txt",
+  "tls_dir": "/opt/strata/stage-tls", "corpus": "/opt/strata/corpus.txt",
   "goal": {"measure_tokens": 32000, "answer_tokens": 500,
            "profile": [[8000, 0.3], [32000, 0.5], [100000, 0.2]], "max_context": 131072},
   "chunks": [5888], "max_runs": 8, "init_splits": [24, 40] }
@@ -530,7 +561,8 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
   request of 49.1 s, and a 125,230-token prompt read at 1,410 tok/s with decode at 33.8. Its report:
   [data/tuner-q4xl-3pc-report.md](https://github.com/lask3802/Strata/blob/remote-stage-data/bench/results/2026-10-10-remote-stage/data/tuner-q4xl-3pc-report.md).
 
-`main.json` is a server config with the token in its `"env"`; keep it private.
+`main.json` is a server config that names the main PC's key folder in its `"env"` (`STRATA_STAGE_TLS`, from
+`"tls_dir"`); the folder's `key.pem` is what to keep private.
 
 ### The Monitor's Workers card
 
@@ -606,17 +638,60 @@ after changing these settings.
 
 ## Security
 
-- **The link is plain TCP, not encrypted.** Every verify window and prompt chunk carries the token ids and the
-  layers' hidden states: whoever can read the traffic can read the conversation. Use it on a LAN you trust; across
-  anything else put it inside a tunnel (not measured).
-- **The token is a shared secret in the hello, also in clear.** It keeps other hosts on the LAN from driving a
-  worker; it is no protection against someone who sees the traffic. Bind the worker to the LAN address
-  (`--stage-bind`) and firewall the port.
-- **A node agent's token is a full credential:** with it a request can start the engine with the flags the agent
-  allows, write files under `data_dir`, and (with `"allow_put_bin"`) the engine itself. Treat it as a password and
-  keep the agent's port on the LAN. An agent run as administrator for `"gpu_clocks"` starts its workers as
-  administrator too.
-- A worker serves one main process at a time; a connection that sends no hello within 10 s is dropped.
+Every connection of a split (main to worker, relay to next worker) and every request to a node agent is TLS 1.3,
+and each end checks the other's certificate against its own folder: the PC's own certificate and those in `peers/`.
+
+What it protects against:
+
+- **Someone reading or changing the traffic.** Prompt chunks, verify windows, the hidden states and the agent's
+  files are encrypted and authenticated (AES-128-GCM between two engines; the agent's HTTPS takes its Python's
+  choice of TLS 1.3's ciphers). A changed or replayed record ends the connection.
+- **A worker that is not yours.** The main process (and a relay) links only with a worker whose certificate it
+  holds. A PC that answers at the worker's address instead (a changed DNS name or DHCP lease, ARP spoofing, another
+  machine on the port) fails the handshake, and the main process says whose certificate it was:
+  `refused the worker at HOST:PORT: TLS: NAME (SHA256:...) is not this PC's nor in its peers/ folder`.
+- **A main process that is not yours.** A worker and an agent serve only a client whose certificate they hold. A
+  client with another certificate, or none, is closed in the handshake, before the worker or the agent reads a
+  message from it, and the worker's log says why. A main process it serves is named in the log by its certificate's
+  name and fingerprint.
+
+What it does not do:
+
+- **A PC whose `key.pem` was copied is that PC** to every PC that holds its certificate, and whoever can write a
+  `peers/` folder chooses whom that PC accepts. `--stage-keygen` makes the folder the user's alone (mode 0700; on
+  Windows a DACL of that user, SYSTEM and Administrators, not the one a folder under `C:\` inherits, which lets every
+  signed-in user change it); keep it so, and run Strata as that user. To shut a PC out, delete its certificate from
+  every `peers/` folder and restart the stages and agents there: they read the folder at start, and nothing else
+  revokes a certificate. The certificates' dates are not checked: a pinned certificate is the PC, also on a PC whose
+  clock is wrong.
+- **No roles.** Every accepted PC is trusted fully: a main process can drive every worker that accepts it, and an
+  accepted client can do whatever an agent allows: start the engine with the flags it allows, write files under
+  `data_dir` and (with `"allow_put_bin"`) the engine itself. An agent run as administrator for `"gpu_clocks"`
+  starts its workers as administrator too.
+- **The sizes and times of messages are visible.** Someone on the network sees when a prompt is read and roughly
+  how long it is (a chunk's size), and the pace of the answer (one round trip a window).
+- **Floods.** Anyone who reaches the port can open connections. A worker serves one main process at a time and drops
+  a connection that has not finished the handshake and its hello within 10 s; still bind the worker and the agent to
+  the LAN address (`--stage-bind`, `"agent_bind"`) and firewall their ports.
+- **No address checks.** A PC is known by its certificate, not its address, so a worker may move to another address
+  or NIC without new certificates.
+- **The PC's OpenSSL configuration does not apply to the link.** The engine sets the versions, ciphers, keys and the
+  security level (2) itself and does not read `openssl.cnf`, so a system-wide crypto policy (a higher security level, a FIPS provider) changes
+  nothing on the link, and every PC links the same way. (A policy at security level 4 made the Ed25519 certificates
+  unusable when the file was read.) The node agent's HTTPS is Python's, which reads the file; the agent sets the
+  same security level itself, so such a policy does not stop it either.
+
+Why it is built this way: each PC makes its own key, and the certificates are pinned (a peer's certificate must be
+one in the folder, itself: one that a certificate there signed is refused), with no certificate authority, so there
+is no key that could vouch for a PC nobody copied. TLS 1.3 only, with a full handshake on every connection (no
+session tickets, no resumption, no 0-RTT data): a connection is made once at start and again after a lost link, so
+the handshake's round trip is paid there; each message then pays for its encryption and the records' 22 bytes each.
+Each direction changes its keys after 16 GiB (a TLS 1.3 KeyUpdate). Older builds (protocol 5, plain TCP with
+`STRATA_STAGE_TOKEN`) cannot link with this one: this build says the other speaks no TLS
+([Troubleshooting](#troubleshooting)), and an older main process sees the connection close (an older worker: "bad
+message magic"). What the encryption costs, measured between two PCs over 10 GbE: 10-25 us more for a decode
+window, a split that decodes as fast as without it, and ~32K-token prompts read about 4.5% slower in two runs of each
+([ENGINEERING.md](remote-stage/ENGINEERING.md#tls-13-and-mutual-certificates)).
 
 ## What it works with
 
@@ -632,7 +707,8 @@ after changing these settings.
 | Linux, NVIDIA (CUDA 13.0) | measured: Ubuntu 24.04 in an LXC container (main), a Linux host with kernel 6.14 (worker) |
 | Windows 11 native, NVIDIA (MSVC 2022, CUDA 13.0) | measured as a worker (and its node agent); as the main PC not tested here (a user ran one: see the AMD row) |
 | WSL2 (Windows 11, mirrored networking) | measured as a worker |
-| AMD (HIP) | builds (ROCm 7.0, gfx1100, in a container); not run here: no AMD card was available. A user ran a Radeon 8060S (gfx1151, Windows) as the worker of an RTX 5070 main PC over USB4, on 0.1.45.3-link.1 ([report](https://github.com/Niko1221/Strata/pull/1748#issuecomment-6332714185)) |
+| AMD (HIP) | Linux: builds (ROCm 7.0, gfx1100, in a container); not run here: no AMD card was available. A user ran a Radeon 8060S (gfx1151, Windows) as the worker of an RTX 5070 main PC over USB4, on 0.1.45.3-link.1 ([report](https://github.com/Niko1221/Strata/pull/1748#issuecomment-6332714185)), before TLS. The Windows AMD engine (`tools/hip/build_windows.bat`) is now built without TLS, so its remote stage refuses to start |
+
 | Intel (SYCL) | the SYCL port builds (oneAPI 2026.1.1, in a container) but has no remote stage: it keeps its own copies of the engine files this feature changes |
 | Apple (Metal, 0.1.44) | refused at start: the Metal backend runs each verify window itself, past the remote stage's hooks. Its build compiles the link's code so the binary links (not built here: no Mac) |
 | Links | measured on 1 GbE and on 10 GbE (limited to ~400 MB/s by its slot) |
@@ -648,7 +724,13 @@ after changing these settings.
 | `remote stage: cannot connect to HOST:PORT` | the main process tried for `STRATA_REMOTE_CONNECT_S` (180 s) after `waiting for the worker at HOST:PORT`. A worker that comes back later (a reboot that takes longer) is still found: the server's next request starts the main engine again, which tries anew. Start the worker and wait for `listening on`; check `--stage-bind`, the address and the firewall (Windows: an inbound rule; WSL2: a Hyper-V firewall rule too) |
 | `cannot connect ...: No route to host` over a second NIC that shows its link up | check that it receives at all (`ip -s link`); a 10 GbE card here received nothing after its host rebooted until the link was taken down and up |
 | a worker restarted right after a stop fails (little VRAM free) | the previous worker is still unpinning (more than 30 s with ~30 GB of experts); wait until its process is gone |
-| `remote stage: the worker refused: wrong token (STRATA_STAGE_TOKEN)` | the same `STRATA_STAGE_TOKEN` on every PC |
+| `remote stage: no credentials folder (STRATA_STAGE_TLS)`, or `cannot read DIR/key.pem` | make the PC's key (`strata --stage-keygen DIR`) and set `STRATA_STAGE_TLS=DIR` for every stage ([Two PCs](#two-pcs)) |
+| `remote stage: refused the worker at HOST:PORT: TLS: NAME (SHA256:...) is not this PC's nor in its peers/ folder` | the main PC (or the relay) does not hold that worker's certificate: copy the worker's `cert.pem` into this PC's `peers/` and start the main process again. If NAME is not your worker, another PC answers at that address |
+| `remote stage: the worker refused: TLS: the peer does not accept this PC's certificate (...)` | copy this PC's `cert.pem` into the worker's `peers/` and start the worker again (it reads `peers/` at start). The worker's log names the certificate it refused |
+| `the peer refused the handshake (...): no TLS 1.3 cipher suite, key exchange or signature algorithm in common, ...` | not a refused certificate: the other side is not this build of the engine (a changed one, or something else on the port). The same build on every PC |
+| `the peer does not speak TLS 1.3 (...)`, or `... in the TLS handshake (a peer without TLS - an older Strata - or one that refused this PC)` | the other side runs a build from before TLS (protocol 5), or something else listens on the port: the same build of the engine on every PC |
+| `this build has no TLS (it was built without OpenSSL 1.1.1 or later)` | build the engine again with OpenSSL's development files (`libssl-dev`); CMake's warning names what it did not find |
+| the shipper or the tuner fails with an SSL error (`CERTIFICATE_VERIFY_FAILED`, `alert unknown ca`, `certificate required`); the agent prints `stage_node: ADDRESS refused: TLS: ...` | the same certificates as for the link, both ways: this PC's `cert.pem` in the node's `peers/`, the node's in this PC's (`--tls-dir`, `"tls_dir"`), and restart the agent after changing its `peers/` |
 | `the main process reads images (--vision): start this worker with --vision too` | add `--vision` to every worker's command, a relay's next worker's too ([Images](#images---vision)) |
 | `remote stage: the two sides differ (protocol ..., first remote layer ..., K/V type ..., model pack ...)` | the same build of the engine on every PC, the same pack, and `--stage-begin` = the previous stage's K (a K/V type there: both PCs run a build from before the K/V element check - the same `--kv` and `--kv-resident` on both, or newer builds) |
 | `remote stage: the two sides differ (K/V type --kv ...)` | the same `--kv` on every PC |

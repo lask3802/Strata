@@ -1,6 +1,7 @@
-"""Tests for the remote-stage node agent (tools/stage_node.py: the file store, the model names, the clocks), the
-shipper's node paths (tools/stage_ship.py) and the tuner's /start body and notes (tools/stage_tune.py): no GPU, no
-network, no engine.
+"""Tests for the remote-stage node agent (tools/stage_node.py: the file store, the model names, the clocks, its
+HTTPS and who it takes), the shipper's node paths (tools/stage_ship.py) and the tuner's /start body and notes
+(tools/stage_tune.py): no GPU, no engine, no network but 127.0.0.1.  The keys are made with the openssl command, as
+`strata --stage-keygen` makes them (the tests that need them are skipped without it).
 
     python -m unittest tools.test_stage_node
 """
@@ -10,14 +11,17 @@ import hashlib
 import io
 import json
 import os
+import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -39,6 +43,48 @@ def on_disk(p: Path) -> int:
         lo = f(str(p), ctypes.byref(hi))
         return (hi.value << 32) | lo
     return os.stat(p).st_blocks * 512
+
+
+OPENSSL = shutil.which("openssl")
+
+
+def make_keys(d: Path, name: str, ca: bool = False) -> Path:
+    """A key folder as `strata --stage-keygen d name` makes it: an Ed25519 key, a self-signed certificate that signs
+    nothing else, an empty peers/.  `ca`: a certificate authority's instead (one that may sign others)."""
+    (d / "peers").mkdir(parents=True, exist_ok=True)
+    # Its own config: the system openssl.cnf adds v3_ca's extensions as well, and a certificate that carries one
+    # twice is one OpenSSL will not take as an issuer.
+    ext = ("basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,digitalSignature\n"
+           "subjectKeyIdentifier=hash\n" if ca else
+           "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n"
+           "extendedKeyUsage=serverAuth,clientAuth\n")
+    (d / "req.cnf").write_text(f"[req]\ndistinguished_name=dn\nx509_extensions=v3\n[dn]\n[v3]\n{ext}")
+    subprocess.run([OPENSSL, "req", "-x509", "-config", str(d / "req.cnf"), "-newkey", "ed25519", "-nodes",
+                    "-days", "36500", "-keyout", str(d / "key.pem"), "-out", str(d / "cert.pem"),
+                    "-subj", f"/O=Strata remote stage/CN={name}"],
+                   check=True, capture_output=True, env=dict(os.environ, MSYS_NO_PATHCONV="1"))
+    return d
+
+
+def make_signed(d: Path, name: str, ca: Path) -> Path:
+    """A key folder whose certificate the CA folder `ca` signed (not self-signed)."""
+    (d / "peers").mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, MSYS_NO_PATHCONV="1")
+    (d / "ext.cnf").write_text("[req]\ndistinguished_name=dn\n[dn]\n"
+                               "[v3]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n"
+                               "extendedKeyUsage=serverAuth,clientAuth\nauthorityKeyIdentifier=keyid\n")
+    subprocess.run([OPENSSL, "req", "-new", "-config", str(d / "ext.cnf"), "-newkey", "ed25519", "-nodes",
+                    "-keyout", str(d / "key.pem"), "-out", str(d / "req.pem"), "-subj", f"/CN={name}"],
+                   check=True, capture_output=True, env=env)
+    subprocess.run([OPENSSL, "x509", "-req", "-in", str(d / "req.pem"), "-CA", str(ca / "cert.pem"),
+                    "-CAkey", str(ca / "key.pem"), "-set_serial", "2", "-days", "365", "-extfile", str(d / "ext.cnf"),
+                    "-extensions", "v3", "-out", str(d / "cert.pem")], check=True, capture_output=True, env=env)
+    return d
+
+
+def trust(d: Path, other: Path) -> None:
+    """d accepts other's certificate."""
+    shutil.copyfile(other / "cert.pem", d / "peers" / f"{other.name}.pem")
 
 
 class StoreTest(unittest.TestCase):
@@ -326,7 +372,7 @@ class ClocksTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as logs, mock.patch.object(sn.subprocess, "Popen", return_value=fake), \
                 mock.patch.object(sn.Workers, "model", return_value={"pack": "p", "native": "n", "ple_gguf": "",
                                                                       "expert_profile": "e"}):
-            self.w.cfg.update({"_token": "t", "log_dir": logs})
+            self.w.cfg.update({"_tls": Path(logs), "log_dir": logs})
             r = self.w.start({"begin": 40, "port": 7899})
         self.assertEqual(r["error"], "the agent is stopping")
         self.assertEqual(killed, [1])
@@ -338,9 +384,10 @@ FAKE_WORKER = """\
 import os, sys, time
 mode = os.environ.get("FAKE_WORKER", "sleep")
 print("fake worker", os.getpid(), flush=True)
+print("keys", os.environ.get("STRATA_STAGE_TLS"), "token", os.environ.get("STRATA_STAGE_TOKEN"), flush=True)
 if mode == "fail":       # ends before it listens
     sys.exit(2)
-print("strata stage worker: listening on 127.0.0.1:7899 (a token is required)", flush=True)
+print("strata stage worker: listening on 127.0.0.1:7899 (TLS 1.3)", flush=True)
 if mode == "exit":       # ends by itself (a stall report, a crash)
     time.sleep(float(os.environ.get("FAKE_LIFE", "0.1")))
     sys.exit(3)
@@ -373,7 +420,7 @@ class SupervisionTest(unittest.TestCase):
 
     def workers(self, **extra):
         w = sn.Workers({"exe": "strata", "bind": "127.0.0.1", "pack": "p", "native": "n", "expert_profile": "e",
-                        "_token": "t", "log_dir": str(self.d), "drop_cache": False, **extra})
+                        "_tls": self.d / "keys", "log_dir": str(self.d), "drop_cache": False, **extra})
         w.say = self.said.append
         return w
 
@@ -412,6 +459,14 @@ class SupervisionTest(unittest.TestCase):
         self.assertEqual((self.d / f"stage-worker-{self.PORT}.prev.log").read_text(), first)
         self.assertNotEqual((self.d / f"stage-worker-{self.PORT}.log").read_text().split("\n")[0],
                             first.split("\n")[0])   # another process
+
+    def test_worker_gets_the_key_folder(self):
+        # the agent's own folder, so the worker accepts the main processes the agent does; an old token is not passed
+        os.environ["FAKE_WORKER"] = "sleep"
+        with mock.patch.dict(os.environ, {"STRATA_STAGE_TOKEN": "old"}):
+            self.assertTrue(self.w.start({"begin": 40, "port": self.PORT})["ok"])
+        log = (self.d / f"stage-worker-{self.PORT}.log").read_text()
+        self.assertIn(f"keys {self.d / 'keys'} token None", log)
 
     def test_backoff_grows_to_its_cap(self):
         self.assertTrue(self.w.start({"begin": 40, "port": self.PORT})["ok"])
@@ -576,7 +631,7 @@ class TunerPiecesTest(unittest.TestCase):
 
     def tuner(self, nodes):
         t = st.Tuner.__new__(st.Tuner)
-        t.nodes = [st.Node(n, "tok") for n in nodes]
+        t.nodes = [st.Node(n, None) for n in nodes]
         t.max_context = 131072
         t.ship_cfg = {"model_dir": "/data/models/q4", "pack_dir": "/data/packs/pk", "profile": "/opt/prof.bin"}
         t.main = mock.Mock(base={"args": ["--native", "/data/models/q4/M-00001-of-00003.gguf"]})
@@ -596,7 +651,7 @@ class TunerPiecesTest(unittest.TestCase):
         self.assertNotIn("model", r)       # not shipped: the node's node.json names the model
         self.assertNotIn("next", r)
         self.assertEqual(r["cache"], 1000)
-        self.assertEqual(t.nodes[0].stage_agent, "http://198.51.100.11:7840")
+        self.assertEqual(t.nodes[0].stage_agent, "https://198.51.100.11:7840")   # (an http:// agent: https://)
 
     def test_notes(self):
         t = self.tuner([{"name": "w", "agent": "http://192.0.2.12:7840", "host": "192.0.2.12"},
@@ -610,8 +665,19 @@ class TunerPiecesTest(unittest.TestCase):
         self.assertIn("not applied", t.node_notes()[0])
 
 
+@unittest.skipIf(OPENSSL is None, "no openssl command to make the keys")
 class ShipTest(unittest.TestCase):
-    """stage_ship's pipeline against an agent in this process on 127.0.0.1 (small pieces, so many are in flight)."""
+    """stage_ship's pipeline against an agent in this process on 127.0.0.1 (small pieces, so many are in flight),
+    over HTTPS with one key at both ends (a PC's own certificate is accepted)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.keydir = tempfile.TemporaryDirectory()
+        cls.keys = make_keys(Path(cls.keydir.name, "pc"), "pc")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.keydir.cleanup()
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -630,7 +696,7 @@ class ShipTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def agent(self, http10=False, idle=600) -> tuple[ss.Agent, set]:
-        cfg = {"_token": "tok", "bind": "127.0.0.1", "data_dir": str(self.dst), "drop_cache": False}
+        cfg = {"_tls": self.keys, "bind": "127.0.0.1", "data_dir": str(self.dst), "drop_cache": False}
         base = sn.make_handler(cfg, sn.Workers(cfg), sn.Store(cfg))
         conns = set()   # the client ends the /puts came from
 
@@ -645,10 +711,10 @@ class ShipTest(unittest.TestCase):
                 conns.add(self.client_address)
                 super().do_POST()
 
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv = sn.TlsServer(("127.0.0.1", 0), H, sn.tls_context(self.keys, True))
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.servers.append(srv)
-        return ss.Agent(f"http://127.0.0.1:{srv.server_address[1]}", "tok"), conns
+        return ss.Agent(f"https://127.0.0.1:{srv.server_address[1]}", sn.tls_context(self.keys, False)), conns
 
     def items(self) -> list[ss.Item]:
         a = self.src / "a.gguf"
@@ -699,10 +765,10 @@ class ShipTest(unittest.TestCase):
         items = self.items()
         def proxies(op):
             return [h.proxies for h in op.handlers if isinstance(h, urllib.request.ProxyHandler)]
-        with mock.patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9",
+        with mock.patch.dict(os.environ, {"https_proxy": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9",
                                           "no_proxy": "", "NO_PROXY": ""}):
-            self.assertIn("http", proxies(urllib.request.build_opener())[0])
-            self.assertFalse(any(proxies(ss.Agent.direct)))   # (an empty ProxyHandler is not even installed)
+            self.assertIn("https", proxies(urllib.request.build_opener())[0])
+            self.assertFalse(any(proxies(agent.direct)))   # (an empty ProxyHandler is not even installed)
             self.assertEqual(ss.ship(agent, items, say=lambda m: None), sum(it.nbytes for it in items))
         self.check(items)
 
@@ -716,9 +782,8 @@ class ShipTest(unittest.TestCase):
     def test_old_shipper(self):
         # urllib, one request a connection, as the shipper before keep-alive put
         agent, _ = self.agent()
-        req = urllib.request.Request(agent.url + "/put?path=data/x.bin&offset=2&total=6", data=b"abcd", method="POST",
-                                     headers={"X-Stage-Token": "tok"})
-        with urllib.request.urlopen(req, timeout=30) as r:
+        req = urllib.request.Request(agent.url + "/put?path=data/x.bin&offset=2&total=6", data=b"abcd", method="POST")
+        with urllib.request.urlopen(req, timeout=30, context=agent.ctx) as r:
             self.assertEqual(json.load(r)["sha256"], hashlib.sha256(b"abcd").hexdigest())
         self.assertEqual((self.dst / "data/x.bin").read_bytes(), b"\0\0abcd")
 
@@ -810,6 +875,215 @@ class ShipTest(unittest.TestCase):
             ss.ship(agent, items, say=lambda m: None, parallel=4)
         self.check(items)
         self.assertGreaterEqual(live[1], 3, "the pieces did not overlap")
+
+
+@unittest.skipIf(OPENSSL is None, "no openssl command to make the keys")
+class AgentTlsTest(unittest.TestCase):
+    """Who the agent takes: a PC whose certificate is its own or in its peers/, over TLS 1.3 - and who a client
+    takes: an agent whose certificate it holds.  Everything else is refused before a request is read, and the agent
+    serves on."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.keydir = tempfile.TemporaryDirectory()
+        k = Path(cls.keydir.name)
+        cls.node, cls.main, cls.stranger = make_keys(k / "node", "node"), make_keys(k / "main", "main"), \
+            make_keys(k / "stranger", "stranger")
+        trust(cls.node, cls.main)
+        trust(cls.main, cls.node)
+        trust(cls.stranger, cls.node)   # it accepts the node; the node does not accept it
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.keydir.cleanup()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        cfg = {"_tls": self.node, "bind": "127.0.0.1", "data_dir": self.tmp.name, "drop_cache": False}
+        self.handler = sn.make_handler(cfg, sn.Workers(cfg), sn.Store(cfg))
+        self.err = io.StringIO()
+        self.quiet = mock.patch.object(sys, "stderr", self.err)
+        self.quiet.start()
+        self.srv = sn.TlsServer(("127.0.0.1", 0), self.handler, sn.tls_context(self.node, True))
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = f"https://127.0.0.1:{self.srv.server_address[1]}"
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.quiet.stop()
+        self.tmp.cleanup()
+
+    def ping(self, ctx: ssl.SSLContext) -> dict:
+        with sn.https_opener(ctx).open(self.url + "/ping", timeout=10) as r:
+            return json.load(r)
+
+    def test_a_host_policy_does_not_reach_it(self):
+        # a PC whose openssl.cnf asks for security level 4 (Ed25519's 128 bits too few): the agent sets the engine's
+        # level itself and still loads its key (Python reads the file as it starts: a process of its own)
+        cnf = Path(self.tmp.name) / "policy.cnf"
+        cnf.write_text("openssl_conf = openssl_init\n[openssl_init]\nssl_conf = ssl_sect\n[ssl_sect]\n"
+                       "system_default = system_default_sect\n[system_default_sect]\nCipherString = DEFAULT@SECLEVEL=4\n")
+        # (first a plain context under the same policy: it must refuse the key, or this Python's new contexts set
+        # their own level - python.org's builds do since 3.10 - and the test would pass without the agent's line)
+        code = "\n".join([
+            "import ssl, sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, sys.argv[1])",
+            "import stage_node as sn",
+            "d = Path(sys.argv[2])",
+            "try:",
+            "    ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(d / 'cert.pem', d / 'key.pem')",
+            "    print('control: loaded')",
+            "except ssl.SSLError:",
+            "    print('control: refused')",
+            "sn.tls_context(d, True)",
+            "sn.tls_context(d, False)",
+            "print('loaded')"])
+        r = subprocess.run([sys.executable, "-c", code, str(ROOT / "tools"), str(self.node)], capture_output=True,
+                           text=True, timeout=60, env={**os.environ, "OPENSSL_CONF": str(cnf)})
+        if "control: loaded" in r.stdout:
+            self.skipTest("this Python's new contexts set their own security level: the host policy reaches none")
+        self.assertEqual((r.returncode, r.stdout.split()), (0, ["control:", "refused", "loaded"]), r.stderr[-400:])
+
+    def test_a_peer_is_served_and_named(self):
+        self.assertEqual(self.ping(sn.tls_context(self.main, False)), {"ok": True})
+        self.assertRegex(self.err.getvalue(), r"127\.0\.0\.1 main \(SHA256:[0-9a-f]{16}\) \"GET /ping")
+
+    def test_an_unknown_main_is_refused(self):
+        with self.assertRaises((ssl.SSLError, urllib.error.URLError, ConnectionError)):
+            self.ping(sn.tls_context(self.stranger, False))
+        self.assertIn("refused: TLS", self.err.getvalue())
+        self.assertEqual(self.ping(sn.tls_context(self.main, False)), {"ok": True})   # and it serves on
+
+    def test_no_certificate_is_refused(self):
+        bare = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        bare.check_hostname = False
+        bare.verify_mode = ssl.CERT_NONE
+        with self.assertRaises((ssl.SSLError, urllib.error.URLError, ConnectionError)):
+            self.ping(bare)
+        self.assertEqual(self.ping(sn.tls_context(self.main, False)), {"ok": True})
+
+    def test_plain_http_gets_nothing(self):
+        with self.assertRaises((urllib.error.URLError, ConnectionError, OSError)):
+            urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                "http://" + self.url[len("https://"):] + "/ping", timeout=10)
+        self.assertEqual(self.ping(sn.tls_context(self.main, False)), {"ok": True})
+
+    def test_a_client_sends_nothing_in_the_clear(self):
+        # an http:// address in any case is the agent's https:// one, and the opener has no handler for http at all
+        url = "HTTP://" + self.url[len("https://"):]
+        self.assertEqual(sn.agent_url(url), self.url)
+        with self.assertRaisesRegex(urllib.error.URLError, "unknown url type: http"):
+            sn.https_opener(sn.tls_context(self.main, False)).open(url + "/ping", timeout=10)
+
+    def test_a_context_without_pins_takes_no_agent(self):
+        ctx = sn.tls_context(self.main, False)
+        del ctx.pinned   # a PinnedContext not made by tls_context: no peer, rather than any its anchors pass
+        with self.assertRaisesRegex((ssl.SSLError, urllib.error.URLError), "no pinned certificates"):
+            self.ping(ctx)
+
+    def test_a_client_refuses_an_unknown_agent(self):
+        # a PC whose folder does not hold the node's certificate refuses the node (the handshake ends there)
+        lone = make_keys(Path(self.tmp.name, "lone"), "lone")
+        with self.assertRaises((ssl.SSLCertVerificationError, urllib.error.URLError)) as e:
+            self.ping(sn.tls_context(lone, False))
+        self.assertIn("certificate verify failed", str(e.exception))
+
+    def test_pinned_not_what_an_accepted_certificate_signed(self):
+        # a CA's certificate in peers/ accepts that PC, not a certificate it signed: on the agent's side, and on a
+        # client's
+        t = Path(self.tmp.name)
+        ca = make_keys(t / "ca", "ca", ca=True)
+        leaf = make_signed(t / "leaf", "signed-by-ca", ca)
+        node2, main2 = t / "node2", t / "main2"
+        shutil.copytree(self.node, node2)
+        shutil.copytree(self.main, main2)
+        trust(node2, ca)    # the agent holds the CA's certificate
+        trust(main2, ca)    # so does a client
+        for d in (ca, leaf):
+            trust(d, self.node)
+        trust(leaf, self.main)
+
+        def serve(folder: Path):
+            srv = sn.TlsServer(("127.0.0.1", 0), self.handler, sn.tls_context(folder, True))
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            return srv, f"https://127.0.0.1:{srv.server_address[1]}/ping"
+
+        srv, url = serve(node2)
+        try:
+            with sn.https_opener(sn.tls_context(ca, False)).open(url, timeout=10) as r:
+                self.assertEqual(json.load(r), {"ok": True})   # the CA's own certificate: in peers/
+            with self.assertRaises((ssl.SSLError, urllib.error.URLError, ConnectionError)):
+                sn.https_opener(sn.tls_context(leaf, False)).open(url, timeout=10).read()
+            self.assertRegex(self.err.getvalue(), r"refused: TLS: signed-by-ca \(SHA256:[0-9a-f]{16}\) is not this PC's")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        srv, url = serve(leaf)   # an agent whose certificate the CA signed, a client that holds the CA's
+        try:
+            with self.assertRaises((ssl.SSLError, urllib.error.URLError)) as e:
+                sn.https_opener(sn.tls_context(main2, False)).open(url, timeout=10)
+            self.assertIn("not one of them", str(e.exception))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_peer_names_make_no_log_lines(self):
+        class Fake:
+            def __init__(self, cn):
+                self.cn = cn
+
+            def getpeercert(self, binary_form=False):
+                if binary_form:
+                    return b"der"
+                return {"subject": ((("commonName", self.cn),),) if self.cn is not None else ()}
+
+        self.assertEqual(sn.peer_name(Fake("pc-a")), f"pc-a (SHA256:{hashlib.sha256(b'der').hexdigest()[:16]})")
+        self.assertTrue(sn.peer_name(Fake("x\nstrata stage worker: listening on 1.2.3.4:1\r")).startswith(
+            "x?strata stage worker: listening on 1.2.3.4:1? (SHA256:"))
+        self.assertEqual(len(sn.peer_name(Fake("y" * 300)).split(" ")[0]), 64)
+        self.assertTrue(sn.peer_name(Fake("pc-é")).startswith("pc-?? (SHA256:"))   # (per UTF-8 byte, as the engine)
+        self.assertTrue(sn.peer_name(Fake(None)).startswith("(no name) (SHA256:"))   # (no name: the engine's words)
+
+        class NoCert:
+            def getpeercert(self, binary_form=False):
+                return None if binary_form else {}
+
+        self.assertEqual(sn.peer_name(NoCert()), "")   # (authorized() then answers 403)
+        self.assertTrue(sn.tls_context(self.main, False).verify_flags & sn.NO_CHECK_TIME)
+
+    def test_a_silent_peer_does_not_hold_the_agent(self):
+        with mock.patch.object(sn, "HANDSHAKE_TIMEOUT_S", 0.5):
+            s = socket.create_connection(self.srv.server_address, timeout=5)
+            try:
+                t0 = time.time()
+                self.assertEqual(self.ping(sn.tls_context(self.main, False)), {"ok": True})   # served meanwhile
+                self.assertEqual(s.recv(1), b"")   # closed at its handshake's time
+                self.assertLess(time.time() - t0, 4)
+            finally:
+                s.close()
+
+    def test_key_folder(self):
+        with mock.patch.dict(os.environ, {"STRATA_STAGE_TLS": ""}):
+            with self.assertRaisesRegex(SystemExit, "stage-keygen"):
+                sn.tls_dir(None, "t")
+            self.assertEqual(sn.tls_dir(str(self.node), "t"), self.node.resolve())
+        with mock.patch.dict(os.environ, {"STRATA_STAGE_TLS": str(self.main)}):
+            self.assertEqual(sn.tls_dir(str(self.node), "t"), self.main.resolve())   # the environment wins
+        notes = self.node / "peers" / "README.txt"
+        notes.write_text("not a certificate")
+        try:
+            self.assertEqual(sn.accepted_certs(self.node).count("BEGIN CERTIFICATE"), 2)   # own + main; not read
+        finally:
+            notes.unlink()
+        self.assertEqual(sn.agent_url("http://192.0.2.1:7840/"), "https://192.0.2.1:7840")
+        self.assertEqual(sn.agent_url("https://192.0.2.1:7840"), "https://192.0.2.1:7840")
+        self.assertEqual(sn.agent_url("Http://192.0.2.1:7840"), "https://192.0.2.1:7840")
+        bad = make_keys(Path(self.tmp.name, "bad"), "bad")
+        (bad / "peers" / "x.pem").write_text("not a certificate")
+        with self.assertRaisesRegex(ValueError, r"no certificate in .*x\.pem"):
+            sn.tls_context(bad, True)
 
 
 class NodePathsTest(unittest.TestCase):

@@ -404,11 +404,21 @@ bool send_all(sock_t fd, const void* p, size_t n, std::string& err) {
     return true;
 }
 
-bool recv_all(sock_t fd, void* p, size_t n, std::string& err) {
-    char* c = (char*) p;
-    while (n > 0) {
-        const int k = (int) std::min<size_t>(n, (size_t) 1 << 30);
-        const long long r = ::recv(fd, c, k, 0);
+// ---- the messages travel as TLS records (stage_tls.hpp): a message is sealed a piece at a time and each piece sent
+// as soon as it is sealed, so the wire carries a message's first piece while the next one is sealed and the reader
+// opens the records as they come; a window's rows and a prompt chunk's take the same path
+// A message goes out in pieces, each sealed and then sent: small ones first, so that the peer opens the first while
+// the rest is sealed (a window's rows fit in them), then bigger ones, a quarter of the sends for a prompt chunk's rows.
+constexpr size_t kPiece = (size_t) 64 << 10;         // plain bytes per send, for a message's first kSmallBytes
+constexpr size_t kBigPiece = (size_t) 256 << 10;     // and after them
+constexpr size_t kSmallBytes = (size_t) 512 << 10;
+constexpr size_t kRecvBytes = (size_t) 256 << 10;    // a read's most (a buffer per receiving end)
+
+// what the socket has, at most a buffer (a blocking read, as without TLS: SO_RCVTIMEO), fed to the session
+bool recv_some(sock_t fd, TlsSession& tls, std::vector<char>& rx, std::string& err) {
+    if (rx.size() < kRecvBytes) rx.resize(kRecvBytes);
+    for (;;) {
+        const long long r = ::recv(fd, rx.data(), (int) rx.size(), 0);
         if (r == 0) { err = "remote stage: the peer closed the connection"; return false; }
         if (r < 0) {
             const int e = sock_errno();
@@ -416,28 +426,77 @@ bool recv_all(sock_t fd, void* p, size_t n, std::string& err) {
             err = std::string("remote stage: receive failed: ") + (sock_timedout(e) ? std::string("timed out") : sock_errstr(e));
             return false;
         }
-        c += r;
-        n -= (size_t) r;
+        tls.feed(rx.data(), (size_t) r);
+        return true;
+    }
+}
+
+// `n` bytes the peer sent: what the session holds, then what the socket brings.  `more` (optional) waits for the
+// socket first - a deadline, a stop flag - and returns false with the reason.
+bool recv_all(sock_t fd, TlsSession& tls, std::vector<char>& rx, void* p, size_t n, std::string& err,
+              const std::function<bool(std::string&)>& more = {}) {
+    char* c = (char*) p;
+    while (n > 0) {
+        const long long got = tls.open(c, n, err);
+        if (got > 0) {
+            c += got;
+            n -= (size_t) got;
+            continue;
+        }
+        if (got == -2) { err = "remote stage: the peer closed the connection (" + err + ")"; return false; }
+        if (got < 0) { err = "remote stage: receive failed: " + err; return false; }
+        if ((more && !more(err)) || !recv_some(fd, tls, rx, err)) return false;
     }
     return true;
 }
 
+// One message going out: its parts sealed in turn (put), each piece sent once it is sealed, the rest at end().  A
+// message whose rows go in the link's format (send_rows) is one of these too, its header and rows one run of records.
+class Sealer {
+public:
+    Sealer(sock_t fd, TlsSession& tls, std::vector<char>& tx) : fd_(fd), tls_(tls), tx_(tx) { tx_.clear(); }
+    bool put(const void* p, size_t n, std::string& err) {
+        const char* c = (const char*) p;
+        while (n > 0) {
+            const size_t piece = sealed_ < kSmallBytes ? kPiece : kBigPiece;
+            const size_t k = std::min(n, piece);
+            if (!tls_.seal(c, k, tx_, err)) { err = "remote stage: send failed: " + err; return false; }
+            c += k;
+            n -= k;
+            sealed_ += k;
+            if (tx_.size() >= piece) {
+                if (!send_all(fd_, tx_.data(), tx_.size(), err)) return false;
+                tx_.clear();
+            }
+        }
+        return true;
+    }
+    bool end(std::string& err) { return tx_.empty() || send_all(fd_, tx_.data(), tx_.size(), err); }
+
+private:
+    sock_t fd_;
+    TlsSession& tls_;
+    std::vector<char>& tx_;
+    size_t sealed_ = 0;
+};
+
 // header + up to two payload parts, as one logical message
-bool send_msg(sock_t fd, const StageHeader& h, const void* p1, size_t n1, const void* p2, size_t n2, std::string& err) {
-    return send_all(fd, &h, sizeof h, err) && (n1 == 0 || send_all(fd, p1, n1, err)) &&
-           (n2 == 0 || send_all(fd, p2, n2, err));
+bool send_msg(sock_t fd, TlsSession& tls, std::vector<char>& tx, const StageHeader& h, const void* p1, size_t n1,
+              const void* p2, size_t n2, std::string& err) {
+    Sealer out(fd, tls, tx);
+    return out.put(&h, sizeof h, err) && out.put(p1, n1, err) && out.put(p2, n2, err) && out.end(err);
 }
 
-// A message's rows in format f (rows x width floats at the engine's side), sent or read a slice at a time: no buffer
+// A message's rows in format f (rows x width floats at the engine's side), sealed or read a slice at a time: no buffer
 // of a whole chunk's rows (a 5888-token chunk's bf16 rows are 120 MB), and each slice's conversion overlaps the socket
 // moving the last one.  fp32 goes as it is, in one call, as before row formats.  conv_ms: the conversions' time.
 constexpr size_t kSliceFloats = (size_t) 1 << 18;   // 256K values a slice (512 KiB of bf16)
 
 size_t slice_rows(size_t width) { return std::max<size_t>(1, kSliceFloats / std::max<size_t>(width, 1)); }
 
-bool send_rows(sock_t fd, StageRows f, const float* src, size_t rows, size_t width, std::vector<unsigned char>& buf,
+bool send_rows(Sealer& out, StageRows f, const float* src, size_t rows, size_t width, std::vector<unsigned char>& buf,
                double& conv_ms, std::string& err) {
-    if (f == StageRows::F32) return rows * width == 0 || send_all(fd, src, rows * width * sizeof(float), err);
+    if (f == StageRows::F32) return out.put(src, rows * width * sizeof(float), err);
     const size_t step = slice_rows(width);
     buf.resize(stage_rows_bytes(f, std::min(rows, step), width));
     for (size_t r = 0; r < rows; r += step) {
@@ -445,19 +504,19 @@ bool send_rows(sock_t fd, StageRows f, const float* src, size_t rows, size_t wid
         const Clock::time_point t = Clock::now();
         stage_rows_encode(f, src + r * width, k, width, buf.data());
         conv_ms += ms_since(t);
-        if (!send_all(fd, buf.data(), stage_rows_bytes(f, k, width), err)) return false;
+        if (!out.put(buf.data(), stage_rows_bytes(f, k, width), err)) return false;
     }
     return true;
 }
 
-bool recv_rows(sock_t fd, StageRows f, float* dst, size_t rows, size_t width, std::vector<unsigned char>& buf,
-               double& conv_ms, std::string& err) {
-    if (f == StageRows::F32) return rows * width == 0 || recv_all(fd, dst, rows * width * sizeof(float), err);
+bool recv_rows(sock_t fd, TlsSession& tls, std::vector<char>& rx, StageRows f, float* dst, size_t rows, size_t width,
+               std::vector<unsigned char>& buf, double& conv_ms, std::string& err) {
+    if (f == StageRows::F32) return rows * width == 0 || recv_all(fd, tls, rx, dst, rows * width * sizeof(float), err);
     const size_t step = slice_rows(width);
     buf.resize(stage_rows_bytes(f, std::min(rows, step), width));
     for (size_t r = 0; r < rows; r += step) {
         const size_t k = std::min(step, rows - r);
-        if (!recv_all(fd, buf.data(), stage_rows_bytes(f, k, width), err)) return false;
+        if (!recv_all(fd, tls, rx, buf.data(), stage_rows_bytes(f, k, width), err)) return false;
         const Clock::time_point t = Clock::now();
         stage_rows_decode(f, buf.data(), k, width, dst + r * width);
         conv_ms += ms_since(t);
@@ -465,20 +524,71 @@ bool recv_rows(sock_t fd, StageRows f, float* dst, size_t rows, size_t width, st
     return true;
 }
 
-bool recv_header(sock_t fd, StageHeader& h, std::string& err) {
-    if (!recv_all(fd, &h, sizeof h, err)) return false;
+bool recv_header(sock_t fd, TlsSession& tls, std::vector<char>& rx, StageHeader& h, std::string& err) {
+    if (!recv_all(fd, tls, rx, &h, sizeof h, err)) return false;
     if (h.magic != kStageMagic) { err = "remote stage: bad message magic (not a Strata stage peer?)"; return false; }
     return true;
 }
 
-bool drain(sock_t fd, uint64_t n, std::string& err) {
+bool drain(sock_t fd, TlsSession& tls, std::vector<char>& rx, uint64_t n, std::string& err) {
     char tmp[65536];
     while (n > 0) {
         const size_t k = (size_t) std::min<uint64_t>(n, sizeof tmp);
-        if (!recv_all(fd, tmp, k, err)) return false;
+        if (!recv_all(fd, tls, rx, tmp, k, err)) return false;
         n -= k;
     }
     return true;
+}
+
+// The TLS handshake on a connected socket.  `more` waits for the socket before each read (a deadline, a stop flag);
+// without it the reads block as the socket's timeout lets them.  What the session writes goes out, a failure's alert
+// too (the peer learns why).  `refused`: the handshake itself failed (a certificate either end does not accept, a
+// peer that does not speak TLS 1.3), not the socket.
+bool tls_handshake(sock_t fd, TlsSession& tls, std::vector<char>& rx, const std::function<bool(std::string&)>& more,
+                   bool& refused, std::string& err) {
+    refused = false;
+    std::vector<char> out;
+    for (;;) {
+        out.clear();
+        const TlsSession::Step s = tls.handshake(out, err);
+        std::string se;
+        if (!out.empty() && !send_all(fd, out.data(), out.size(), se) && s != TlsSession::Step::Failed) {
+            err = se;
+            return false;
+        }
+        if (s == TlsSession::Step::Done) return true;
+        if (s == TlsSession::Step::Failed) {
+            refused = true;
+            return false;
+        }
+        if ((more && !more(err)) || !recv_some(fd, tls, rx, err)) {
+            if (err == "remote stage: the peer closed the connection")
+                err += " in the TLS handshake (a peer without TLS - an older Strata - or one that refused this PC)";
+            return false;
+        }
+    }
+}
+
+// a refused peer's end: what was sent to it (an alert, an error) is left to arrive before the connection closes - a
+// close with its bytes unread would reset it, and a reset can throw away what the peer has not read yet.  At most a
+// second, or until it closes; the caller still closes the socket.
+void close_after_refusal(sock_t fd, const std::atomic<bool>* drop) {
+#if defined(_WIN32)
+    (void) ::shutdown(fd, SD_SEND);
+#else
+    (void) ::shutdown(fd, SHUT_WR);
+#endif
+    const Clock::time_point t0 = Clock::now();
+    char tmp[4096];
+    while (ms_since(t0) < 1000.0 && (drop == nullptr || !drop->load())) {
+        poll_fd p{};
+        p.fd = fd;
+        p.events = POLLIN;
+        const int r = sock_poll(&p, 1, 50);
+        if (r < 0 && !sock_eintr(sock_errno())) break;
+        if (r <= 0) continue;
+        if (::recv(fd, tmp, (int) sizeof tmp, 0) <= 0) break;
+    }
 }
 
 // ---- StageClient::connect with a deadline or a stop flag: the connect and the hello's reply are looked at every
@@ -562,28 +672,6 @@ bool wait_readable(sock_t s, Clock::time_point deadline, const std::atomic<bool>
     }
 }
 
-// recv_all within the same deadline and stop flag: each part is waited for, then read as far as it is there (a recv
-// on a readable socket does not block), so a peer that sends part of its reply and then nothing is given up at the
-// deadline as one that sends nothing is
-bool recv_within(sock_t s, void* p, size_t n, Clock::time_point deadline, const std::atomic<bool>* stop,
-                 std::string& err) {
-    char* c = (char*) p;
-    while (n > 0) {
-        if (!wait_readable(s, deadline, stop, err)) return false;
-        const long long r = ::recv(s, c, (int) std::min<size_t>(n, (size_t) 1 << 30), 0);
-        if (r == 0) { err = "remote stage: the peer closed the connection"; return false; }
-        if (r < 0) {
-            const int e = sock_errno();
-            if (sock_eintr(e)) continue;
-            err = std::string("remote stage: receive failed: ") + (sock_timedout(e) ? std::string("timed out") : sock_errstr(e));
-            return false;
-        }
-        c += r;
-        n -= (size_t) r;
-    }
-    return true;
-}
-
 // the longest error text a peer's Error message is read for: a worker's errors are sentences; a longer one is not
 // read (its size is not allocated) - the link is out of step, or the peer is not a Strata stage worker
 constexpr uint64_t kMaxErrorBytes = 65536;
@@ -651,6 +739,7 @@ void StageClient::close() {
     if (fd_ >= 0) (void) sock_close(S(fd_));
     fd_ = -1;
     broken_ = false;
+    tls_.reset();
 }
 
 void StageClient::break_() {
@@ -670,6 +759,10 @@ bool StageClient::connect(const std::string& host_port, const StageHello& mine, 
     // polls below, so a stop flag that is already set is looked at here: a caller trying again every few seconds
     // stops at its next try instead of spinning through tries until its time is up)
     if (stop != nullptr && stop->load()) { err = kCancelled; return false; }
+    if (cred_ == nullptr) {
+        err = "remote stage: no TLS credentials for the link (STRATA_STAGE_TLS; docs/REMOTE_STAGE.md)";
+        return false;
+    }
     if (!net_init()) { err = "remote stage: the sockets did not start (WSAStartup)"; return false; }
     const size_t colon = host_port.rfind(':');
     if (colon == std::string::npos || colon == 0 || colon + 1 >= host_port.size()) {
@@ -714,19 +807,36 @@ bool StageClient::connect(const std::string& host_port, const StageHello& mine, 
         std::lock_guard<std::mutex> lq(q_mu_);
         sent_at_.clear();   // (a connection before this one: no chunk of it is outstanding here)
     }
+    // (the handshake's and the reply's reads wait while the worker serves another main process: a take-over waits for
+    // its idle time.)  With a stop flag but no deadline they are polled too, within STRATA_REMOTE_TIMEOUT_S as the
+    // blocking read would be.  The whole reply is read within it, not only its first byte.
+    const bool polled = timed || stop != nullptr;
+    const Clock::time_point reply_by = timed ? deadline : Clock::now() + std::chrono::seconds(io_timeout_s());
+    std::function<bool(std::string&)> more;
+    if (polled) more = [&](std::string& e) { return wait_readable(S(fd_), reply_by, stop, e); };
+    tls_ = std::make_unique<TlsSession>(cred_, true);
+    bool refused = false;
+    if (!tls_handshake(S(fd_), *tls_, tls_rx_, more, refused, err)) {
+        // the worker's certificate is not one this PC accepts, or the peer does not speak TLS: not a lost link
+        if (refused) err = "remote stage: refused the worker at " + host_port + ": " + err;
+        close();
+        return false;
+    }
+    auto take = [&](void* p, size_t n, std::string& e) {
+        if (recv_all(S(fd_), *tls_, tls_rx_, p, n, e, more)) return true;
+        // TLS 1.3 ends the client's handshake before the worker has checked its certificate: a worker that refuses it
+        // says so in the first records that come back (an alert), and that is a refusal, not a lost link.  Any other
+        // TLS failure there (a record that does not open) stays a lost link, tried again as one
+        const std::string bad = "remote stage: receive failed: TLS: ";
+        if (e.rfind(bad, 0) == 0 && e.find("alert ", bad.size()) != std::string::npos)
+            e = "remote stage: the worker refused: TLS: " + e.substr(bad.size());
+        return false;
+    };
     StageHeader h;
     h.type = (uint32_t) StageMsg::Hello;
     h.bytes = sizeof mine;
     StageHeader r;
-    // (the reply waits while the worker serves another main process: a take-over waits for its idle time.)  With a
-    // stop flag but no deadline the reply is polled too, within STRATA_REMOTE_TIMEOUT_S as the blocking read would be.
-    // The whole reply is read within it, not only its first byte.
-    const bool polled = timed || stop != nullptr;
-    const Clock::time_point reply_by = timed ? deadline : Clock::now() + std::chrono::seconds(io_timeout_s());
-    auto take = [&](void* p, size_t n, std::string& e) {
-        return polled ? recv_within(S(fd_), p, n, reply_by, stop, e) : recv_all(S(fd_), p, n, e);
-    };
-    if (!send_msg(S(fd_), h, &mine, sizeof mine, nullptr, 0, err) || !take(&r, sizeof r, err)) {
+    if (!send_msg(S(fd_), *tls_, tls_tx_, h, &mine, sizeof mine, nullptr, 0, err) || !take(&r, sizeof r, err)) {
         close();
         return false;
     }
@@ -768,6 +878,11 @@ bool StageClient::alive(std::string& err) {
     std::lock_guard<std::mutex> lr(recv_mu_);
     if (broken_) { err = "remote stage: the link failed earlier"; return false; }
     if (fd_ < 0) { err = "remote stage: not connected"; return false; }
+    if (tls_->buffered()) {   // (records already read: as the socket's bytes below would be)
+        err = "remote stage: receive failed: data no message asked for (the link is out of step)";
+        break_();
+        return false;
+    }
     for (;;) {
         poll_fd pfd{};
         pfd.fd = S(fd_);
@@ -804,7 +919,7 @@ bool StageClient::read_reply_(StageMsg want, void* reply, size_t reply_bytes, in
                               size_t rows, size_t width, double* conv_ms) {
     StageHeader r;
     if (broken_) { err = "remote stage: the link failed earlier"; return false; }
-    if (!recv_header(S(fd_), r, err)) { break_(); return false; }
+    if (!recv_header(S(fd_), *tls_, tls_rx_, r, err)) { break_(); return false; }
     if (r.type == (uint32_t) StageMsg::Error && r.bytes > kMaxErrorBytes) {
         err = "remote stage: receive failed: an error reply of " + std::to_string(r.bytes) +
               " bytes (the link is out of step)";
@@ -814,7 +929,7 @@ bool StageClient::read_reply_(StageMsg want, void* reply, size_t reply_bytes, in
     if (r.type == (uint32_t) StageMsg::Error) {
         std::string m((size_t) r.bytes, '\0');
         std::string e2;
-        (void) recv_all(S(fd_), m.data(), m.size(), e2);
+        (void) recv_all(S(fd_), *tls_, tls_rx_, m.data(), m.size(), e2);
         err = "remote stage (worker): " + m;
         return false;
     }
@@ -827,8 +942,8 @@ bool StageClient::read_reply_(StageMsg want, void* reply, size_t reply_bytes, in
         return false;
     }
     double conv = 0;
-    if (rows > 0 ? !recv_rows(S(fd_), rows_, (float*) reply, rows, width, rx_, conv, err)
-                 : reply_bytes > 0 && !recv_all(S(fd_), reply, reply_bytes, err)) {
+    if (rows > 0 ? !recv_rows(S(fd_), *tls_, tls_rx_, rows_, (float*) reply, rows, width, rx_, conv, err)
+                 : reply_bytes > 0 && !recv_all(S(fd_), *tls_, tls_rx_, reply, reply_bytes, err)) {
         break_();
         return false;
     }
@@ -858,9 +973,10 @@ bool StageClient::run(int T, const int32_t* tokens, int64_t pos0, const float* r
     h.a = T;
     h.b = pos0;
     h.bytes = (uint64_t) T * sizeof(int32_t) + in_bytes;
-    if (f32 ? !send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int32_t), rows_in, in_bytes, err)
-            : !send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int32_t), nullptr, 0, err) ||
-                  !send_rows(S(fd_), rows_, rows_in, (size_t) T, w_in, tx_, stats_.ms_encode, err)) {
+    Sealer out(S(fd_), *tls_, tls_tx_);
+    if (!out.put(&h, sizeof h, err) || !out.put(tokens, (size_t) T * sizeof(int32_t), err) ||
+        !(f32 ? out.put(rows_in, in_bytes, err) : send_rows(out, rows_, rows_in, (size_t) T, w_in, tx_, stats_.ms_encode, err)) ||
+        !out.end(err)) {
         break_();
         return false;
     }
@@ -888,7 +1004,7 @@ bool StageClient::commit(int n_keep, std::string& err) {
     StageHeader h;
     h.type = (uint32_t) StageMsg::Commit;
     h.a = n_keep;
-    if (!send_msg(S(fd_), h, nullptr, 0, nullptr, 0, err)) { break_(); return false; }
+    if (!send_msg(S(fd_), *tls_, tls_tx_, h, nullptr, 0, nullptr, 0, err)) { break_(); return false; }
     stats_.bytes_out += sizeof h;
     ++stats_.commits;
     return true;
@@ -915,9 +1031,10 @@ bool StageClient::prefill_send(const int64_t* tokens, int64_t T, int64_t pos0, i
         sent_at_.push_back(Sent{Clock::now(), seq, 0});
     }
     double encode_ms = 0;
-    if (f32 ? !send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int64_t), rows_in, in_bytes, err)
-            : !send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int64_t), nullptr, 0, err) ||
-                  !send_rows(S(fd_), rows_, rows_in, (size_t) T, row_floats, tx_, encode_ms, err)) {
+    Sealer out(S(fd_), *tls_, tls_tx_);
+    if (!out.put(&h, sizeof h, err) || !out.put(tokens, (size_t) T * sizeof(int64_t), err) ||
+        !(f32 ? out.put(rows_in, in_bytes, err) : send_rows(out, rows_, rows_in, (size_t) T, row_floats, tx_, encode_ms, err)) ||
+        !out.end(err)) {
         break_();
         return false;
     }
@@ -977,7 +1094,7 @@ bool StageClient::keep_call_(StageMsg type, StageMsg want, int64_t a, int64_t b,
     h.a = a;
     h.b = b;
     h.bytes = keep.size() * sizeof(int64_t);   // (a Reset that keeps nothing is the header alone, as before checkpoints)
-    if (!send_msg(S(fd_), h, keep.data(), (size_t) h.bytes, nullptr, 0, err)) { break_(); return false; }
+    if (!send_msg(S(fd_), *tls_, tls_tx_, h, keep.data(), (size_t) h.bytes, nullptr, 0, err)) { break_(); return false; }
     // a Reset is counted as before checkpoints (in `resets`, not in bytes_out); the checkpoint messages' bytes are
     if (type == StageMsg::Reset) ++stats_.resets;
     else stats_.bytes_out += sizeof h + h.bytes;
@@ -1016,7 +1133,7 @@ bool StageClient::positions(const int32_t* table, int64_t cells, std::string& er
     h.b = table != nullptr ? 0 : 1;
     h.bytes = table != nullptr ? (uint64_t) cells * 3 * sizeof(int32_t) : 0;
     if (table != nullptr && cells < 1) { err = "remote stage: an empty position table"; return false; }
-    if (!send_msg(S(fd_), h, table, (size_t) h.bytes, nullptr, 0, err)) { break_(); return false; }
+    if (!send_msg(S(fd_), *tls_, tls_tx_, h, table, (size_t) h.bytes, nullptr, 0, err)) { break_(); return false; }
     stats_.bytes_out += sizeof h + h.bytes;
     return true;
 }
@@ -1038,15 +1155,42 @@ struct Inbox {
     std::string bad;            ///< the message was malformed: reply this error
     bool closed = false;        ///< the connection ended (err says why)
     std::string err;
+    std::string tls;            ///< a hello read: the main process's certificate, the TLS version and cipher
 };
 
-// A main process's connection: tuned, its hello due within 10 s (a silent peer does not hold the worker; after the
-// hello there is no read timeout - the main process may wait for its next prompt for hours), logged.
-sock_t accept_main(sock_t lfd, std::string& host) {
+// A main process's connection: its socket and its TLS session.  The serving thread and a chunk's replying thread send
+// one after the other (tx_mu keeps one message going out at a time, its records in order); the receiving thread alone
+// reads (rx).
+struct Peer {
+    sock_t fd = kNoSock;
+    std::unique_ptr<TlsSession> tls;
+    std::mutex tx_mu;
+    std::vector<char> tx, rx;
+    ~Peer() {
+        if (fd != kNoSock) (void) sock_close(fd);
+    }
+};
+
+bool send_msg(Peer& p, const StageHeader& h, const void* p1, size_t n1, const void* p2, size_t n2, std::string& err) {
+    std::lock_guard<std::mutex> lk(p.tx_mu);
+    return send_msg(p.fd, *p.tls, p.tx, h, p1, n1, p2, n2, err);
+}
+
+// the header, then `rows` rows of `width` floats in format f (send_rows), as one message
+bool send_rows_msg(Peer& p, const StageHeader& h, StageRows f, const float* src, size_t rows, size_t width,
+                   std::vector<unsigned char>& buf, double& conv_ms, std::string& err) {
+    std::lock_guard<std::mutex> lk(p.tx_mu);
+    Sealer out(p.fd, *p.tls, p.tx);
+    return out.put(&h, sizeof h, err) && send_rows(out, f, src, rows, width, buf, conv_ms, err) && out.end(err);
+}
+
+// A main process's connection: tuned, its handshake and hello due within 10 s (a silent peer does not hold the worker;
+// after the hello there is no read timeout - the main process may wait for its next prompt for hours), logged.
+std::unique_ptr<Peer> accept_main(sock_t lfd, const std::shared_ptr<TlsCredentials>& cred, std::string& host) {
     sockaddr_storage peer{};
     sock_len plen = sizeof peer;
     const sock_t fd = ::accept(lfd, (sockaddr*) &peer, &plen);
-    if (fd == kNoSock) return fd;
+    if (fd == kNoSock) return nullptr;
     char name[128] = "?";
     (void) getnameinfo((sockaddr*) &peer, plen, name, sizeof name, nullptr, 0, NI_NUMERICHOST);
     host = name;
@@ -1054,49 +1198,46 @@ sock_t accept_main(sock_t lfd, std::string& host) {
     set_timeout(fd, SO_RCVTIMEO, 10);
     std::fprintf(stderr, "strata stage worker: connection from %s\n", name);
     std::fflush(stderr);
-    return fd;
+    auto p = std::make_unique<Peer>();
+    p->fd = fd;
+    p->tls = std::make_unique<TlsSession>(cred, false);
+    return p;
 }
 
-// The first message of a connection (one that arrived while another one is served, or the one served now): a hello
-// read whole (its read timeout lifted), else `bad` or `closed`.  Nothing else is read: such a connection is refused
-// and closed.  Every read is polled, within the hello's 10 s in all, so `drop` ends it at once (shutting a socket
-// down does not wake a recv blocked on it on Windows) - also when the peer sent part of a hello, or sends it a byte
-// at a time.
-Inbox read_hello(sock_t fd, const std::atomic<bool>& drop) {
+// The first message of a connection (one that arrived while another one is served, or the one served now): the TLS
+// handshake (its certificate must be one this PC accepts), then a hello read whole (its read timeout lifted), else
+// `bad` or `closed`.  Nothing else is read: such a connection is refused and closed.  Every read is polled, within
+// the hello's 10 s in all (the handshake's included), so `drop` ends it at once (shutting a socket down does not wake
+// a recv blocked on it on Windows) - also when the peer sent part of a hello, or sends it a byte at a time.
+Inbox read_hello(Peer& p, const std::atomic<bool>& drop) {
     Inbox in;
     const Clock::time_point t0 = Clock::now();
-    auto take = [&](void* p, size_t n) -> bool {
-        char* c = (char*) p;
-        while (n > 0) {
-            bool ready = false;
-            while (!ready) {
-                if (drop.load()) return false;
-                if (ms_since(t0) >= 10000.0) { in.err = "remote stage: receive failed: timed out"; return false; }
-                poll_fd pfd{};
-                pfd.fd = fd;
-                pfd.events = POLLIN;
-                const int pr = sock_poll(&pfd, 1, 50);
-                if (pr < 0) {
-                    const int e = sock_errno();
-                    if (sock_eintr(e)) continue;
-                    in.err = "remote stage: receive failed: " + sock_errstr(e);
-                    return false;
-                }
-                ready = pr > 0;
-            }
-            const long long r = ::recv(fd, c, (int) n, 0);   // (what is there: it does not block)
-            if (r == 0) { in.err = "remote stage: the peer closed the connection"; return false; }
-            if (r < 0) {
-                const int e = sock_errno();
-                if (sock_eintr(e)) continue;
-                in.err = "remote stage: receive failed: " + sock_errstr(e);
+    // until the socket has something (the read after it does not block); false with the reason (none for `drop`)
+    auto more = [&](std::string& e) -> bool {
+        for (;;) {
+            if (drop.load()) { e.clear(); return false; }
+            if (ms_since(t0) >= 10000.0) { e = "remote stage: receive failed: timed out"; return false; }
+            poll_fd pfd{};
+            pfd.fd = p.fd;
+            pfd.events = POLLIN;
+            const int pr = sock_poll(&pfd, 1, 50);
+            if (pr < 0) {
+                const int er = sock_errno();
+                if (sock_eintr(er)) continue;
+                e = "remote stage: receive failed: " + sock_errstr(er);
                 return false;
             }
-            c += r;
-            n -= (size_t) r;
+            if (pr > 0) return true;
         }
-        return true;
     };
+    bool refused = false;
+    if (!tls_handshake(p.fd, *p.tls, p.rx, more, refused, in.err)) {
+        in.closed = true;
+        if (refused) close_after_refusal(p.fd, &drop);   // (the alert reaches it: its main process says why)
+        return in;
+    }
+    in.tls = p.tls->peer();
+    auto take = [&](void* d, size_t n) { return recv_all(p.fd, *p.tls, p.rx, d, n, in.err, more); };
     if (!take(&in.h, sizeof in.h)) {
         in.closed = true;
     } else if (in.h.magic != kStageMagic) {
@@ -1109,17 +1250,17 @@ Inbox read_hello(sock_t fd, const std::atomic<bool>& drop) {
     } else if (!take(&in.hello, sizeof in.hello)) {
         in.closed = true;
     } else {
-        set_timeout(fd, SO_RCVTIMEO, 0);
+        set_timeout(p.fd, SO_RCVTIMEO, 0);
     }
     return in;
 }
 
-void send_error(sock_t fd, const std::string& m) {
+void send_error(Peer& p, const std::string& m) {
     StageHeader e;
     e.type = (uint32_t) StageMsg::Error;
     e.bytes = m.size();
     std::string se;
-    (void) send_msg(fd, e, m.data(), m.size(), nullptr, 0, se);
+    (void) send_msg(p, e, m.data(), m.size(), nullptr, 0, se);
 }
 
 }  // namespace
@@ -1147,8 +1288,12 @@ bool StageRelay::send(const int64_t* tokens, int64_t T, int64_t pos0, int64_t fl
     return true;
 }
 
-int serve_stage(const std::string& bind_addr, int port, const std::string& token, const StageHandlers& h,
+int serve_stage(const std::string& bind_addr, int port, std::shared_ptr<TlsCredentials> cred, const StageHandlers& h,
                 const StageBuffers& buf, StageStats& stats, const std::atomic<bool>* stop) {
+    if (cred == nullptr) {
+        std::fprintf(stderr, "strata stage worker: no TLS credentials (STRATA_STAGE_TLS; docs/REMOTE_STAGE.md)\n");
+        return 1;
+    }
     if (!net_init()) {
         std::fprintf(stderr, "strata stage worker: the sockets did not start (WSAStartup)\n");
         return 1;
@@ -1178,31 +1323,30 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         return 1;
     }
     freeaddrinfo(res);
-    std::fprintf(stderr, "strata stage worker: listening on %s:%d%s\n", bind_addr.empty() ? "*" : bind_addr.c_str(), port,
-                 token.empty() ? " - WARNING: no STRATA_STAGE_TOKEN, any host that reaches this port can drive the worker"
-                               : " (a token is required)");
+    std::fprintf(stderr, "strata stage worker: listening on %s:%d (TLS 1.3: this PC is %s %s; %d certificate%s accepted)\n",
+                 bind_addr.empty() ? "*" : bind_addr.c_str(), port, cred->name().c_str(),
+                 stage_tls_short(cred->fingerprint()).c_str(), cred->accepted(), cred->accepted() == 1 ? "" : "s");
     std::fflush(stderr);
     // A connection that arrives while a main process is served (its PC lost power, say, and its process started
     // again) waits in the listen backlog until the served one has had no message read, being read, or a reply going
-    // out for `takeover` seconds.  Then it is accepted, its hello read on a thread of its own, and a valid hello (the
-    // token, the same checks as below) takes the worker over: the old connection ends as a closed one does, and the
+    // out for `takeover` seconds.  Then it is accepted, its handshake and hello read on a thread of its own, and a
+    // valid hello (from a certificate this PC accepts, the same checks as below) takes the worker over: the old connection ends as a closed one does, and the
     // new one is served.  An invalid one is refused; the old one stays.  One accepted while the served main process
     // sends again is closed (its main process connects again).
     const int takeover = takeover_s();
-    sock_t cand = kNoSock;
+    std::unique_ptr<Peer> cand;
     std::string cand_host;
     std::atomic<bool> cand_drop{false};   // ends the wait for its hello (drop_cand; declared first: it outlives it)
     std::future<Inbox> cand_hello;
     // the connection served next: accepted while another was served, its hello read (`first`)
-    sock_t next_fd = kNoSock;
+    std::unique_ptr<Peer> next_peer;
     std::string next_host;
     Inbox first;
     while (stop == nullptr || !*stop) {
-        sock_t fd = next_fd;
+        std::unique_ptr<Peer> served = std::move(next_peer);
         std::string host = next_host;
-        const bool have_first = fd != kNoSock;
-        next_fd = kNoSock;
-        if (fd == kNoSock) {
+        const bool have_first = served != nullptr;
+        if (served == nullptr) {
             poll_fd pfd{};
             pfd.fd = lfd;
             pfd.events = POLLIN;
@@ -1212,9 +1356,11 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 continue;
             }
             if (pr <= 0) continue;
-            fd = accept_main(lfd, host);
-            if (fd == kNoSock) continue;
+            served = accept_main(lfd, cred, host);
+            if (served == nullptr) continue;
         }
+        Peer& link = *served;
+        const sock_t fd = link.fd;
 
         // ---- the receiving thread: whole messages into a queue, a prompt chunk's rows straight into a free pf_in
         std::mutex mu;
@@ -1231,9 +1377,9 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         std::thread reader([&] {
             // The first message is read as a waiting connection's is (read_hello): a hello, whole within 10 s, and
             // nothing else.  A peer that sends it a byte at a time holds the worker no longer, and another message's
-            // body is neither received nor drained (its sizes come from a peer no token has admitted): the serving
+            // body is neither received nor drained (its sizes come from a peer no hello has admitted): the serving
             // thread answers it and ends the connection.  After a hello (the first, or another a served main process
-            // sends) nothing is read until the serving thread has admitted it (its token): a refused peer's next
+            // sends) nothing is read until the serving thread has admitted it (its checks): a refused peer's next
             // header, with a body that never comes, would hold this thread in a recv that shutting the socket down
             // does not wake on Windows.  Then the wait for each message is polled, so this connection's end (quit)
             // ends it, for the same reason.
@@ -1245,7 +1391,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 bool last = false;   // a first message that is not a whole hello: nothing after it is read
                 const bool first_read = !hello_in;
                 if (first_read) {
-                    in = read_hello(fd, quit);
+                    in = read_hello(link, quit);
                     hello_in = !in.closed && in.bad.empty();
                     last = !hello_in;
                 } else {
@@ -1259,22 +1405,23 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                         poll_fd pfd{};
                         pfd.fd = fd;
                         pfd.events = POLLIN;
-                        ready = sock_poll(&pfd, 1, 250) != 0;   // (data, the peer's end or an error: the recv says)
+                        // (records already read, data, the peer's end or an error: the read says)
+                        ready = link.tls->buffered() || sock_poll(&pfd, 1, 250) != 0;
                     }
                     if (!ready) break;
                     reading.store(true);   // (from here until it is queued: not idle)
                 }
                 if (first_read) {
                     // (read whole above)
-                } else if (!recv_header(fd, in.h, in.err)) {
+                } else if (!recv_header(fd, *link.tls, link.rx, in.h, in.err)) {
                     in.closed = true;
                 } else {
                     const StageMsg type = (StageMsg) in.h.type;
                     if (type == StageMsg::Hello) {
                         if (in.h.bytes != sizeof in.hello) {
                             in.bad = "bad hello";
-                            if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
-                        } else if (!recv_all(fd, &in.hello, sizeof in.hello, in.err)) {
+                            if (!drain(fd, *link.tls, link.rx, in.h.bytes, in.err)) in.closed = true;
+                        } else if (!recv_all(fd, *link.tls, link.rx, &in.hello, sizeof in.hello, in.err)) {
                             in.closed = true;
                         } else {
                             set_timeout(fd, SO_RCVTIMEO, 0);
@@ -1291,13 +1438,13 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                             fits ? stage_rows_bytes(fmt, (size_t) T, (size_t) buf.handoff_floats) : 0;
                         if (!fits || in.h.bytes != (uint64_t) T * 4 + rows_bytes) {
                             in.bad = "bad window size";
-                            if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                            if (!drain(fd, *link.tls, link.rx, in.h.bytes, in.err)) in.closed = true;
                         } else {
                             in.tok32.resize((size_t) T);
                             in.rows.resize(rows);
-                            if (!recv_all(fd, in.tok32.data(), (size_t) T * 4, in.err) ||
-                                !recv_rows(fd, fmt, in.rows.data(), (size_t) T, (size_t) buf.handoff_floats, wire,
-                                           in.decode_ms, in.err))
+                            if (!recv_all(fd, *link.tls, link.rx, in.tok32.data(), (size_t) T * 4, in.err) ||
+                                !recv_rows(fd, *link.tls, link.rx, fmt, in.rows.data(), (size_t) T,
+                                           (size_t) buf.handoff_floats, wire, in.decode_ms, in.err))
                                 in.closed = true;
                         }
                     } else if (type == StageMsg::Prefill) {
@@ -1309,7 +1456,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                             fits ? stage_rows_bytes(fmt, (size_t) T, (size_t) buf.pf_row_floats) : 0;
                         if (!fits || in.h.bytes != (uint64_t) T * 8 + rows_bytes) {
                             in.bad = "bad prompt chunk size";
-                            if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                            if (!drain(fd, *link.tls, link.rx, in.h.bytes, in.err)) in.closed = true;
                         } else {
                             {   // a free buffer: the serving thread releases one when it has read that chunk
                                 std::unique_lock<std::mutex> lk(mu);
@@ -1320,9 +1467,9 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                             }
                             // (fp32 straight into the free buffer; another format a slice at a time, converted into it)
                             in.tok64.resize((size_t) T);
-                            if (!recv_all(fd, in.tok64.data(), (size_t) T * 8, in.err) ||
-                                !recv_rows(fd, fmt, buf.pf_in[in.slot], (size_t) T, (size_t) buf.pf_row_floats, wire,
-                                           in.decode_ms, in.err))
+                            if (!recv_all(fd, *link.tls, link.rx, in.tok64.data(), (size_t) T * 8, in.err) ||
+                                !recv_rows(fd, *link.tls, link.rx, fmt, buf.pf_in[in.slot], (size_t) T,
+                                           (size_t) buf.pf_row_floats, wire, in.decode_ms, in.err))
                                 in.closed = true;
                         }
                     } else if (type == StageMsg::Positions) {
@@ -1332,22 +1479,23 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                         if (identity ? in.h.bytes != 0
                                      : (cells < 1 || cells > ((int64_t) 1 << 22) || in.h.bytes != (uint64_t) cells * 12)) {
                             in.bad = "bad position table size";
-                            if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                            if (!drain(fd, *link.tls, link.rx, in.h.bytes, in.err)) in.closed = true;
                         } else if (!identity) {
                             in.tok32.resize((size_t) cells * 3);
-                            if (!recv_all(fd, in.tok32.data(), (size_t) cells * 12, in.err)) in.closed = true;
+                            if (!recv_all(fd, *link.tls, link.rx, in.tok32.data(), (size_t) cells * 12, in.err)) in.closed = true;
                         }
                     } else if (type == StageMsg::Reset || type == StageMsg::CkptSave || type == StageMsg::CkptRestore) {
                         if (in.h.bytes % 8 != 0 || in.h.bytes / 8 > (uint64_t) kStageCkptMax) {
                             in.bad = "bad checkpoint list";
-                            if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                            if (!drain(fd, *link.tls, link.rx, in.h.bytes, in.err)) in.closed = true;
                         } else {
                             in.keep.resize((size_t) (in.h.bytes / 8));
-                            if (!recv_all(fd, in.keep.data(), (size_t) in.h.bytes, in.err)) in.closed = true;
+                            if (!recv_all(fd, *link.tls, link.rx, in.keep.data(), (size_t) in.h.bytes, in.err))
+                                in.closed = true;
                         }
                     } else if (type != StageMsg::Commit) {
                         in.bad = "unknown message type " + std::to_string(in.h.type);
-                        if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                        if (!drain(fd, *link.tls, link.rx, in.h.bytes, in.err)) in.closed = true;
                     }
                 }
                 const bool closed = in.closed;
@@ -1405,7 +1553,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
             e.type = (uint32_t) StageMsg::Error;
             e.bytes = m.size();
             std::string se;
-            return send_msg(fd, e, m.data(), m.size(), nullptr, 0, se);
+            return send_msg(link, e, m.data(), m.size(), nullptr, 0, se);
         };
         StageHello greeted_mine;   // this worker's hello to the main process served: a new one's is checked against it
         // a new connection's hello (read on its thread): whether it takes the worker over; else it is refused and
@@ -1416,18 +1564,14 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 why = ci.err.empty() ? "no hello" : ci.err;
             } else if (!ci.bad.empty()) {
                 why = ci.bad;
-                send_error(cand, why);
+                send_error(*cand, why);
             } else {
-                const std::string theirs_token(ci.hello.token, strnlen(ci.hello.token, sizeof ci.hello.token));
                 StageHello mine;
-                if (!token.empty() && theirs_token != token) {
-                    why = "a wrong token";
-                    send_error(cand, "wrong token (STRATA_STAGE_TOKEN)");
-                } else if (!hello_matches(ci.hello, greeted_mine, why)) {
-                    send_error(cand, why);
+                if (!hello_matches(ci.hello, greeted_mine, why)) {
+                    send_error(*cand, why);
                 } else if (!(why = ckpt_max_refusal(ci.hello)).empty() || !h.hello(ci.hello, mine, why)) {
                     // (the checkpoint limit before the handler: it records the new main process's values)
-                    send_error(cand, why);
+                    send_error(*cand, why);
                 } else {
                     return true;
                 }
@@ -1443,14 +1587,13 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         // otherwise take over at the next idle time with a hello read long before, from a peer that may be gone.)
         auto drop_cand = [&] {
             cand_drop = true;   // (a hello not in yet, or not whole, is not waited for)
-            (void) sock_shutdown(cand);
+            (void) sock_shutdown(cand->fd);
             (void) cand_hello.get();
-            (void) sock_close(cand);
             std::fprintf(stderr,
                          "strata stage worker: %s connected while %s was served: closed (it may connect again)\n",
                          cand_host.c_str(), host.c_str());
             std::fflush(stderr);
-            cand = kNoSock;
+            cand.reset();
         };
         // the next message (true); once the served main process has had no message read, being read, or a reply
         // going out for `takeover` seconds, a new connection that takes over (false: its hello in `first`).  Before
@@ -1463,11 +1606,11 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 bool reading_now;
                 {
                     std::unique_lock<std::mutex> lk(mu);
-                    if (cv.wait_for(lk, std::chrono::milliseconds(cand != kNoSock ? 20 : 250), [&] { return !q.empty(); })) {
+                    if (cv.wait_for(lk, std::chrono::milliseconds(cand != nullptr ? 20 : 250), [&] { return !q.empty(); })) {
                         in = std::move(q.front());
                         q.pop_front();
                         lk.unlock();
-                        if (cand != kNoSock && !in.closed) drop_cand();   // (a closed one: the held one is served next)
+                        if (cand != nullptr && !in.closed) drop_cand();   // (a closed one: the held one is served next)
                         return true;
                     }
                     reading_now = reading.load();   // (with the queue: a message is either queued or being read)
@@ -1494,14 +1637,14 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     }
                 }
                 if (!greeted || takeover == 0 || idle_s < (double) takeover) continue;
-                if (cand == kNoSock) {
+                if (cand == nullptr) {
                     poll_fd pfd{};
                     pfd.fd = lfd;
                     pfd.events = POLLIN;
-                    if (sock_poll(&pfd, 1, 0) > 0 && (cand = accept_main(lfd, cand_host)) != kNoSock) {
+                    if (sock_poll(&pfd, 1, 0) > 0 && (cand = accept_main(lfd, cred, cand_host)) != nullptr) {
                         cand_drop = false;
                         cand_hello = std::async(std::launch::async,
-                                                [c = cand, &cand_drop] { return read_hello(c, cand_drop); });
+                                                [c = cand.get(), &cand_drop] { return read_hello(*c, cand_drop); });
                     }
                     continue;
                 }
@@ -1511,8 +1654,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     first = std::move(ci);
                     return false;
                 }
-                (void) sock_close(cand);
-                cand = kNoSock;
+                cand.reset();
             }
         };
         for (;;) {
@@ -1521,9 +1663,8 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 char idle[64];
                 std::snprintf(idle, sizeof idle, "%.0f s", idle_s);
                 err = "a new main process (" + cand_host + ") took over after " + idle + " without a message";
-                next_fd = cand;
+                next_peer = std::move(cand);
                 next_host = cand_host;
-                cand = kNoSock;
                 break;
             }
             if (in.closed) { err = in.err; break; }
@@ -1563,13 +1704,6 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
             case StageMsg::Hello: {
                 StageHello mine;
                 std::string he;
-                const std::string theirs_token(in.hello.token, strnlen(in.hello.token, sizeof in.hello.token));
-                if (!token.empty() && theirs_token != token) {
-                    std::fprintf(stderr, "strata stage worker: %s sent a wrong token: refused\n", host.c_str());
-                    (void) reply_error("wrong token (STRATA_STAGE_TOKEN)");
-                    keep = false;
-                    break;
-                }
                 if (!h.hello(in.hello, mine, he) || !hello_matches(in.hello, mine, he)) {
                     (void) reply_error(he);
                     keep = false;
@@ -1586,7 +1720,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::HelloOk;
                 r.bytes = sizeof mine;
-                if (!replies_out() || !send_msg(fd, r, &mine, sizeof mine, nullptr, 0, err)) keep = false;
+                if (!replies_out() || !send_msg(link, r, &mine, sizeof mine, nullptr, 0, err)) keep = false;
                 greeted = true;
                 greeted_mine = mine;
                 if (keep) {   // its reader reads on (a HelloOk that did not go out ends the connection)
@@ -1597,9 +1731,9 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     }
                     cv.notify_all();
                 }
-                std::fprintf(stderr, "strata stage worker: main process %s: layers %d.. here, context %lld, chunk %lld, "
-                             "rows %s\n", host.c_str(), in.hello.layer_begin, (long long) in.hello.max_context,
-                             (long long) in.hello.chunk, stage_rows_name(fmt));
+                std::fprintf(stderr, "strata stage worker: main process %s (%s): layers %d.. here, context %lld, chunk %lld, "
+                             "rows %s\n", host.c_str(), link.tls->peer().c_str(), in.hello.layer_begin,
+                             (long long) in.hello.max_context, (long long) in.hello.chunk, stage_rows_name(fmt));
                 if ((in.hello.row_formats & kStageCapKvElem) == 0 && (mine.row_formats & kStageCapKvElem) != 0)
                     std::fprintf(stderr, "strata stage worker: main process %s: its hello predates the K/V element "
                                  "check: --kv must match by hand\n", host.c_str());
@@ -1621,12 +1755,12 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 r.a = (int64_t) (ms_since(t0) * 1000.0);   // the worker's own time, microseconds
                 r.bytes = in.rows.size() * 4;
                 if (rows_fmt == StageRows::F32) {
-                    if (!replies_out() || !send_msg(fd, r, buf.run_out, (size_t) r.bytes, nullptr, 0, err)) keep = false;
+                    if (!replies_out() || !send_msg(link, r, buf.run_out, (size_t) r.bytes, nullptr, 0, err)) keep = false;
                 } else {   // (the link's format, converted as it goes out)
                     r.bytes = stage_rows_bytes(rows_fmt, (size_t) T, (size_t) buf.handoff_floats);
-                    if (!replies_out() || !send_msg(fd, r, nullptr, 0, nullptr, 0, err) ||
-                        !send_rows(fd, rows_fmt, buf.run_out, (size_t) T, (size_t) buf.handoff_floats, run_tx,
-                                   stats.ms_encode, err))
+                    if (!replies_out() ||
+                        !send_rows_msg(link, r, rows_fmt, buf.run_out, (size_t) T, (size_t) buf.handoff_floats, run_tx,
+                                       stats.ms_encode, err))
                         keep = false;
                 }
                 stats.bytes_out += sizeof r + r.bytes;
@@ -1673,7 +1807,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 const float* src = out + (size_t) skip * D;
                 reply_err.clear();
                 // (the rows in the link's format on the reply thread too, after a relay's next worker has filled them)
-                reply_out = std::async(std::launch::async, [fd, r, src, back_rows, D, out, T, skip, fmt = rows_fmt,
+                reply_out = std::async(std::launch::async, [&link, r, src, back_rows, D, out, T, skip, fmt = rows_fmt,
                                                             &pf_tx, &reply_encode_ms, &h, &reply_err] {
                     if (h.prefill_reply) {   // a relay worker: the next worker's rows (in chunk order)
                         std::string e;
@@ -1681,12 +1815,11 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                             StageHeader eh;
                             eh.type = (uint32_t) StageMsg::Error;
                             eh.bytes = e.size();
-                            return send_msg(fd, eh, e.data(), e.size(), nullptr, 0, reply_err);
+                            return send_msg(link, eh, e.data(), e.size(), nullptr, 0, reply_err);
                         }
                     }
-                    if (fmt == StageRows::F32) return send_msg(fd, r, src, (size_t) r.bytes, nullptr, 0, reply_err);
-                    const bool sent = send_msg(fd, r, nullptr, 0, nullptr, 0, reply_err) &&
-                                      send_rows(fd, fmt, src, back_rows, D, pf_tx, reply_encode_ms, reply_err);
+                    if (fmt == StageRows::F32) return send_msg(link, r, src, (size_t) r.bytes, nullptr, 0, reply_err);
+                    const bool sent = send_rows_msg(link, r, fmt, src, back_rows, D, pf_tx, reply_encode_ms, reply_err);
                     if (sent && remote_timing())
                         std::fprintf(stderr, "strata stage worker: chunk T=%lld: its rows to %s in %.0f ms\n",
                                      (long long) T, stage_rows_name(fmt), reply_encode_ms);
@@ -1720,7 +1853,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 pos = 0;
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::ResetOk;
-                if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                if (!send_msg(link, r, nullptr, 0, nullptr, 0, err)) keep = false;
                 ++stats.resets;
                 break;
             }
@@ -1754,7 +1887,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::CkptSaveOk;
                 r.a = stored;
-                if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                if (!send_msg(link, r, nullptr, 0, nullptr, 0, err)) keep = false;
                 break;
             }
             case StageMsg::CkptRestore: {
@@ -1778,7 +1911,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 pos = in.h.b;
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::CkptRestoreOk;
-                if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                if (!send_msg(link, r, nullptr, 0, nullptr, 0, err)) keep = false;
                 break;
             }
             default:
@@ -1801,27 +1934,26 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         (void) sock_shutdown(fd);
         cv.notify_all();
         reader.join();
-        (void) sock_close(fd);
+        served.reset();   // (closes it)
         std::fprintf(stderr, "strata stage worker: %s disconnected%s%s\n", host.c_str(), err.empty() ? "" : ": ",
                      err.c_str());
         std::fflush(stderr);
         if (h.disconnected) h.disconnected();
         // a connection accepted meanwhile that did not take over (this one ended before its hello was decided): its
         // hello is served next, as a first one is
-        if (cand != kNoSock) {
+        if (cand != nullptr) {
             Inbox ci = cand_hello.get();   // (within its 10 s)
             if (!ci.closed && ci.bad.empty() && (stop == nullptr || !*stop)) {
-                next_fd = cand;
+                next_peer = std::move(cand);
                 next_host = cand_host;
                 first = std::move(ci);
-            } else {
-                if (!ci.bad.empty()) send_error(cand, ci.bad);
-                (void) sock_close(cand);
+            } else if (!ci.bad.empty()) {
+                send_error(*cand, ci.bad);
             }
-            cand = kNoSock;
+            cand.reset();
         }
     }
-    if (next_fd != kNoSock) (void) sock_close(next_fd);   // (stopped with one waiting)
+    next_peer.reset();   // (stopped with one waiting)
     (void) sock_close(lfd);
     return 0;
 }

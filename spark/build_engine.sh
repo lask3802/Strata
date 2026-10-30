@@ -1,7 +1,8 @@
 #!/bin/sh
 # Build the Strata CUDA engine for an NVIDIA DGX Spark (GB10, sm_121, arm64 Linux) into a ready-made engine folder.
 #
-# Runs on arm64 Linux with a CUDA 13 toolkit (13.0 is the release toolkit), on the Spark itself.
+# Runs on arm64 Linux with a CUDA 13 toolkit (13.0 is the release toolkit) and libssl-dev (the remote stage's TLS 1.3, linked
+# statically), on the Spark itself.
 #
 #   spark/build_engine.sh                    # engine + DeepSeek engine + picture reader -> ./out-spark/engine
 #   BUILD_VISION=0 spark/build_engine.sh     # text only (faster)

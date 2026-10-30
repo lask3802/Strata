@@ -1,10 +1,11 @@
 // src/net/stage_link_test.cpp - the remote stage's link over loopback, no GPU: a worker (serve_stage) with handlers
-// that copy rows, keep a StageCkptStore and record the image positions they get, and a StageClient driving it.  What
-// it checks (docs/remote-stage/CHECKPOINTS.md; docs/remote-stage/ENGINEERING.md, "Images"):
+// that copy rows, keep a StageCkptStore and record the image positions they get, and a StageClient driving it, over
+// TLS 1.3 with keys made for the test (stage_keygen).  What it checks (docs/remote-stage/CHECKPOINTS.md;
+// docs/remote-stage/ENGINEERING.md, "Images", "TLS"):
 //
 //   0. the worker's table from what a Positions message carries (stage_positions_fill): the identity, the cells
 //      sent, the cells past them;
-//   1. the hello: an older side (protocol 4) is refused for its protocol, a main process that would have the worker
+//   1. the hello: an older side (protocol 7) is refused for its protocol, a main process that would have the worker
 //      keep more than kStageCkptMax checkpoints is refused, a main process with --vision refuses a worker without it,
 //      a matching one is served;
 //   2. Reset / CkptSave / CkptRestore carry their id, position and keep[] whole (int64 ids beyond 32 bits);
@@ -23,23 +24,24 @@
 //      --vision;
 //   8. a new main process waits while the served one sends messages, and takes it over once it has been silent (not
 //      closed) for STRATA_REMOTE_TAKEOVER_S (1 s here): B served, A's next message fails as a lost link; one with a
-//      wrong token, another model or more checkpoints than a worker keeps is refused and A stays; when the served one
-//      closes, the one waiting is served at once; which errors stage_link_lost counts as a lost link;
+//      certificate the worker does not accept, another model or more checkpoints than a worker keeps is refused and A
+//      stays; when the served one closes, the one waiting is served at once; which errors stage_link_lost counts as a
+//      lost link;
 //   9. STRATA_REMOTE_TAKEOVER_S=0: a new main process waits however long the served one is silent; a connection the
 //      worker accepted while the served one was idle is closed when the served one sends again (and does not take
 //      over at its next idle time); the idle time starts when a slow reply (a relay's) is out, not when it began;
 //  10. StageClient::alive, the main process's check at a request's start (and a relay's of its next worker): true on
-//      an idle served link, and it reads nothing (the next reply is in step); false, as a lost link, once the
-//      worker's end closed it (a take-over by another main process, the worker stopped) or sent bytes no message
-//      asked for, and the link is marked failed; no check blocks;
-//  11. connect() with a deadline: a hello left unanswered and a connect no host answers are given up at it, as lost
-//      links; a stop flag ends the wait at once (also before a try that would fail at once), not as a lost link; a
-//      worker that answers is served as without one;
+//      an idle served link (no TLS session tickets come unasked), and it reads nothing (the next reply is in step);
+//      false, as a lost link, once the worker's end closed it (a take-over by another main process, the worker
+//      stopped) or sent bytes no message asked for, and the link is marked failed; no check blocks;
+//  11. connect() with a deadline: a handshake left unanswered and a connect no host answers are given up at it, as
+//      lost links; a stop flag ends the wait at once (also before a try that would fail at once), not as a lost link;
+//      a worker that answers is served as without one;
 //  12. StageHandlers::idle (a relay's look at its next worker): not while the served main process sends, about once
 //      a second while it is idle; false ends that connection, and the main process's next message finds it lost;
 //  13. a worker reads nothing but a hello first (another first message is answered and the connection closed, its
 //      body neither waited for nor drained; a hello sent a byte a second is given up at 10 s in all), and nothing
-//      after a hello - the first, or a second on a served connection - before its token is taken (a refused one's next
+//      after a hello - the first, or a second on a served connection - before it is checked (a refused one's next
 //      headers, one with a body that never comes, neither end the worker nor hold it); a window's or a chunk's T is
 //      bounded before any product with it: T = 2^62, whose sizes wrap to 0, ends no worker - before the hello or
 //      after one;
@@ -50,11 +52,23 @@
 //      link uses the narrowest format both hellos list (fp32 when no other); a main process listing bf16 gets a
 //      window's and a chunk's rows back rounded to bf16, in half the bytes, one listing fp32 only gets them exact; the
 //      worker's sizes follow the agreed format (an fp32-sized window or chunk on a bf16 link is malformed), and a
-//      second hello on a connection agrees again; a chunk larger than one conversion slice comes back whole.
+//      second hello on a connection agrees again; a chunk larger than one conversion slice comes back whole;
+//  16. the K/V element type (row_formats' kStageCapKvElem);
+//  17. TLS: the credentials (no folder, no key, a key and another PC's certificate, a peers/ .pem without a
+//      certificate - another file there is not read -, a key not overwritten by --stage-keygen, whose folder is this
+//      user's alone); two PCs that accept each other's certificate link, and the main process names the worker; the
+//      certificates are pinned (a CA's in peers/ is accepted itself, one it signed is not) and their dates are not
+//      looked at; a worker refuses a main process whose
+//      certificate it does not hold (and says why), one that sends none, one that speaks no TLS, one whose handshake
+//      comes a byte a second (at 10 s) - and serves on; a main process refuses a worker whose certificate it does
+//      not hold, or one that answers without TLS - neither is a lost link - and an older worker, which closes on
+//      the handshake, is a closed connection that says why; a prompt chunk of many records, and a KeyUpdate every
+//      4 KiB, keep every byte (every link above runs over TLS too: 15's rows are sealed as one message per reply).
 // The handlers run on the worker's serving thread: what they share with the test is behind a mutex or atomic.
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/net/stage_ckpt_store.hpp"
 #include "strata/net/stage_link.hpp"
+#include "strata/net/stage_tls.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -63,6 +77,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <random>
 #include <string>
@@ -82,8 +99,21 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
+#endif
+
+#if defined(STRATA_HAVE_OPENSSL)
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#endif
+#if defined(_WIN32)
+#include <aclapi.h>
 #endif
 
 using namespace strata::net;
@@ -111,6 +141,14 @@ StageHello hello_of(int32_t vision = 1) {
     return h;
 }
 bool contains(const std::string& s, const char* part) { return s.find(part) != std::string::npos; }
+
+// the key most checks use on both ends (a main process and its worker on one PC: its own certificate is accepted)
+std::shared_ptr<TlsCredentials> g_cred;
+
+// a main process's end with the test's key (or another)
+struct Client : StageClient {
+    explicit Client(std::shared_ptr<TlsCredentials> c = g_cred) { set_credentials(std::move(c)); }
+};
 
 // the worker's side the test looks at
 struct Shared {
@@ -150,20 +188,21 @@ struct Worker {
     StageStats st;
     std::thread t;
     std::string where;
-    bool start(const StageHandlers& h, const StageBuffers& buf, const std::string& token = "") {
+    bool start(const StageHandlers& h, const StageBuffers& buf, std::shared_ptr<TlsCredentials> cred = g_cred) {
         std::mt19937 rng(std::random_device{}());
         for (int attempt = 0; attempt < 8 && where.empty(); ++attempt) {
             const int port = 20000 + (int) (rng() % 40000);
             served = -1;
-            t = std::thread([&, port, token] { served = serve_stage("127.0.0.1", port, token, h, buf, st, &stop_flag); });
+            t = std::thread([&, port, cred] { served = serve_stage("127.0.0.1", port, cred, h, buf, st, &stop_flag); });
             const std::string at = "127.0.0.1:" + std::to_string(port);
-            // until it listens: the worker's own refusal of a protocol 4 hello (not the system's "connection refused")
+            // until it listens: the worker's own refusal of a protocol 5 hello (not the system's "connection
+            // refused"), from a main process with the worker's own key (accepted whatever its peers are)
             for (int i = 0; i < 100 && served.load() < 0; ++i) {
                 StageHello bad = hello_of();
-                bad.protocol = 4;
+                bad.protocol = 5;
                 StageHello peer;
                 std::string e;
-                StageClient c;
+                Client c(cred);
                 if (c.connect(at, bad, peer, e) || contains(e, "the worker refused:")) { where = at; break; }
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
@@ -177,6 +216,7 @@ struct Worker {
         t.join();
         stop_flag = false;
     }
+    ~Worker() { stop(); }
 };
 
 // a worker reads it when it starts listening
@@ -188,39 +228,130 @@ void set_takeover(const char* s) {
 #endif
 }
 
-// a peer that connects to a worker on loopback and sends its hello in parts, when the test says; a thread waits (up
-// to 15 s) for the worker to close it.  The sockets are started: a StageClient connected before.
-struct Silent {
+// ---- peers spoken by hand: plain sockets, and a TLS session over them (the bytes a StageClient or a worker never
+// sends go inside the records, as an authenticated peer would send them)
 #if defined(_WIN32)
-    using sock = SOCKET;
-    static constexpr sock kNone = INVALID_SOCKET;
-    static void shut(sock s) { (void) ::shutdown(s, SD_BOTH); }
-    static void close_(sock s) { (void) ::closesocket(s); }
+using sock = SOCKET;
+constexpr sock kNone = INVALID_SOCKET;
+using sock_len = int;
+void shut(sock s) { (void) ::shutdown(s, SD_BOTH); }
+void shut_send(sock s) { (void) ::shutdown(s, SD_SEND); }
+void close_(sock s) { (void) ::closesocket(s); }
 #else
-    using sock = int;
-    static constexpr sock kNone = -1;
-    static void shut(sock s) { (void) ::shutdown(s, SHUT_RDWR); }
-    static void close_(sock s) { (void) ::close(s); }
+using sock = int;
+constexpr sock kNone = -1;
+using sock_len = socklen_t;
+void shut(sock s) { (void) ::shutdown(s, SHUT_RDWR); }
+void shut_send(sock s) { (void) ::shutdown(s, SHUT_WR); }
+void close_(sock s) { (void) ::close(s); }
 #endif
+
+// (to a connection the worker closed: dropped, without SIGPIPE)
+void send_raw(sock fd, const void* p, size_t n) {
+#if defined(_WIN32)
+    (void) ::send(fd, (const char*) p, (int) n, 0);
+#else
+    (void) ::send(fd, p, n, MSG_NOSIGNAL);
+#endif
+}
+
+void set_rcv_timeout(sock s, int seconds) {
+#if defined(_WIN32)
+    const DWORD ms = (DWORD) seconds * 1000;
+    (void) setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*) &ms, sizeof ms);
+#else
+    timeval tv{};
+    tv.tv_sec = seconds;
+    (void) setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+#endif
+}
+
+sock connect_loopback(const std::string& where) {
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short) std::atoi(where.substr(where.rfind(':') + 1).c_str()));
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sock s = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (s != kNone && ::connect(s, (const sockaddr*) &a, sizeof a) != 0) {
+        close_(s);
+        s = kNone;
+    }
+    return s;
+}
+
+// a loopback port of its own, listening: `where`
+sock listen_any(std::string& where) {
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = 0;   // any free port
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sock l = ::socket(AF_INET, SOCK_STREAM, 0);
+    sock_len len = (sock_len) sizeof a;
+    if (l == kNone || ::bind(l, (const sockaddr*) &a, sizeof a) != 0 || ::listen(l, 4) != 0 ||
+        ::getsockname(l, (sockaddr*) &a, &len) != 0) {
+        if (l != kNone) close_(l);
+        return kNone;
+    }
+    where = "127.0.0.1:" + std::to_string(ntohs(a.sin_port));
+    return l;
+}
+
+// one TLS end over a blocking socket
+struct TlsEnd {
+    std::unique_ptr<TlsSession> tls;
+    std::vector<char> rx = std::vector<char>(65536);
+    std::string err;
+    bool handshake(sock s, bool client, std::shared_ptr<TlsCredentials> cred = g_cred) {
+        tls = std::make_unique<TlsSession>(std::move(cred), client);
+        std::vector<char> out;
+        for (;;) {
+            out.clear();
+            const TlsSession::Step st = tls->handshake(out, err);
+            if (!out.empty()) send_raw(s, out.data(), out.size());
+            if (st == TlsSession::Step::Done) return true;
+            if (st == TlsSession::Step::Failed) return false;
+            const long long r = ::recv(s, rx.data(), (int) rx.size(), 0);
+            if (r <= 0) return false;
+            tls->feed(rx.data(), (size_t) r);
+        }
+    }
+    void send(sock s, const void* p, size_t n) {
+        std::vector<char> out;
+        if (tls->seal(p, n, out, err)) send_raw(s, out.data(), out.size());
+    }
+    bool recv_n(sock s, void* p, size_t n) {
+        char* c = (char*) p;
+        while (n > 0) {
+            const long long got = tls->open(c, n, err);
+            if (got > 0) {
+                c += got;
+                n -= (size_t) got;
+                continue;
+            }
+            if (got < 0) return false;
+            const long long r = ::recv(s, rx.data(), (int) rx.size(), 0);
+            if (r <= 0) return false;
+            tls->feed(rx.data(), (size_t) r);
+        }
+        return true;
+    }
+};
+
+// a peer that connects to a worker on loopback (and, `tls`, does its handshake) and sends bytes when the test says
+// (inside its records, or raw); a thread waits (up to 15 s) for the worker to close it.  The sockets are started: a
+// StageClient connected before.
+struct Silent {
     sock s = kNone;
+    TlsEnd te;
+    bool use_tls = true;
     std::thread t;
     std::atomic<bool> closed{false};   // the worker closed it (its recv ended before its own 15 s)
     std::chrono::steady_clock::time_point at;
-    bool open(const std::string& where) {
-        sockaddr_in a{};
-        a.sin_family = AF_INET;
-        a.sin_port = htons((unsigned short) std::atoi(where.substr(where.rfind(':') + 1).c_str()));
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        s = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (s == kNone || ::connect(s, (const sockaddr*) &a, sizeof a) != 0) return false;
-#if defined(_WIN32)
-        const DWORD ms = 15000;
-        (void) setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*) &ms, sizeof ms);
-#else
-        timeval tv{};
-        tv.tv_sec = 15;
-        (void) setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-#endif
+    bool open(const std::string& where, bool tls = true) {
+        use_tls = tls;
+        if ((s = connect_loopback(where)) == kNone) return false;
+        set_rcv_timeout(s, 15);
+        if (tls && !te.handshake(s, true)) return false;
         t = std::thread([this] {
             const auto t0 = std::chrono::steady_clock::now();
             char c;
@@ -230,13 +361,10 @@ struct Silent {
         });
         return true;
     }
-    // bytes of a hello, a part at a time (to a connection the worker closed: dropped, without SIGPIPE)
+    // bytes [from, to) of `b`: a record of their own, or raw bytes without TLS
     void send_part(const std::vector<char>& b, size_t from, size_t to) {
-#if defined(_WIN32)
-        (void) ::send(s, b.data() + from, (int) (to - from), 0);
-#else
-        (void) ::send(s, b.data() + from, to - from, MSG_NOSIGNAL);
-#endif
+        if (use_tls) te.send(s, b.data() + from, to - from);
+        else send_raw(s, b.data() + from, to - from);
     }
     void close() {
         if (s == kNone) return;
@@ -249,105 +377,63 @@ struct Silent {
 };
 
 // a worker that answers a hello with hello_of() and then sends `extra`, bytes no message asked for (a link out of
-// step); it keeps the connection open until stop().  The sockets are started: a StageClient connected before.
+// step), inside its records; it keeps the connection open until stop().  The sockets are started: a StageClient
+// connected before.
 struct Chatty {
-#if defined(_WIN32)
-    using sock_len = int;
-#else
-    using sock_len = socklen_t;
-#endif
-    Silent::sock l = Silent::kNone, s = Silent::kNone;
+    sock l = kNone, s = kNone;
+    TlsEnd te;
     std::thread t;
     std::string where;
-    static bool recv_n(Silent::sock fd, void* p, size_t n) {
-        char* c = (char*) p;
-        while (n > 0) {
-            const long long r = ::recv(fd, c, (int) n, 0);
-            if (r <= 0) return false;
-            c += r;
-            n -= (size_t) r;
-        }
-        return true;
-    }
-    static void send_n(Silent::sock fd, const void* p, size_t n) {
-#if defined(_WIN32)
-        (void) ::send(fd, (const char*) p, (int) n, 0);
-#else
-        (void) ::send(fd, p, n, MSG_NOSIGNAL);
-#endif
-    }
-    // a loopback port of its own, listening: `where`
-    static Silent::sock listen_any(std::string& where) {
-        sockaddr_in a{};
-        a.sin_family = AF_INET;
-        a.sin_port = 0;   // any free port
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        Silent::sock l = ::socket(AF_INET, SOCK_STREAM, 0);
-        sock_len len = (sock_len) sizeof a;
-        if (l == Silent::kNone || ::bind(l, (const sockaddr*) &a, sizeof a) != 0 || ::listen(l, 4) != 0 ||
-            ::getsockname(l, (sockaddr*) &a, &len) != 0) {
-            if (l != Silent::kNone) Silent::close_(l);
-            return Silent::kNone;
-        }
-        where = "127.0.0.1:" + std::to_string(ntohs(a.sin_port));
-        return l;
-    }
     // answer = false: `extra` is the whole reply to the hello (a crafted one)
     bool start(const std::string& extra, bool answer = true) {
-        if ((l = listen_any(where)) == Silent::kNone) return false;
+        if ((l = listen_any(where)) == kNone) return false;
         t = std::thread([this, extra, answer] {
             s = ::accept(l, nullptr, nullptr);
-            if (s == Silent::kNone) return;
+            if (s == kNone || !te.handshake(s, false)) return;
             StageHeader h;
             StageHello theirs;
-            if (!recv_n(s, &h, sizeof h) || !recv_n(s, &theirs, sizeof theirs)) return;
+            if (!te.recv_n(s, &h, sizeof h) || !te.recv_n(s, &theirs, sizeof theirs)) return;
             if (answer) {
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::HelloOk;
                 r.bytes = sizeof(StageHello);
                 const StageHello mine = hello_of();
-                send_n(s, &r, sizeof r);
-                send_n(s, &mine, sizeof mine);
+                te.send(s, &r, sizeof r);
+                te.send(s, &mine, sizeof mine);
             }
-            if (!extra.empty()) send_n(s, extra.data(), extra.size());
+            if (!extra.empty()) te.send(s, extra.data(), extra.size());
         });
         return true;
     }
     void stop() {
-        if (l != Silent::kNone) {   // first: an accept still waiting (no client came) ends, not the test
-            Silent::shut(l);
-            Silent::close_(l);
-            l = Silent::kNone;
+        if (l != kNone) {   // first: an accept still waiting (no client came) ends, not the test
+            shut(l);
+            close_(l);
+            l = kNone;
         }
         if (t.joinable()) t.join();
-        if (s != Silent::kNone) Silent::close_(s);
-        s = Silent::kNone;
+        if (s != kNone) close_(s);
+        s = kNone;
     }
     ~Chatty() { stop(); }
 };
 
-// a main process's end spoken by hand, to a worker on loopback: headers a StageClient never sends.  Its reads wait
-// 5 s at most.
+// a main process's end spoken by hand, to a worker on loopback: headers a StageClient never sends, inside its
+// records (`tls` false: none, raw bytes).  Its reads wait 5 s at most.
 struct Raw {
-    Silent::sock s = Silent::kNone;
-    bool open(const std::string& where) {
-        sockaddr_in a{};
-        a.sin_family = AF_INET;
-        a.sin_port = htons((unsigned short) std::atoi(where.substr(where.rfind(':') + 1).c_str()));
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        s = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (s == Silent::kNone || ::connect(s, (const sockaddr*) &a, sizeof a) != 0) return false;
-#if defined(_WIN32)
-        const DWORD ms = 5000;
-        (void) setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*) &ms, sizeof ms);
-#else
-        timeval tv{};
-        tv.tv_sec = 5;
-        (void) setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-#endif
-        return true;
+    sock s = kNone;
+    TlsEnd te;
+    bool use_tls = true;
+    bool open(const std::string& where, bool tls = true, std::shared_ptr<TlsCredentials> cred = g_cred) {
+        use_tls = tls;
+        if ((s = connect_loopback(where)) == kNone) return false;
+        set_rcv_timeout(s, 5);
+        return !tls || te.handshake(s, true, std::move(cred));
     }
-    void send(const void* p, size_t n) { Chatty::send_n(s, p, n); }
+    void send(const void* p, size_t n) {
+        if (use_tls) te.send(s, p, n);
+        else send_raw(s, p, n);
+    }
     void header(StageMsg type, int64_t a, uint64_t bytes) {
         StageHeader h;
         h.type = (uint32_t) type;
@@ -357,9 +443,9 @@ struct Raw {
     }
     // the next message, its payload as bytes (up to 1 MiB); false: none within 5 s, or the worker closed it
     bool reply(StageHeader& r, std::string& payload) {
-        if (!Chatty::recv_n(s, &r, sizeof r)) return false;
+        if (!te.recv_n(s, &r, sizeof r)) return false;
         payload.assign((size_t) std::min<uint64_t>(r.bytes, (uint64_t) 1 << 20), '\0');
-        return Chatty::recv_n(s, payload.data(), payload.size());
+        return te.recv_n(s, payload.data(), payload.size());
     }
     // the worker closed it within 4.5 s, what it still sent read and dropped (not a time-out, nor bytes that keep
     // coming).  A reset counts: a worker that closes with bytes it did not read (headers sent behind a refused hello)
@@ -375,25 +461,243 @@ struct Raw {
         }
     }
     ~Raw() {
-        if (s != Silent::kNone) Silent::close_(s);
+        if (s != kNone) close_(s);
     }
 };
 
 // a port that takes connections (the system completes them in its backlog) and never answers one: a worker that
-// leaves a hello unanswered, as one serving another main process does
+// leaves a handshake unanswered, as one serving another main process does
 struct Mute {
-    Silent::sock l = Silent::kNone;
+    sock l = kNone;
     std::string where;
-    bool start() { return (l = Chatty::listen_any(where)) != Silent::kNone; }
+    bool start() { return (l = listen_any(where)) != kNone; }
     ~Mute() {
-        if (l != Silent::kNone) Silent::close_(l);
+        if (l != kNone) close_(l);
     }
 };
+
+// a peer without TLS where a worker should be: it reads what comes first (a handshake's first bytes), sends `reply`
+// (none: an older worker, which closes a connection whose first bytes are no hello), and closes once the other end
+// has (its own end first: what it sent arrives, not a reset)
+struct Plain {
+    sock l = kNone, s = kNone;
+    std::thread t;
+    std::string where;
+    bool start(const std::string& reply) {
+        if ((l = listen_any(where)) == kNone) return false;
+        t = std::thread([this, reply] {
+            s = ::accept(l, nullptr, nullptr);
+            if (s == kNone) return;
+            set_rcv_timeout(s, 3);
+            char b[4096];
+            (void) ::recv(s, b, (int) sizeof b, 0);
+            if (!reply.empty()) send_raw(s, reply.data(), reply.size());
+            shut_send(s);
+            while (::recv(s, b, (int) sizeof b, 0) > 0) {}
+        });
+        return true;
+    }
+    void stop() {
+        if (l != kNone) {
+            shut(l);
+            close_(l);
+            l = kNone;
+        }
+        if (t.joinable()) t.join();
+        if (s != kNone) close_(s);
+        s = kNone;
+    }
+    ~Plain() { stop(); }
+};
+
+// a worker whose handshake passes and whose answer to the hello is damaged on the way (a bit of its record's tag
+// flipped), then closes once the other end has
+struct Garbled {
+    sock l = kNone, s = kNone;
+    std::thread t;
+    std::string where;
+    bool start() {
+        if ((l = listen_any(where)) == kNone) return false;
+        t = std::thread([this] {
+            s = ::accept(l, nullptr, nullptr);
+            if (s == kNone) return;
+            set_rcv_timeout(s, 3);
+            TlsEnd te;
+            StageHeader h;
+            if (!te.handshake(s, false) || !te.recv_n(s, &h, sizeof h)) return;
+            std::vector<char> hello((size_t) h.bytes), out;
+            StageHeader r;
+            r.type = (uint32_t) StageMsg::Hello;
+            if (!te.recv_n(s, hello.data(), hello.size()) || !te.tls->seal(&r, sizeof r, out, te.err) || out.empty())
+                return;
+            out.back() ^= 1;
+            send_raw(s, out.data(), out.size());
+            shut_send(s);
+            char b[4096];
+            while (::recv(s, b, (int) sizeof b, 0) > 0) {}
+        });
+        return true;
+    }
+    void stop() {
+        if (l != kNone) {
+            shut(l);
+            close_(l);
+            l = kNone;
+        }
+        if (t.joinable()) t.join();
+        if (s != kNone) close_(s);
+        s = kNone;
+    }
+    ~Garbled() { stop(); }
+};
+
+// a folder of the test's own (removed at the end)
+std::filesystem::path g_tmp;
+std::string make_key(const char* name) {
+    const std::filesystem::path d = g_tmp / name;
+    std::string fp, e;
+    if (!stage_keygen(d.string(), name, fp, e)) std::printf("stage_link_test: stage_keygen %s: %s\n", name, e.c_str());
+    return d.string();
+}
+void copy_cert(const std::string& from, const std::string& to, const char* as) {
+    std::error_code ec;
+    std::filesystem::copy_file(std::filesystem::path(from) / "cert.pem", std::filesystem::path(to) / "peers" / as,
+                               std::filesystem::copy_options::overwrite_existing, ec);
+}
+std::shared_ptr<TlsCredentials> load_key(const std::string& dir) {
+    std::string e;
+    auto c = TlsCredentials::load(dir, e);
+    if (c == nullptr) std::printf("stage_link_test: load %s: %s\n", dir.c_str(), e.c_str());
+    return c;
+}
+std::string read_text(const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+// whether only this user may open a folder --stage-keygen made, and it is this user's: Windows, a protected DACL of
+// three entries (this user, SYSTEM, Administrators) and this user its owner (or the Administrators, as an elevated
+// prompt makes it); elsewhere no group or other permission bits, and this user's uid
+bool owner_only(const std::filesystem::path& d) {
+#if defined(_WIN32)
+    PACL dacl = nullptr;
+    PSID owner = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (GetNamedSecurityInfoW(d.wstring().c_str(), SE_FILE_OBJECT,
+                              OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr, &dacl, nullptr,
+                              &sd) != ERROR_SUCCESS)
+        return false;
+    bool mine = false;
+    HANDLE tok = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        DWORD n = 0;
+        (void) GetTokenInformation(tok, TokenUser, nullptr, 0, &n);
+        std::vector<unsigned char> user(n);
+        mine = n > 0 && GetTokenInformation(tok, TokenUser, user.data(), n, &n) && owner != nullptr &&
+               (EqualSid(owner, ((TOKEN_USER*) user.data())->User.Sid) ||
+                IsWellKnownSid(owner, WinBuiltinAdministratorsSid));
+        CloseHandle(tok);
+    }
+    SECURITY_DESCRIPTOR_CONTROL ctl = 0;
+    DWORD rev = 0;
+    const bool ok = mine && GetSecurityDescriptorControl(sd, &ctl, &rev) && (ctl & SE_DACL_PROTECTED) != 0 &&
+                    dacl != nullptr && dacl->AceCount == 3;
+    LocalFree(sd);
+    return ok;
+#else
+    std::error_code ec;
+    const auto p = std::filesystem::status(d, ec).permissions();
+    struct stat st {};
+    return !ec && (p & (std::filesystem::perms::group_all | std::filesystem::perms::others_all)) ==
+                      std::filesystem::perms::none &&
+           ::stat(d.c_str(), &st) == 0 && st.st_uid == ::geteuid();
+#endif
+}
+
+#if defined(STRATA_HAVE_OPENSSL)
+// certificates the keygen does not make (its own are CA:FALSE and valid from now): an Ed25519 key, and `key`'s
+// certificate named `cn`, signed by `by` with `by_key` (self-signed without), a certificate authority's when `ca`,
+// valid for a year from `from_days` days from now
+EVP_PKEY* ed25519_key() {
+    EVP_PKEY* k = nullptr;
+    EVP_PKEY_CTX* c = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr);
+    if (c == nullptr || EVP_PKEY_keygen_init(c) != 1 || EVP_PKEY_keygen(c, &k) != 1) k = nullptr;
+    EVP_PKEY_CTX_free(c);
+    return k;
+}
+X509* cert_for(EVP_PKEY* key, const char* cn, X509* by, EVP_PKEY* by_key, bool ca, long from_days) {
+    X509* x = X509_new();
+    bool ok = x != nullptr && key != nullptr && X509_set_version(x, 2) == 1 &&
+              ASN1_INTEGER_set(X509_get_serialNumber(x), 1000 + from_days) == 1 &&
+              X509_gmtime_adj(X509_getm_notBefore(x), from_days * 86400L) != nullptr &&
+              X509_gmtime_adj(X509_getm_notAfter(x), (from_days + 365) * 86400L) != nullptr &&
+              X509_set_pubkey(x, key) == 1 &&
+              X509_NAME_add_entry_by_txt(X509_get_subject_name(x), "CN", MBSTRING_ASC, (const unsigned char*) cn, -1,
+                                         -1, 0) == 1 &&
+              X509_set_issuer_name(x, X509_get_subject_name(by != nullptr ? by : x)) == 1;
+    X509V3_CTX v3;
+    X509V3_set_ctx(&v3, by != nullptr ? by : x, x, nullptr, nullptr, 0);
+    const std::pair<int, const char*> exts[] = {
+        {NID_basic_constraints, ca ? "critical,CA:TRUE" : "critical,CA:FALSE"},
+        {NID_key_usage, ca ? "critical,keyCertSign,digitalSignature" : "critical,digitalSignature"}};
+    for (const auto& [nid, value] : exts) {
+        X509_EXTENSION* e = ok ? X509V3_EXT_conf_nid(nullptr, &v3, nid, value) : nullptr;
+        ok = ok && e != nullptr && X509_add_ext(x, e, -1) == 1;
+        X509_EXTENSION_free(e);
+    }
+    ok = ok && X509_sign(x, by_key != nullptr ? by_key : key, nullptr) > 0;
+    if (!ok) {
+        X509_free(x);
+        return nullptr;
+    }
+    return x;
+}
+// a key folder of `key` and `cert` that accepts the certificates in `accepts` (cert.pem files)
+std::string key_folder(const char* name, EVP_PKEY* key, X509* cert, const std::vector<std::string>& accepts) {
+    namespace fs = std::filesystem;
+    const fs::path d = g_tmp / name;
+    std::error_code ec;
+    fs::create_directories(d / "peers", ec);
+    BIO* kb = BIO_new_file((d / "key.pem").string().c_str(), "wb");
+    BIO* cb = BIO_new_file((d / "cert.pem").string().c_str(), "wb");
+    if (kb != nullptr && key != nullptr) PEM_write_bio_PrivateKey(kb, key, nullptr, nullptr, 0, nullptr, nullptr);
+    if (cb != nullptr && cert != nullptr) PEM_write_bio_X509(cb, cert);
+    BIO_free(kb);
+    BIO_free(cb);
+    int i = 0;
+    for (const std::string& a : accepts)
+        fs::copy_file(a, d / "peers" / ("p" + std::to_string(i++) + ".pem"), fs::copy_options::overwrite_existing, ec);
+    return d.string();
+}
+#endif
 }  // namespace
 
 int main() {
     std::printf("stage_link_test\n");
     set_takeover("1");   // (section 8: before the first worker reads it)
+    if (!stage_tls_available()) {   // (a build without OpenSSL: the remote stage refuses to start)
+        std::string e;
+        check(TlsCredentials::load("any", e) == nullptr && contains(e, "without OpenSSL"),
+              "a build without TLS: no credentials, so no remote stage");
+        std::printf("stage_link_test: the link's checks skipped (no TLS in this build)\n");
+        return g_fail == 0 ? 0 : 1;
+    }
+    // the keys: one most checks use at both ends; two PCs that accept each other's certificate; a stranger, which
+    // accepts the shared key's and the worker PC's certificates, while neither accepts its own
+    g_tmp = std::filesystem::temp_directory_path() / ("stage_link_test_" + std::to_string(std::random_device{}()));
+    const std::string shared_dir = make_key("shared"), main_dir = make_key("test-main"),
+                      worker_dir = make_key("test-worker"), stranger_dir = make_key("stranger");
+    copy_cert(main_dir, worker_dir, "test-main.pem");
+    copy_cert(worker_dir, main_dir, "test-worker.pem");
+    copy_cert(shared_dir, stranger_dir, "shared.pem");
+    copy_cert(worker_dir, stranger_dir, "test-worker.pem");
+    g_cred = load_key(shared_dir);
+    const std::shared_ptr<TlsCredentials> cred_main = load_key(main_dir), cred_worker = load_key(worker_dir),
+                                          cred_stranger = load_key(stranger_dir);
+    if (g_cred == nullptr || cred_main == nullptr || cred_worker == nullptr || cred_stranger == nullptr) return 1;
+    check(g_cred->accepted() == 1 && cred_main->accepted() == 2 && cred_worker->accepted() == 2 &&
+              cred_stranger->accepted() == 3,
+          "keys made and loaded: each accepts its own certificate and those in its peers/");
     // 0. the worker's table from a Positions message (no link)
     {
         std::vector<int32_t> out(10 * 3, -1);
@@ -513,7 +817,7 @@ int main() {
         std::printf("stage_link_test: no loopback port to listen on\n");
         return 1;
     }
-    StageClient c;
+    Client c;
     std::string err;
     StageHello peer;
     auto greet_at = [&](const std::string& at, StageHello mine) {
@@ -525,9 +829,9 @@ int main() {
 
     // 1. the hello
     StageHello old_side = hello_of();
-    old_side.protocol = 4;
-    check(!greet(old_side) && contains(err, "the worker refused:") && contains(err, "protocol 4/7"),
-          "a protocol 4 main process is refused for its protocol");
+    old_side.protocol = 7;
+    check(!greet(old_side) && contains(err, "the worker refused:") && contains(err, "protocol 7/8"),
+          "a protocol 7 main process (a token, no TLS) is refused for its protocol");
     StageHello greedy = hello_of();
     greedy.ckpt_max = kStageCkptMax + 1;
     check(!greet(greedy) && contains(err, "at most 64"),
@@ -712,19 +1016,14 @@ int main() {
     //    is never closed)
     worker_vision = 1;
     Worker wk3;
-    if (!wk3.start(h, buf, "tok")) {
+    if (!wk3.start(h, buf)) {
         std::printf("stage_link_test: no loopback port to listen on\n");
         return 1;
     }
-    auto with_token = [](StageHello x, const char* t) {
-        std::memset(x.token, 0, sizeof x.token);
-        std::memcpy(x.token, t, std::strlen(t));
-        return x;
-    };
     using SteadyClock = std::chrono::steady_clock;
     // a main process connecting on a thread of its own (it waits while the worker leaves it in the backlog)
     struct Pending {
-        StageClient cl;
+        Client cl;
         std::thread t;
         std::atomic<bool> done{false};
         bool ok = false;
@@ -740,23 +1039,23 @@ int main() {
         });
     };
     // main processes of their own (greet connects c)
-    auto greet_with = [&](StageClient& cl, const std::string& at, StageHello mine) {
+    auto greet_with = [&](Client& cl, const std::string& at, StageHello mine) {
         err.clear();
         cl.close();
         return cl.connect(at, mine, peer, err);
     };
     float rows1[kHbf] = {1, 2, 3, 4}, back1[kHbf] = {};
     const int32_t tok1 = 7;
-    StageClient a, bad;
-    check(greet_with(a, wk3.where, with_token(hello_of(), "tok")) && a.reset({}, err), "main A is served");
+    Client a, bad, stranger(cred_stranger);
+    check(greet_with(a, wk3.where, hello_of()) && a.reset({}, err), "main A is served");
     const int disc0 = disconnects.load();
-    check(!greet_with(bad, wk3.where, with_token(hello_of(), "nope")) && contains(err, "wrong token"),
-          "a main with a wrong token is refused (once A is idle)");
+    check(!greet_with(stranger, wk3.where, hello_of()) && contains(err, "refused") && contains(err, "certificate"),
+          "a main whose certificate the worker does not hold is refused (once A is idle)");
     check(!stage_link_lost(err), "... a refusal is not a lost link");
-    StageHello other = with_token(hello_of(), "tok");
+    StageHello other = hello_of();
     other.pack_hash ^= 1;
     check(!greet_with(bad, wk3.where, other) && contains(err, "differ"), "... and one with another model");
-    StageHello greedy_b = with_token(hello_of(), "tok");
+    StageHello greedy_b = hello_of();
     greedy_b.ckpt_max = kStageCkptMax + 1;
     check(!greet_with(bad, wk3.where, greedy_b) && contains(err, "conversation checkpoints") &&
               disconnects.load() == disc0,
@@ -764,7 +1063,7 @@ int main() {
     err.clear();
     check(a.reset({}, err) && disconnects.load() == disc0, "... A is still served, never disconnected");
     Pending b;
-    connect_later(b, with_token(hello_of(), "tok"), wk3.where);
+    connect_later(b, hello_of(), wk3.where);
     bool a_ok = true;
     SteadyClock::time_point a_last = SteadyClock::now();
     for (int i = 0; i < 6; ++i) {   // A busy: a message every 0.5 s, for 3 s (STRATA_REMOTE_TAKEOVER_S is 1)
@@ -789,7 +1088,7 @@ int main() {
     check(b.cl.reset({}, err), "... B is still served");
     // a served connection that closes: the one waiting is served at once, not after the idle time
     Pending c3;
-    connect_later(c3, with_token(hello_of(), "tok"), wk3.where);
+    connect_later(c3, hello_of(), wk3.where);
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     const bool b_last = b.cl.reset({}, err);
     const auto b_closed = SteadyClock::now();
@@ -804,16 +1103,16 @@ int main() {
     bad.close();
     wk3.stop();
     err.clear();
-    check(!greet_with(a, wk3.where, with_token(hello_of(), "tok")) && contains(err, "cannot connect") &&
+    check(!greet_with(a, wk3.where, hello_of()) && contains(err, "cannot connect") &&
               stage_link_lost(err),
           "nothing listening: a lost link (worth trying again)");
     a.close();
     err.clear();
-    check(!greet_with(a, "name.invalid:5000", with_token(hello_of(), "tok")) && contains(err, "cannot resolve") &&
+    check(!greet_with(a, "name.invalid:5000", hello_of()) && contains(err, "cannot resolve") &&
               stage_link_lost(err),
           "a name that does not resolve: a lost link (a name service may answer later)");
     a.close();
-    check(!greet_with(a, "no-port", with_token(hello_of(), "tok")) && !stage_link_lost(err),
+    check(!greet_with(a, "no-port", hello_of()) && !stage_link_lost(err),
           "an address without a port: not a lost link");
     a.close();
     auto ms_between = [](SteadyClock::time_point from, SteadyClock::time_point to) {
@@ -823,17 +1122,17 @@ int main() {
     // 9. STRATA_REMOTE_TAKEOVER_S=0: never taken over, however long the served one is silent
     set_takeover("0");
     Worker wk4;
-    const bool wk4_up = wk4.start(h, buf, "tok");
+    const bool wk4_up = wk4.start(h, buf);
     set_takeover("1");
     if (!wk4_up) {
         std::printf("stage_link_test: no loopback port to listen on\n");
         return 1;
     }
-    check(greet_with(a, wk4.where, with_token(hello_of(), "tok")) && a.reset({}, err),
+    check(greet_with(a, wk4.where, hello_of()) && a.reset({}, err),
           "STRATA_REMOTE_TAKEOVER_S=0: main A is served");
     int disc = disconnects.load();
     Pending b4;
-    connect_later(b4, with_token(hello_of(), "tok"), wk4.where);
+    connect_later(b4, hello_of(), wk4.where);
     std::this_thread::sleep_for(std::chrono::milliseconds(2500));
     err.clear();
     check(!b4.done.load() && disconnects.load() == disc && a.reset({}, err),
@@ -849,11 +1148,11 @@ int main() {
     // a connection accepted while A was idle (its hello not in yet), then A sends again: that one is closed at once
     // (its main process connects again), and does not take over at A's next idle time
     Worker wk5;
-    if (!wk5.start(h, buf, "tok")) {
+    if (!wk5.start(h, buf)) {
         std::printf("stage_link_test: no loopback port to listen on\n");
         return 1;
     }
-    check(greet_with(a, wk5.where, with_token(hello_of(), "tok")) && a.reset({}, err), "main A is served");
+    check(greet_with(a, wk5.where, hello_of()) && a.reset({}, err), "main A is served");
     disc = disconnects.load();
     // a valid hello (header, then the hello), of which the peer sends 8 bytes first
     std::vector<char> hello_bytes(sizeof(StageHeader) + sizeof(StageHello));
@@ -861,7 +1160,7 @@ int main() {
         StageHeader hh;
         hh.type = (uint32_t) StageMsg::Hello;
         hh.bytes = sizeof(StageHello);
-        const StageHello hl = with_token(hello_of(), "tok");
+        const StageHello hl = hello_of();
         std::memcpy(hello_bytes.data(), &hh, sizeof hh);
         std::memcpy(hello_bytes.data() + sizeof hh, &hl, sizeof hl);
     }
@@ -893,14 +1192,14 @@ int main() {
         return true;
     };
     Worker wk6;
-    if (!wk6.start(slow, buf, "tok")) {
+    if (!wk6.start(slow, buf)) {
         std::printf("stage_link_test: no loopback port to listen on\n");
         return 1;
     }
-    check(greet_with(a, wk6.where, with_token(hello_of(), "tok")) && a.reset({}, err), "a relay's main A is served");
+    check(greet_with(a, wk6.where, hello_of()) && a.reset({}, err), "a relay's main A is served");
     disc = disconnects.load();
     Pending b6;
-    connect_later(b6, with_token(hello_of(), "tok"), wk6.where);
+    connect_later(b6, hello_of(), wk6.where);
     const int64_t ptok[2] = {1, 2};
     const float pin[2 * kD] = {1, 2, 3, 4, 5, 6, 7, 8};
     float pout[2 * kD] = {};
@@ -920,19 +1219,19 @@ int main() {
 
     // 10. alive(): the link between requests, checked with nothing sent and without blocking
     Worker wk7;
-    if (!wk7.start(h, buf, "tok")) {
+    if (!wk7.start(h, buf)) {
         std::printf("stage_link_test: no loopback port to listen on\n");
         return 1;
     }
     double alive_worst_ms = 0;
-    auto alive_timed = [&](StageClient& cl) {
+    auto alive_timed = [&](Client& cl) {
         const auto t0 = SteadyClock::now();
         const bool up = cl.alive(err);
         alive_worst_ms = std::max(alive_worst_ms, ms_between(t0, SteadyClock::now()));
         return up;
     };
     // the first check that finds it down, within 2 s (the worker's end may take a moment to arrive)
-    auto alive_until_down = [&](StageClient& cl) {
+    auto alive_until_down = [&](Client& cl) {
         for (int i = 0; i < 200; ++i) {
             if (!alive_timed(cl)) return true;
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -940,13 +1239,13 @@ int main() {
         return false;
     };
     err.clear();
-    bool up = greet_with(a, wk7.where, with_token(hello_of(), "tok")) && a.reset({}, err);
+    bool up = greet_with(a, wk7.where, hello_of()) && a.reset({}, err);
     for (int i = 0; i < 20 && up; ++i) up = alive_timed(a);
     check(up && err.empty(), "an idle served link is alive (20 checks)");
     check(a.reset({}, err) && a.alive(err) && a.reset({}, err),
           "... the check sends nothing: the next messages and their replies are in step");
     Pending b7;
-    connect_later(b7, with_token(hello_of(), "tok"), wk7.where);
+    connect_later(b7, hello_of(), wk7.where);
     for (int i = 0; i < 500 && !b7.done.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     b7.t.join();
     check(b7.ok, "main B takes the worker over once A is silent past 1 s");
@@ -983,7 +1282,7 @@ int main() {
         std::printf("stage_link_test: no loopback port to listen on\n");
         return 1;
     }
-    auto timed_connect = [&](StageClient& cl, const std::string& at, StageHello mine, int timeout_s,
+    auto timed_connect = [&](Client& cl, const std::string& at, StageHello mine, int timeout_s,
                              const std::atomic<bool>* stop, double& ms) {
         cl.close();
         err.clear();
@@ -995,7 +1294,7 @@ int main() {
     double ms = 0;
     check(!timed_connect(a, mute.where, hello_of(), 1, nullptr, ms) && ms >= 900 && ms < 3000 &&
               contains(err, "no reply to the hello") && stage_link_lost(err),
-          "a hello left unanswered: given up after the 1 s, as a lost link (worth trying again)");
+          "a handshake left unanswered: given up after the 1 s, as a lost link (worth trying again)");
     std::atomic<bool> stop_now{false};
     std::thread stopper([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -1019,12 +1318,12 @@ int main() {
     std::printf("    (%s)\n", contains(err, "timed out") ? "it timed out: the deadline ended it"
                                                          : "the network refused it at once: the deadline not reached");
     Worker wk8;
-    if (!wk8.start(h, buf, "tok")) {
+    if (!wk8.start(h, buf)) {
         std::printf("stage_link_test: no loopback port to listen on\n");
         return 1;
     }
     std::atomic<bool> never{false};
-    check(timed_connect(a, wk8.where, with_token(hello_of(), "tok"), 5, &never, ms) && a.reset({}, err) &&
+    check(timed_connect(a, wk8.where, hello_of(), 5, &never, ms) && a.reset({}, err) &&
               a.run(1, &tok1, 0, rows1, kHbf, back1, kHbf, err) && std::memcmp(rows1, back1, sizeof rows1) == 0,
           "a worker that answers: served within the deadline, the link blocking again for its messages");
     a.close();
@@ -1042,11 +1341,11 @@ int main() {
         return false;
     };
     Worker wk9;
-    if (!wk9.start(relay_h, buf, "tok")) {
+    if (!wk9.start(relay_h, buf)) {
         std::printf("stage_link_test: no loopback port to listen on\n");
         return 1;
     }
-    check(greet_with(a, wk9.where, with_token(hello_of(), "tok")) && a.reset({}, err), "a relay's main A is served");
+    check(greet_with(a, wk9.where, hello_of()) && a.reset({}, err), "a relay's main A is served");
     bool busy_ok = true;
     for (int i = 0; i < 6; ++i) {   // a message every 0.3 s, for 1.8 s
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -1065,13 +1364,13 @@ int main() {
     err.clear();
     check(!a.reset({}, err) && stage_link_lost(err), "... A's next message finds it lost (its main process connects again)");
     next_gone = false;
-    check(greet_with(a, wk9.where, with_token(hello_of(), "tok")) && a.reset({}, err), "... and connected again, A is served");
+    check(greet_with(a, wk9.where, hello_of()) && a.reset({}, err), "... and connected again, A is served");
     a.close();
     wk9.stop();
 
     // 13. a worker reads nothing but a hello before the hello, and bounds a message's T before any product with it
     Worker wk10;
-    if (!wk10.start(h, buf, "tok")) {
+    if (!wk10.start(h, buf)) {
         std::printf("stage_link_test: no loopback port to listen on\n");
         return 1;
     }
@@ -1090,7 +1389,7 @@ int main() {
     auto serves_on = [&] {   // (a hello's reply waited for 5 s: a worker held fails here, not at the test's time-out)
         err.clear();
         a.close();
-        const bool ok = a.connect(wk10.where, with_token(hello_of(), "tok"), peer, err, 5) &&
+        const bool ok = a.connect(wk10.where, hello_of(), peer, err, 5) &&
                         a.run(1, &tok1, 0, rows1, kHbf, back1, kHbf, err) &&
                         std::memcmp(rows1, back1, sizeof rows1) == 0;
         a.close();
@@ -1120,14 +1419,15 @@ int main() {
         check(ok && at >= 9000 && at < 12000 && serves_on(),
               "a hello sent a byte a second: closed at 10 s in all, and the worker serves on");
     }
-    // a hello with a wrong token, and headers right behind it: a window of T = 2^62, and one of a good size whose body
-    // never comes.  Nothing after a hello is read before its token is taken, so neither ends the worker nor holds it
-    // (a recv on that body is not woken by shutting the socket down on Windows).  The peer stays open meanwhile: its
-    // close would end such a recv.  The refusal's text is not checked: closing with those headers unread resets the
-    // connection, and the reset may drop it.
+    // a hello the worker refuses (another model), and headers right behind it: a window of T = 2^62, and one of a good
+    // size whose body never comes.  Nothing after a hello is read before it is checked, so neither ends the worker nor
+    // holds it (a recv on that body is not woken by shutting the socket down on Windows).  The peer stays open
+    // meanwhile: its close would end such a recv.  The refusal's text is not checked: closing with those headers
+    // unread resets the connection, and the reset may drop it.
     std::vector<char> wrong(hello_bytes);
     {
-        const StageHello nope = with_token(hello_of(), "nope");
+        StageHello nope = hello_of();
+        nope.pack_hash ^= 1;
         std::memcpy(wrong.data() + sizeof(StageHeader), &nope, sizeof nope);
     }
     {
@@ -1137,10 +1437,10 @@ int main() {
         p.header(StageMsg::Run, wrap, 0);
         p.header(StageMsg::Run, 1, 4 + kHbf * 4);
         check(ok && p.closed_by_worker() && serves_on(),
-              "a wrong token's hello, then a window of T = 2^62 and one whose body never comes: closed, the worker "
-              "serves on");
+              "a refused hello, then a window of T = 2^62 and one whose body never comes: closed, the worker serves "
+              "on");
     }
-    // the same behind a second hello on a served connection: its token is taken before anything after it is read
+    // the same behind a second hello on a served connection: it is checked before anything after it is read
     {
         Raw p;
         bool ok = p.open(wk10.where);
@@ -1152,7 +1452,7 @@ int main() {
         p.header(StageMsg::Run, wrap, 0);
         p.header(StageMsg::Run, 1, 4 + kHbf * 4);
         check(ok && p.closed_by_worker() && serves_on(),
-              "... behind a second hello, a wrong token's, on a served connection: closed, the worker serves on");
+              "... behind a second hello, a refused one, on a served connection: closed, the worker serves on");
     }
     // after the hello: the same window and chunk are malformed messages, and the link stays in step
     {
@@ -1291,7 +1591,7 @@ int main() {
         if (!wk15.start(h, buf)) {
             check(false, "a worker for the row formats");
         } else {
-            StageClient cl;
+            Client cl;
             StageHello mine_b = hello_of();
             mine_b.row_formats = f32 | b16;
             check(cl.connect(wk15.where, mine_b, peer, err) && cl.rows() == StageRows::BF16 &&
@@ -1406,7 +1706,7 @@ int main() {
         if (!wkb.start(hb, bb)) {
             check(false, "a worker for the large chunk");
         } else {
-            StageClient cl;
+            Client cl;
             StageHello mine_b = hello_of();
             mine_b.row_formats = f32 | b16;
             const int64_t skip = 3;
@@ -1439,7 +1739,7 @@ int main() {
             std::string err;
             StageHello peer;
             auto greet16 = [&](uint32_t main_bits, int32_t main_kv_type) {
-                StageClient cl;
+                Client cl;
                 StageHello mine = hello_of();
                 mine.row_formats |= main_bits;
                 mine.kv_type = main_kv_type;
@@ -1466,6 +1766,368 @@ int main() {
         }
     }
 
+    // 17. TLS: the credentials, two PCs, the refusals, a message of many records, KeyUpdate
+    {
+        namespace fs = std::filesystem;
+        std::string e;
+        check(TlsCredentials::load("", e) == nullptr && contains(e, "STRATA_STAGE_TLS"),
+              "no credentials folder: refused, naming STRATA_STAGE_TLS");
+        check(TlsCredentials::load((g_tmp / "missing").string(), e) == nullptr && contains(e, "cannot read") &&
+                  contains(e, "--stage-keygen"),
+              "a folder without a key: refused, naming --stage-keygen");
+        std::error_code ec;
+        const fs::path mixed = g_tmp / "mixed", junk = g_tmp / "junk";
+        fs::create_directories(mixed, ec);
+        fs::copy_file(fs::path(shared_dir) / "key.pem", mixed / "key.pem", ec);
+        fs::copy_file(fs::path(main_dir) / "cert.pem", mixed / "cert.pem", ec);
+        check(TlsCredentials::load(mixed.string(), e) == nullptr && contains(e, "do not belong together"),
+              "a key and another PC's certificate: refused");
+        fs::create_directories(junk / "peers", ec);
+        fs::copy_file(fs::path(shared_dir) / "key.pem", junk / "key.pem", ec);
+        fs::copy_file(fs::path(shared_dir) / "cert.pem", junk / "cert.pem", ec);
+        std::ofstream(junk / "peers" / "notes.txt") << "not a certificate\n";
+        const auto notes = TlsCredentials::load(junk.string(), e);
+        check(notes != nullptr && notes->accepted() == 1, "a file in peers/ that is not .pem or .crt: not read");
+        std::ofstream(junk / "peers" / "pc.pem") << "not a certificate\n";
+        check(TlsCredentials::load(junk.string(), e) == nullptr && contains(e, "no certificate in") &&
+                  contains(e, "pc.pem"),
+              "a peers/ .pem without a certificate: refused, naming it");
+        const std::string key0 = read_text(fs::path(shared_dir) / "key.pem");
+        std::string fp;
+        check(!stage_keygen(shared_dir, "again", fp, e) && contains(e, "exists") && !key0.empty() &&
+                  read_text(fs::path(shared_dir) / "key.pem") == key0,
+              "--stage-keygen on a folder with a key: refused, the key left as it was");
+        const fs::path busy = g_tmp / "busy";   // (a folder of other files, e.g. the models': its permissions kept)
+        fs::create_directories(busy, ec);
+#if !defined(_WIN32)
+        fs::permissions(busy, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
+                                  fs::perms::others_read | fs::perms::others_exec, ec);   // (whatever the umask)
+#endif
+        std::ofstream(busy / "model.gguf") << "weights\n";
+        check(!stage_keygen(busy.string(), "busy", fp, e) && contains(e, "holds other files") &&
+                  contains(e, "model.gguf") && !fs::exists(busy / "key.pem") && !fs::exists(busy / "peers") &&
+                  !owner_only(busy),
+              "--stage-keygen on a folder of other files: refused, nothing written, its permissions not changed");
+        const fs::path rekey = g_tmp / "rekey";   // a keygen's folder whose key.pem was removed: a new key there
+        std::string fp1, fp2;
+        const bool made1 = stage_keygen(rekey.string(), "rekey", fp1, e);
+        fs::remove(rekey / "key.pem", ec);
+        bool made2 = made1 && stage_keygen(rekey.string(), "rekey", fp2, e);
+        const auto rc2 = made2 ? TlsCredentials::load(rekey.string(), e) : nullptr;
+        check(made2 && !fp2.empty() && fp2 != fp1 && rc2 != nullptr && rc2->fingerprint() == fp2,
+              "--stage-keygen where only key.pem was removed: a new key, its cert.pem replaced (it loads, as made)");
+        // what was there is made again, not written through: a cert.pem linked from elsewhere keeps its bytes (as
+        // another user's file would stay theirs), and peers/ is a new folder (POSIX: the sticky bit set on the old
+        // one is gone)
+        fs::remove(rekey / "key.pem", ec);
+        const std::string old_cert = read_text(rekey / "cert.pem");
+        std::error_code le;
+        fs::create_hard_link(rekey / "cert.pem", g_tmp / "rekey-old-cert.pem", le);
+#if !defined(_WIN32)
+        fs::permissions(rekey / "peers", fs::perms::sticky_bit, fs::perm_options::add, ec);
+#endif
+        std::string fp3;
+        made2 = stage_keygen(rekey.string(), "rekey", fp3, e);
+        const auto rc3 = made2 ? TlsCredentials::load(rekey.string(), e) : nullptr;
+        if (le) std::printf("  (no hard link made here: the old cert.pem's bytes not checked)\n");
+        bool made_again = made2 && rc3 != nullptr && rc3->fingerprint() == fp3 && fp3 != fp2 &&
+                          (le || read_text(g_tmp / "rekey-old-cert.pem") == old_cert) &&
+                          read_text(rekey / "cert.pem") != old_cert;
+#if !defined(_WIN32)
+        made_again = made_again &&
+                     (fs::status(rekey / "peers", ec).permissions() & fs::perms::sticky_bit) == fs::perms::none;
+#endif
+        check(made_again, "... again: its cert.pem and peers/ made new, not written through (a hard link keeps the "
+                          "old bytes)");
+        // a link is refused: a cert.pem that is one, and the folder itself given as one ("DIR/" too)
+        const fs::path linked = g_tmp / "linked", real = g_tmp / "real", alias = g_tmp / "alias";
+        fs::create_directories(linked, ec);
+        fs::create_directories(real, ec);
+        std::error_code l1, l2;
+        fs::create_symlink(fs::path(shared_dir) / "cert.pem", linked / "cert.pem", l1);
+        fs::create_directory_symlink(real, alias, l2);
+        if (l1 || l2) std::printf("  (no symbolic links made here: those checks skipped)\n");
+        if (!l1)
+            check(!stage_keygen(linked.string(), "linked", fp, e) && contains(e, "holds other files (cert.pem)") &&
+                      !fs::exists(linked / "key.pem"),
+                  "--stage-keygen with a cert.pem that is a link: refused, no key written");
+        if (!l2) {
+            bool refused = !stage_keygen(alias.string() + "/", "alias", fp, e) && contains(e, "is a link");
+            refused = refused && !stage_keygen(alias.string() + "/.", "alias", fp, e) && contains(e, "is a link");
+            check(refused && fs::is_empty(real), "--stage-keygen on a link to a folder (\"DIR/\", \"DIR/.\"): refused, "
+                                                 "nothing written");
+        }
+#if defined(_WIN32)
+        // a junction (any user may make one; std::filesystem does not call it a symlink): refused as a link
+        const fs::path jreal = g_tmp / "jreal", junction = g_tmp / "junction";
+        fs::create_directories(jreal, ec);
+        const std::string mk = "mklink /J \"" + junction.string() + "\" \"" + jreal.string() + "\" >nul 2>&1";
+        if (std::system(mk.c_str()) != 0 || !fs::exists(junction, ec)) {
+            std::printf("  (no junction made here: that check skipped)\n");
+        } else {
+            const std::string j = junction.string();
+            bool refused = !stage_keygen(j, "junction", fp, e) && contains(e, "is a link");
+            refused = refused && !stage_keygen(j + "\\.", "junction", fp, e) && contains(e, "is a link");
+            check(refused && fs::is_empty(jreal) && !owner_only(jreal),
+                  "--stage-keygen on a junction (\"DIR\", \"DIR\\.\"): refused, nothing written, its target's DACL "
+                  "kept");
+            fs::remove(junction, ec);
+        }
+        // a folder another process holds with the right to delete it (as one may that opened it while it inherited
+        // C:\'s Modify for every user, to move it away and put a link in its place): refused, then made once closed
+        const fs::path held = g_tmp / "held";
+        fs::create_directories(held, ec);
+        const HANDLE hh = CreateFileW(held.c_str(), DELETE | FILE_READ_ATTRIBUTES,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                      FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        const bool held_refused = hh != INVALID_HANDLE_VALUE && !stage_keygen(held.string(), "held", fp, e) &&
+                                  contains(e, "held open") && !fs::exists(held / "key.pem") && !owner_only(held);
+        if (hh != INVALID_HANDLE_VALUE) CloseHandle(hh);
+        check(held_refused && stage_keygen(held.string(), "held", fp, e) && owner_only(held),
+              "--stage-keygen on a folder another process holds with the right to delete it: refused, its DACL kept; "
+              "made once closed");
+#else
+        // another user's folder, which root may change: refused before its mode is (run as root: the containers')
+        if (::geteuid() == 0) {
+            const fs::path theirs = g_tmp / "theirs";
+            fs::create_directories(theirs, ec);
+            const bool given = ::chown(theirs.c_str(), 65534, 65534) == 0 && ::chmod(theirs.c_str(), 0777) == 0;
+            check(given && !stage_keygen(theirs.string(), "theirs", fp, e) && contains(e, "another user's folder") &&
+                      (fs::status(theirs, ec).permissions() & fs::perms::all) == fs::perms::all && fs::is_empty(theirs),
+                  "--stage-keygen (as root) on another user's folder: refused, its mode kept, nothing written");
+        } else {
+            std::printf("  (not root: the check of another user's folder skipped)\n");
+        }
+#endif
+        fs::remove(rekey / "key.pem", ec);
+        fs::copy_file(fs::path(shared_dir) / "cert.pem", rekey / "peers" / "pc.pem", ec);
+        check(!stage_keygen(rekey.string(), "rekey", fp, e) && contains(e, "is not an empty folder") &&
+                  !fs::exists(rekey / "key.pem"),
+              "--stage-keygen with a certificate already in peers/: refused, no key written");
+        check(owner_only(shared_dir) && owner_only(worker_dir),
+              "--stage-keygen's folder is this user's alone (Windows: a protected DACL of 3 entries; else 0700)");
+    }
+    Worker wk12;   // the worker PC's key: it accepts its own certificate and the main PC's
+    if (!wk12.start(h, buf, cred_worker)) {
+        std::printf("stage_link_test: no loopback port to listen on\n");
+        return 1;
+    }
+    auto serves_on12 = [&] {   // (the main PC's key, as the worker accepts)
+        Client x(cred_main);
+        err.clear();
+        return x.connect(wk12.where, hello_of(), peer, err, 5) && x.run(1, &tok1, 0, rows1, kHbf, back1, kHbf, err) &&
+               std::memcmp(rows1, back1, sizeof rows1) == 0;
+    };
+    {
+        Client pm(cred_main);
+        check(greet_with(pm, wk12.where, hello_of()) && pm.reset({}, err) && pm.run(1, &tok1, 0, rows1, kHbf, back1, kHbf, err) &&
+                  std::memcmp(rows1, back1, sizeof rows1) == 0,
+              "two PCs that accept each other's certificate: linked, a window runs");
+        const std::string tp = pm.tls_peer();
+        std::printf("    (%s)\n", tp.c_str());
+        check(contains(tp, "test-worker (SHA256:") && contains(tp, "TLSv1.3"),
+              "... the main process names the worker: its certificate's name and fingerprint, TLS 1.3");
+    }
+    {
+        Client unknown;   // (the shared key: it accepts the worker PC's certificate no more than that PC accepts it)
+        check(!greet_with(unknown, wk12.where, hello_of()) && contains(err, "refused the worker at") &&
+                  contains(err, "test-worker") && contains(err, "peers/") && !stage_link_lost(err),
+              "a main process refuses a worker whose certificate it does not hold: named, not a lost link");
+        check(serves_on12(), "... and the worker serves on");
+        Client outsider(cred_stranger);   // (it accepts the worker PC's certificate; the worker does not accept it)
+        check(!greet_with(outsider, wk12.where, hello_of()) &&
+                  contains(err, "the worker refused: TLS: the peer does not accept this PC's certificate") &&
+                  !stage_link_lost(err),
+              "a worker refuses a main process whose certificate it does not hold, and says why (no lost link)");
+        check(serves_on12(), "... and serves on");
+    }
+#if defined(STRATA_HAVE_OPENSSL)
+    {   // a client that sends no certificate (OpenSSL's own, no stage_tls): its handshake ends, the worker's alert comes
+        SSL_CTX* cx = SSL_CTX_new(TLS_client_method());
+        SSL* ssl = nullptr;
+        sock s = kNone;
+        bool done = false;
+        std::string why;
+        if (cx != nullptr) {
+            SSL_CTX_set_min_proto_version(cx, TLS1_3_VERSION);
+            SSL_CTX_set_verify(cx, SSL_VERIFY_NONE, nullptr);
+            s = connect_loopback(wk12.where);
+            ssl = s != kNone ? SSL_new(cx) : nullptr;
+        }
+        if (ssl != nullptr) {
+            set_rcv_timeout(s, 5);
+            SSL_set_fd(ssl, (int) s);
+            done = SSL_connect(ssl) == 1;   // (TLS 1.3: a client's part ends before the worker looks at it)
+            const char hi[sizeof(StageHeader)] = {};
+            (void) SSL_write(ssl, hi, (int) sizeof hi);
+            char byte;
+            if (SSL_read(ssl, &byte, 1) <= 0)
+                for (unsigned long x; (x = ERR_get_error()) != 0;)
+                    if (const char* r = ERR_reason_error_string(x)) why += std::string(r) + "; ";
+            SSL_free(ssl);
+        }
+        if (s != kNone) close_(s);
+        SSL_CTX_free(cx);
+        std::printf("    (%s)\n", why.c_str());
+        check(done && contains(why, "certificate required") && serves_on12(),
+              "a main process that sends no certificate: refused (certificate required), the worker serves on");
+    }
+    {   // pinned: a certificate in peers/ is accepted itself, not what it signed (a CA's in peers/ vouches for no
+        // other); the clock is not looked at (a certificate valid only from 2036 on)
+        EVP_PKEY* ca_key = ed25519_key();
+        EVP_PKEY* leaf_key = ed25519_key();
+        EVP_PKEY* later_key = ed25519_key();
+        X509* ca = cert_for(ca_key, "test-ca", nullptr, nullptr, true, -1);
+        X509* leaf = ca != nullptr ? cert_for(leaf_key, "signed-by-ca", ca, ca_key, false, -1) : nullptr;
+        X509* later = cert_for(later_key, "from-2036", nullptr, nullptr, false, 3650);
+        const std::string worker_cert = (std::filesystem::path(worker_dir) / "cert.pem").string();
+        const std::string ca_dir = key_folder("pin-ca", ca_key, ca, {worker_cert}),
+                          leaf_dir = key_folder("pin-leaf", leaf_key, leaf, {worker_cert}),
+                          later_dir = key_folder("pin-later", later_key, later, {worker_cert});
+        EVP_PKEY* worker_key = nullptr;
+        X509* worker_x = nullptr;
+        if (BIO* b = BIO_new_file((std::filesystem::path(worker_dir) / "key.pem").string().c_str(), "rb")) {
+            worker_key = PEM_read_bio_PrivateKey(b, nullptr, nullptr, nullptr);
+            BIO_free(b);
+        }
+        if (BIO* b = BIO_new_file(worker_cert.c_str(), "rb")) {
+            worker_x = PEM_read_bio_X509(b, nullptr, nullptr, nullptr);
+            BIO_free(b);
+        }
+        const std::string pin_worker = key_folder(
+            "pin-worker", worker_key, worker_x,
+            {(std::filesystem::path(ca_dir) / "cert.pem").string(), (std::filesystem::path(later_dir) / "cert.pem").string()});
+        const auto by_ca = load_key(ca_dir), by_leaf = load_key(leaf_dir), by_later = load_key(later_dir),
+                   wcred = load_key(pin_worker);
+        Worker wpin;
+        if (by_ca != nullptr && by_leaf != nullptr && by_later != nullptr && wcred != nullptr &&
+            wpin.start(h, buf, wcred)) {
+            Client ca_main(by_ca), leaf_main(by_leaf), later_main(by_later);
+            check(greet_with(ca_main, wpin.where, hello_of()),
+                  "pinned: a main process whose certificate (a CA's) is in the worker's peers/: served");
+            check(!greet_with(leaf_main, wpin.where, hello_of()) &&
+                      contains(err, "the worker refused: TLS: the peer does not accept this PC's certificate") &&
+                      !stage_link_lost(err),
+                  "... one that this certificate signed: refused (pinned, no chain), not a lost link");
+            check(greet_with(later_main, wpin.where, hello_of()),
+                  "a certificate valid only from 2036 on: accepted (the clock is not looked at)");
+        } else {
+            check(false, "pinned: the test's certificates made and loaded, a worker started");
+        }
+        for (X509* x : {ca, leaf, later, worker_x}) X509_free(x);
+        for (EVP_PKEY* k : {ca_key, leaf_key, later_key, worker_key}) EVP_PKEY_free(k);
+    }
+#endif
+    {
+        Raw p;
+        const bool ok = p.open(wk12.where, false);
+        p.send(hello_bytes.data(), hello_bytes.size());
+        check(ok && p.closed_by_worker() && serves_on12(),
+              "a main process that speaks no TLS (an older Strata's hello): closed, the worker serves on");
+    }
+    {   // a handshake sent a byte a second: closed at 10 s in all, as a hello sent so is
+        TlsSession first(g_cred, true);
+        std::vector<char> ch;
+        std::string e;
+        (void) first.handshake(ch, e);   // (its first flight: the ClientHello)
+        Silent drip;
+        const auto t0 = SteadyClock::now();
+        bool ok = ch.size() > 20 && drip.open(wk12.where, false);
+        for (size_t i = 0; ok && i < ch.size() && !drip.closed.load(); ++i) {
+            if (ms_between(t0, SteadyClock::now()) >= 13000) break;
+            drip.send_part(ch, i, i + 1);
+            for (int k = 0; k < 10 && !drip.closed.load(); ++k)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        ok = ok && drip.closed.load();
+        const double at = ok ? ms_between(t0, drip.at) : 0;
+        drip.close();
+        check(ok && at >= 9000 && at < 12000 && serves_on12(),
+              "a handshake sent a byte a second: closed at 10 s in all, and the worker serves on");
+    }
+    wk12.stop();
+    {
+        StageHeader eh;
+        eh.type = (uint32_t) StageMsg::Error;
+        eh.bytes = 11;
+        Plain bare;
+        check(bare.start(std::string((const char*) &eh, sizeof eh) + "hello first") &&
+                  !greet_with(a, bare.where, hello_of()) && contains(err, "refused the worker at") &&
+                  contains(err, "does not speak TLS 1.3") && !stage_link_lost(err),
+              "a worker that answers without TLS: refused (it does not speak TLS 1.3), not a lost link");
+        a.close();
+        bare.stop();
+        Plain older;
+        check(older.start("") && !greet_with(a, older.where, hello_of()) && contains(err, "in the TLS handshake") &&
+                  contains(err, "older Strata"),
+              "an older worker, which closes on the handshake: a closed connection whose error says why");
+        a.close();
+        older.stop();
+        Garbled garbled;
+        check(garbled.start() && !greet_with(a, garbled.where, hello_of()) && contains(err, "receive failed: TLS:") &&
+                  !contains(err, "refused") && stage_link_lost(err),
+              "a damaged record in answer to the hello: a lost link (tried again), not a refusal");
+        a.close();
+        garbled.stop();
+    }
+    {   // a prompt chunk of 65536 rows: 1.5 MiB out, 1 MiB back, many records and pieces each way
+        constexpr int64_t kBigT = 65536;
+        std::vector<float> big_in0((size_t) (kBigT * kD)), big_in1(big_in0.size()), big_out0(big_in0.size()),
+            big_out1(big_in0.size());
+        StageBuffers big = buf;
+        big.pf_in[0] = big_in0.data();
+        big.pf_in[1] = big_in1.data();
+        big.pf_out[0] = big_out0.data();
+        big.pf_out[1] = big_out1.data();
+        big.pf_floats = big_in0.size();
+        std::atomic<int64_t> token_sum{0};
+        StageHandlers big_h = h;
+        big_h.prefill = [&](const int64_t* t, int64_t T, int64_t, int64_t, int64_t, const float* in, float* out,
+                            std::string&) {
+            int64_t sum = 0;
+            for (int64_t i = 0; i < T; ++i) sum += t[i];
+            token_sum = sum;
+            std::memcpy(out, in, (size_t) (T * kD) * 4);
+            return true;
+        };
+        Worker wkb;
+        if (!wkb.start(big_h, big)) {
+            std::printf("stage_link_test: no loopback port to listen on\n");
+            return 1;
+        }
+        std::vector<int64_t> btok((size_t) kBigT);
+        std::vector<float> bin(big_in0.size()), bout(big_in0.size());
+        int64_t want = 0;
+        for (int64_t i = 0; i < kBigT; ++i) want += (btok[(size_t) i] = i * 7919 + 3);
+        for (size_t k = 0; k < bin.size(); ++k) bin[k] = (float) (k % 4093) * 0.25f + 1.0f;
+        auto chunk_round = [&](const char* what) {
+            std::fill(bout.begin(), bout.end(), 0.0f);
+            token_sum = 0;
+            const bool ok = a.prefill_send(btok.data(), kBigT, 0, 0, bin.data(), kD, 0, err) &&
+                            a.prefill_recv(bout.data(), kD, kBigT, 0, err) &&
+                            std::memcmp(bin.data(), bout.data(), bin.size() * 4) == 0 && token_sum.load() == want;
+            if (!ok) std::printf("    (%s: %s)\n", what, err.c_str());
+            return ok;
+        };
+        check(greet_with(a, wkb.where, hello_of()) && chunk_round("one chunk"),
+              "a prompt chunk of 65536 rows (1.5 MiB out, 1 MiB back): every byte arrives");
+        // each side's next key every 4 KiB: within a message, across messages, while the other side sends
+        stage_tls_set_rekey_bytes(4096);
+        const uint64_t ku0 = stage_tls_key_updates();
+        bool ok = true;
+        for (int r = 0; r < 3 && ok; ++r) ok = chunk_round("a chunk with KeyUpdates");
+        for (int r = 0; r < 200 && ok; ++r)
+            ok = a.run(1, &tok1, 0, rows1, kHbf, back1, kHbf, err) && std::memcmp(rows1, back1, sizeof rows1) == 0;
+        const uint64_t updates = stage_tls_key_updates() - ku0;
+        stage_tls_set_rekey_bytes(0);
+        std::printf("    (%llu KeyUpdates)\n", (unsigned long long) updates);
+        check(ok && updates >= 60 && a.alive(err) && a.reset({}, err),
+              "a KeyUpdate every 4 KiB: 3 chunks and 200 windows keep every byte, the link in step");
+        a.close();
+        wkb.stop();
+    }
+    std::error_code rm;
+    std::filesystem::remove_all(g_tmp, rm);
     if (g_fail == 0) std::printf("stage_link_test: all passed\n");
     else std::printf("stage_link_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

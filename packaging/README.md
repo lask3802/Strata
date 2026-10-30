@@ -35,6 +35,15 @@ Each row is an OS, CPU ABI and backend. A row is `qualified` only after the acce
 | `windows-x86_64-sycl` | none | none | Gated. No native Windows SYCL path exists upstream. |
 | `macos-x86_64-*` | none | none | Unsupported. The macOS engine is Apple Silicon only. |
 
+**OpenSSL for `strata`.** The remote stage's link is TLS 1.3 ([REMOTE_STAGE.md](../docs/REMOTE_STAGE.md)), and a release
+build (`STRATA_PORTABLE`) links OpenSSL 1.1.1 or later statically, so the engine needs no OpenSSL file on the user's PC.
+Linux: `libssl-dev` (its `libssl.a`). Windows NVIDIA: the "Win64 OpenSSL" install (not the Light one; its
+`lib/VC/x64/MT`) found through `OPENSSL_ROOT_DIR`, or vcpkg's `x64-windows-static`. Without them a release build stops at
+configure; `-DSTRATA_STAGE_TLS=OFF` builds it without TLS, and its remote stage then refuses to start. The DeepSeek
+scripts that build `strata-dsv41` alone (`build_dsv41_cuda.sh`, `build_dsv41_windows.bat`,
+`tools\dsv41\win\build_hip_win.bat`) and `tools/hip/build_windows.bat` pass that flag; the others build `strata` too and
+need OpenSSL.
+
 **DeepSeek V4.1-Flash.** The signed feed's `dsv41` member carries the DeepSeek engine `strata-dsv41` as its own package: Windows
 NVIDIA `cuda13`, Linux NVIDIA `cuda13`, Linux AMD `rx9070`, and since 0.2.7 Windows AMD `rdna3` (Ryzen AI Max, gfx1151). All other
 engine packages carry no DeepSeek engine. Build `strata-dsv41` with `packaging/build_dsv41_cuda.sh` (Linux) or

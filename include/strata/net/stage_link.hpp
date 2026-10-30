@@ -16,8 +16,12 @@
 // another thread.  Images (--vision on both sides): a request with a picture rotates its tokens by M-RoPE positions
 // that are not the cell index, so the main process sends its position table before the request (and a reset to the
 // identity before the next text request); the worker's layers read their own copy.  POSIX sockets on Linux, Winsock on
-// Windows.
+// Windows.  Every connection is TLS 1.3, and each end accepts only a peer whose certificate it holds (stage_tls.hpp):
+// the main process's worker is one of its PCs, and so is a worker's main process.  The messages below are the
+// records' contents.
 #pragma once
+
+#include "strata/net/stage_tls.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -26,6 +30,7 @@
 #include <deque>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -33,7 +38,8 @@
 namespace strata::net {
 
 inline constexpr uint32_t kStageMagic = 0x4d525453u;   // "STRM"
-inline constexpr uint32_t kStageProtocol = 7;
+// 8: TLS 1.3, both ends' certificates (7: a token in the hello; upstream's PR numbers the same change 5 -> 6)
+inline constexpr uint32_t kStageProtocol = 8;
 /// Conversation checkpoints (docs/remote-stage/CHECKPOINTS.md): the most parts a worker keeps; a main process whose
 /// hello asks for more is refused
 inline constexpr int32_t kStageCkptMax = 64;
@@ -89,7 +95,7 @@ struct StageHello {
     /// process lists fp32 and the one it asks for (STRATA_REMOTE_ROWS), a worker every one it has
     uint32_t row_formats = 1u << 0;
     char build[48] = {};          ///< engine build id (informational)
-    char token[64] = {};          ///< the shared secret (STRATA_STAGE_TOKEN); the worker refuses a wrong one
+    char unused[64] = {};         ///< (protocol 7's token: the TLS handshake proves both ends now)
 };
 #pragma pack(pop)
 // one size across protocols: an older peer's hello is read whole and refused for its protocol, not as malformed
@@ -139,9 +145,9 @@ int io_timeout_s();
 
 /// Whether a StageClient's error says the link itself failed - nothing listened or the network did not reach it, the
 /// connection closed, was reset or timed out, a send or a receive failed, the name did not resolve (yet: a name
-/// service after a reboot) - so connecting again may mend it; false for a refusal (token, model, layers, chunk,
-/// protocol: "refused", "differ"), an address that does not parse, and an error the worker reported
-/// ("remote stage (worker): ...").
+/// service after a reboot) - so connecting again may mend it; false for a refusal (a certificate either end does not
+/// accept, a peer without TLS, model, layers, chunk, protocol: "refused", "differ"), an address that does not parse,
+/// and an error the worker reported ("remote stage (worker): ...").
 bool stage_link_lost(const std::string& err);
 
 /// Whether a StageClient's error is the end of a wait its stop flag cancelled (StageClient::connect).
@@ -166,10 +172,13 @@ public:
     StageClient(const StageClient&) = delete;
     StageClient& operator=(const StageClient&) = delete;
 
-    /// "host:port".  Sends `mine`, receives the worker's hello into `peer` and checks it against `mine`.
-    /// `timeout_s` > 0: the connection and the hello's reply take that long at most, together; an address that does
-    /// not answer leaves the next one of the name's addresses the rest (each but the last gets 10 s at most).  0: the
-    /// system's connect time-out, then STRATA_REMOTE_TIMEOUT_S for the reply.  `stop`, set by another thread, ends the
+    /// This PC's key and the certificates it accepts (connect refuses without them).
+    void set_credentials(std::shared_ptr<TlsCredentials> cred) { cred_ = std::move(cred); }
+    /// "host:port".  The TLS handshake (the worker must present a certificate `set_credentials` accepts, and accepts
+    /// this PC's), then sends `mine`, receives the worker's hello into `peer` and checks it against `mine`.
+    /// `timeout_s` > 0: the connection, the handshake and the hello's reply take that long at most, together; an
+    /// address that does not answer leaves the next one of the name's addresses the rest (each but the last gets 10 s
+    /// at most).  0: the system's connect time-out, then STRATA_REMOTE_TIMEOUT_S for the handshake and the reply.  `stop`, set by another thread, ends the
     /// wait for either: "remote stage: the wait was cancelled" (stage_wait_cancelled), which stage_link_lost does not
     /// count.  The name's lookup is not cut short by either.
     bool connect(const std::string& host_port, const StageHello& mine, StageHello& peer, std::string& err,
@@ -177,9 +186,9 @@ public:
     bool connected() const { return fd_ >= 0 && !broken_; }
     void close();
     /// Between requests (no reply outstanding): whether the link still stands, without sending anything and without
-    /// blocking.  The worker sends nothing unasked, so a readable socket means its end closed or failed, or bytes
-    /// came that no message asked for (the link is out of step): false, with an error stage_link_lost counts, and
-    /// the link is marked failed.
+    /// blocking.  The worker sends nothing unasked (no TLS session tickets either), so a readable socket, or bytes the
+    /// TLS session holds, mean its end closed or failed, or bytes came that no message asked for (the link is out of
+    /// step): false, with an error stage_link_lost counts, and the link is marked failed.
     bool alive(std::string& err);
     /// From another thread: the socket shut down, so a run() waiting for its reply fails (and then breaks the link).
     /// Linux wakes a blocked read at once; on Windows (not tested) the read may wait for the link's own timeout.
@@ -211,6 +220,8 @@ public:
     std::string peer_name() const { return peer_; }
     /// the row format the connection agreed on (connect)
     StageRows rows() const { return rows_; }
+    /// After connect: the worker's certificate (its name and fingerprint), the TLS version and cipher.
+    std::string tls_peer() const { return tls_ != nullptr ? tls_->peer() : std::string(); }
 
 private:
     /// `rows` > 0: the payload is that many rows of `width` floats in the link's format, read into `reply` (floats),
@@ -227,6 +238,9 @@ private:
     std::atomic<bool> broken_{false};   ///< (the sending side sets it, the receiving side reads it)
     std::string peer_;
     StageRows rows_ = StageRows::F32;
+    std::shared_ptr<TlsCredentials> cred_;
+    std::unique_ptr<TlsSession> tls_;     ///< the connection's (both threads': it locks inside)
+    std::vector<char> tls_tx_, tls_rx_;   ///< records going out (send_mu_), bytes coming in (recv_mu_)
     std::mutex send_mu_, recv_mu_, q_mu_;
     struct Sent {
         std::chrono::steady_clock::time_point at;   ///< the send's start
@@ -325,9 +339,10 @@ inline void stage_positions_fill(int32_t* out, int64_t cells, const int32_t* tab
 /// being read, or a reply going out for STRATA_REMOTE_TAKEOVER_S seconds (default 30; 0: until it closes); then a
 /// valid hello takes the worker over: the old one ends as a closed one does (`disconnected`).  An invalid one is
 /// refused and the old one stays; one accepted while the served one sends again is closed (its main process connects
-/// again).  `token`: the secret a main process's hello must carry (empty: none - any host that reaches the port can
-/// drive the worker).  Returns 0 when stopped, nonzero on a listen error (the reason on stderr).
-int serve_stage(const std::string& bind_addr, int port, const std::string& token, const StageHandlers& h,
+/// again).  `cred`: this PC's key and the certificates it accepts - a connection whose TLS handshake does not present
+/// one of them is refused before anything of it is read.  Returns 0 when stopped, nonzero without credentials or on a
+/// listen error (the reason on stderr).
+int serve_stage(const std::string& bind_addr, int port, std::shared_ptr<TlsCredentials> cred, const StageHandlers& h,
                 const StageBuffers& buf, StageStats& stats, const std::atomic<bool>* stop);
 
 }  // namespace strata::net

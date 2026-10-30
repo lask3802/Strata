@@ -14,7 +14,8 @@ node.json (paths are this PC's):
       "agent_port": 7840,
       "log_dir": "/srv/stage",
       "args": ["--spec", "4", "--max-context", "131072", "--kv", "int8", "--kv-resident", "32768"],
-      "token_file": "/srv/stage/stage-token",      or STRATA_STAGE_TOKEN in the environment
+      "tls_dir": "/srv/stage/stage-tls",           this PC's key folder (`strata --stage-keygen DIR`;
+                                                   STRATA_STAGE_TLS in the environment, when set, instead)
       "data_dir": "/srv/stage/shipped",            where tools/stage_ship.py writes (optional)
       "pack": ".../packs/<pack>", "native": "...-00001-of-0000N.gguf", "ple_gguf": "...-00002-of-0000N.gguf",
       "expert_profile": ".../expert-profile.bin",  the model a /start that names none runs (optional with data_dir)
@@ -27,10 +28,12 @@ node.json (paths are this PC's):
       "restart": true                              default: start a worker that ended by itself again (Workers.exited)
     }
 
-What the token allows: a holder can start and stop this PC's workers with the engine and model files node.json
-names, and the flags in EXTRA_ALLOWED (or "extra_allow"); with "data_dir", write files under it; with
-"allow_put_bin", also the engine there (that is running code of their choice - for a node you ship the engine to).
-The token and the traffic are plain text: a LAN you trust, or a VPN tunnel.
+Who may drive it: the agent speaks HTTPS, TLS 1.3 only, and takes a connection only from a PC whose certificate is
+this PC's own or one in tls_dir/peers/ - the same folder, and the same rule, as its workers' stage link
+(docs/REMOTE_STAGE.md, "Keys").  The tuner and the shipper show their PC's certificate, and check the agent's in
+turn.  Such a PC can start and stop this PC's workers with the engine and model files node.json names, and the
+flags in EXTRA_ALLOWED (or "extra_allow"); with "data_dir", write files under it; with "allow_put_bin", also the
+engine there (that is running code of their choice - for a node you ship the engine to).
 
 The page cache: a worker reads its layers' experts through the file cache and copies them into pinned memory, and
 a shipped file passes through the cache too - left there, a 10-layer worker would take its experts' RAM twice (and
@@ -38,8 +41,8 @@ under WSL the VM keeps the cache from Windows).  So the agent drops the files it
 from the cache once the worker listens (posix_fadvise DONTNEED: no root; mapped pages stay).  "drop_cache": false
 keeps them (a faster restart with the same layers).
 
-Every request carries the shared token in the X-Stage-Token header (the workers get it as STRATA_STAGE_TOKEN), so
-only the tuner and the main process drive this PC.  Endpoints (JSON in and out):
+The workers get the folder as STRATA_STAGE_TLS, so they accept the same main processes.  Endpoints (JSON in and
+out, https://):
     GET  /ping                 {"ok": true}: a round trip with no work behind it
     GET  /info                 the GPU (nvidia-smi), RAM, CPU and the workers running here; "ports": each port's
                                worker - running, restarts so far, its last exit (code, time) and the next start's time
@@ -53,7 +56,7 @@ only the tuner and the main process drive this PC.  Endpoints (JSON in and out):
     GET  /log?port=P&lines=N   a worker's log tail (&prev=1: the last run that listened before this one,
                                stage-worker-P.prev.log)
     POST /sink                 reads the body; answers its bytes and the seconds it took (a link test toward here)
-    POST /send                 {"url": "http://other:7840", "mib": 64} - sends to another node's /sink
+    POST /send                 {"url": "https://other:7840", "mib": 64} - sends to another node's /sink
     POST /put?path=P&offset=N&total=T[&mode=755][&sha256=H]
                                writes the body at byte N of data_dir/P (a file of T bytes, sparse where nothing
                                was written) and answers the body's sha256; P.ranges.json records what is written
@@ -69,13 +72,13 @@ every shard's header) loads them as from the whole file - tools/stage_ship.py se
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import os
 import platform
 import re
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import threading
@@ -100,14 +103,139 @@ RESTART_MAX_S = 300.0
 RESTART_STABLE_S = 600.0   # ... back to RESTART_FIRST_S after a run at least this long
 
 
+HANDSHAKE_TIMEOUT_S = 10  # a peer's TLS handshake, as a worker allows its main process
+
+
+# ---------------------------------------------------------------- TLS (the stage link's keys, stage_tls.hpp)
+# Each PC's folder from `strata --stage-keygen DIR`: key.pem, cert.pem and peers/ (the other PCs' cert.pem, as *.pem
+# or *.crt).  A peer is accepted when its certificate is this PC's own or one in peers/, that certificate itself:
+# each is a trust anchor of its own (PARTIAL_CHAIN), and PinnedSocket then wants the peer's own among them (the chain's
+# check alone also passes one an accepted certificate signed, a CA's in peers/ too).  Host names and the clock
+# (NO_CHECK_TIME) are not looked at, as in the engine.
+PARTIAL_CHAIN = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0x80000)   # (the flag itself before Python 3.10)
+NO_CHECK_TIME = 0x200000   # X509_V_FLAG_NO_CHECK_TIME (OpenSSL 1.1.0 and later; Python has no name for it)
+PEM_CERT = re.compile(r"-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE-----")
+
+
+class PinnedSocket(ssl.SSLSocket):
+    """An SSLSocket whose handshake fails unless the peer's certificate is one of its context's `pinned`."""
+
+    def do_handshake(self, block=False):
+        super().do_handshake(block)
+        pinned = getattr(self.context, "pinned", None)
+        if pinned is None:   # a context not made by tls_context: no peer is accepted, rather than any one it trusts
+            raise ssl.SSLError(ssl.SSL_ERROR_SSL, "this TLS context has no pinned certificates (tls_context makes them)")
+        der = self.getpeercert(binary_form=True)
+        if not der or hashlib.sha256(der).hexdigest() not in pinned:
+            # Two arguments: with one, str() of an SSLError is its args tuple.
+            raise ssl.SSLError(ssl.SSL_ERROR_SSL,
+                               f"{peer_name(self) or 'a peer without a certificate'} is not this PC's nor in its "
+                               "peers/ folder (an accepted certificate signed it, but it is not one of them)")
+
+
+class PinnedContext(ssl.SSLContext):
+    sslsocket_class = PinnedSocket
+
+
+def accepted_certs(d: Path) -> str:
+    """This PC's certificate and every one in d/peers/, as one PEM text; a file there without one is an error, as
+    it is to the engine."""
+    peers = d / "peers"
+    files = [d / "cert.pem"] + (sorted(p for p in peers.iterdir() if p.suffix in (".pem", ".crt") and p.is_file())
+                                if peers.is_dir() else [])
+    texts = []
+    for p in files:
+        t = p.read_text(encoding="ascii", errors="replace")
+        if "-----BEGIN CERTIFICATE-----" not in t:
+            raise ValueError(f"no certificate in {p}")
+        texts.append(t if t.endswith("\n") else t + "\n")
+    return "".join(texts)
+
+
+def tls_context(d: Path, server: bool) -> ssl.SSLContext:
+    """TLS 1.3 only, this PC's key, and a peer's certificate required and pinned to accepted_certs."""
+    ctx = PinnedContext(ssl.PROTOCOL_TLS_SERVER if server else ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    # the security level the engine's link sets (2), whatever the PC's openssl.cnf says (a policy at level 4 refuses
+    # the Ed25519 certificate in a Python that keeps OpenSSL's default cipher string, as Ubuntu 24.04's does;
+    # python.org's builds set their own, at level 2, since 3.10); TLS 1.2 is off, so of this string only the level
+    # counts.  Before the key is loaded: the level is checked there
+    ctx.set_ciphers("DEFAULT:@SECLEVEL=2")
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.load_cert_chain(d / "cert.pem", d / "key.pem")
+    accepted = accepted_certs(d)
+    ctx.load_verify_locations(cadata=accepted)
+    ctx.pinned = {hashlib.sha256(ssl.PEM_cert_to_DER_cert(m.group(0))).hexdigest() for m in PEM_CERT.finditer(accepted)}
+    ctx.verify_flags |= PARTIAL_CHAIN | NO_CHECK_TIME
+    if server:
+        ctx.num_tickets = 0   # no resumption: every connection shows its certificate
+    return ctx
+
+
+def tls_dir(given: str | None, who: str) -> Path:
+    """The key folder: STRATA_STAGE_TLS, else `given` (a config's tls_dir); exits without one."""
+    d = os.environ.get("STRATA_STAGE_TLS") or given or ""
+    if not d:
+        sys.exit(f"{who}: no key folder (STRATA_STAGE_TLS or the config's tls_dir): make one on each PC with "
+                 "`strata --stage-keygen DIR` and copy each PC's DIR/cert.pem into the others' DIR/peers/ "
+                 "(docs/REMOTE_STAGE.md)")
+    if os.environ.get("STRATA_STAGE_TOKEN"):
+        sys.stderr.write(f"{who}: STRATA_STAGE_TOKEN is not used any more (TLS certificates instead)\n")
+    return Path(d).resolve()
+
+
+def client_context(d: Path, who: str) -> ssl.SSLContext:
+    try:
+        return tls_context(d, server=False)
+    except (OSError, ssl.SSLError, ValueError) as e:
+        sys.exit(f"{who}: the key folder {d}: {e}")
+
+
+def agent_url(url: str) -> str:
+    """An agent's address as https:// (an http:// one from an older cluster.json is the same agent)."""
+    url = url.rstrip("/")
+    scheme, sep, rest = url.partition("://")
+    return "https://" + rest if sep and scheme.lower() in ("http", "https") else url
+
+
+def https_opener(ctx: ssl.SSLContext) -> urllib.request.OpenerDirector:
+    """urllib with this PC's TLS context, https only (any other address fails as an unknown url type: nothing goes
+    in the clear), and no proxy from the environment (an agent is a LAN or tunnel address a proxy cannot reach)."""
+    o = urllib.request.OpenerDirector()
+    for h in (urllib.request.ProxyHandler({}), urllib.request.UnknownHandler(), urllib.request.HTTPSHandler(context=ctx),
+              urllib.request.HTTPDefaultErrorHandler(), urllib.request.HTTPRedirectHandler(),
+              urllib.request.HTTPErrorProcessor()):
+        o.add_handler(h)
+    return o
+
+
+def peer_name(sock: ssl.SSLSocket) -> str:
+    """A handshaken peer's certificate: its name and fingerprint, as the engine logs those its keygen makes (a UTF-8
+    name; "" without a certificate, "(no name)" without a name).  The peer chose the name: each byte of its UTF-8 but
+    printable ASCII becomes "?" (no line of its own, no terminal control or bidi character) and it is cut at 64
+    bytes."""
+    der = sock.getpeercert(binary_form=True)
+    if not der:
+        return ""
+    try:
+        subject = (sock.getpeercert() or {}).get("subject", ())
+    except ValueError:
+        subject = ()
+    cn = next((v for rdn in subject for k, v in rdn if k == "commonName"), "(no name)")
+    cn = "".join(chr(b) if 0x20 <= b < 0x7F else "?" for b in cn.encode("utf-8", "replace")[:64])
+    return f"{cn} (SHA256:{hashlib.sha256(der).hexdigest()[:16]})"
+
+
 def load_config(path: str) -> dict:
     cfg = json.loads(Path(path).read_text(encoding="utf-8"))
-    token = os.environ.get("STRATA_STAGE_TOKEN", "")
-    if not token and cfg.get("token_file"):
-        token = Path(cfg["token_file"]).read_text(encoding="utf-8").strip()
-    if not token:
-        sys.exit("stage_node: no token (STRATA_STAGE_TOKEN or node.json's token_file)")
-    cfg["_token"] = token
+    if cfg.get("token_file"):
+        sys.stderr.write("stage_node: node.json's token_file is not used any more (tls_dir instead)\n")
+    d = tls_dir(cfg.get("tls_dir"), "stage_node")
+    try:
+        cfg["_tls"], cfg["_server_ctx"], cfg["_client_ctx"] = d, tls_context(d, True), tls_context(d, False)
+    except (OSError, ssl.SSLError, ValueError) as e:
+        sys.exit(f"stage_node: the key folder {d}: {e}")
     return cfg
 
 
@@ -402,7 +530,8 @@ class Workers:
                  "--prefill", str(int(req.get("prefill", 2048))), "--stage-bind", c["bind"]]
         args += [str(a) for a in c.get("args", [])] + extra
         env = dict(os.environ)
-        env["STRATA_STAGE_TOKEN"] = c["_token"]
+        env.pop("STRATA_STAGE_TOKEN", None)
+        env["STRATA_STAGE_TLS"] = str(c["_tls"])
         env["STRATA_REMOTE_TIMING"] = "1"
         libs = os.pathsep.join(c.get("lib_dirs", []))
         if libs:
@@ -718,9 +847,24 @@ def make_handler(cfg: dict, workers: Workers, store: Store):
         # a next request.  An idle kept connection is closed after `timeout` s (its thread freed).
         protocol_version = "HTTP/1.1"
         timeout = 600
+        peer = ""   # the handshaken peer's certificate (peer_name)
+
+        def handle(self):
+            # the TLS handshake first, on this request's thread (the server's accept never waits for one), within
+            # HANDSHAKE_TIMEOUT_S: a peer whose certificate this PC does not accept, or one without TLS, gets no answer
+            try:
+                self.connection.settimeout(HANDSHAKE_TIMEOUT_S)
+                self.connection.do_handshake()
+                self.peer = peer_name(self.connection)
+                self.connection.settimeout(self.timeout)
+            except (ssl.SSLError, OSError, AttributeError) as e:
+                sys.stderr.write(f"stage_node: {self.client_address[0]} refused: TLS: {e}\n")
+                self.close_connection = True
+                return
+            super().handle()
 
         def log_message(self, fmt, *args):   # one line per request on stderr
-            sys.stderr.write("stage_node: %s %s\n" % (self.address_string(), fmt % args))
+            sys.stderr.write("stage_node: %s %s %s\n" % (self.address_string(), self.peer, fmt % args))
 
         def reply(self, code: int, obj, keep: bool = False) -> None:
             body = json.dumps(obj).encode()
@@ -732,10 +876,10 @@ def make_handler(cfg: dict, workers: Workers, store: Store):
             self.end_headers()
             self.wfile.write(body)
 
-        def authorized(self) -> bool:
-            if hmac.compare_digest(self.headers.get("X-Stage-Token", "").encode(), cfg["_token"].encode()):
+        def authorized(self) -> bool:   # (handle let only a handshaken peer this far; this keeps it so)
+            if self.peer:
                 return True
-            self.reply(403, {"ok": False, "error": "wrong or missing X-Stage-Token"})
+            self.reply(403, {"ok": False, "error": "no TLS peer certificate"})
             return False
 
         def body_json(self) -> dict:
@@ -828,23 +972,37 @@ def make_handler(cfg: dict, workers: Workers, store: Store):
             elif path == "/stop":
                 self.reply(200, {"ok": True, "stopped": workers.stop(req.get("port"))})
             elif path == "/send":
-                self.reply(200, send_test(req["url"], int(req.get("mib", 64)), cfg["_token"]))
+                self.reply(200, send_test(req["url"], int(req.get("mib", 64)), cfg["_client_ctx"]))
             else:
                 self.reply(404, {"ok": False, "error": "unknown path"})
 
     return Handler
 
 
-def send_test(url: str, mib: int, token: str) -> dict:
-    """POST `mib` MiB to another node's /sink: the link's throughput from here (the wall time of the request)."""
+def send_test(url: str, mib: int, ctx: ssl.SSLContext) -> dict:
+    """POST `mib` MiB to another node's /sink: the link's throughput from here (the wall time of the request, its
+    TLS handshake included)."""
     data = b"\0" * (mib << 20)
-    req = urllib.request.Request(url.rstrip("/") + "/sink", data=data, method="POST",
-                                 headers={"X-Stage-Token": token, "Content-Type": "application/octet-stream"})
+    req = urllib.request.Request(agent_url(url) + "/sink", data=data, method="POST",
+                                 headers={"Content-Type": "application/octet-stream"})
     t0 = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=300) as r:
+    with https_opener(ctx).open(req, timeout=300) as r:
         got = json.load(r)
     s = time.perf_counter() - t0
     return {"ok": bool(got.get("ok")), "bytes": len(data), "seconds": s, "mb_s": len(data) / s / 1e6}
+
+
+class TlsServer(ThreadingHTTPServer):
+    """The agent's HTTPS server: each connection is wrapped as it is accepted, its handshake left to its own thread
+    (the handler's handle)."""
+
+    def __init__(self, addr, handler, ctx: ssl.SSLContext):
+        self.ctx = ctx
+        super().__init__(addr, handler)
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        return self.ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
 
 
 def main() -> None:
@@ -853,8 +1011,12 @@ def main() -> None:
     cfg = load_config(sys.argv[1])
     workers = Workers(cfg)
     addr = cfg.get("agent_bind") or cfg["bind"]
-    srv = ThreadingHTTPServer((addr, int(cfg.get("agent_port", 7840))), make_handler(cfg, workers, Store(cfg)))
-    sys.stderr.write(f"stage_node: listening on {addr}:{cfg.get('agent_port', 7840)}\n")
+    srv = TlsServer((addr, int(cfg.get("agent_port", 7840))), make_handler(cfg, workers, Store(cfg)),
+                    cfg["_server_ctx"])
+    cert = ssl.PEM_cert_to_DER_cert((cfg["_tls"] / "cert.pem").read_text(encoding="ascii"))
+    n = accepted_certs(cfg["_tls"]).count("-----BEGIN CERTIFICATE-----")
+    sys.stderr.write(f"stage_node: listening on https://{addr}:{cfg.get('agent_port', 7840)} (TLS 1.3: this PC is "
+                     f"SHA256:{hashlib.sha256(cert).hexdigest()[:16]}; {n} certificate(s) accepted)\n")
 
     def interrupt(signum, frame):   # a service stop (SIGTERM) or Ctrl+Break: stop the workers, reset the clocks
         raise KeyboardInterrupt

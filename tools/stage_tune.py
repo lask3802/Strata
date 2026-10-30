@@ -12,7 +12,7 @@ cluster.json:
                "exe": "/opt/strata/build/strata", "cwd": "/opt/strata",
                "python": "/opt/strata/.venv/bin/python", "port": 8080,
                "api_key_file": "/opt/strata/api-key", "extra": []},
-      "nodes": [{"name": "node-b", "agent": "http://192.0.2.11:7840", "host": "192.0.2.11", "port": 7841,
+      "nodes": [{"name": "node-b", "agent": "https://192.0.2.11:7840", "host": "192.0.2.11", "port": 7841,
                  "ship": false,                      true: send the node its layers first (tools/stage_ship.py); its
                                                      /start then names the shipped model, so node.json need not
                  "cache": "auto",                    or N: an expert cache of N times the model's largest expert
@@ -22,7 +22,8 @@ cluster.json:
                                                      for IQ3_S, ~1.5 GiB for UD-Q4_K_XL)
       "ship": {"model_dir": "/data/models/<model>", "pack_dir": "/data/packs/<pack>",
                "profile": "/opt/strata/data/expert-profile.bin", "bin_dir": null},
-      "token_file": "/opt/strata/stage-token",
+      "tls_dir": "/opt/strata/stage-tls",   this PC's key folder (strata --stage-keygen; STRATA_STAGE_TLS, when set,
+                                            instead): the agents and the first worker check this PC's certificate
       "corpus": "/opt/strata/corpus.txt",
       "goal": {
         "measure_tokens": 32000,      the prompt every searched configuration reads ("prompt_tokens" works too)
@@ -61,6 +62,7 @@ import itertools
 import json
 import os
 import re
+import ssl
 import statistics
 import subprocess
 import sys
@@ -71,6 +73,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import stage_node  # noqa: E402  (the agents' TLS)
 
 N_LAYERS_DEFAULT = 48      # Qwen3.8-Flash-Next (every variant Strata runs), when the GGUF cannot be read
 MIN_LAYERS = 2             # the fewest layers a stage may hold
@@ -124,16 +127,17 @@ def model_layers(native: str | None) -> tuple[int, list[int]]:
 
 # ---------------------------------------------------------------- nodes (tools/stage_node.py)
 class Node:
-    def __init__(self, spec: dict, token: str):
+    def __init__(self, spec: dict, ctx: ssl.SSLContext | None):
         self.name = spec.get("name", spec["host"])
-        self.agent = spec["agent"].rstrip("/")
+        self.agent = stage_node.agent_url(spec["agent"])
         self.host = spec["host"]
         self.port = int(spec.get("port", 7841))
         self.cache = spec.get("cache", "auto")
         self.extra = list(spec.get("extra", []))
         self.ship = bool(spec.get("ship", False))
         self.max_layers = int(spec["max_layers"]) if spec.get("max_layers") else None
-        self.token = token
+        self.ctx = ctx
+        self.opener = stage_node.https_opener(ctx) if ctx is not None else None
         self.info: dict = {}
 
     @property
@@ -148,14 +152,14 @@ class Node:
 
     def call(self, path: str, body: dict | None = None, timeout: float = 900, data: bytes | None = None,
              base: str | None = None) -> dict:
-        headers = {"X-Stage-Token": self.token}
+        headers = {}
         if data is None and body is not None:
             data = json.dumps(body).encode()
             headers["Content-Type"] = "application/json"
         url = (base or self.agent) + path
         req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data is not None else "GET")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with self.opener.open(req, timeout=timeout) as r:
                 return json.load(r)
         except urllib.error.HTTPError as e:
             return {"ok": False, "error": f"HTTP {e.code}: {e.read().decode(errors='replace')[:300]}"}
@@ -168,9 +172,9 @@ class Node:
 
 # ---------------------------------------------------------------- the main process (serve/server.py)
 class Main:
-    def __init__(self, spec: dict, token: str, outdir: Path):
+    def __init__(self, spec: dict, tls: Path, outdir: Path):
         self.spec = spec
-        self.token = token
+        self.tls = tls   # this PC's key folder: the main process links to the first worker with it
         self.outdir = outdir
         self.base = json.loads(Path(spec["config"]).read_text(encoding="utf-8"))
         self.port = int(spec.get("port", 8080))
@@ -190,7 +194,8 @@ class Main:
         args += [str(a) for a in self.spec.get("extra", [])] + [str(a) for a in extra]
         cfg = dict(self.base)
         env = dict(cfg.get("env") or {})
-        env["STRATA_STAGE_TOKEN"] = self.token
+        env.pop("STRATA_STAGE_TOKEN", None)
+        env["STRATA_STAGE_TLS"] = str(self.tls)
         if timing:
             env["STRATA_REMOTE_TIMING"] = "1"
         cfg.update(exe=self.spec["exe"], cwd=self.spec["cwd"], args=args, env=env,
@@ -301,12 +306,12 @@ class Tuner:
         self.cl = cluster
         self.outdir = outdir
         outdir.mkdir(parents=True, exist_ok=True)
-        tf = cluster.get("token_file")
-        self.token = (Path(tf).read_text().strip() if tf else os.environ.get("STRATA_STAGE_TOKEN", "")).strip()
-        if not self.token:
-            sys.exit("stage_tune: no token (cluster.json's token_file or STRATA_STAGE_TOKEN)")
-        self.nodes = [Node(n, self.token) for n in cluster["nodes"]]
-        self.main = Main(cluster["main"], self.token, outdir)
+        if cluster.get("token_file"):
+            sys.stderr.write("stage_tune: cluster.json's token_file is not used any more (tls_dir instead)\n")
+        tls = stage_node.tls_dir(cluster.get("tls_dir"), "stage_tune")
+        self.ctx = stage_node.client_context(tls, "stage_tune")
+        self.nodes = [Node(n, self.ctx) for n in cluster["nodes"]]
+        self.main = Main(cluster["main"], tls, outdir)
         self.n_layers, self.layer_bytes = model_layers(arg_value(self.main.base["args"], "--native"))
         self.pre = [0] + list(itertools.accumulate(self.layer_bytes))
         goal = cluster.get("goal", {})
@@ -342,7 +347,7 @@ class Tuner:
         items = stage_ship.plan(Path(c["model_dir"]), Path(c["pack_dir"]), Path(c["profile"]),
                                 Path(c["bin_dir"]) if c.get("bin_dir") else None, lo, hi)
         try:
-            stage_ship.ship(stage_ship.Agent(n.agent, self.token), items, say=lambda m: say("  " + m))
+            stage_ship.ship(stage_ship.Agent(n.agent, self.ctx), items, say=lambda m: say("  " + m))
         except (SystemExit, OSError, urllib.error.URLError) as e:
             return False, f"shipping layers {lo}-{hi - 1}: {e}"
         return True, ""
@@ -718,11 +723,10 @@ class Tuner:
 
 
 def apply(cluster: dict, outdir: Path) -> None:
-    tf = cluster.get("token_file")
-    token = (Path(tf).read_text().strip() if tf else os.environ.get("STRATA_STAGE_TOKEN", "")).strip()
+    ctx = stage_node.client_context(stage_node.tls_dir(cluster.get("tls_dir"), "stage_tune"), "stage_tune")
     nodes = json.loads((outdir / "nodes.json").read_text(encoding="utf-8"))
     for spec in reversed(nodes):   # the last first: a relay connects to the next when it starts
-        n = Node({"name": spec["name"], "agent": spec["agent"], "host": "-", "port": spec["port"]}, token)
+        n = Node({"name": spec["name"], "agent": spec["agent"], "host": "-", "port": spec["port"]}, ctx)
         req = {k: spec[k] for k in ("begin", "end", "next", "port", "prefill", "cache", "extra", "model") if k in spec}
         r = n.call("/start", req)
         if not r.get("ok"):

@@ -7,8 +7,10 @@ loads its own layers, the dense weights come from the pack).  This sends, from t
     the per-layer token embeddings (the PLE, ~27 GB) only to a node that runs layer 1 - a worker never does;
   - the pack directory, the expert profile and (optional) the engine's directory, whole.
 What the node has already (its /ranges) is not sent again, and every piece's sha256 is compared on arrival.
+--tls-dir (or STRATA_STAGE_TLS) is this PC's key folder: the agent takes the connection only with this PC's
+certificate in its peers/, and the agent's certificate must be in this folder's (docs/REMOTE_STAGE.md, "Keys").
 
-    python3 tools/stage_ship.py --agent http://192.0.2.12:7840 --token-file /opt/strata/stage-token \\
+    python3 tools/stage_ship.py --agent https://192.0.2.12:7840 --tls-dir /opt/strata/stage-tls \\
         --model-dir /data/models/<model> --pack-dir /data/packs/<pack> \\
         --profile /opt/strata/data/expert-profile.bin [--bin-dir /opt/strata/build/bin] \\
         --layers 36-47 [--data-dir <the node's data_dir>] [--parallel 4]
@@ -29,9 +31,9 @@ import argparse
 import hashlib
 import http.client
 import json
-import os
 import queue
 import re
+import ssl
 import stat
 import sys
 import threading
@@ -42,6 +44,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import stage_node  # noqa: E402  (the TLS contexts)
 from gguf_reader import GGUFFile  # noqa: E402
 
 PIECE = 64 << 20
@@ -128,33 +131,31 @@ def tree_items(src: Path, prefix: str) -> list[Item]:
 
 
 class Agent:
-    """A node agent.  Every request goes to it directly, never through an HTTP proxy from the environment (the
-    /puts use http.client, which knows no proxies; the agent is a LAN or tunnel address a proxy cannot reach)."""
-    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    """A node agent, over HTTPS with this PC's certificate (`ctx`, stage_node.client_context).  Every request goes
+    to it directly, never through an HTTP proxy from the environment (the /puts use http.client, which knows no
+    proxies; the agent is a LAN or tunnel address a proxy cannot reach)."""
 
-    def __init__(self, url: str, token: str):
-        self.url = url.rstrip("/")
-        self.token = token
+    def __init__(self, url: str, ctx: ssl.SSLContext):
+        self.url = stage_node.agent_url(url)
+        self.ctx = ctx
+        self.direct = stage_node.https_opener(ctx)
         u = urllib.parse.urlsplit(self.url)
-        self.scheme, self.netloc, self.base = u.scheme, u.netloc, u.path
+        self.netloc, self.base = u.netloc, u.path
 
     def sha256(self, rel: str) -> dict:
-        req = urllib.request.Request(f"{self.url}/sha256?path={urllib.parse.quote(rel)}",
-                                     headers={"X-Stage-Token": self.token})
+        req = urllib.request.Request(f"{self.url}/sha256?path={urllib.parse.quote(rel)}")
         with self.direct.open(req, timeout=600) as r:
             return json.load(r)
 
     def ranges(self, rel: str) -> dict:
-        req = urllib.request.Request(f"{self.url}/ranges?path={urllib.parse.quote(rel)}",
-                                     headers={"X-Stage-Token": self.token})
+        req = urllib.request.Request(f"{self.url}/ranges?path={urllib.parse.quote(rel)}")
         with self.direct.open(req, timeout=60) as r:
             return json.load(r)
 
-    def connect(self) -> http.client.HTTPConnection:
+    def connect(self) -> http.client.HTTPSConnection:
         """A connection for /put, kept alive between pieces (an agent that answers HTTP/1.0 closes it after each
-        request: http.client then opens the next one itself)."""
-        cls = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
-        return cls(self.netloc, timeout=600)
+        request: http.client then opens the next one itself, with a handshake of its own)."""
+        return http.client.HTTPSConnection(self.netloc, timeout=600, context=self.ctx)
 
     def put(self, conn: http.client.HTTPConnection, item: Item, off: int, data: bytes, sha: str | None = None) -> dict:
         """`sha`: the piece's sha256 - an agent that knows the parameter records the range only when the bytes
@@ -174,8 +175,7 @@ class Agent:
                 # then a stall's, not the whole 64 MiB's - one piece of `parallel` on a slow link takes long
                 conn.request("POST", f"{self.base}/put?{q}",
                              body=(view[i:i + (1 << 20)] for i in range(0, len(view), 1 << 20)),
-                             headers={"X-Stage-Token": self.token, "Content-Type": "application/octet-stream",
-                                      "Content-Length": str(len(view))})
+                             headers={"Content-Type": "application/octet-stream", "Content-Length": str(len(view))})
                 r = conn.getresponse()
                 body = r.read()
             except (OSError, http.client.HTTPException) as e:
@@ -358,8 +358,8 @@ def node_paths(data_dir: str, model_dir: Path, pack_dir: Path, profile: Path) ->
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--agent", required=True)
-    ap.add_argument("--token-file")
+    ap.add_argument("--agent", required=True, help="https://HOST:PORT (an http:// one is taken as https://)")
+    ap.add_argument("--tls-dir", help="this PC's key folder (strata --stage-keygen; default: STRATA_STAGE_TLS)")
     ap.add_argument("--model-dir", required=True, type=Path)
     ap.add_argument("--pack-dir", required=True, type=Path)
     ap.add_argument("--profile", required=True, type=Path)
@@ -371,11 +371,11 @@ def main() -> None:
     a = ap.parse_args()
     if a.parallel < 1:
         ap.error("--parallel: 1 or more")
-    token = (Path(a.token_file).read_text().strip() if a.token_file else os.environ.get("STRATA_STAGE_TOKEN", ""))
+    ctx = stage_node.client_context(stage_node.tls_dir(a.tls_dir, "ship"), "ship")
     lo, hi = (int(x) for x in a.layers.split("-"))
     items = plan(a.model_dir, a.pack_dir, a.profile, a.bin_dir, lo, hi + 1)
     t0 = time.time()
-    sent = ship(Agent(a.agent, token), items, parallel=a.parallel)
+    sent = ship(Agent(a.agent, ctx), items, parallel=a.parallel)
     print(f"ship: {sent / 2**30:.2f} GiB in {time.time() - t0:.0f} s")
     if a.data_dir:
         print("node.json paths:", json.dumps(node_paths(a.data_dir, a.model_dir, a.pack_dir, a.profile), indent=1))

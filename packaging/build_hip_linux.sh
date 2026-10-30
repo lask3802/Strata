@@ -1,7 +1,8 @@
 #!/bin/bash
 # Linux AMD (HIP) engine package: strata (+ strata-dsv41 for rx9070) + the CPU picture reader (strata-vision) + the GPU picture reader (strata-vision-hip),
 # the ROCm libraries both load, and the rocBLAS / hipBLASLt kernel data for the listed archs, packaged as an engine component.
-# Run on a Linux box that has ROCm (TheRock Python wheels are enough); the tester packages were built in an Ubuntu 22.04 chroot
+# Run on a Linux box that has ROCm (TheRock Python wheels are enough) and libssl-dev (the remote stage's TLS 1.3, linked
+# statically); the tester packages were built in an Ubuntu 22.04 chroot
 # (glibc 2.35) so they run on every distribution since.  All settings are environment variables:
 #
 #   VARIANT=rx9070     rx9070 (gfx1200 gfx1201) | rx7900 (gfx1100 gfx1101 gfx1102) | rx6000 (gfx1030 gfx1031) | halo (gfx1151) | igpu (gfx1103 gfx1150) | a name + ARCHS=

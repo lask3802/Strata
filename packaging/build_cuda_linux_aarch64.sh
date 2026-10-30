@@ -4,8 +4,8 @@
 #
 #   COMMIT=<40 hex> packaging/build_cuda_linux_aarch64.sh
 #
-# Run it on the Spark (arm64 Linux, CUDA 13.0 toolkit, a Python 3 venv with requirements.txt and requirements-build.txt, cmake and
-# ninja on PATH; PYTHON=<that python>).  It runs spark/build_engine.sh, then makes two packages in $OUT (default ./out-engine-cuda13-aarch64):
+# Run it on the Spark (arm64 Linux, CUDA 13.0 toolkit, libssl-dev for the remote stage's TLS 1.3, a Python 3 venv with
+# requirements.txt and requirements-build.txt, cmake and ninja on PATH; PYTHON=<that python>).  It runs spark/build_engine.sh, then makes two packages in $OUT (default ./out-engine-cuda13-aarch64):
 #   <ver>-linux-aarch64-cuda-cuda13/       strata, libstrata_kq.so, strata-vision, strata-dsv41 and the CUDA libraries  (feed member "engine")
 #   dsv41/<ver>-linux-aarch64-cuda-cuda13/ strata-dsv41 and the CUDA libraries                                         (feed member "dsv41")
 # Nothing is signed or uploaded: sign with packaging/feed_tool.py (sign-package, then pack-engine; --prefix strata-dsv41 for the second).

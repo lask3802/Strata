@@ -801,8 +801,8 @@ struct Options {
     /// remote stage, the worker: listen on this port and run layers [stage_begin, n_layers) without the head
     int stage_worker = 0;
     int64_t stage_begin = -1;
-    /// the worker's listening address (--stage-bind ADDR; empty: every interface).  STRATA_STAGE_TOKEN (both sides)
-    /// is the shared secret the worker requires in the main process's hello
+    /// the worker's listening address (--stage-bind ADDR; empty: every interface).  STRATA_STAGE_TLS (both sides):
+    /// this PC's key and the certificates it accepts (strata --stage-keygen DIR; the link is TLS 1.3, both ends checked)
     std::string stage_bind;
     /// a relay worker (more than two stages): it runs [stage_begin, stage_end) and hands its rows to the next worker
     /// (--stage-end K2 --stage-next HOST:PORT); that worker's reply is this one's
@@ -2915,6 +2915,29 @@ int main(int argc, char** argv) {
             std::printf("strata %s\n", STRATA_VERSION);
             return 0;
         }
+        // `strata --stage-keygen DIR [NAME]`: this PC's remote-stage key and certificate (docs/REMOTE_STAGE.md)
+        if (std::strcmp(argv[i], "--stage-keygen") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "strata: --stage-keygen DIR [NAME] (NAME: this PC's name in the others' logs)\n");
+                return 2;
+            }
+            const std::string dir = argv[i + 1];
+            std::string name = i + 2 < argc ? argv[i + 2] : "";
+            if (name.empty()) name = strata::net::stage_host_name();
+            std::string fp, err;
+            if (!strata::net::stage_keygen(dir, name, fp, err)) {
+                std::fprintf(stderr, "strata: --stage-keygen: %s\n", err.c_str());
+                return 1;
+            }
+            std::printf("strata: this PC's remote-stage key is in %s\n"
+                        "  key.pem    its key: it stays on this PC\n"
+                        "  cert.pem   its certificate, \"%s\" %s\n"
+                        "  peers/     the certificates of the PCs it links with\n"
+                        "Copy cert.pem into the peers/ folder of every PC this one links with (name it %s.pem there), "
+                        "theirs into %s/peers/, and start every stage with STRATA_STAGE_TLS=%s.\n",
+                        dir.c_str(), name.c_str(), fp.c_str(), name.c_str(), dir.c_str(), dir.c_str());
+            return 0;
+        }
         // `strata --families`: the GGUF architectures this build runs (setup asks before it installs one)
         if (std::strcmp(argv[i], "--families") == 0) {
 #if defined(STRATA_HAVE_QWEN35)
@@ -3637,6 +3660,7 @@ int main(int argc, char** argv) {
     const bool remote_main = !o.remote_stage.empty();
     const bool stage_worker = o.stage_worker > 0;
     int64_t own_lo = 0, own_hi = -1;
+    std::shared_ptr<strata::net::TlsCredentials> stage_cred;   // remote stage: this PC's key and the certificates it accepts
     if (remote_main || stage_worker) {
         const char* why = nullptr;
         if (remote_main && stage_worker) why = "--remote-stage and --stage-worker exclude each other";
@@ -3674,6 +3698,14 @@ int main(int argc, char** argv) {
 #endif
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: remote stage: %s\n", why);
+            return 2;
+        }
+        // every link is TLS 1.3 (stage_tls.hpp): the key folder is read here, so that a missing or broken one stops
+        // the process before the model loads
+        std::string tls_err;
+        stage_cred = strata::net::TlsCredentials::load(strata::net::stage_tls_dir(), tls_err);
+        if (stage_cred == nullptr) {
+            std::fprintf(stderr, "strata generate: remote stage: %s\n", tls_err.c_str());
             return 2;
         }
         // conversation checkpoints hold only this process's layers: every prompt is read from token 0, unless the main
@@ -12944,13 +12976,16 @@ int main(int argc, char** argv) {
                 for (size_t n; (n = std::fread(b.data(), 1, b.size(), pf)) > 0;) me.pack_hash = fnv1a(b.data(), n, me.pack_hash);
                 std::fclose(pf);
             }
-            const char* tok_env = std::getenv("STRATA_STAGE_TOKEN");
-            const std::string stage_token = tok_env != nullptr ? tok_env : "";
-            if (stage_token.size() >= sizeof me.token) {
-                std::fprintf(stderr, "strata serve: STRATA_STAGE_TOKEN is longer than %zu characters\n", sizeof me.token - 1);
-                return 1;
-            }
-            if (remote_main) std::memcpy(me.token, stage_token.data(), stage_token.size());
+            // every link is TLS 1.3: this PC's key, and the certificates of the PCs it links with (read before the
+            // model loaded, stage_cred above)
+            if (std::getenv("STRATA_STAGE_TOKEN") != nullptr)
+                std::fprintf(stderr, "strata serve: remote stage: STRATA_STAGE_TOKEN is not used any more (the TLS "
+                                     "certificates in STRATA_STAGE_TLS decide who may link)\n");
+            std::fprintf(stderr, "strata serve: remote stage: TLS 1.3, this PC is \"%s\" %s, %d certificate%s accepted\n",
+                         stage_cred->name().c_str(), strata::net::stage_tls_short(stage_cred->fingerprint()).c_str(),
+                         stage_cred->accepted(), stage_cred->accepted() == 1 ? "" : "s");
+            remote_link.set_credentials(stage_cred);
+            next_link.set_credentials(stage_cred);
             if (stage_worker && std::getenv("STRATA_REMOTE_ROWS") != nullptr)
                 std::fprintf(stderr, "strata serve: STRATA_REMOTE_ROWS is the main process's choice; a worker takes "
                                      "the row format its main process asks for (it ignores its own)\n");
@@ -12971,9 +13006,9 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 std::fprintf(stderr, "strata serve: remote stage %s: layers %d-%d there (prompt chunk %lld, context %lld, "
-                             "rows %s)\n", o.remote_stage.c_str(), remote_peer.layer_begin, remote_peer.n_layers - 1,
+                             "rows %s; %s)\n", o.remote_stage.c_str(), remote_peer.layer_begin, remote_peer.n_layers - 1,
                              (long long) remote_peer.chunk, (long long) remote_peer.max_context,
-                             strata::net::stage_rows_name(remote_link.rows()));
+                             strata::net::stage_rows_name(remote_link.rows()), remote_link.tls_peer().c_str());
                 if ((remote_peer.row_formats & strata::net::kStageCapKvElem) == 0)
                     std::fprintf(stderr, "strata serve: remote stage: the worker's hello predates the K/V element "
                                          "check: --kv must match by hand\n");
@@ -13255,21 +13290,21 @@ int main(int argc, char** argv) {
                     // the main process's formats (until its hello, fp32), this worker's own K/V type
                     mine_next.row_formats = (main_rows & strata::net::kStageRowsAll) |
                                             (me.row_formats & ~strata::net::kStageRowsAll);
-                    std::memcpy(mine_next.token, stage_token.data(), stage_token.size());
                     for (int i = 0;; ++i) {
                         // each try can block (a connect's SYN tries, the hello's reply): its own allowance (as in
                         // NextWorkerWait), not a stall
                         strata::core::progress_allow(strata::net::io_timeout_s() + 150);
                         next_link.close();
                         if (next_link.connect(o.stage_next, mine_next, peer_next, e)) break;
-                        // a refusal (token, context, chunk) or a different model does not change by waiting
-                        if (i >= 30 || e.find("differ") != std::string::npos || e.find("refused") != std::string::npos)
-                            return false;
+                        // what connecting again can mend (nothing listening yet, a lost link) is tried again; a
+                        // refusal (a certificate, context, chunk) or a different model does not change by waiting.
+                        // (A text match on "refused" also took "Connection refused", a worker not listening yet.)
+                        if (i >= 30 || !strata::net::stage_link_lost(e)) return false;
                         std::this_thread::sleep_for(std::chrono::seconds(2));
                     }
-                    std::fprintf(stderr, "strata serve: relay: layers %d-%d on %s (rows %s)\n", peer_next.layer_begin,
+                    std::fprintf(stderr, "strata serve: relay: layers %d-%d on %s (rows %s; %s)\n", peer_next.layer_begin,
                                  peer_next.n_layers - 1, o.stage_next.c_str(),
-                                 strata::net::stage_rows_name(next_link.rows()));
+                                 strata::net::stage_rows_name(next_link.rows()), next_link.tls_peer().c_str());
                     if ((peer_next.row_formats & strata::net::kStageCapKvElem) == 0)
                         std::fprintf(stderr, "strata serve: relay: the next worker's hello predates the K/V element "
                                              "check: --kv must match by hand\n");
@@ -13446,7 +13481,7 @@ int main(int argc, char** argv) {
                              stage_relay ? ("relaying to " + o.stage_next).c_str() : "no head", (long long) pf_chunk,
                              o.stage_worker);
                 std::fflush(stderr);
-                return strata::net::serve_stage(o.stage_bind, o.stage_worker, stage_token, hs, bufs, wst, nullptr);
+                return strata::net::serve_stage(o.stage_bind, o.stage_worker, stage_cred, hs, bufs, wst, nullptr);
             }
         }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
