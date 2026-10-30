@@ -119,7 +119,8 @@ jobs:
       # (CMakeLists.txt strata_stage_tls): vcpkg's x64-windows-static, the static C runtime as the engine's (/MT), from
       # a vcpkg checkout pinned to its 2026.10.16 release (not the runner's, which moves with the image). Its own
       # OpenSSL port is 3.6, which is not an LTS line; the overlay .github/vcpkg-ports/openssl is its 3.5.4 port on
-      # the 3.5.9 release tarball the Linux job pins, so both zips carry the same OpenSSL. `vcpkg list` prints it
+      # the 3.5.9 release tarball the Linux job pins, so both zips carry the same OpenSSL. `vcpkg list` prints it, and
+      # the step stops on any other version (the overlay missed: vcpkg's own 3.6)
       - name: OpenSSL 3.5.9 LTS, static, for the engine (vcpkg 2026.10.16 + the overlay port, x64-windows-static)
         if: matrix.part == 'engine'
         run: |
@@ -127,8 +128,10 @@ jobs:
           git -C "$RUNNER_TEMP/vcpkg" checkout -q 9eec002df1cd109f8f104cd966a763daf9751489
           "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
           "$RUNNER_TEMP/vcpkg/vcpkg.exe" install openssl:x64-windows-static --vcpkg-root "$RUNNER_TEMP/vcpkg" \
-            --overlay-ports="$GITHUB_WORKSPACE/.github/vcpkg-ports"
-          "$RUNNER_TEMP/vcpkg/vcpkg.exe" list openssl --vcpkg-root "$RUNNER_TEMP/vcpkg"
+            --overlay-ports="$(cygpath -m "$GITHUB_WORKSPACE")/.github/vcpkg-ports"
+          "$RUNNER_TEMP/vcpkg/vcpkg.exe" list openssl --vcpkg-root "$RUNNER_TEMP/vcpkg" | tee "$RUNNER_TEMP/openssl.txt"
+          grep -qE '^openssl:x64-windows-static +3\.5\.9( |#|$)' "$RUNNER_TEMP/openssl.txt" ||
+            { echo "::error::vcpkg installed another OpenSSL than the overlay port's 3.5.9"; exit 1; }
           echo "OPENSSL_ROOT=$(cygpath -m "$RUNNER_TEMP")/vcpkg/installed/x64-windows-static" >> "$GITHUB_ENV"
       - name: build ${{ matrix.part }}
         run: >-
