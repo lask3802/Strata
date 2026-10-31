@@ -3833,6 +3833,28 @@ def parallel_stack_platform() -> bool:
     return sys.platform.startswith("linux")
 
 
+# Strata Link: upstream 05cd12e7 (engine 0.1.55) made the grouped GDN launch commit a one-row batch window; an engine before it
+# skips that commit when both switches below are on (self-commit skips the commit graph) and decodes wrong.  setup keeps an
+# installed older engine when the new one cannot be had, so the server checks the engine it will start (BUILD.json "version").
+# No BUILD.json or no readable version (a source tree built by this checkout): the engine is this checkout's, defaults as before.
+PARALLEL_STACK_PAIR = ("STRATA_BATCH_GDN_GROUPS", "STRATA_BATCH_SELF_COMMIT")
+PARALLEL_STACK_PAIR_MIN_ENGINE = "0.1.55"
+
+
+def parallel_stack_engine_skips(cfg: dict) -> str | None:
+    """'0.1.54' when the engine cfg["exe"] names is older than PARALLEL_STACK_PAIR_MIN_ENGINE, else None (also when unknown)."""
+    try:
+        exe = cfg.get("exe")
+        if not isinstance(exe, str) or not exe or engine_component.is_reference(exe):
+            return None
+        ver = str(json.loads((Path(exe).parent / "BUILD.json").read_text(encoding="utf-8-sig")).get("version") or "")
+        key = tuple(int(x) for x in re.match(r"(\d+)\.(\d+)\.(\d+)", ver).groups())
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    need = tuple(int(x) for x in PARALLEL_STACK_PAIR_MIN_ENGINE.split("."))
+    return ver if key < need else None
+
+
 def parallel_stack_env(env: dict, cfg: dict) -> None:
     """Switch the exact parallel stack on (setdefault: a value the user or the config set stays) when the config runs batch
     slots on a CUDA or HIP Qwen engine.  Other engines (DeepSeek, SYCL, Metal) do not read these."""
@@ -3842,7 +3864,16 @@ def parallel_stack_env(env: dict, cfg: dict) -> None:
         return
     if cfg.get("backend") == "hip":
         return
+    skip = parallel_stack_engine_skips(cfg)                        # Strata Link: an engine before 0.1.55 never gets the GDN pair
+    if skip:
+        if not getattr(parallel_stack_env, "_said", False):
+            parallel_stack_env._said = True
+            print(f"[strata] the engine is {skip}: before {PARALLEL_STACK_PAIR_MIN_ENGINE} it skips the GDN commit of a one-row batch "
+                  "window when STRATA_BATCH_GDN_GROUPS and STRATA_BATCH_SELF_COMMIT are both on, so this run leaves those two off "
+                  "(update the engine to get them)", flush=True)
     for k, v in PARALLEL_STACK_ENV.items():
+        if skip and k in PARALLEL_STACK_PAIR:
+            continue
         env.setdefault(k, v)
 
 

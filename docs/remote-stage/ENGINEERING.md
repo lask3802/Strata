@@ -965,7 +965,13 @@ merge). Nothing in the stage link, its TLS, `tools/stage_node.py` or the release
   stage refuses `--batch` (`src/program/generate.cpp:3748`), and the multi-prompt read declines it as the layer-major
   read does (`src/prefill/prefill.cpp:6227`). Because the server sets `STRATA_BATCH_GDN_GROUPS` and
   `STRATA_BATCH_SELF_COMMIT` together and an 0.1.54 engine then never commits a one-row batch window's GDN state,
-  setup's `LINK_REQUIRED` is 0.1.55-link.1.
+  setup's `LINK_REQUIRED` is 0.1.55-link.1. That bound only limits a download: setup keeps an installed older engine
+  when the new one cannot be had (`link_soft()` asks for 0.1.46, `get_prebuilt()` returns the installed one), and a
+  source build or a manual engine can be older as well. So the server checks the engine it will start
+  (`parallel_stack_engine_skips` in `serve/server.py`, BUILD.json `version`): below 0.1.55 it leaves the two switches
+  off (0.2.8's safe batch path; the rest of the stack stays) and says so once in the log. An explicit variable or the
+  config's `env` still wins, and an engine with no readable version keeps the defaults (it is this checkout's own build).
+  The test is `ParallelStackEngineGate` in `serve/test_parallel.py` (it includes the kept 0.1.54-link.1 case).
 - **The server's GDN prompt switches** (`STRATA_GDN_TC=1`, `STRATA_GDN_CONVL2=2`; Linux, any Qwen3.8 configuration;
   `serve/server.py` `gdn_stack_env`; the engine takes the tensor-core scan from compute capability 8): they reach the
   main process only. A worker runs with its agent's environment (`tools/stage_node.py:532`), so its layers keep the

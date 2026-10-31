@@ -848,6 +848,91 @@ class ParallelStackDefaults(unittest.TestCase):
         self.assertNotIn("STRATA_CKPT_POOL", self.env_for({"parallel": 8, "args": [], "backend": "sycl"}))
 
 
+class ParallelStackEngineGate(unittest.TestCase):
+    """Strata Link: an engine before 0.1.55 never gets STRATA_BATCH_GDN_GROUPS + STRATA_BATCH_SELF_COMMIT together (05cd12e7 is
+    in 0.1.55; before it a one-row batch window's GDN state is not committed).  The gate reads the engine's BUILD.json."""
+    PAIR = ("STRATA_BATCH_GDN_GROUPS", "STRATA_BATCH_SELF_COMMIT")
+
+    def engine(self, build):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        exe = Path(tmp.name) / "strata"
+        exe.write_bytes(b"x")
+        if build is not None:
+            (Path(tmp.name) / "BUILD.json").write_text(json.dumps(build))
+        return str(exe)
+
+    def env_for(self, exe, extra=None, base=None):
+        import os
+        from unittest import mock
+        cfg = {"parallel": 2, "args": [], "exe": exe, **(extra or {})}
+        with mock.patch.dict(os.environ, base or {}, clear=False), mock.patch.object(server, "parallel_stack_platform", return_value=True):
+            for k in list(os.environ):
+                if k in server.PARALLEL_STACK_ENV and not (base and k in base):
+                    del os.environ[k]
+            return server.child_env(cfg)
+
+    def test_kept_054_engine_after_a_failed_update(self):
+        """The real boundary: 0.1.54-link.1 installed, 0.1.55-link.1 not to be had (every request 404), Linux batch 2."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from tools import test_setup_link_release as lr
+        t = lr.GetPrebuilt()
+        t.LINK = lr.setup.link_version()
+        t.setUp()
+        try:
+            from unittest import mock
+            with mock.patch.object(lr.setup, "LINK_REQUIRED", "0.1.55-link.1"):
+                t.installed(source="release", version="0.1.54", link="0.1.54-link.1")
+                eng, out, heads, got = t.run_get([], {})
+                self.assertEqual(json.loads((eng / "BUILD.json").read_text())["link"], "0.1.54-link.1")   # kept
+                env = self.env_for(str(eng / lr.setup.EXE))
+        finally:
+            t.doCleanups()
+        for k in self.PAIR:
+            self.assertNotIn(k, env, k)
+        self.assertEqual(env.get("STRATA_CKPT_POOL"), "1")          # the rest of the stack is unchanged
+
+    def test_055_engine_gets_the_pair(self):
+        for ver in ("0.1.55", "0.1.56", "0.2.0"):
+            env = self.env_for(self.engine({"version": ver, "link": "0.1.55-link.1"}))
+            for k in self.PAIR:
+                self.assertEqual(env.get(k), "1", (ver, k))
+
+    def test_054_engine_without_a_link_field_and_other_old_versions(self):
+        for ver in ("0.1.54", "0.1.46", "0.0.9"):
+            env = self.env_for(self.engine({"version": ver}))
+            for k in self.PAIR:
+                self.assertNotIn(k, env, (ver, k))
+
+    def test_unknown_engine_keeps_the_defaults(self):
+        for exe in (self.engine(None), self.engine({}), self.engine({"version": "dev"}), ""):
+            env = self.env_for(exe)
+            for k in self.PAIR:
+                self.assertEqual(env.get(k), "1", (exe, k))
+
+    def test_explicit_env_wins_on_an_old_engine(self):
+        old = self.engine({"version": "0.1.54", "link": "0.1.54-link.1"})
+        env = self.env_for(old, {"env": {"STRATA_BATCH_GDN_GROUPS": "1", "STRATA_BATCH_SELF_COMMIT": "1"}})
+        for k in self.PAIR:
+            self.assertEqual(env[k], "1", k)
+        env = self.env_for(old, base={"STRATA_BATCH_SELF_COMMIT": "0"})
+        self.assertEqual(env["STRATA_BATCH_SELF_COMMIT"], "0")
+        self.assertNotIn("STRATA_BATCH_GDN_GROUPS", env)
+
+    def test_said_once(self):
+        import io
+        from contextlib import redirect_stdout
+        old = self.engine({"version": "0.1.54"})
+        server.parallel_stack_env._said = False
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.env_for(old)
+            self.env_for(old)
+        self.assertEqual(buf.getvalue().count("leaves those two off"), 1)
+
+
 class GdnStackDefaults(unittest.TestCase):
     """The qualified GDN speedups are on from the server (Linux CUDA; Linux HIP gfx12 only); an explicit value wins."""
     def env_for(self, cfg, archs=None, linux=True, base=None):
