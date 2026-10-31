@@ -952,6 +952,33 @@ Open: `STRATA_PRIMARY_DEVICE` other than 0 on a worker is allowed and not checke
 device 0); a checkpoint taken from `STRATA_CKPT_POOL` that the worker did not store is dropped rather than given back
 (`src/program/generate.cpp:9757-9760`); `clear_marks` (`src/program/generate.cpp:1788`) does not clear `remote_id`.
 
+### After the merge of 0.2.9 (2026-10-31)
+
+Upstream v0.2.9 (c62d5e3a, engine 0.1.55) was merged into the fork's line (merge branch `merge-029`, from the 0.2.8
+merge). Nothing in the stage link, its TLS, `tools/stage_node.py` or the release workflow changed upstream; protocol
+8 stands. What meets a remote stage:
+- **The shared expert arena** (`--shared-expert-arena`, for the replicas): one engine reads the experts into a shared
+  file and the others skip the read. A layer range is refused with a shared arena file
+  (`src/core/expert_source.cpp:5844`), so the election runs only for a whole arena.
+- **The batch work** (the exact parallel stack the server now turns on with `--batch` on Linux CUDA, the grouped GDN
+  launch with `STRATA_BATCH_SELF_COMMIT`, the co-reads of `Prefill::run_multi`, the concurrent prompt read): a remote
+  stage refuses `--batch` (`src/program/generate.cpp:3748`), and the multi-prompt read declines it as the layer-major
+  read does (`src/prefill/prefill.cpp:6227`). Because the server sets `STRATA_BATCH_GDN_GROUPS` and
+  `STRATA_BATCH_SELF_COMMIT` together and an 0.1.54 engine then never commits a one-row batch window's GDN state,
+  setup's `LINK_REQUIRED` is 0.1.55-link.1.
+- **The server's GDN prompt switches** (`STRATA_GDN_TC=1`, `STRATA_GDN_CONVL2=2`; Linux, any Qwen3.8 configuration;
+  `serve/server.py` `gdn_stack_env`; the engine takes the tensor-core scan from compute capability 8): they reach the
+  main process only. A worker runs with its agent's environment (`tools/stage_node.py:532`), so its layers keep the
+  old kernels unless the agent is started with them. Each side's layers are its own, so this mixes two qualified
+  paths; it has not been measured in a split.
+- **The hyper-connection read's exact 5..8-token kernels** (`src/kernels/cuda/fused_gr.cu:1379`, `STRATA_GR_R2`,
+  default 2; the same bits by upstream's account) are in the v3 read only, which is on by itself on an sm_120 card of
+  more than 13 GiB (`include/strata/core/sm120_series.hpp:73`) and otherwise with `STRATA_GR_V3=1`: an RTX 30 or 20
+  card does not run them by default. Window sizes did not change, so the deferral's heavy / light split keeps 0.2.8's
+  rule.
+
+These rest on the builds and the CPU tests; no engine has run on a GPU since the merge.
+
 ### After the merge of 0.2.8 and TLS (2026-10-30)
 
 Upstream v0.2.8 (870aedd9, engine 0.1.54) was merged into the fork's line (merge branch `merge-028`, from the 0.2.7.1
