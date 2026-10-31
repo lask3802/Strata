@@ -48,7 +48,7 @@ else:
 args = list(cfg["args"]) + os.environ.get("STRATA_EXTRA_ARGS", "").split()
 log = os.path.join(S, f"probe-{NAME}.log")
 t0 = time.time()
-eng = StrataEngine(EXE, args, cwd=cfg.get("cwd"), log=log, env=child_env(cfg))
+eng = StrataEngine(EXE, args, cwd=cfg.get("cwd"), log=log, env=child_env(cfg, exe=EXE))
 print(f"READY after {time.time() - t0:.1f} s, prompt {len(ids)} tokens", flush=True)
 t1 = time.time()
 out = [t for t in eng.generate(ids, MAX_NEW, {"temperature": 0}, threading.Event()) if t is not None]

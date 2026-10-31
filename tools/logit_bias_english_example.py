@@ -41,8 +41,9 @@ class AuditEngine(StrataEngine):
                 self.emitted.append(token)
             yield token
 
-engine = AuditEngine(str(a.candidate.resolve()), engine_args(cfg), cwd=str(source),
-                     log=str(a.output / 'engine.txt'), env=child_env(cfg))
+exe = str(a.candidate.resolve())   # the binary started; child_env checks this one, not cfg['exe']
+engine = AuditEngine(exe, engine_args(cfg), cwd=str(source),
+                     log=str(a.output / 'engine.txt'), env=child_env(cfg, exe=exe))
 server = serve(Service(engine, tok, ChatTemplate(tp / 'chat_template.jinja'),
                        model_name='bias-validation'), port=0)
 base = dict(model='bias-validation', messages=[dict(role='user', content=

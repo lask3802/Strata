@@ -104,14 +104,15 @@ def main():
                     '<|im_start|>assistant\n<think>\n\n</think>\n\n')
     other = prompt('Unrelated worker conversation. Reply with HELLO and nothing else.')
     args.output.mkdir(mode=0o700, parents=False, exist_ok=False)
-    env = child_env(cfg)
+    exe = str(args.engine.resolve())   # the binary started; child_env checks this one, not cfg['exe']
+    env = child_env(cfg, exe=exe)
     env['STRATA_STATE_HASH'] = '1'
     env['STRATA_VERIFY_DEFER_CPU'] = '0'   # the exact path (Strata Link defers by default)
     results = {'requested_cycles': args.cycles, 'engine_info': {}, 'contexts': [], 'cycles': []}
     heads, continuations = [], []
     for label, budget in [('baseline', 0), ('candidate', args.cache_mib)]:
         log = args.output / f'{label}.log'
-        engine = StrataEngine(str(args.engine.resolve()), engine_args(cfg, budget, 1),
+        engine = StrataEngine(exe, engine_args(cfg, budget, 1),
                               cwd=cfg.get('cwd'), log=str(log), env=env)
         results['engine_info'][label] = dict(engine.info)
         hash_count = 0

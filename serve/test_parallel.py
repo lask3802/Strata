@@ -1173,6 +1173,102 @@ class ParallelStackEngineGate(unittest.TestCase):
         self.assertEqual(buf.getvalue().count("leaves those two off"), 1)
 
 
+class ToolEngineGate(unittest.TestCase):
+    """Strata Link: a dev tool that starts a binary other than cfg["exe"] (STRATA_EXE, --engine, --candidate) hands child_env that
+    binary, so the pair is decided on the engine started.  cfg.exe is 0.1.55, the binary started is 0.1.54: the pair stays off."""
+    PAIR = ParallelStackEngineGate.PAIR
+    tmpdir = ParallelStackEngineGate.tmpdir
+    engine = ParallelStackEngineGate.engine
+    run_linux = ParallelStackEngineGate.run_linux
+    assert_pair_off = ParallelStackEngineGate.assert_pair_off
+    assert_pair_on = ParallelStackEngineGate.assert_pair_on
+
+    class Stop(Exception):
+        pass
+
+    def setUp(self):
+        self.new = self.engine({"version": "0.1.55", "link": "0.1.55-link.1"})
+        self.old = self.engine({"version": "0.1.54"})
+        tok = self.tmpdir()
+        (tok / "vocab.json").write_text(json.dumps({"a": 0, "b": 1}))
+        (tok / "merges.txt").write_text("a b")
+        (tok / "token_type.json").write_text("[1, 1]")
+        (tok / "chat_template.jinja").write_text((Path(server.__file__).parent / "chat_template.jinja").read_text(encoding="utf-8"),
+                                                 encoding="utf-8")
+        work = self.tmpdir()
+        self.cfg = {"parallel": 2, "args": ["--serve"], "exe": self.new, "tokenizer": str(tok), "log": str(work / "engine.log"),
+                    "cwd": str(work)}
+        self.cfg_path = work / "cfg.json"
+        self.cfg_path.write_text(json.dumps(self.cfg))
+        self.started = []
+
+    def fake_engine(self):
+        started, stop = self.started, self.Stop
+
+        class Recorder:
+            def __init__(self, exe, args, **kw):
+                started.append((exe, dict(kw.get("env") or {})))
+                raise stop()
+        return Recorder
+
+    def run_tool(self, name, argv, environ=None):
+        import os
+        import runpy
+        tool = Path(__file__).resolve().parent.parent / "tools" / name
+        saved = list(sys.argv)
+        sys.argv = [str(tool), *argv]
+        sys.path.insert(0, str(tool.parent))
+        self.addCleanup(sys.path.remove, str(tool.parent))
+        import strata_tokenizer
+        try:
+            with mock.patch.object(strata_tokenizer.Tokenizer, "encode", return_value=[0, 1]),                  mock.patch.object(server, "StrataEngine", self.fake_engine()), \
+                 mock.patch.dict(os.environ, environ or {}), mock.patch.object(sys, "path", list(sys.path)):
+                with self.assertRaises(self.Stop):
+                    self.run_linux(lambda: runpy.run_path(str(tool), run_name="__main__"), environ)
+        finally:
+            sys.argv = saved
+
+    def test_strata_exe_override_decides_the_pair_on_the_binary_started(self):
+        for name, argv in (("batch_groups_cache_test.py", [str(self.cfg_path)]), ("cancel_park_test.py", [str(self.cfg_path)]),
+                           ("session_pressure_test.py", [str(self.cfg_path), str(self.tmpdir() / "out.json")])):
+            with self.subTest(tool=name):
+                self.started.clear()
+                self.run_tool(name, argv, {"STRATA_EXE": self.old})
+                exe, env = self.started[-1]
+                self.assertEqual(exe, self.old)
+                self.assert_pair_off(env, name)
+                self.started.clear()                                        # no override: the config's engine, 0.1.55, gets the pair
+                self.run_tool(name, argv)
+                exe, env = self.started[-1]
+                self.assertEqual(exe, self.new)
+                self.assert_pair_on(env, name)
+
+    def test_candidate_binaries_each_get_their_own_environment(self):
+        out = self.tmpdir() / "out"
+        self.run_tool("conversation_cache_disabled.py",
+                      ["--config", str(self.cfg_path), "--upstream", self.old, "--candidate", self.new, "--output", str(out), "--run"])
+        self.assertEqual(self.started[0][0], str(Path(self.old).resolve()))
+        self.assert_pair_off(self.started[0][1])
+
+    def test_engine_option_tools_decide_the_pair_on_the_binary_started(self):
+        for name in ("conversation_cache_parity.py", "conversation_cache_growth.py", "conversation_cache_soak.py",
+                     "conversation_restore_speed.py"):          # (conversation_cache_isolation.py reads a real GGUF before it starts)
+            for binary, pair in ((self.old, "off"), (self.new, "on")):
+                with self.subTest(tool=name, engine=pair):
+                    self.started.clear()
+                    self.run_tool(name, ["--config", str(self.cfg_path), "--engine", binary, "--output", str(self.tmpdir() / "out"), "--run"])
+                    exe, env = self.started[0]
+                    self.assertEqual(exe, str(Path(binary).resolve()))
+                    (self.assert_pair_off if pair == "off" else self.assert_pair_on)(env, name)
+
+    def test_the_first_candidate_arm_of_the_comparison_tool_follows_its_own_binary(self):
+        self.run_tool("conversation_cache_disabled.py",
+                      ["--config", str(self.cfg_path), "--upstream", self.new, "--candidate", self.old, "--output",
+                       str(self.tmpdir() / "out2"), "--run"])
+        self.assertEqual(self.started[0][0], str(Path(self.new).resolve()))
+        self.assert_pair_on(self.started[0][1])
+
+
 class GdnStackDefaults(unittest.TestCase):
     """The qualified GDN speedups are on from the server (Linux CUDA; Linux HIP gfx12 only); an explicit value wins."""
     def env_for(self, cfg, archs=None, linux=True, base=None):

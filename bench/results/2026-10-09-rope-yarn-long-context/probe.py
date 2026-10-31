@@ -61,7 +61,7 @@ def main():
     args+=['--kv','fp16','--spec','2','--suffix-draft','0','--conversation-cache-mib','0',
            '--prefill','8192','--max-context',str(a.capacity),'--rope-scaling',a.rope]
     if a.rope=='yarn':args+=['--rope-scale','4','--yarn-orig-ctx','262144']
-    env=child_env(cfg);env['STRATA_PREFILL_CPU_SHARE']='0'
+    env=child_env(cfg,exe=str(a.exe.resolve()));env['STRATA_PREFILL_CPU_SHARE']='0'
     for key in ('STRATA_LOGPOS','STRATA_MIGRATION_LOGITS','STRATA_MIGRATION_LOGITS_FROM'):env.pop(key,None)
     result=dict(input_tokens=len(ids),input_sha256=hashlib.sha256(token_json.encode()).hexdigest(),
                 rope=a.rope,capacity=a.capacity,argv=args,expected='CEDAR-731|MARBLE-482|QUARTZ-956',

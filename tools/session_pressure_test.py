@@ -15,7 +15,7 @@ REPO = Path(os.environ.get("STRATA_REPO", Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "tools")); sys.path.insert(0, str(REPO))
 import strata_tokenizer as ST
 from serve import server as S
-from serve.server import StrataEngine, child_env
+from serve.server import StrataEngine, child_env, engine_exe_path
 
 cfg = json.load(open(sys.argv[1]))
 out_file = sys.argv[2]
@@ -26,8 +26,9 @@ for t, i in vocab.items():
     toks[i] = t
 tok = ST.Tokenizer(toks, (tp / "merges.txt").read_text().split("\n"), json.loads((tp / "token_type.json").read_text()))
 args = cfg["args"] + os.environ.get("STRATA_EXTRA_ARGS", "").split()
-eng = StrataEngine(os.environ.get("STRATA_EXE", cfg["exe"]), args, cwd=cfg.get("cwd"),
-                   log=os.environ.get("SMOKE_LOG", cfg["log"]), env={**child_env(cfg), 'STRATA_VERIFY_DEFER_CPU': '0'})   # exact (Strata Link defers by default)
+exe = os.environ.get("STRATA_EXE") or engine_exe_path(cfg)   # the binary started; child_env checks this one, not cfg["exe"]
+eng = StrataEngine(exe, args, cwd=cfg.get("cwd"),
+                   log=os.environ.get("SMOKE_LOG", cfg["log"]), env={**child_env(cfg, exe=exe),'STRATA_VERIFY_DEFER_CPU': '0'})   # exact (Strata Link defers by default)
 GEN = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 

@@ -96,7 +96,8 @@ def main():
             '\nWhat is the secret code? Reply with only that word.<|im_end|>\n'
             '<|im_start|>assistant\n<think>\n\n</think>\n\n')
     args = common_args(cfg, a.spec) + ['--conversation-cache-mib', str(a.cache_mib), '--conversation-cache-slots', '4']
-    env = child_env(cfg)
+    exe = str(a.engine.resolve())   # the binary started; child_env checks this one, not cfg['exe']
+    env = child_env(cfg, exe=exe)
     env['STRATA_STATE_HASH'] = '1'
     env['STRATA_VERIFY_DEFER_CPU'] = '0'   # the exact path (Strata Link defers by default)
     env['STRATA_SNAPSHOT_VERIFY'] = '1'
@@ -111,7 +112,7 @@ def main():
             current_env.pop('STRATA_SNAPSHOT_FULL_CAPTURE', None)
         print('START', name, flush=True)
         log = a.output / (name + '.log')
-        engine = StrataEngine(str(a.engine.resolve()), args, cwd=cfg.get('cwd'), log=str(log), env=current_env)
+        engine = StrataEngine(exe, args, cwd=cfg.get('cwd'), log=str(log), env=current_env)
         arm = {'name': name, 'args': args, 'info': dict(engine.info), 'records': []}
         with a.engine.open('rb') as source:
             arm['exe_sha256'] = hashlib.file_digest(source, 'sha256').hexdigest()

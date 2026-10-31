@@ -131,7 +131,8 @@ def main():
     follow = [enc('<|im_end|>\n<|im_start|>user\nContinue the story, with new records.<|im_end|>\n'
                   '<|im_start|>assistant\n<think>\n\n</think>\n\n')]
     a.output.mkdir(parents=False, exist_ok=False)
-    env = child_env(cfg)
+    exe = str(a.engine.resolve())   # the binary started; child_env checks this one, not cfg['exe']
+    env = child_env(cfg, exe=exe)
     env['STRATA_VERIFY_DEFER_CPU'] = '0'   # the exact path (Strata Link defers by default)
     base_args = override(cfg['args'], parse_sets(a.set) + [('--adapt-swaps', '0'), ('--prompt-cache', '6')])
     results = {'prompt_tokens': len(A), 'args': base_args}
@@ -140,7 +141,7 @@ def main():
         sides = [s for s in sides if s[0] == a.only]
     for label, budget in sides:
         args = base_args + ['--conversation-cache-mib', str(budget), '--conversation-cache-slots', '4']
-        engine = StrataEngine(str(a.engine.resolve()), args, cwd=cfg.get('cwd'), log=str(a.output / f'{label}.log'),
+        engine = StrataEngine(exe, args, cwd=cfg.get('cwd'), log=str(a.output / f'{label}.log'),
                               env=env)
         records = []
 

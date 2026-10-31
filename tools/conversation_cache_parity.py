@@ -185,7 +185,8 @@ def main():
     suffix = encode('<|im_end|>\n<|im_start|>user\nName a color from the list.<|im_end|>\n'
                     '<|im_start|>assistant\n<think>\n\n</think>\n\n')
     a.output.mkdir(mode=0o700, parents=False, exist_ok=False)
-    env = child_env(cfg)
+    exe = str(a.engine.resolve())   # the binary started; child_env checks this one, not cfg['exe']
+    env = child_env(cfg, exe=exe)
     env['STRATA_STATE_HASH'] = '1'
     env['STRATA_VERIFY_DEFER_CPU'] = '0'   # the exact path (Strata Link defers by default)
     results = {'engine_info': {}}
@@ -193,7 +194,7 @@ def main():
         log = a.output / f'{label}.log'
         args = engine_args(cfg, budget, a.spec)
         args += ['--conversation-cache-min-free-mib', str(a.min_free_mib)]
-        engine = StrataEngine(str(a.engine.resolve()), args, cwd=cfg.get('cwd'), log=str(log), env=env)
+        engine = StrataEngine(exe, args, cwd=cfg.get('cwd'), log=str(log), env=env)
         results['engine_info'][label] = dict(engine.info)
         records = []
         def generate(ids, count, name):

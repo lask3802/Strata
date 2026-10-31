@@ -126,11 +126,15 @@ def main():
     suffix = encode('<|im_end|>\n<|im_start|>user\nWhat exact code did I ask you to remember? '
                     'Reply with only that code.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n')
     args = common_args(cfg, a.spec)
-    env = child_env(cfg)
-    env.pop('STRATA_SNAPSHOT_VERIFY', None)
-    env['STRATA_STATE_HASH'] = '1'
-    env['STRATA_VERIFY_DEFER_CPU'] = '0'   # the exact path (Strata Link defers by default)
-    env['STRATA_MTP_BATCH'] = '1'
+    def arm_env(binary):
+        # one environment per binary: child_env checks the engine it is given, so each arm gets its own
+        env = child_env(cfg, exe=str(binary.resolve()))
+        env.pop('STRATA_SNAPSHOT_VERIFY', None)
+        env['STRATA_STATE_HASH'] = '1'
+        env['STRATA_VERIFY_DEFER_CPU'] = '0'   # the exact path (Strata Link defers by default)
+        env['STRATA_MTP_BATCH'] = '1'
+        return env
+    env = arm_env(a.upstream)   # the recorded environment is the upstream arm's; each arm's own is recorded below
     a.output.mkdir(mode=0o700, parents=False, exist_ok=False)
     results = {'config': cfg, 'paragraphs': a.paragraphs, 'spec': a.spec, 'arms': [], 'requests': [],
                'compared_state_fields': STATE_KEYS,
@@ -140,7 +144,7 @@ def main():
         log = a.output / f'{name}.log'
         print(f'START {name}: {exe}', flush=True)
         started = time.monotonic()
-        engine = StrataEngine(str(exe.resolve()), args, cwd=cfg.get('cwd'), log=str(log), env=env)
+        engine = StrataEngine(str(exe.resolve()), args, cwd=cfg.get('cwd'), log=str(log), env=arm_env(exe))
         arm = {'name': name, 'exe': str(exe.resolve()), 'args': args, 'info': dict(engine.info),
                'startup_seconds': time.monotonic() - started, 'records': []}
         with exe.open('rb') as source:

@@ -16,7 +16,7 @@ from pathlib import Path
 REPO = Path(os.environ.get("STRATA_REPO", Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(REPO / "tools")); sys.path.insert(0, str(REPO))
 import strata_tokenizer as ST
-from serve.server import StrataEngine, child_env, engine_args
+from serve.server import StrataEngine, child_env, engine_args, engine_exe_path
 
 cfg = json.load(open(sys.argv[1]))
 tp = Path(cfg["tokenizer"])
@@ -30,7 +30,8 @@ if os.environ.get("GPUS"):   # e.g. GPUS=0,1: a layer split over those cards (SP
     cfg["layer_split"] = os.environ.get("SPLIT", "auto")
 args = engine_args(cfg) + os.environ.get("STRATA_EXTRA_ARGS", "").split()
 log = os.environ.get("SMOKE_LOG", cfg["log"])
-eng = StrataEngine(os.environ.get("STRATA_EXE", cfg["exe"]), args, cwd=cfg.get("cwd"), log=log, env=child_env(cfg))
+exe = os.environ.get("STRATA_EXE") or engine_exe_path(cfg)   # the binary started; child_env checks this one, not cfg["exe"]
+eng = StrataEngine(exe, args, cwd=cfg.get("cwd"), log=log, env=child_env(cfg, exe=exe))
 GEN = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 
