@@ -821,13 +821,21 @@ class ParallelStackDefaults(unittest.TestCase):
                     del os.environ[k]
             return server.child_env(cfg)
 
+    def new_engine(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        (Path(tmp.name) / "BUILD.json").write_text(json.dumps({"version": "0.1.55"}))
+        return str(Path(tmp.name) / "strata")
+
     def test_on_with_parallel(self):
-        env = self.env_for({"parallel": 8, "args": []})
-        hip = self.env_for({"parallel": 8, "args": [], "backend": "hip"})
+        exe = self.new_engine()
+        env = self.env_for({"parallel": 8, "args": [], "exe": exe})
+        hip = self.env_for({"parallel": 8, "args": [], "backend": "hip", "exe": exe})
         for k, v in server.PARALLEL_STACK_ENV.items():
             self.assertEqual(env.get(k), v, k)
             self.assertNotIn(k, hip)           # HIP: nothing (no measurement without replicas)
-        self.assertEqual(self.env_for({"args": ["--batch", "4"]}).get("STRATA_BATCH_SELF_COMMIT"), "1")
+        self.assertEqual(self.env_for({"args": ["--batch", "4"], "exe": exe}).get("STRATA_BATCH_SELF_COMMIT"), "1")
 
     def test_off_on_windows_and_mac(self):
         self.assertNotIn("STRATA_CKPT_POOL", self.env_for({"parallel": 8, "args": []}, linux=False))
@@ -850,28 +858,62 @@ class ParallelStackDefaults(unittest.TestCase):
 
 class ParallelStackEngineGate(unittest.TestCase):
     """Strata Link: an engine before 0.1.55 never gets STRATA_BATCH_GDN_GROUPS + STRATA_BATCH_SELF_COMMIT together (05cd12e7 is
-    in 0.1.55; before it a one-row batch window's GDN state is not committed).  The gate reads the engine's BUILD.json."""
+    in 0.1.55; before it a one-row batch window's GDN state is not committed).  The gate reads the binary the launch starts (its
+    BUILD.json, else its component manifest, else the engine= line compiled into it); a version nothing tells leaves the pair off."""
     PAIR = ("STRATA_BATCH_GDN_GROUPS", "STRATA_BATCH_SELF_COMMIT")
 
-    def engine(self, build):
+    def tmpdir(self):
         import tempfile
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        exe = Path(tmp.name) / "strata"
-        exe.write_bytes(b"x")
+        return Path(tmp.name)
+
+    def engine(self, build, binary=b"x", folder=None):
+        folder = folder or self.tmpdir()
+        folder.mkdir(parents=True, exist_ok=True)
+        exe = folder / "strata"
+        exe.write_bytes(binary)
         if build is not None:
-            (Path(tmp.name) / "BUILD.json").write_text(json.dumps(build))
+            (folder / "BUILD.json").write_text(json.dumps(build))
         return str(exe)
 
+    def manifest(self, exe, version):
+        import hashlib
+        from strata_control import components, engine_component as ec
+        exe = Path(exe)
+        exe.chmod(0o755)                                                     # (Linux: a package's entrypoint must be executable)
+        data = exe.read_bytes()
+        (exe.parent / ec.MANIFEST).write_text(json.dumps({
+            "schema_version": 1, "id": ec.COMPONENT_ID, "version": version, "platform": components.host_platform(), "backend": "cuda",
+            "entrypoint": exe.name, "files": [{"path": exe.name, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}]}))
+
+    @staticmethod
+    def marker(version):
+        return b"\0prefill_pipe=%g%s engine=" + version.encode() + b"\n\0"
+
+    def in_folder(self, folder):
+        import os
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(folder)
+
     def env_for(self, exe, extra=None, base=None):
+        return self.run_linux(lambda: server.child_env({"parallel": 2, "args": [], "exe": exe, **(extra or {})}), base)
+
+    def run_linux(self, call, base=None):
         import os
         from unittest import mock
-        cfg = {"parallel": 2, "args": [], "exe": exe, **(extra or {})}
         with mock.patch.dict(os.environ, base or {}, clear=False), mock.patch.object(server, "parallel_stack_platform", return_value=True):
             for k in list(os.environ):
                 if k in server.PARALLEL_STACK_ENV and not (base and k in base):
                     del os.environ[k]
-            return server.child_env(cfg)
+            return call()
+
+    def assert_pair_off(self, env, why=None):
+        self.assertEqual({k: env.get(k) for k in self.PAIR}, dict.fromkeys(self.PAIR), why)      # (a slice: a failure never prints the environment)
+        self.assertEqual(env.get("STRATA_CKPT_POOL"), "1", why)      # the rest of the stack is unchanged
+
+    def assert_pair_on(self, env, why=None):
+        self.assertEqual({k: env.get(k) for k in self.PAIR}, dict.fromkeys(self.PAIR, "1"), why)
 
     def test_kept_054_engine_after_a_failed_update(self):
         """The real boundary: 0.1.54-link.1 installed, 0.1.55-link.1 not to be had (every request 404), Linux batch 2."""
@@ -890,36 +932,234 @@ class ParallelStackEngineGate(unittest.TestCase):
                 env = self.env_for(str(eng / lr.setup.EXE))
         finally:
             t.doCleanups()
-        for k in self.PAIR:
-            self.assertNotIn(k, env, k)
-        self.assertEqual(env.get("STRATA_CKPT_POOL"), "1")          # the rest of the stack is unchanged
+        self.assert_pair_off(env)
 
     def test_055_engine_gets_the_pair(self):
         for ver in ("0.1.55", "0.1.56", "0.2.0"):
-            env = self.env_for(self.engine({"version": ver, "link": "0.1.55-link.1"}))
-            for k in self.PAIR:
-                self.assertEqual(env.get(k), "1", (ver, k))
+            self.assert_pair_on(self.env_for(self.engine({"version": ver, "link": "0.1.55-link.1"})), ver)
 
     def test_054_engine_without_a_link_field_and_other_old_versions(self):
         for ver in ("0.1.54", "0.1.46", "0.0.9"):
-            env = self.env_for(self.engine({"version": ver}))
-            for k in self.PAIR:
-                self.assertNotIn(k, env, (ver, k))
+            self.assert_pair_off(self.env_for(self.engine({"version": ver})), ver)
 
-    def test_unknown_engine_keeps_the_defaults(self):
-        for exe in (self.engine(None), self.engine({}), self.engine({"version": "dev"}), ""):
-            env = self.env_for(exe)
-            for k in self.PAIR:
-                self.assertEqual(env.get(k), "1", (exe, k))
+    def test_unknown_engine_leaves_the_pair_off(self):
+        """No BUILD.json, no manifest, no engine= line: not taken for a new engine."""
+        broken = self.engine(None)
+        (Path(broken).parent / "BUILD.json").write_text("{not json")
+        listed = self.engine(None)
+        (Path(listed).parent / "BUILD.json").write_text("[]")
+        for exe in (self.engine(None), self.engine({}), self.engine({"version": "dev"}), self.engine({"version": 55}), broken, listed,
+                    str(self.tmpdir() / "no-such-engine"), "", "component:strata-engine"):
+            self.assert_pair_off(self.env_for(exe), exe)
+
+    def test_a_config_with_no_exe_leaves_the_pair_off(self):
+        self.assert_pair_off(self.run_linux(lambda: server.child_env({"parallel": 2, "args": []})))
+
+    def test_unknown_engine_is_said_once(self):
+        import io
+        from contextlib import redirect_stdout
+        unknown = self.engine(None)
+        server.parallel_stack_env._said = False
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.env_for(unknown)
+            self.env_for(unknown)
+        self.assertEqual(buf.getvalue().count("version cannot be read"), 1)
+        self.assertEqual(buf.getvalue().count("leaves those two off"), 1)
+
+    def test_relative_exe_is_the_configs_cwds_not_the_servers(self):
+        """The launch runs <cfg.cwd>/engine/strata (0.1.54): nothing beside the server, then a newer BUILD.json beside it."""
+        installed, launcher = self.tmpdir(), self.tmpdir()
+        self.engine({"version": "0.1.54"}, folder=installed / "engine")
+        self.in_folder(launcher)
+        self.assert_pair_off(self.env_for("engine/strata", {"cwd": str(installed)}), "nothing beside the server")
+        self.engine({"version": "0.1.55"}, folder=launcher / "engine")
+        self.assert_pair_off(self.env_for("engine/strata", {"cwd": str(installed)}), "a newer engine beside the server")
+
+    def test_relative_exe_new_engine_with_an_old_one_beside_the_server(self):
+        installed, launcher = self.tmpdir(), self.tmpdir()
+        self.engine({"version": "0.1.55"}, folder=installed / "engine")
+        self.engine({"version": "0.1.54"}, folder=launcher / "engine")
+        self.in_folder(launcher)
+        self.assert_pair_on(self.env_for("engine/strata", {"cwd": str(installed)}))
+
+    def test_relative_exe_without_a_marker_or_record_at_cfg_cwd(self):
+        """The binary is read at the launch's path as well: an old manual build under cfg.cwd, a new one beside the server."""
+        installed, launcher = self.tmpdir(), self.tmpdir()
+        self.engine(None, self.marker("0.1.54"), folder=installed / "engine")
+        self.engine(None, self.marker("0.1.55"), folder=launcher / "engine")
+        self.in_folder(launcher)
+        self.assert_pair_off(self.env_for("engine/strata", {"cwd": str(installed)}))
+
+    def test_engine_exe_path_is_the_launchs_rule(self):
+        import os
+        launcher = self.tmpdir()
+        self.in_folder(launcher)
+        cwd = str(self.tmpdir())
+        absolute = str(self.tmpdir() / "strata")
+        self.assertEqual(server.engine_exe_path({"exe": "engine/strata", "cwd": cwd}), os.path.abspath(os.path.join(cwd, "engine/strata")))
+        self.assertEqual(server.engine_exe_path({"exe": "engine/strata"}), os.path.abspath("engine/strata"))
+        self.assertEqual(server.engine_exe_path({"exe": absolute, "cwd": cwd}), absolute)
+
+    def test_main_checks_the_binary_it_starts(self):
+        """The real main(): one path for the version check and the start."""
+        import os
+        from unittest import mock
+        from strata_control import engine_component as ec
+        from tools.strata_tokenizer import BYTE_TO_UNICODE
+
+        class Started(Exception):
+            pass
+        root, launcher = self.tmpdir(), self.tmpdir()
+        old = self.engine({"version": "0.1.54"}, folder=root / "engine")
+        self.engine({"version": "0.1.55"}, folder=launcher / "engine")
+        tok = root / "tokenizer"
+        tok.mkdir()
+        tokens = [BYTE_TO_UNICODE[i] for i in range(256)] + ["ab", "<|im_start|>", "<|im_end|>", "<|endoftext|>"]
+        (tok / "vocab.json").write_text(json.dumps({t: i for i, t in enumerate(tokens)}))
+        (tok / "merges.txt").write_text("a b")
+        (tok / "token_type.json").write_text(json.dumps([0] * 257 + [3, 3, 3]))
+        config = root / "run.json"
+        config.write_text(json.dumps({"exe": "engine/strata", "cwd": str(root), "tokenizer": str(tok), "parallel": 2, "args": []}))
+        self.in_folder(launcher)
+        started = {}
+
+        def engine(exe, args, **kw):
+            started.update(exe=exe, env=kw["env"])
+            raise Started
+
+        def go():
+            with mock.patch.object(server, "StrataEngine", engine), \
+                    mock.patch.object(ec, "read_engine_version", wraps=ec.read_engine_version) as read:
+                with self.assertRaises(Started):
+                    server.main(["--engine", "strata", "--config", str(config), "--port", "0"])
+            return read
+        read = self.run_linux(go)
+        self.assertEqual(os.path.normcase(started["exe"]), os.path.normcase(old))
+        self.assertEqual({str(c.args[0]) for c in read.call_args_list}, {started["exe"]})
+        self.assert_pair_off(started["env"])
+
+    def starts(self, call):
+        """What a replica or split start hands its engines: (exe, env) of each, the first one failing the start after that."""
+        from unittest import mock
+        seen = []
+
+        def engine(exe, args, **kw):
+            seen.append((exe, kw["env"]))
+            raise RuntimeError("not started in a test")
+        with mock.patch.object(server, "StrataEngine", engine):
+            self.run_linux(call)
+        return seen
+
+    def test_replicas_check_the_binary_they_start(self):
+        new, old = self.engine({"version": "0.1.55"}), self.engine({"version": "0.1.54"})
+        cfg = {"exe": new, "parallel": 2, "args": [], "gpu": [0, 1], "replica_cpus": False}
+
+        def call():
+            with self.assertRaises(SystemExit):
+                server.start_replicas(cfg, [[0], [1]], old, [], True)
+        seen = self.starts(call)
+        self.assertEqual(len(seen), 2)
+        for exe, env in seen:
+            self.assertEqual(exe, old)
+            self.assert_pair_off(env)
+
+    def test_split_checks_the_binary_it_starts(self):
+        from unittest import mock
+        from serve import split as sp
+        new, old = self.engine({"version": "0.1.55"}), self.engine({"version": "0.1.54"})
+        cfg = {"exe": new, "parallel": 2, "args": [], "split_serve": {"prefill_gpu": 0, "decode_gpu": 1}}
+
+        def call():
+            with mock.patch.object(sp, "check_cfg"), mock.patch.object(sp, "arena_path", return_value=(None, "no arena")), \
+                    mock.patch.object(sp, "session_dir", return_value=self.tmpdir()), self.assertRaises(RuntimeError):
+                server.start_split(cfg, sp.split_spec(cfg), old, [], True)
+        seen = self.starts(call)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], old)
+        self.assert_pair_off(seen[0][1])
+
+    def test_manual_old_binary_with_no_build_json(self):
+        """A direct CMake build (docs/SOURCE_INSTALL.md) or a copied binary: only the engine= line says 0.1.54."""
+        exe = self.engine(None, self.marker("0.1.54"))
+        self.assertEqual(server.parallel_stack_engine_skips({"exe": exe}), "0.1.54")
+        self.assert_pair_off(self.env_for(exe))
+
+    def test_a_valid_component_at_054_without_build_json(self):
+        """The real start path: with_component_engine resolves the package and checks its hashes; BUILD.json is optional there."""
+        import os
+        from unittest import mock
+        from strata_control import components
+        root = self.tmpdir()
+        exe = self.engine(None, folder=root / "engine" / f"0.1.54-{components.host_platform()}-cuda")
+        self.manifest(exe, "0.1.54")
+        cfg = {"exe": "component:strata-engine", "backend": "cuda", "parallel": 2, "args": []}
+        with mock.patch.dict(os.environ, {"STRATA_COMPONENTS_DIR": str(root), "STRATA_ENGINE_BACKEND": "cuda"}):
+            started = server.with_component_engine(cfg)
+        self.assertEqual(Path(started["exe"]).resolve(), Path(exe).resolve())
+        self.assertFalse((Path(exe).parent / "BUILD.json").exists())
+        self.assertEqual(server.parallel_stack_engine_skips(started), "0.1.54")
+        self.assert_pair_off(self.run_linux(lambda: server.child_env(started)))
+
+    def test_each_reader_gives_the_pair_to_a_new_engine(self):
+        from strata_control import engine_component as ec
+        by_build = self.engine({"version": "0.1.55-link.1"})
+        by_manifest = self.engine(None)
+        self.manifest(by_manifest, "0.1.55")
+        by_binary = self.engine(None, self.marker("0.1.55"))
+        hotfix = self.engine(None, self.marker("0.1.55.2"))
+        later = self.engine(None, self.marker("0.2.0"))
+        for exe, version in ((by_build, "0.1.55-link.1"), (by_manifest, "0.1.55"), (by_binary, "0.1.55"), (hotfix, "0.1.55.2"), (later, "0.2.0")):
+            self.assertEqual(ec.read_engine_version(exe), version)
+            self.assertIsNone(server.parallel_stack_engine_skips({"exe": exe}), exe)
+            self.assert_pair_on(self.env_for(exe), exe)
+
+    def test_the_readers_go_in_order(self):
+        from strata_control import engine_component as ec
+        first = self.engine({"version": "0.1.54"}, self.marker("0.1.55"))
+        self.manifest(first, "0.1.55")
+        self.assertEqual(ec.read_engine_version(first), "0.1.54")
+        second = self.engine(None, self.marker("0.1.55"))
+        self.manifest(second, "0.1.54")
+        self.assertEqual(ec.read_engine_version(second), "0.1.54")
+        not_a_version = self.engine({"version": "dev"}, self.marker("0.1.54"))
+        self.assertEqual(ec.read_engine_version(not_a_version), "0.1.54")
+        other_package = self.engine(None, self.marker("0.1.54"))
+        (Path(other_package).parent / ec.MANIFEST).write_text(json.dumps({"schema_version": 1, "id": "another", "version": "0.1.55"}))
+        self.assertEqual(ec.read_engine_version(other_package), "0.1.54")
+        dev_package = self.engine(None, self.marker("0.1.54"))              # a valid manifest whose version is not a number
+        self.manifest(dev_package, "dev")
+        self.assertEqual(ec.read_engine_version(dev_package), "0.1.54")
+        nothing = self.engine(None)
+        self.manifest(nothing, "dev")
+        self.assertIsNone(ec.read_engine_version(nothing))
+        self.assert_pair_off(self.env_for(nothing))
+
+    def test_explicit_env_wins_on_an_unknown_engine(self):
+        """A binary with no version line that the user knows is new: both set by hand.  Nothing is read and nothing is said."""
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from strata_control import engine_component as ec
+        unknown = self.engine(None)
+        server.parallel_stack_env._said = False
+        buf = io.StringIO()
+        with mock.patch.object(ec, "read_engine_version", side_effect=AssertionError("read")), redirect_stdout(buf):
+            env = self.env_for(unknown, {"env": {"STRATA_BATCH_GDN_GROUPS": "1", "STRATA_BATCH_SELF_COMMIT": "1"}})
+            shell = self.env_for(unknown, base={"STRATA_BATCH_GDN_GROUPS": "1", "STRATA_BATCH_SELF_COMMIT": "1"})
+        self.assert_pair_on(env)
+        self.assert_pair_on(shell)
+        self.assertEqual(buf.getvalue(), "")
+        one = self.env_for(unknown, base={"STRATA_BATCH_SELF_COMMIT": "0"})         # one of them set: it stays, the other stays off
+        self.assertEqual(one["STRATA_BATCH_SELF_COMMIT"], "0")
+        self.assertIsNone(one.get("STRATA_BATCH_GDN_GROUPS"))
 
     def test_explicit_env_wins_on_an_old_engine(self):
         old = self.engine({"version": "0.1.54", "link": "0.1.54-link.1"})
-        env = self.env_for(old, {"env": {"STRATA_BATCH_GDN_GROUPS": "1", "STRATA_BATCH_SELF_COMMIT": "1"}})
-        for k in self.PAIR:
-            self.assertEqual(env[k], "1", k)
+        self.assert_pair_on(self.env_for(old, {"env": {"STRATA_BATCH_GDN_GROUPS": "1", "STRATA_BATCH_SELF_COMMIT": "1"}}))
         env = self.env_for(old, base={"STRATA_BATCH_SELF_COMMIT": "0"})
         self.assertEqual(env["STRATA_BATCH_SELF_COMMIT"], "0")
-        self.assertNotIn("STRATA_BATCH_GDN_GROUPS", env)
+        self.assertIsNone(env.get("STRATA_BATCH_GDN_GROUPS"))
 
     def test_said_once(self):
         import io

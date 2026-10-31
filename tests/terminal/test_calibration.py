@@ -670,6 +670,39 @@ class CalibrationFlowTests(unittest.TestCase):
         saved_args = json.loads(self.config.read_text())["args"]
         self.assertNotIn("--batch-groups", saved_args)
 
+    def test_smoke_checks_the_binary_it_starts(self):
+        """_smoke has its own path rule (a relative exe without a cwd is the config's folder's): the server's engine check gets that path."""
+        from serve import server
+        old = self.root / "engine"
+        old.mkdir()
+        (old / "strata").write_bytes(b"x")
+        (old / "BUILD.json").write_text('{"version": "0.1.54"}', encoding="utf-8")
+        with tempfile.TemporaryDirectory() as elsewhere:
+            (Path(elsewhere) / "engine").mkdir()
+            (Path(elsewhere) / "engine" / "BUILD.json").write_text('{"version": "0.1.55"}', encoding="utf-8")
+            cfg = json.loads(self.config.read_text(encoding="utf-8"))
+            del cfg["cwd"]
+            cfg.update(exe="engine/strata", parallel=2)
+            seen = {}
+
+            def engine(exe, args, **kwargs):
+                seen.update(exe=exe, env=kwargs["env"])
+                raise OSError("not started in a test")
+            pair = ("STRATA_BATCH_GDN_GROUPS", "STRATA_BATCH_SELF_COMMIT")
+            here = os.getcwd()
+            os.chdir(elsewhere)
+            try:
+                with mock.patch.object(server, "StrataEngine", engine), mock.patch("strata_tokenizer.Tokenizer"), \
+                        mock.patch.object(server, "parallel_stack_platform", return_value=True), mock.patch.dict(os.environ):
+                    for name in pair:
+                        os.environ.pop(name, None)
+                    with self.assertRaises(OSError):
+                        calibration._smoke(cfg, self.config)
+            finally:
+                os.chdir(here)
+        self.assertEqual(Path(seen["exe"]), old / "strata")
+        self.assertEqual([seen["env"].get(name) for name in pair], [None, None])
+
     def test_profile_edit_during_measurement_marks_report_stale(self):
         report_path = self.root / "calibration.json"
 

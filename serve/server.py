@@ -3835,27 +3835,32 @@ def parallel_stack_platform() -> bool:
 
 # Strata Link: upstream 05cd12e7 (engine 0.1.55) made the grouped GDN launch commit a one-row batch window; an engine before it
 # skips that commit when both switches below are on (self-commit skips the commit graph) and decodes wrong.  setup keeps an
-# installed older engine when the new one cannot be had, so the server checks the engine it will start (BUILD.json "version").
-# No BUILD.json or no readable version (a source tree built by this checkout): the engine is this checkout's, defaults as before.
+# installed older engine when the new one cannot be had, and a manual CMake build or a copied binary can be older too, so the
+# server checks the binary it will start: BUILD.json "version", else the component manifest, else the engine= line compiled into
+# the binary (engine_component.read_engine_version).  A version nothing can tell is not taken for a new one: the pair stays off.
+# An engine built from this checkout carries engine=0.1.55 in the binary, so it gets the pair with or without a BUILD.json.
 PARALLEL_STACK_PAIR = ("STRATA_BATCH_GDN_GROUPS", "STRATA_BATCH_SELF_COMMIT")
 PARALLEL_STACK_PAIR_MIN_ENGINE = "0.1.55"
+PARALLEL_STACK_UNKNOWN_ENGINE = "unknown"
 
 
-def parallel_stack_engine_skips(cfg: dict) -> str | None:
-    """'0.1.54' when the engine cfg["exe"] names is older than PARALLEL_STACK_PAIR_MIN_ENGINE, else None (also when unknown)."""
-    try:
-        exe = cfg.get("exe")
-        if not isinstance(exe, str) or not exe or engine_component.is_reference(exe):
-            return None
-        ver = str(json.loads((Path(exe).parent / "BUILD.json").read_text(encoding="utf-8-sig")).get("version") or "")
-        key = tuple(int(x) for x in re.match(r"(\d+)\.(\d+)\.(\d+)", ver).groups())
-    except (OSError, ValueError, AttributeError, TypeError):
-        return None
+def parallel_stack_engine_skips(cfg: dict, exe: str | None = None) -> str | None:
+    """Why the engine does not get the pair: its version when it is older than PARALLEL_STACK_PAIR_MIN_ENGINE, or
+    PARALLEL_STACK_UNKNOWN_ENGINE; None when it is new enough.  `exe`: the path the launch resolved (engine_exe_path); without it,
+    the same rule on cfg["exe"].  A "component:" reference is expanded before a start (with_component_engine), not here."""
+    if exe is None:
+        named = cfg.get("exe")
+        if isinstance(named, str) and named and not engine_component.is_reference(named):
+            exe = engine_exe_path(cfg)
+    ver = engine_component.read_engine_version(exe) if exe else None
+    if ver is None:
+        return PARALLEL_STACK_UNKNOWN_ENGINE
+    key = tuple(int(x) for x in re.match(r"(\d+)\.(\d+)\.(\d+)", ver).groups())
     need = tuple(int(x) for x in PARALLEL_STACK_PAIR_MIN_ENGINE.split("."))
     return ver if key < need else None
 
 
-def parallel_stack_env(env: dict, cfg: dict) -> None:
+def parallel_stack_env(env: dict, cfg: dict, exe: str | None = None) -> None:
     """Switch the exact parallel stack on (setdefault: a value the user or the config set stays) when the config runs batch
     slots on a CUDA or HIP Qwen engine.  Other engines (DeepSeek, SYCL, Metal) do not read these."""
     if parallel_slots(cfg) < 2 or (cfg.get("arch") or "") == "deepseek41" or cfg.get("backend") in ("sycl", "metal", "vulkan"):
@@ -3864,13 +3869,17 @@ def parallel_stack_env(env: dict, cfg: dict) -> None:
         return
     if cfg.get("backend") == "hip":
         return
-    skip = parallel_stack_engine_skips(cfg)                        # Strata Link: an engine before 0.1.55 never gets the GDN pair
+    # Strata Link: only an engine known to be 0.1.55 or newer gets the GDN pair; a pair the user set stays, and nothing is read for it
+    skip = None if all(k in env for k in PARALLEL_STACK_PAIR) else parallel_stack_engine_skips(cfg, exe)
     if skip:
         if not getattr(parallel_stack_env, "_said", False):
             parallel_stack_env._said = True
-            print(f"[strata] the engine is {skip}: before {PARALLEL_STACK_PAIR_MIN_ENGINE} it skips the GDN commit of a one-row batch "
+            what = (f"the engine is {skip}" if skip != PARALLEL_STACK_UNKNOWN_ENGINE else
+                    "the engine's version cannot be read (not from BUILD.json, a component manifest or an engine= line in the binary)")
+            print(f"[strata] {what}: an engine before {PARALLEL_STACK_PAIR_MIN_ENGINE} skips the GDN commit of a one-row batch "
                   "window when STRATA_BATCH_GDN_GROUPS and STRATA_BATCH_SELF_COMMIT are both on, so this run leaves those two off "
-                  "(update the engine to get them)", flush=True)
+                  f"(update the engine; if it is {PARALLEL_STACK_PAIR_MIN_ENGINE} or newer, setting both in the config's env turns "
+                  "them on)", flush=True)
     for k, v in PARALLEL_STACK_ENV.items():
         if skip and k in PARALLEL_STACK_PAIR:
             continue
@@ -3909,9 +3918,9 @@ def gdn_stack_env(env: dict, cfg: dict, archs: dict | None = None) -> None:
             env.setdefault(k, v)
 
 
-def child_env(cfg: dict, *, offline: bool = False) -> dict:
+def child_env(cfg: dict, *, offline: bool = False, exe: str | None = None) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
-    compiled it) first on the library search path."""
+    compiled it) first on the library search path.  `exe`: the binary the caller will start, when it has resolved it."""
     env = dict(os.environ)
     if gpu_all_off(cfg):                             # every card Off: the engine sees none (a CPU engine runs; the others say so at start)
         env["CUDA_VISIBLE_DEVICES"] = ""
@@ -3925,7 +3934,7 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         env[str(k)] = str(v)
     if (cfg.get("arch") or "") == "deepseek41":      # (only this engine reads these; Qwen's environment is untouched)
         deepseek_slot_env(env, cfg)
-    parallel_stack_env(env, cfg)
+    parallel_stack_env(env, cfg, exe)
     gdn_stack_env(env, cfg)
     # Strict offline reaches children through the environment, because a tool subprocess or a model
     # loader is code this server does not own. Applied last so a profile's own `env` cannot remove
@@ -9067,7 +9076,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
             rc["args"] = list(rc["args"]) + ["--shared-expert-arena", arena]
         try:
             engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
-                                      env=child_env(rc, offline=offline), lazy=lazy, cpus=cpus[i] if cpus else None)
+                                      env=child_env(rc, offline=offline, exe=exe), lazy=lazy, cpus=cpus[i] if cpus else None)
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
@@ -9134,7 +9143,7 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
             if role == "prefill":
                 warn_budget_over_ram(engine_args(rc) if "args" in rc else [])
             engines[role] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
-                                         env=child_env(rc, offline=offline), lazy=lazy)
+                                         env=child_env(rc, offline=offline, exe=exe), lazy=lazy)
     except BaseException:
         for e in engines.values():
             try:
@@ -9296,6 +9305,14 @@ def _component_exe(reference: str, cfg: dict) -> str:
     except engine_component.EngineMissing as e:
         print(f"[strata] {e}", file=sys.stderr, flush=True)
         raise SystemExit(e.exit_code) from None
+
+
+def engine_exe_path(cfg: dict) -> str:
+    """The engine binary a run config starts.  A relative "exe" is the config's cwd's: Windows' CreateProcess resolves
+    "engine/strata.exe" against nothing it is told about (WinError 2), so it is made absolute here."""
+    if engine_component.is_reference(cfg["exe"]):      # "component:strata-engine": the engine package for this PC
+        return _component_exe(cfg["exe"], cfg)
+    return cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
 
 
 def tool_call_recovery_setting(cfg: dict) -> bool:
@@ -9547,10 +9564,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if not cfg:
             ap.error("--engine strata needs --config")
         cfg = with_component_engine(cfg)
+        exe = engine_exe_path(cfg)                      # once: the engine check below and every start use this path
         vision = None
         # The engine's own environment. It carries the offline policy too: an engine that fetched a
         # missing shard or a plugin would break the promise the flag makes.
-        env = child_env(cfg, offline=a.offline)
+        env = child_env(cfg, offline=a.offline, exe=exe)
         configure_batch_telemetry_env(env, cfg, a.batch_telemetry)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
@@ -9582,12 +9600,6 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         elif len(gpu_list(cfg)) > 1:
             print(f"[strata] GPUs {gpu_list(cfg)}: the later card(s) serve as the peer expert tier (--peer-device)",
                   flush=True)
-        # a relative "exe" is the config's cwd's: Windows' CreateProcess resolves "engine/strata.exe" against nothing
-        # it is told about (WinError 2), so it is made absolute here
-        if engine_component.is_reference(cfg["exe"]):      # "component:strata-engine": the engine package for this PC
-            exe = _component_exe(cfg["exe"], cfg)
-        else:
-            exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
         try:
             silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
             apply_ready_timeout(cfg)

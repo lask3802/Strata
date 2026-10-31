@@ -6833,14 +6833,7 @@ def source_version() -> str:
     return m.group(1) if m else "0"
 
 
-def binary_engine_version(exe) -> str | None:
-    """The version compiled into an engine binary (the `engine=X.Y.Z` line it prints at start; 0.1.13 and newer carry
-    it), read from the file without running it.  None: unreadable, or a binary without it."""
-    try:
-        m = re.search(rb"engine=(\d+\.\d+\.\d+(?:\.\d+)?)\n", Path(exe).read_bytes())
-    except OSError:
-        return None
-    return m.group(1).decode() if m else None
+binary_engine_version = engine_component.binary_engine_version     # Strata Link: shared with the server's engine check
 
 
 def stale_binary(exe) -> bool:

@@ -967,11 +967,21 @@ merge). Nothing in the stage link, its TLS, `tools/stage_node.py` or the release
   `STRATA_BATCH_SELF_COMMIT` together and an 0.1.54 engine then never commits a one-row batch window's GDN state,
   setup's `LINK_REQUIRED` is 0.1.55-link.1. That bound only limits a download: setup keeps an installed older engine
   when the new one cannot be had (`link_soft()` asks for 0.1.46, `get_prebuilt()` returns the installed one), and a
-  source build or a manual engine can be older as well. So the server checks the engine it will start
-  (`parallel_stack_engine_skips` in `serve/server.py`, BUILD.json `version`): below 0.1.55 it leaves the two switches
-  off (0.2.8's safe batch path; the rest of the stack stays) and says so once in the log. An explicit variable or the
-  config's `env` still wins, and an engine with no readable version keeps the defaults (it is this checkout's own build).
-  The test is `ParallelStackEngineGate` in `serve/test_parallel.py` (it includes the kept 0.1.54-link.1 case).
+  source build or a manual engine can be older as well. So the server checks the binary it will start, by the path the
+  launch itself resolves (`engine_exe_path`: a relative `exe` is `cfg.cwd`'s; `main()` resolves it once and the check,
+  the launch, the replicas and the split all use that path; `parallel_stack_engine_skips` in `serve/server.py`). The
+  version comes from `read_engine_version` in `strata_control/engine_component.py`, without running the binary: BUILD.json
+  `version`, else `engine-component.json`, else the `engine=X.Y.Z` line compiled into the binary (setup's own helper,
+  now shared). BUILD.json is optional: a direct CMake build, a copied binary and a valid component can lack it. Below
+  0.1.55 **or when nothing tells the version** the server leaves the two switches off and says so once in the log. The
+  other seven switches of the stack stay on; that combination has not been measured. An unknown version does not count
+  as new. A build of this checkout
+  still gets the pair with no BUILD.json: `engine=0.1.55` is in the binary (`src/program/generate.cpp:12685`, `CMakeLists.txt`
+  version; read from the Windows CUDA `strata.exe` of this merge). An explicit variable or the config's `env` still wins:
+  that is how a binary with no version line gets the pair. Not covered: a BUILD.json that says 0.1.55 beside an older
+  binary, since BUILD.json is read first; and a build of an upstream development commit that is versioned 0.1.55 without
+  05cd12e7 (dbdec0bb is one; v0.2.9 and this merge have the fix). The test is `ParallelStackEngineGate` in `serve/test_parallel.py` (it includes
+  the kept 0.1.54-link.1 case).
 - **The server's GDN prompt switches** (`STRATA_GDN_TC=1`, `STRATA_GDN_CONVL2=2`; Linux, any Qwen3.8 configuration;
   `serve/server.py` `gdn_stack_env`; the engine takes the tensor-core scan from compute capability 8): they reach the
   main process only. A worker runs with its agent's environment (`tools/stage_node.py:532`), so its layers keep the

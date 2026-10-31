@@ -324,6 +324,36 @@ def read_manifest(folder: Path) -> EngineComponent:
         raw=data)
 
 
+# ----------------------------------------------------------------------------------------------- the version of an engine file
+
+def binary_engine_version(exe) -> str | None:
+    """The version compiled into an engine binary (the `engine=X.Y.Z` line it prints at start; 0.1.13 and newer carry
+    it), read from the file without running it.  None: unreadable, or a binary without it."""
+    try:
+        m = re.search(rb"engine=(\d+\.\d+\.\d+(?:\.\d+)?)\n", Path(exe).read_bytes())
+    except (OSError, ValueError):
+        return None
+    return m.group(1).decode() if m else None
+
+
+def read_engine_version(exe) -> str | None:
+    """The version of the engine binary `exe`, without running it: its folder's BUILD.json, else its folder's component
+    manifest, else the line compiled into the binary.  BUILD.json is optional: a package may leave it out, and a manual
+    CMake build or a copied binary has none.  A value that is not a version counts as not there.  None: nothing says."""
+    folder = Path(exe).parent
+    try:
+        version = json.loads((folder / "BUILD.json").read_text(encoding="utf-8-sig")).get("version")
+    except (OSError, ValueError, AttributeError):
+        version = None
+    if isinstance(version, str) and re.match(r"\d+\.\d+\.\d+", version):
+        return version
+    try:
+        version = read_manifest(folder).version
+    except ComponentProblem:
+        version = ""
+    return version if re.match(r"\d+\.\d+\.\d+", version) else binary_engine_version(exe)
+
+
 # ----------------------------------------------------------------------------------------------- signature (S6)
 
 #: A signature verifier is ``fn(payload: bytes, signature: dict, component) -> None``; it raises

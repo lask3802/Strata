@@ -397,8 +397,8 @@ def _smoke(cfg: dict, source_path: Path) -> int:
         tokens[index] = token
     tok = st.Tokenizer(tokens, (tokdir / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tokdir / "token_type.json").read_text(encoding="utf-8")))
-    engine = StrataEngine(str(_resolved(cfg["exe"], cfg, source_path)), engine_args(cfg),
-                          cwd=cfg.get("cwd"), log=cfg.get("log"), env=child_env(cfg))
+    exe = str(_resolved(cfg["exe"], cfg, source_path))
+    engine = StrataEngine(exe, engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=child_env(cfg, exe=exe))
     try:
         ids = cal.chat_ids(tok, "Say OK.")
         count = sum(token is not None for token in engine.generate(ids, 16, {"temperature": 0}, threading.Event()))
