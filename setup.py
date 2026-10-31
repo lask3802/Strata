@@ -10515,8 +10515,10 @@ def main() -> int:
 # link.N brought.  One between it and LINK_VERSION is installed (the latest release, while LINK_VERSION's tag is not
 # out yet) and replaced once the tag is there.  0.1.54-link.1: the remote stage is TLS only from there on - this
 # checkout's stage_node.py hands a worker STRATA_STAGE_TLS and no token, and an older engine's worker without a
-# token accepts anyone, in plain text.
-LINK_REQUIRED = "0.1.54-link.1"
+# token accepts anyone, in plain text.  0.1.55-link.1: the server turns STRATA_BATCH_GDN_GROUPS and
+# STRATA_BATCH_SELF_COMMIT on together with --batch on Linux (serve/server.py PARALLEL_STACK_ENV), and an engine before
+# upstream's 05cd12e7 (every 0.1.54) then never commits a one-row batch window's GDN state.
+LINK_REQUIRED = "0.1.55-link.1"
 # Strata Link builds no AMD engine (.github/workflows/release.yml): by default it comes from upstream's releases, as before
 WIN_HIP_REPO = "Niko1221/Strata"
 # What get_prebuilt learned about this checkout's release, in the engine folder, so a start does not download the same

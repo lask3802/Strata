@@ -78,6 +78,11 @@ class TheCheckoutsRelease(unittest.TestCase):
         stage_node.py (STRATA_STAGE_TLS, no token), would accept anyone in plain text."""
         self.assertGreaterEqual(setup.link_key(setup.LINK_REQUIRED), setup.link_key("0.1.54-link.1"))
 
+    def test_link_required_has_the_batch_self_commit_fix(self):
+        """No release from before 0.2.9's engine: the server's parallel stack sets STRATA_BATCH_GDN_GROUPS and
+        STRATA_BATCH_SELF_COMMIT together, and a 0.1.54 engine then never commits a one-row batch window's GDN state."""
+        self.assertGreaterEqual(setup.link_key(setup.LINK_REQUIRED), setup.link_key("0.1.55-link.1"))
+
     def test_link_required_is_not_newer_than_link_version(self):
         self.assertLessEqual(setup.link_key(setup.LINK_REQUIRED), setup.link_key(setup.link_version()))
         self.assertIsNotNone(re.fullmatch(r"\d+(\.\d+)+-link\.\d+", setup.LINK_REQUIRED))
