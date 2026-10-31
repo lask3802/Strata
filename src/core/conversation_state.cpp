@@ -192,8 +192,8 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
 }  // namespace strata::core
 namespace strata::metal_engine {
 // the running state lives in the Metal decode window (metal/src/engine/window.cpp), not in the session's buffers
-bool window_checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& error);
-bool window_checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& error);
+bool window_checkpoint_save(strata::core::ConversationCheckpoint& c, const strata::core::SessionState* ss, std::string& error);
+bool window_checkpoint_restore(const strata::core::ConversationCheckpoint& c, const strata::core::SessionState* ss, std::string& error);
 }  // namespace strata::metal_engine
 namespace strata::core {
 #endif
@@ -432,8 +432,8 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
     if (std::getenv("STRATA_PARK_TRACE")) std::fprintf(stderr, "strata parktrace: save join %.2f ms\n",
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - j0).count());
 #if defined(STRATA_GPU_METAL)
-    (void) ss; (void) g;
-    return strata::metal_engine::window_checkpoint_save(c, error);
+    (void) g;
+    return strata::metal_engine::window_checkpoint_save(c, &ss, error);
 #endif
     return checkpoint_save_n(c, ss, g, c.ids.size(), error, &staged);
 }
@@ -458,7 +458,7 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     const void* gdn = checkpoint_gdn_source(c);
 #if defined(STRATA_GPU_METAL)
     (void) g;
-    if (!strata::metal_engine::window_checkpoint_restore(c, error)) return false;
+    if (!strata::metal_engine::window_checkpoint_restore(c, &ss, error)) return false;
     ss.ple_prev[0] = c.ids.size() >= 2 ? c.ids[c.ids.size() - 2] : -1;
     ss.ple_prev[1] = c.ids.size() >= 1 ? c.ids[c.ids.size() - 1] : -1;
     return true;
